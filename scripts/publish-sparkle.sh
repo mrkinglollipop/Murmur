@@ -17,7 +17,8 @@
 #
 # Flow matches plans/015: bump → xcodegen → DMG (notarized when NOTARIZE=1) →
 # sign_update + --verify → prepend-only appcast merge → asserts BEFORE appcast
-# --clobber → curl -sfL.
+# --clobber → also clobber stable appcast/Murmur.dmg (marketing download alias)
+# → curl -sfL (feed + versioned DMG + stable alias).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -692,12 +693,22 @@ fi
 echo "==> Uploading appcast.xml (--clobber)"
 gh release upload appcast "$STAGE_APPCAST" --repo "$UPDATES_REPO" --clobber
 
+# Stable installer alias for marketing download links (kinglollipop.com/murmur/download).
+# Same bytes as the versioned DMG; overwritten every publish so the site never hardcodes a version.
+STABLE_DMG="$ROOT/build/Murmur.dmg"
+STABLE_DMG_URL="https://github.com/${UPDATES_REPO}/releases/download/appcast/Murmur.dmg"
+cp "$DMG" "$STABLE_DMG"
+echo "==> Uploading stable Murmur.dmg alias (--clobber)"
+gh release upload appcast "$STABLE_DMG" --repo "$UPDATES_REPO" --clobber
+
 # --- 8) Live URL asserts (GET -L; HEAD often 404s on GitHub XML assets) ---
 echo "==> curl -sfL live URLs (up to 3 attempts each)"
 curl_assert_url "feed" "$FEED_URL"
 curl_assert_url "dmg" "$ENCLOSURE_URL"
+curl_assert_url "stable-dmg" "$STABLE_DMG_URL"
 echo ""
 echo "==> Done"
-echo "  Feed: $FEED_URL"
-echo "  DMG:  $ENCLOSURE_URL"
-echo "  App:  $SHORT ($BUILD) pubkey present"
+echo "  Feed:   $FEED_URL"
+echo "  DMG:    $ENCLOSURE_URL"
+echo "  Stable: $STABLE_DMG_URL"
+echo "  App:    $SHORT ($BUILD) pubkey present"

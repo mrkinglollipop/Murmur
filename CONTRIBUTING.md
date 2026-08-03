@@ -3,8 +3,8 @@
 Thanks for contributing. Murmur is licensed under the **GNU Affero General
 Public License v3.0** (see [`LICENSE`](LICENSE)). Copyright is held by
 **Matthew Schwartz** (d/b/a King Lollipop Studios). Dual-licensing remains
-available only if contributors assign copyright via a CLA — a DCO is not
-enough for that.
+available only if contributors assign copyright via a CLA — a DCO alone is
+not sufficient.
 
 ## Contributor License Agreement (CLA)
 
@@ -15,43 +15,41 @@ By opening a pull request, you agree that:
    be licensed under AGPL-3.0 and optionally dual-licensed.
 3. Your contribution is provided under AGPL-3.0 terms unless otherwise stated.
 
-If you cannot assign copyright (e.g. employer ownership), say so in the PR
-before merge; we will not land the change until that is resolved.
+If you cannot assign copyright (for example, employer ownership), say so in the
+PR before merge. We will not land the change until that is resolved.
 
-## Build and test (local only — no CI by design)
+## Build and test
 
-This repository intentionally has **no CI**. Local verification on macOS with
-Xcode is the gate.
+This repository has **no CI by design**. Verification is local on macOS with
+Xcode.
 
 ```bash
-cp Config/Team.xcconfig.example Config/Team.xcconfig   # required by xcodegen
-# Set DEVELOPMENT_TEAM in Config/Team.xcconfig for signed builds, or export it.
+cp Config/Team.xcconfig.example Config/Team.xcconfig   # required by XcodeGen
+# Optional: set DEVELOPMENT_TEAM in that file for signed builds
 xcodegen generate
 xcodebuild -scheme Voice -configuration Debug build CODE_SIGNING_ALLOWED=NO
 xcodebuild test -scheme VoiceTests -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
 ```
 
-Contributor builds that skip codesigning should use `CODE_SIGNING_ALLOWED=NO`.
-Release / install scripts need a stable Developer ID — see the comment above
-`CODE_SIGN_STYLE` in [`project.yml`](project.yml) and
-[`scripts/README.md`](scripts/README.md) (`DEVELOPMENT_TEAM` env override).
+`Voice.xcodeproj` is generated and not tracked — run `xcodegen generate` after
+clone or any `project.yml` change.
 
-After cloning a tree that does not track `Voice.xcodeproj`, run
-`xcodegen generate` before opening the project in Xcode.
+Unsigned contributor builds should use `CODE_SIGNING_ALLOWED=NO`. Release and
+install scripts need a stable Developer ID — see the signing comments in
+[`project.yml`](project.yml) and [`scripts/README.md`](scripts/README.md).
 
-When shipping a version, bump `Resources/WhatsNew/releases.json` with a
-newest-first entry (version, build, title, bullet items) so the in-app
-What's New sheet and Settings section stay current.
+When shipping a version, bump [`Resources/WhatsNew/releases.json`](Resources/WhatsNew/releases.json)
+with a newest-first entry (`version`, `build`, `title`, bullet `items`) so the
+in-app What's New sheet and Settings section stay current.
 
-## Copyright file headers
+## Copyright headers
 
-**Intentional omission:** Murmur source files do not carry per-file copyright
-headers. A repo-wide grep for Murmur/program copyright headers found none
-outside license/font third-party notices and this plan/docs set. Do not
-mass-insert headers. The project copyright line lives in [`LICENSE`](LICENSE).
+Murmur source files intentionally omit per-file copyright headers. Do not
+mass-insert them. Project copyright lives in [`LICENSE`](LICENSE).
 
 ## Pull requests
 
-- Branches: `feat/<slug>` / `fix/<slug>`. Conventional commits.
-- Prefer a focused PR with build + test evidence in the description.
-- Do not commit `Config/Team.xcconfig`, Sparkle private keys, or API keys.
+- Branches: `feat/<slug>` / `fix/<slug>`
+- Conventional commits
+- Prefer a focused PR with build and test evidence in the description
+- Do not commit `Config/Team.xcconfig`, Sparkle private keys, or API keys

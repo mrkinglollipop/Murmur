@@ -1,13 +1,15 @@
 # Murmur — open-source readiness plan
 
-> **Wrapper defaults supersede Claude’s blocked / Matt-call section.**
-> Locked by Cursor wrapper (`open-source_readiness_0be2a008`): SECURITY.md → GitHub private vulnerability reporting (no personal email); Copyright → `Copyright (C) 2026 Matthew Schwartz d/b/a King Lollipop Studios`; public `Voice.xcodeproj` → gitignore + `xcodegen generate` required setup. CLA counterparty = Matthew Schwartz until LLC assignment.
+> **Status: SHIPPED** — Phases 1–5 complete.
 >
-> Status: **SHIPPED** — Phases 1–5 complete. Public orphan tip `24b7c2f` on
-> **public** `mrkinglollipop/Murmur`. Private archive SSOT =
-> `mrkinglollipop/Murmur-archive`. Sparkle feed tip **0.1.20** / build 21.
+> - Public repo: [`mrkinglollipop/Murmur`](https://github.com/mrkinglollipop/Murmur)
+> - Private archive: [`mrkinglollipop/Murmur-archive`](https://github.com/mrkinglollipop/Murmur-archive)
+> - Sparkle feed tip at plan close: **0.1.20** / build 21
 >
-> Historical Claude brief: local Claude plan archive on the operator machine (not in-repo; 2026-08-03, `4a1cd49`). This file is the in-repo SSOT after port-023 HARD transforms.
+> Locked product defaults: GitHub private vulnerability reporting; copyright
+> `Copyright (C) 2026 Matthew Schwartz d/b/a King Lollipop Studios`; public tree
+> gitignores generated `Voice.xcodeproj` (`xcodegen generate` required); CLA
+> counterparty = Matthew Schwartz until LLC assignment.
 
 ## Context
 

@@ -1,11 +1,13 @@
 ## Summary
 
+<!-- What changed and why (1–3 bullets). -->
+
 ## Test plan
 
 - [ ] `xcodegen generate`
 - [ ] `xcodebuild -scheme Voice -configuration Debug build CODE_SIGNING_ALLOWED=NO`
 - [ ] `xcodebuild test -scheme VoiceTests -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO`
-- [ ] Manual: hold activation key → dictate → text injects / history records (if behavior changed)
+- [ ] Manual (if behavior changed): hold activation key → dictate → text injects / history records
 
 ## CLA
 

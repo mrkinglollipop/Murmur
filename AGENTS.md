@@ -1,48 +1,39 @@
 # AGENTS.md
 
-Primary developer docs live in `CLAUDE.md` (setup, verify, install, conventions, sharp
-edges) and `README.md` (product + runtime behavior). Read those first. This file only adds
-guidance specific to Cursor Cloud (Linux) agents.
+Primary developer docs: [`CLAUDE.md`](CLAUDE.md) (setup, verify, conventions)
+and [`README.md`](README.md) (product overview). This file adds guidance for
+**Cursor Cloud (Linux)** agents only.
 
-## Cursor Cloud specific instructions
+## Cursor Cloud
 
-**This is a macOS-only app and cannot be built, run, tested, or lint-checked on the Linux
-cloud VM.** `Murmur` targets macOS 26.0 and depends on macOS-exclusive toolchain and
-frameworks:
+**Murmur is macOS-only.** It cannot be built, run, tested, or lint-checked on
+the Linux cloud VM. It targets macOS 26.0 and depends on macOS-exclusive
+tooling and frameworks:
 
-- Build requires `xcodegen` + `xcodebuild` (Xcode), which are macOS-only and cannot be
-  installed on Linux. There is no Swift toolchain or macOS SDK on the cloud VM.
-- The app links AppKit, SwiftUI Liquid Glass (`.glassEffect`, macOS 26-only), CoreML via
-  WhisperKit, CGEvent HID taps, Keychain, TCC/Accessibility — none available on Linux.
-- Signing is Manual Developer ID bound to TCC grants (see `project.yml` / `CLAUDE.md`).
-- The Parakeet sidecar (`Resources/parakeet_transcribe.py`) needs `parakeet-mlx`
-  (Apple MLX / Metal), which is macOS-only.
+- `xcodegen` + `xcodebuild` (Xcode) — not available on Linux
+- AppKit, SwiftUI Liquid Glass, WhisperKit / CoreML, CGEvent HID taps, Keychain,
+  TCC / Accessibility
+- Parakeet sidecar (`Resources/parakeet_transcribe.py`) via `parakeet-mlx`
+  (Apple MLX / Metal)
 
-Consequence for cloud agents: the real build/test/lint/run loop (`xcodegen generate`,
-`xcodebuild build`, `xcodebuild test`, `scripts/install-local.sh`) can ONLY be executed on a
-macOS host with Xcode. Use the exact commands in `CLAUDE.md` there; do not attempt them on
-the Linux VM. Do not try to `apt install swift` or otherwise fake a build — the code will not
-compile without the macOS SDK.
+On a Linux cloud agent: do **not** attempt to install a Swift toolchain or fake
+a build. Use the commands in [`CLAUDE.md`](CLAUDE.md) on a Mac with Xcode.
 
-**What DOES run on the Linux cloud VM:** offline release-tooling oracles
+**What does run on Linux:** offline release-tooling oracles
 
 ```bash
 bash scripts/test-publish-sparkle-helpers.sh   # expect: "ORACLE OK", exit 0
-bash scripts/test-app-icon-helpers.sh          # partial on Linux (skips provenance/icns)
+bash scripts/test-app-icon-helpers.sh          # partial (skips provenance / icns)
 ```
 
-`test-publish-sparkle-helpers.sh` uses only `bash -n`, `grep`, and `python3` (no network, no
-`gh`, no Xcode). `test-app-icon-helpers.sh` needs **Pillow** (`pip install pillow`) for
-cross-platform source/iconset geometry checks; on Linux it **SKIP**s macOS provenance (regenerate
-all ten members from pinned source + icns hash compare). Full icon verification requires macOS
-(`sips` + `iconutil`). Icon generation (`scripts/generate-app-icon.sh`) is macOS-only.
+`test-app-icon-helpers.sh` needs Pillow (`pip install pillow`) for geometry
+checks. Full icon verification requires macOS (`sips` + `iconutil`).
 
-**Config prerequisite:** `xcodegen` hard-requires `Config/Team.xcconfig` to exist. It is
-gitignored; create it from the example when missing (the update script does this idempotently):
+**Config prerequisite:**
 
 ```bash
 [ -f Config/Team.xcconfig ] || cp Config/Team.xcconfig.example Config/Team.xcconfig
 ```
 
-**CI:** this repo intentionally has no CI (see `CLAUDE.md`). Local macOS verification is the
-verification — do not add a workflow.
+**CI:** this repository has no CI by design. Local macOS verification is the
+gate — do not add a workflow from a cloud session.
