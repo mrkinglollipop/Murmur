@@ -1,0 +1,32 @@
+[
+  {
+    "version": "0.1.20",
+    "build": "21",
+    "title": "What's New in 0.1.20",
+    "items": [
+      "Sparkle update dialog now shows release notes from the same bundled What's New catalog.",
+      "What's New is still available anytime in Settings → What's New."
+    ]
+  },
+  {
+    "version": "0.1.19",
+    "build": "20",
+    "title": "What's New in 0.1.19",
+    "items": [
+      "What's New: after an update you'll see a short summary once, and you can re-read it anytime in Settings → What's New.",
+      "WhisperKit model files now live under Application Support instead of Documents, with a one-time migration from the old location.",
+      "Model cache migration and usable-cache checks are hardened so a partial or stale download is less likely to block dictation.",
+      "Public-repo scrub: operator paths and credential-store references removed from shipped plan docs ahead of open-source release."
+    ]
+  },
+  {
+    "version": "0.1.18",
+    "build": "19",
+    "title": "What's New in 0.1.18",
+    "items": [
+      "WhisperKit model cache path and migration hardening (Application Support).",
+      "Repository prep for an upcoming public release (LICENSE, contributing guidelines, and related housekeeping).",
+      "In-app updates via Sparkle continue from the same feed."
+    ]
+  }
+]

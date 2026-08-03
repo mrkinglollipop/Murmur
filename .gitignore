@@ -1,0 +1,31 @@
+.DS_Store
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.build/
+*.resolved
+__pycache__/
+
+# xcodebuild derived data (from -derivedDataPath build)
+build/
+
+# Local signing team override (copy from Config/Team.xcconfig.example)
+Config/Team.xcconfig
+
+# Sparkle EdDSA private keys (never commit)
+*.ed25519
+sparkle_private*
+sparkle_ed25519
+
+
+# Iterate / harness local state
+.cursor/state/
+
+# Agent scratch worktrees. Registered git worktrees live here, so staging one
+# records a mode-160000 gitlink with no .gitmodules entry — a submodule pointer
+# to nowhere that breaks every fresh clone.
+.claude/
+
+# Public-cut fragment (Phase 5) — merge into .gitignore when cutting the public repo.
+# Voice.xcodeproj is generated from project.yml; contributors run xcodegen generate.
+Voice.xcodeproj

@@ -1,0 +1,10 @@
+// Copy to Config/Team.xcconfig and customize, or export DEVELOPMENT_TEAM
+// before running xcodegen / xcodebuild.
+//
+//   cp Config/Team.xcconfig.example Config/Team.xcconfig
+//   # edit DEVELOPMENT_TEAM=YOUR_TEAM_ID
+//
+// Environment override at build time:
+//   DEVELOPMENT_TEAM=YOUR_TEAM_ID xcodebuild ...
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID

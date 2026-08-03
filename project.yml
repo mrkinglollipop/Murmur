@@ -1,0 +1,147 @@
+name: Voice
+options:
+  bundleIdPrefix: com.matt
+  deploymentTarget:
+    # macOS 26 floor: the UI uses native Liquid Glass (.glassEffect,
+    # GlassEffectContainer, .buttonStyle(.glass)/.glassProminent), which are
+    # macOS 26-only. The retheme is all-in glass with no availability fallback.
+    macOS: "26.0"
+  createIntermediateGroups: true
+
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    # MIT licence — confirmed at https://github.com/argmaxinc/WhisperKit/blob/main/LICENSE
+    from: "0.9.0"
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio
+    # Apache-2.0 licence — confirmed at https://github.com/FluidInference/FluidAudio/blob/v0.15.5/LICENSE
+    exactVersion: "0.15.5"
+
+configs:
+  Debug: debug
+  Release: release
+
+configFiles:
+  Debug: Config/Team.xcconfig
+  Release: Config/Team.xcconfig
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.matt.voice-dictation
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SWIFT_VERSION: "5.10"
+    ENABLE_HARDENED_RUNTIME: YES
+    # Permissions required at runtime:
+    # Input Monitoring — granted via System Settings, no entitlement needed for CGEvent tap
+    # Microphone — entitlement required
+    #
+    # Signing: MANUAL with a stable Developer ID identity (not ad-hoc/automatic).
+    # TCC binds Accessibility/Input-Monitoring grants to the code-signing
+    # designated requirement (team ID + identity), NOT the cdhash. Ad-hoc signing
+    # mints a fresh cdhash every build, so grants silently stop applying and the
+    # app loses fn-consumption + injection after each rebuild. Signing with the
+    # same Developer ID cert keeps the designated requirement constant, so grants
+    # persist across rebuilds.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Developer ID Application"
+    # Default team ID lives in Config/Team.xcconfig (override via DEVELOPMENT_TEAM env at build time).
+
+targets:
+  Voice:
+    type: application
+    platform: macOS
+    # productName (not just a PRODUCT_NAME build setting) so xcodegen derives
+    # TEST_HOST and product references as Murmur.app for the VoiceTests target.
+    productName: Murmur
+    sources:
+      - path: Sources/Voice
+      - path: Resources
+        buildPhase: resources
+        excludes:
+          # Junk must never enter the sealed bundle — orphans break codesign,
+          # grey out Sparkle, and tank Accessibility/injection.
+          - "**/*.bak"
+          - "**/*~.icns"
+          - "**/.DS_Store"
+          - "**/__pycache__"
+    info:
+      path: Sources/Voice/Info.plist
+      properties:
+        CFBundleName: Murmur
+        CFBundleDisplayName: Murmur
+        CFBundleIconFile: AppIcon
+        CFBundleIdentifier: com.matt.voice-dictation
+        CFBundleVersion: "21"
+        CFBundleShortVersionString: "0.1.20"
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundlePackageType: APPL
+        CFBundleSignature: "????"
+        NSPrincipalClass: NSApplication
+        # Normal Dock app (NOT LSUIElement): the app shows in the Dock while
+        # running and quits with Cmd-Q / Dock → Quit, like Wispr. It still
+        # installs a menu-bar status item and the floating HUD pill.
+        NSMicrophoneUsageDescription: "Murmur uses the microphone to capture audio while you hold the push-to-talk key."
+        NSAccessibilityUsageDescription: "Murmur uses Accessibility to inject transcribed text at your cursor and suppress the emoji picker while the push-to-talk key is held."
+        # Sparkle auto-update — public feed on Murmur-updates (source stays private)
+        SUFeedURL: "https://github.com/mrkinglollipop/Murmur-updates/releases/download/appcast/appcast.xml"
+        SUEnableAutomaticChecks: true
+        SUPublicEDKey: "avl49QCQMbC5HBkcNxpcRiFLqJrn2aTfCcAuaauEAoQ="
+        # Input Monitoring: CGEvent tap apps request this at runtime via TCC; no Info.plist key required,
+        # but we surface a helpful message via code when it is missing.
+    entitlements:
+      path: Sources/Voice/Voice.entitlements
+      properties:
+        com.apple.security.device.audio-input: true
+        # Hardened runtime + audio
+        com.apple.security.cs.allow-jit: false
+    dependencies:
+      - package: WhisperKit
+        product: WhisperKit
+      - package: Sparkle
+        product: Sparkle
+      - package: FluidAudio
+        product: FluidAudio
+    settings:
+      base:
+        # productName above only renames the product reference / TEST_HOST;
+        # PRODUCT_NAME must ALSO be set for the built bundle to be Murmur.app.
+        PRODUCT_NAME: Murmur
+        # Module stays `Voice` (tests use `@testable import Voice`); only the
+        # product bundle is renamed.
+        PRODUCT_MODULE_NAME: Voice
+        INFOPLIST_FILE: Sources/Voice/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/Voice/Voice.entitlements
+
+  VoiceTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/VoiceTests
+    dependencies:
+      - target: Voice
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matt.voice-dictation.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        ENABLE_TESTING_SEARCH_PATHS: YES
+
+schemes:
+  Voice:
+    build:
+      targets:
+        Voice: all
+    test:
+      targets:
+        - VoiceTests
+  VoiceTests:
+    build:
+      targets:
+        VoiceTests: [test]
+    test:
+      targets:
+        - VoiceTests
