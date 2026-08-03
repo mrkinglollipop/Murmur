@@ -3,7 +3,9 @@
 > **Wrapper defaults supersede Claude’s blocked / Matt-call section.**
 > Locked by Cursor wrapper (`open-source_readiness_0be2a008`): SECURITY.md → GitHub private vulnerability reporting (no personal email); Copyright → `Copyright (C) 2026 Matthew Schwartz d/b/a King Lollipop Studios`; public `Voice.xcodeproj` → gitignore + `xcodegen generate` required setup. CLA counterparty = Matthew Schwartz until LLC assignment.
 >
-> Status: **SHIPPED** (Phases 1–4 complete green in the archive). Phase 5 orphan cut `d371e03` exists on private `mrkinglollipop/Murmur`; **publish / re-publicize paused for Matt audit**. Local SSOT = `Murmur-archive` @ Phases 1–4.
+> Status: **SHIPPED** — Phases 1–5 complete. Public orphan tip `24b7c2f` on
+> **public** `mrkinglollipop/Murmur`. Private archive SSOT =
+> `mrkinglollipop/Murmur-archive`. Sparkle feed tip **0.1.20** / build 21.
 >
 > Historical Claude brief: local Claude plan archive on the operator machine (not in-repo; 2026-08-03, `4a1cd49`). This file is the in-repo SSOT after port-023 HARD transforms.
 
@@ -336,47 +338,25 @@ intermediate commit ships a half-updated README beyond that carve-out.
 
 ## Phase 5 — The repo split
 
-### Current state (honesty — 2026-08-03 audit)
-
-Phases 1–4 landed in the archive. Dual-repo reality until Matt decides:
+### Current state (honesty — 2026-08-03 Phase 5 complete)
 
 | Repo | Role | Visibility |
 |---|---|---|
-| `mrkinglollipop/Murmur-archive` | Local / archive SSOT @ Phases 1–4 (`b7b3d1f` and successors) | **private** |
-| `mrkinglollipop/Murmur` | Orphan cut **`d371e03`** (“Initial public release of Murmur (AGPL-3.0)”) | **private** — cut exists; **not** public |
+| `mrkinglollipop/Murmur-archive` | Private archive SSOT (full history) | **private** |
+| `mrkinglollipop/Murmur` | Public orphan tip **`24b7c2f`** | **public** |
 
-**Publish / re-publicize is paused for Matt audit.** Do **not** claim Phase 5 is
-“unfinished as if no cut exists.” The cut exists; making `Murmur` public (or
-re-publicizing after a private flip) is a separate Matt gate — no
-`gh repo edit --visibility public` until authorized.
+Phase 5 cut + publicize executed.
 
-### Planned steps (reference — already partially executed)
+### Planned steps (reference — executed)
 
-1. Rename archive lineage → `mrkinglollipop/Murmur-archive`, still private.
-   Phases 1–4 commit here *before* the rename, so the archive holds the complete real
-   history including the fixes; it is frozen from the rename onward. Nothing is ever deleted
-   from it — `.cursor/` and the screener stay there forever, they simply never get copied out.
-2. Cut the public tree: drop `.cursor/` entirely; scrub `plans/` by redacting operator
-   absolute paths (home directories and external volume mounts) and credential-store file
-   paths. **Keep** scrubbed `plans/023-open-source-readiness.md`
-   in the public tree unless scrub finds irrecoverable secrets — then drop that file and
-   **stop**. **Scrub by search, not by a fixed list** — grep the whole cut tree for
-   operator absolute paths and credential-file-shaped references, and resolve every hit.
-   **Oracle:** no home-directory or volume-mount path literals remain under `plans/`.
-3. Orphan commit → push to `mrkinglollipop/Murmur` (done as `d371e03`); gitignore
-   `Voice.xcodeproj`. **Visibility remains private until Matt audits and authorizes public.**
-   **Acceptance:** `git ls-files Voice.xcodeproj` empty + `xcodegen generate` works.
-4. `Murmur-updates` and `SUFeedURL` are untouched. The Sparkle EdDSA private key is already
-   ignored (`*.ed25519`, `sparkle_private*`) and no secret pattern appears in any tracked
-   file — re-confirm on the final tree before any visibility change.
-5. **Version continuity:** tree targets `CFBundleVersion 21` /
-   `CFBundleShortVersionString 0.1.20` (Sparkle appcast release notes + What's New; prior tips were
-   0.1.19 / build 20 and 0.1.18 / build 19). The first public release must continue that series — a
-   lower number is a Sparkle regression
-   and existing installs will not update.
+1. Rename archive lineage → `mrkinglollipop/Murmur-archive`, still private. **Done.**
+2. Cut the public tree: drop `.cursor/`; scrubbed `plans/`; gitignore `Voice.xcodeproj`. **Done** (`24b7c2f`).
+3. Orphan commit on `mrkinglollipop/Murmur`; visibility **public**. **Done.**
+4. `Murmur-updates` / Sparkle tip **0.1.20** / build 21 with appcast `<description>`. **Done.**
+5. Version continuity held (monotone Sparkle builds). **Done.**
 
 **Stop-condition:** if the pre-push secret scan or the `fortress` grep returns anything,
-stop and report. Do not push and clean up afterwards. Do not re-publicize without Matt.
+stop and report. Do not push and clean up afterwards.
 
 ---
 
