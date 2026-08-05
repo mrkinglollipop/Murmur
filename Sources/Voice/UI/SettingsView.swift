@@ -249,6 +249,17 @@ struct SettingsView: View {
 
                         Divider().overlay(Theme.hairline)
 
+                        Toggle("Learn from corrections in other apps", isOn: $settingsStore.learnFromInlineCorrections)
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("When you fix a misheard word after dictation, Murmur learns it for next time.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+
+                        Divider().overlay(Theme.hairline)
+
                         Button("Replay onboarding") {
                             onReplayOnboarding()
                         }

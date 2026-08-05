@@ -21,6 +21,23 @@ final class TextInjector {
     private static var lastDeliveredText: String?
     private static var lastDeliveredAt: Date?
 
+    enum InsertResult: Equatable {
+        /// Delivery confirmed (paste chord or unicode observer).
+        case inserted(deliveredText: String)
+        /// Suppressed within the dedupe window — no field mutation.
+        case deduped
+        /// Failed, or delivery unconfirmed (paste-blind / unverified pid fallback).
+        case failed
+
+        /// History/HUD: treat dedupe like success (no failure badge); watch only on `.inserted`.
+        var wasInjectedForHistory: Bool {
+            switch self {
+            case .inserted, .deduped: return true
+            case .failed: return false
+            }
+        }
+    }
+
     typealias DeliveryLane = (String) -> Bool
     internal static var deliveryLaneForTesting: DeliveryLane?
 
@@ -190,14 +207,14 @@ final class TextInjector {
     }
 
     @discardableResult
-    func insert(_ text: String) -> Bool {
+    func insert(_ text: String) -> InsertResult {
         let trimmed = Self.trimmingTrailingWhitespaceAndNewlines(text)
         guard !trimmed.isEmpty,
-              trimmed.contains(where: { !$0.isWhitespace && !$0.isNewline }) else { return false }
+              trimmed.contains(where: { !$0.isWhitespace && !$0.isNewline }) else { return .failed }
 
         if IsSecureEventInputEnabled() {
             Self.log("blocked secure-input chars=\(trimmed.count)")
-            return false
+            return .failed
         }
 
         Self.dedupeLock.lock()
@@ -212,33 +229,32 @@ final class TextInjector {
             window: Self.dedupeWindow
         ) {
             Self.log("DEDUPED chars=\(trimmed.count)")
-            return true
+            return .deduped
         }
 
-        let success: Bool
+        let result: InsertResult
         if let deliveryLane = Self.deliveryLaneForTesting {
-            success = deliveryLane(trimmed)
+            result = deliveryLane(trimmed) ? .inserted(deliveredText: trimmed) : .failed
         } else {
-            success = performInsert(trimmed)
+            result = performInsert(trimmed)
         }
 
-        if success {
+        if case .inserted = result {
             Self.lastDeliveredText = trimmed
             Self.lastDeliveredAt = Date()
         }
 
-        return success
+        return result
     }
 
-    @discardableResult
-    private func performInsert(_ trimmed: String) -> Bool {
+    private func performInsert(_ trimmed: String) -> InsertResult {
         let utf16Count = trimmed.utf16.count
         let savedPasteboardString = Self.savedPasteboardString(from: NSPasteboard.general)
 
         guard let observer = UnicodeDeliveryObserver.create() else {
-            // Observer unavailable: paste-blind only. Do not claim success if the
-            // chord never posted (e.g. pasteboard race aborted before Cmd-V).
-            return insertViaPasteBlind(trimmed, savedPasteboardString: savedPasteboardString)
+            // Paste-blind is unconfirmed — fail closed for watch / InsertResult.
+            _ = insertViaPasteBlind(trimmed, savedPasteboardString: savedPasteboardString)
+            return .failed
         }
         defer { observer.stop() }
 
@@ -251,7 +267,7 @@ final class TextInjector {
                 Self.log("skip pasteboard restore — external overwrite after paste")
             }
             Self.log("paste chord emitted with verified pasteboard chars=\(utf16Count)")
-            return true
+            return .inserted(deliveredText: trimmed)
         }
 
         observer.resetObservedCount()
@@ -313,11 +329,11 @@ final class TextInjector {
         switch outcome.path {
         case .confirmed, .confirmedOnRetry:
             Self.log("unicode typing confirmed chars=\(utf16Count)")
-            return true
+            return .inserted(deliveredText: trimmed)
         case .unverifiedFallback:
-            return true
+            return .failed
         case .clipboard:
-            return false
+            return .failed
         }
     }
 

@@ -490,7 +490,11 @@ final class DictionaryStore: ObservableObject {
                 guard similarity >= Self.minLearnSimilarity else { continue }
             }
 
-            if let correction = recordLearnedVariant(strippedOld, mapsTo: strippedNew) {
+            if let correction = recordLearnedVariant(
+                strippedOld,
+                mapsTo: strippedNew,
+                respectBlocklist: !userInitiated
+            ) {
                 recorded.append(correction)
             }
         }
@@ -517,7 +521,11 @@ final class DictionaryStore: ObservableObject {
             }
 
             if let merge = findMerge(oldWords: oldWords, newWords: newWords, startOld: i, startNew: j) {
-                if let correction = recordLearnedVariant(merge.variant, mapsTo: merge.term) {
+                if let correction = recordLearnedVariant(
+                    merge.variant,
+                    mapsTo: merge.term,
+                    respectBlocklist: !userInitiated
+                ) {
                     recorded.append(correction)
                 }
                 i += merge.oldCount
@@ -526,7 +534,11 @@ final class DictionaryStore: ObservableObject {
             }
 
             if let split = findSplit(oldWords: oldWords, newWords: newWords, startOld: i, startNew: j) {
-                if let correction = recordLearnedVariant(split.variant, mapsTo: split.term) {
+                if let correction = recordLearnedVariant(
+                    split.variant,
+                    mapsTo: split.term,
+                    respectBlocklist: !userInitiated
+                ) {
                     recorded.append(correction)
                 }
                 i += 1
@@ -540,7 +552,11 @@ final class DictionaryStore: ObservableObject {
                !strippedNew.isEmpty,
                strippedOld.caseInsensitiveCompare(strippedNew) != .orderedSame {
                 if userInitiated,
-                   let correction = recordLearnedVariant(strippedOld, mapsTo: strippedNew) {
+                   let correction = recordLearnedVariant(
+                    strippedOld,
+                    mapsTo: strippedNew,
+                    respectBlocklist: false
+                   ) {
                     recorded.append(correction)
                 }
             }
@@ -647,7 +663,14 @@ final class DictionaryStore: ObservableObject {
     /// variant case-insensitively), or creates a new entry. Returns the
     /// `LearnedCorrection` describing what happened (and where), or `nil` if
     /// the variant was already present and nothing changed.
-    private func recordLearnedVariant(_ variant: String, mapsTo term: String) -> LearnedCorrection? {
+    private func recordLearnedVariant(
+        _ variant: String,
+        mapsTo term: String,
+        respectBlocklist: Bool = false
+    ) -> LearnedCorrection? {
+        if respectBlocklist, isBlocklisted(heard: variant, replaced: term) {
+            return nil
+        }
         if let existing = entries.first(where: { $0.term.caseInsensitiveCompare(term) == .orderedSame }) {
             let alreadyPresent = existing.variants.contains { $0.caseInsensitiveCompare(variant) == .orderedSame }
             guard !alreadyPresent else { return nil }

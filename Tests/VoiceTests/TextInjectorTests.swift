@@ -405,8 +405,8 @@ final class TextInjectorTests: XCTestCase {
         let injector = TextInjector()
         let text = "retry after failure"
 
-        XCTAssertFalse(injector.insert(text))
-        XCTAssertTrue(injector.insert(text))
+        XCTAssertEqual(injector.insert(text), .failed)
+        XCTAssertEqual(injector.insert(text), .inserted(deliveredText: text))
         XCTAssertEqual(callCount, 2)
     }
 

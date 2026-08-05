@@ -66,6 +66,7 @@ final class SettingsStore: ObservableObject {
         static let removeFillerWords = "voice.settings.removeFillerWords"
         static let useToggleLock = "voice.settings.useToggleLock"
         static let smartLeadingSpace = "voice.settings.smartLeadingSpace"
+        static let learnFromInlineCorrections = "voice.settings.learnFromInlineCorrections"
         static let selectedLanguage = "voice.settings.selectedLanguage"
         static let speakerGatingEnabled = "voice.settings.speakerGatingEnabled"
         static let speakerGatingSensitivity = "voice.settings.speakerGatingSensitivity"
@@ -228,6 +229,15 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// When on, watch for inline spelling fixes after inject and auto-learn them.
+    @Published var learnFromInlineCorrections: Bool {
+        didSet {
+            guard !isHydrating else { return }
+            UserDefaults.standard.set(learnFromInlineCorrections, forKey: Keys.learnFromInlineCorrections)
+            applyLearnFromInlineCorrections()
+        }
+    }
+
     /// ISO 639-1 language code for ASR backends (default `"en"`).
     @Published var selectedLanguage: String {
         didSet {
@@ -291,6 +301,9 @@ final class SettingsStore: ObservableObject {
 
     /// Optional history store for prune protect-list + export transcripts.
     weak var historyStore: HistoryStore?
+
+    /// Inline correction watcher — toggle applies here without relaunch.
+    weak var correctionWatcher: CorrectionWatcher?
 
     /// Owns per-model download/storage state (see `ModelManager`). Wired in
     /// by `AppDelegate` alongside the other live components; also exposed to
@@ -385,6 +398,12 @@ final class SettingsStore: ObservableObject {
             smartLeadingSpace = true
         }
 
+        if defaults.object(forKey: Keys.learnFromInlineCorrections) != nil {
+            learnFromInlineCorrections = defaults.bool(forKey: Keys.learnFromInlineCorrections)
+        } else {
+            learnFromInlineCorrections = true
+        }
+
         if let lang = defaults.string(forKey: Keys.selectedLanguage), !lang.isEmpty {
             selectedLanguage = lang
         } else {
@@ -422,6 +441,7 @@ final class SettingsStore: ObservableObject {
         applyCloudSettings()
         applyCleanupSettings()
         applyLanguage()
+        applyLearnFromInlineCorrections()
         refreshEnrolledVoiceProfile(autoEnableGatingIfPresent: false)
         applySpeakerGatingSettings()
         applyRecordingBudget()
@@ -515,6 +535,10 @@ final class SettingsStore: ObservableObject {
             openAIKey: keychain.key(for: Self.cleanupKeyAccount),
             xaiKey: keychain.key(for: CloudProvider.xai.keychainAccount)
         )
+    }
+
+    private func applyLearnFromInlineCorrections() {
+        correctionWatcher?.isEnabled = learnFromInlineCorrections
     }
 
     private func applyLanguage() {
