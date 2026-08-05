@@ -178,6 +178,12 @@ final class ASREngineSelector {
         set { pipeline.onTranscriptionLogged = newValue }
     }
 
+    /// Confirmed insert delivered text — for inline correction watching.
+    var onTextInserted: ((String) -> Void)? {
+        get { pipeline.onTextInserted }
+        set { pipeline.onTextInserted = newValue }
+    }
+
     /// Optional failure hook for terminal errors (transcription, injection,
     /// audio capture). Invoked on the main thread. Wired by AppDelegate to
     /// the HUD error pill and menu-bar badge.

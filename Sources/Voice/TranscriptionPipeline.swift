@@ -38,6 +38,10 @@ final class TranscriptionPipeline {
     /// Sixth arg is optional history entry ID to replace (retry path).
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)?
 
+    /// Fired on the main thread after a confirmed insert with the delivered text
+    /// (for inline correction watching). Not called for dedupe or failed inserts.
+    var onTextInserted: ((String) -> Void)?
+
     /// Invoked on the main thread when dictionary/phonetic corrections fire.
     var onCorrectionsRecorded: (([CorrectionRecord]) -> Void)?
 
@@ -282,7 +286,14 @@ final class TranscriptionPipeline {
                 } else {
                     textToInject = expanded
                 }
-                let injected = secureInput ? false : TextInjector().insert(textToInject)
+                let insertResult = secureInput ? TextInjector.InsertResult.failed : TextInjector().insert(textToInject)
+                let injected = insertResult.wasInjectedForHistory
+                if case .inserted(let delivered) = insertResult {
+                    let notify = self.onTextInserted
+                    DispatchQueue.main.async {
+                        notify?(delivered)
+                    }
+                }
                 DispatchQueue.main.async {
                     let outcome = Self.secureInputOutcome(secureInput: secureInput, injected: injected)
                     if outcome.shouldLog {

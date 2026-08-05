@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let transformsStore = TransformsStore()
     private let scratchpadStore = ScratchpadStore()
     private let settingsStore = SettingsStore()
+    private let correctionWatcher = CorrectionWatcher()
 
     /// Owns per-model download/storage state. `@MainActor`-isolated, so it's
     /// constructed lazily from `applicationDidFinishLaunching` (guaranteed
@@ -144,6 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         activationController?.audioRecorder.asrSelector.onRecordingStart = { [weak self] in
             self?.styleStore.applyStyleForFrontmostApp()
+            self?.correctionWatcher.endWatchForNewRecording()
         }
 
         activationController?.audioRecorder.asrSelector.onInterimTranscript = { [weak self] text in
@@ -166,6 +168,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return text }
             return self.snippetsStore.expand(text)
         }
+        activationController?.audioRecorder.asrSelector.onTextInserted = { [weak self] delivered in
+            self?.correctionWatcher.beginWatch(deliveredText: delivered)
+        }
+
+        correctionWatcher.onLearn = { [weak self] oldText, newText in
+            _ = self?.dictionaryStore.learn(from: oldText, to: newText, userInitiated: false)
+        }
+        settingsStore.correctionWatcher = correctionWatcher
+        correctionWatcher.isEnabled = settingsStore.learnFromInlineCorrections
 
         // Feeds the learned dictionary's canonical terms into ElevenLabs'
         // `keyterms` vocabulary bias (plan 014) — read fresh on every
