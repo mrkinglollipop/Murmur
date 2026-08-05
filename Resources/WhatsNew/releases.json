@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.21",
+    "build": "22",
+    "title": "What's New in 0.1.21",
+    "items": [
+      "Learn from corrections in other apps: when you fix a misspelled word after dictation, Murmur can add it to your dictionary automatically (Settings → Dictionary).",
+      "Toggle is on by default; turn it off anytime to stop watching for inline edits."
+    ]
+  },
+  {
     "version": "0.1.20",
     "build": "21",
     "title": "What's New in 0.1.20",
