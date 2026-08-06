@@ -51,14 +51,19 @@ struct DictionaryView: View {
             Divider().overlay(Theme.hairline)
             searchBar
 
-            if store.entries.isEmpty {
-                emptyState
-            } else {
-                list
+            // One outer scroll: entries (or compact empty) + corrections +
+            // auto-learned. Composer/search stay pinned above.
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    if store.entries.isEmpty {
+                        emptyState
+                    } else {
+                        entryRows
+                    }
+                    recentCorrectionsSection
+                    autoLearnedSection
+                }
             }
-
-            recentCorrectionsSection
-            autoLearnedSection
         }
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
@@ -168,6 +173,7 @@ struct DictionaryView: View {
 
                 Button("Never") {
                     store.blocklistPair(heard: record.heard, replaced: record.replaced)
+                    correctionsLog.remove(id: record.id)
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 12))
@@ -197,6 +203,8 @@ struct DictionaryView: View {
             userInitiated: true,
             announce: false
         )
+        // Always dismiss the rejected row, even when learn is a no-op.
+        correctionsLog.remove(id: record.id)
     }
 
     private func handleLearnAcceptedRevert(_ record: CorrectionRecord) {
@@ -211,13 +219,15 @@ struct DictionaryView: View {
             if createdNew {
                 pendingRevertRecord = record
                 showRevertDeleteConfirmation = true
-            } else {
-                store.unlearn(correction)
+            } else if store.unlearn(correction) {
+                correctionsLog.remove(id: record.id)
             }
             return
         }
         // Old records without entryID: blocklist + best-effort variant removal.
-        degradeRevertLearnAccepted(record)
+        if degradeRevertLearnAccepted(record) {
+            correctionsLog.remove(id: record.id)
+        }
     }
 
     private func handleLearnAcceptedNever(_ record: CorrectionRecord) {
@@ -231,15 +241,19 @@ struct DictionaryView: View {
             )
             store.unlearn(correction)
         } else {
-            degradeRevertLearnAccepted(record)
+            _ = degradeRevertLearnAccepted(record)
         }
         store.blocklistPair(heard: record.heard, replaced: record.replaced)
+        // User intent = stop this pair; dismiss even if unlearn was a quiet no-op.
+        correctionsLog.remove(id: record.id)
     }
 
     /// Pre-migration learnAccepted rows: pure undo (remove matching variant by CI).
     /// Never must call `blocklistPair` separately — Revert must not blocklist.
     /// Tears down any active Learn toast for the undone variant only.
-    private func degradeRevertLearnAccepted(_ record: CorrectionRecord) {
+    /// - Returns: `true` when a store mutation was applied.
+    @discardableResult
+    private func degradeRevertLearnAccepted(_ record: CorrectionRecord) -> Bool {
         if let entry = store.entries.first(where: {
             $0.term.caseInsensitiveCompare(record.replaced) == .orderedSame
         }) {
@@ -249,7 +263,7 @@ struct DictionaryView: View {
                 $0.caseInsensitiveCompare(record.heard) == .orderedSame
             }
             // Mirror `applyUnlearn`: no-op when the variant was already gone.
-            guard updated.variants.count != before else { return }
+            guard updated.variants.count != before else { return false }
             if updated.variants.isEmpty && entry.isAutoLearned {
                 store.delete(entry)
             } else {
@@ -262,7 +276,9 @@ struct DictionaryView: View {
                     term: record.replaced
                 )
             ])
+            return true
         }
+        return false
     }
 
     private func handleRevert(_ record: CorrectionRecord) {
@@ -287,7 +303,9 @@ struct DictionaryView: View {
                 createdNewEntry: createdNew,
                 entryID: entryID
             )
-            store.unlearn(correction)
+            if store.unlearn(correction) {
+                correctionsLog.remove(id: record.id)
+            }
             return
         }
         if deleteEntry,
@@ -297,6 +315,7 @@ struct DictionaryView: View {
             store.delete(entry)
         }
         store.blocklistPair(heard: record.heard, replaced: record.replaced)
+        correctionsLog.remove(id: record.id)
     }
 
     // MARK: - Auto-learned entries
@@ -412,21 +431,18 @@ struct DictionaryView: View {
 
     // MARK: - List
 
-    private var list: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(filteredEntries) { entry in
-                    Group {
-                        if editingID == entry.id {
-                            editRow(for: entry)
-                        } else {
-                            row(for: entry)
-                        }
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                    Divider().overlay(Theme.hairline)
+    @ViewBuilder
+    private var entryRows: some View {
+        ForEach(filteredEntries) { entry in
+            Group {
+                if editingID == entry.id {
+                    editRow(for: entry)
+                } else {
+                    row(for: entry)
                 }
             }
+            .transition(.opacity.combined(with: .move(edge: .top)))
+            Divider().overlay(Theme.hairline)
         }
     }
 
@@ -536,7 +552,6 @@ struct DictionaryView: View {
 
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Spacer()
             Image(systemName: "book.closed")
                 .font(.system(size: 28))
                 .foregroundColor(Theme.textSecondary)
@@ -546,9 +561,9 @@ struct DictionaryView: View {
             Text("Terms you correct in History land here — or add one above")
                 .font(Theme.body(12))
                 .foregroundColor(Theme.textSecondary)
-            Spacer()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
     }
 
     private func beginEdit(_ entry: DictionaryEntry) {
