@@ -1,11 +1,21 @@
 [
   {
+    "version": "0.1.23",
+    "build": "24",
+    "title": "What's New in 0.1.23",
+    "items": [
+      "Dictionary Recent corrections and Auto-learned scroll with the list, including when the dictionary is empty.",
+      "Revert, Never, and Restore dismiss the acted-on correction from Recent corrections.",
+      "Say capital X (or NATO letters like capital kilo) to capitalize that letter in dictation."
+    ]
+  },
+  {
     "version": "0.1.22",
     "build": "23",
     "title": "What's New in 0.1.22",
     "items": [
       "When Murmur learns a correction, a system toast appears with Reject to undo and stop learning that pair.",
-      "Accepted and rejected learns show in Dictionary → Corrections, with Restore and Revert / Never actions."
+      "Accepted and rejected learns show in Dictionary \u2192 Corrections, with Restore and Revert / Never actions."
     ]
   },
   {
@@ -13,7 +23,7 @@
     "build": "22",
     "title": "What's New in 0.1.21",
     "items": [
-      "Learn from corrections in other apps: when you fix a misspelled word after dictation, Murmur can add it to your dictionary automatically (Settings → Dictionary).",
+      "Learn from corrections in other apps: when you fix a misspelled word after dictation, Murmur can add it to your dictionary automatically (Settings \u2192 Dictionary).",
       "Toggle is on by default; turn it off anytime to stop watching for inline edits."
     ]
   },
@@ -23,7 +33,7 @@
     "title": "What's New in 0.1.20",
     "items": [
       "Sparkle update dialog now shows release notes from the same bundled What's New catalog.",
-      "What's New is still available anytime in Settings → What's New."
+      "What's New is still available anytime in Settings \u2192 What's New."
     ]
   },
   {
@@ -31,7 +41,7 @@
     "build": "20",
     "title": "What's New in 0.1.19",
     "items": [
-      "What's New: after an update you'll see a short summary once, and you can re-read it anytime in Settings → What's New.",
+      "What's New: after an update you'll see a short summary once, and you can re-read it anytime in Settings \u2192 What's New.",
       "WhisperKit model files now live under Application Support instead of Documents, with a one-time migration from the old location.",
       "Model cache migration and usable-cache checks are hardened so a partial or stale download is less likely to block dictation.",
       "Public-repo scrub: operator paths and credential-store references removed from shipped plan docs ahead of open-source release."
