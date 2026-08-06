@@ -243,7 +243,7 @@ struct SettingsView: View {
                             .font(Theme.body(12))
                             .foregroundColor(Theme.textPrimary)
 
-                        Text("Prepends a space before injected text so it doesn't glue to prior text.")
+                        Text("Prepends a space before injected text so it doesn't glue to prior text. Also strips a trailing period, question mark, or exclamation when replacing selected mid-sentence words.")
                             .font(Theme.body(10))
                             .foregroundColor(Theme.textSecondary)
 

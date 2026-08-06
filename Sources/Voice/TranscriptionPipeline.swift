@@ -286,17 +286,14 @@ final class TranscriptionPipeline {
             // completion (which drives finishHUDAfterPipeline) hops back to
             // main; correction/snippet steps above stay on main as before.
             DispatchQueue.global(qos: .utility).async {
-                let textToInject: String
-                if !secureInput && self.smartLeadingSpaceEnabled {
-                    let precedingChar = CaretContext.precedingCharacter()
-                    let shouldPrepend = CaretContext.shouldPrependSpace(
-                        precedingChar: precedingChar,
-                        transcriptFirstChar: expanded.first
-                    )
-                    textToInject = shouldPrepend ? " " + expanded : expanded
-                } else {
-                    textToInject = expanded
-                }
+                let snapshot = CaretContext.snapshot()
+                let textToInject = Self.applyInjectTransforms(
+                    expanded: expanded,
+                    snapshot: snapshot,
+                    secureInput: secureInput,
+                    smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
+                    codeAware: self.codeAware
+                )
                 let insertResult = secureInput ? TextInjector.InsertResult.failed : TextInjector().insert(textToInject)
                 let injected = insertResult.wasInjectedForHistory
                 if case .inserted(let delivered) = insertResult {
@@ -308,9 +305,9 @@ final class TranscriptionPipeline {
                 DispatchQueue.main.async {
                     let outcome = Self.secureInputOutcome(secureInput: secureInput, injected: injected)
                     if outcome.shouldLog {
-                        // Keep retained file path on success when present so history
-                        // retry remains possible (same path as failure retention).
-                        self.onTranscriptionLogged?(expanded, engineID, injected, audioPath, false, replaceHistoryEntryID)
+                        // History matches inject intent (post-strip + leading space),
+                        // not pasteboard bytes after TextInjector trailing-WS trim.
+                        self.onTranscriptionLogged?(textToInject, engineID, injected, audioPath, false, replaceHistoryEntryID)
                     }
                     if let failure = outcome.failure {
                         self.onFailure?(failure)
@@ -320,6 +317,33 @@ final class TranscriptionPipeline {
                 }
             }
         }
+    }
+
+    /// Inject-time transforms: mid-sentence trailing `.!?` strip, then smart
+    /// leading space — both gated on `!secureInput && smartLeadingSpaceEnabled`
+    /// and driven from one `CaretContext.Snapshot` (no dual AX fetch).
+    /// Package-visible for seam unit tests without mocking `finishTranscription`.
+    static func applyInjectTransforms(
+        expanded: String,
+        snapshot: CaretContext.Snapshot,
+        secureInput: Bool,
+        smartLeadingSpaceEnabled: Bool,
+        codeAware: Bool
+    ) -> String {
+        guard !secureInput, smartLeadingSpaceEnabled else {
+            return expanded
+        }
+
+        let stripped = CaretContext.stripTrailingSentencePunctuationIfNeeded(
+            snapshot: snapshot,
+            transcript: expanded,
+            codeAware: codeAware
+        )
+        let shouldPrepend = CaretContext.shouldPrependSpace(
+            precedingChar: snapshot.precedingChar,
+            transcriptFirstChar: stripped.first
+        )
+        return shouldPrepend ? " " + stripped : stripped
     }
 
     /// Pure decision seam for the secure-input / history-logging outcome at
