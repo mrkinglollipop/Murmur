@@ -33,6 +33,8 @@ enum SpokenCapitalization {
         guard !raw.isEmpty else { return text }
 
         var tokens = raw.map { Token(text: $0) }
+        /// Trailing punct peeled from consumed letter tokens (e.g. `S.` → `.`).
+        var salvagedTrailingPunctuation = ""
 
         // Collect command spans (verbIndex, letterIndex) left-to-right, apply RTL.
         var commands: [(verb: Int, letter: Int)] = []
@@ -67,6 +69,9 @@ enum SpokenCapitalization {
             tokens[targetIndex].usedAsTarget = true
             tokens[cmd.verb].isCommand = true
             tokens[cmd.letter].isCommand = true
+            // Keep sentence-final / glued punct that ASR stuck on the letter (`S.`).
+            let peeled = peelEdgePunctuation(tokens[cmd.letter].text)
+            salvagedTrailingPunctuation = peeled.trailing + salvagedTrailingPunctuation
         }
 
         // Identity when nothing applied: preserve commas, newlines, spacing.
@@ -74,8 +79,11 @@ enum SpokenCapitalization {
             return text
         }
 
-        let kept = tokens.filter { !$0.isCommand }.map(\.text)
-        return kept.joined(separator: " ")
+        var result = tokens.filter { !$0.isCommand }.map(\.text).joined(separator: " ")
+        if !salvagedTrailingPunctuation.isEmpty {
+            result += salvagedTrailingPunctuation
+        }
+        return result
     }
 
     /// Split for command parsing; commas are optional separators ≡ whitespace.
@@ -88,16 +96,35 @@ enum SpokenCapitalization {
     }
 
     private static func isCommandVerb(_ word: String) -> Bool {
-        commandVerbs.contains(word.lowercased())
+        commandVerbs.contains(peelEdgePunctuation(word).core.lowercased())
     }
 
     /// Letter from a single A–Z token or NATO word; nil if unknown.
+    /// ASR often glues sentence punct onto the letter (`S.`, `S,`, `"S"`).
     private static func letterFromCommandWord(_ word: String) -> Character? {
-        let lower = word.lowercased()
-        if lower.count == 1, let ch = lower.first, ch.isLetter {
+        let core = peelEdgePunctuation(word).core.lowercased()
+        if core.count == 1, let ch = core.first, ch.isLetter {
             return Character(ch.uppercased())
         }
-        return natoLetters[lower]
+        return natoLetters[core]
+    }
+
+    /// Strip leading/trailing punctuation/symbols so `S.` / `"xray"` still parse.
+    private static func peelEdgePunctuation(_ word: String) -> (core: String, trailing: String) {
+        var core = word
+        var trailing = ""
+        while let last = core.last, Self.isPeelablePunctuation(last) {
+            trailing = String(last) + trailing
+            core.removeLast()
+        }
+        while let first = core.first, Self.isPeelablePunctuation(first) {
+            core.removeFirst()
+        }
+        return (core, trailing)
+    }
+
+    private static func isPeelablePunctuation(_ ch: Character) -> Bool {
+        ch.isPunctuation || ch.isSymbol
     }
 
     /// Nearest preceding unused match: prefer exact single-letter token, else

@@ -81,6 +81,25 @@ final class SpokenCapitalizationTests: XCTestCase {
             "line1\nline2"
         )
     }
+
+    func testLetterTokenWithTrailingPeriod() {
+        // ASR often emits sentence-final punct glued to the letter.
+        XCTAssertEqual(
+            SpokenCapitalization.apply("Client secret capital S."),
+            "Client Secret."
+        )
+        XCTAssertEqual(
+            SpokenCapitalization.apply("A lot of 2.0 Client secret capital S."),
+            "A lot of 2.0 Client Secret."
+        )
+    }
+
+    func testOAuthStyleCapitalCS() {
+        XCTAssertEqual(
+            SpokenCapitalization.apply("OAuth Client secret capital c capital s"),
+            "OAuth Client Secret"
+        )
+    }
 }
 
 final class TranscriptionPipelineCapsGateTests: XCTestCase {
