@@ -30,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let scratchpadStore = ScratchpadStore()
     private let settingsStore = SettingsStore()
     private let correctionWatcher = CorrectionWatcher()
+    private let learnToast = LearnToastHUD()
+    private var learnEventsCoordinator: LearnEventsCoordinator?
 
     /// Owns per-model download/storage state. `@MainActor`-isolated, so it's
     /// constructed lazily from `applicationDidFinishLaunching` (guaranteed
@@ -177,6 +179,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsStore.correctionWatcher = correctionWatcher
         correctionWatcher.isEnabled = settingsStore.learnFromInlineCorrections
+
+        wireLearnToast()
 
         // Feeds the learned dictionary's canonical terms into ElevenLabs'
         // `keyterms` vocabulary bias (plan 014) — read fresh on every
@@ -440,9 +444,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // hide() is the only reliable "back to idle" signal — reachable from
         // every terminal path (silence, early failures, post-flash) without
         // necessarily passing through a state onStateChange already handles.
+        // onHide fires at hide() start (menu-bar idle); LearnToast re-stacks
+        // from onLayoutChange after the fade clears isVisible.
         activationController?.audioRecorder.hud.onHide = { [weak self] in
             self?.resetMenuBarIconToIdle()
         }
+    }
+
+    private func wireLearnToast() {
+        let hud = activationController?.audioRecorder.hud
+        learnToast.recordingHUD = hud
+        hud?.onLayoutChange = { [weak self] in
+            self?.learnToast.reposition()
+        }
+
+        let coordinator = LearnEventsCoordinator(
+            correctionsLog: correctionsLog,
+            dictionaryStore: dictionaryStore,
+            learnToast: learnToast
+        )
+        coordinator.bind()
+        learnEventsCoordinator = coordinator
     }
 
     private func resetMenuBarIconToIdle() {

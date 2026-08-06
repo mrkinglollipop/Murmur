@@ -50,4 +50,36 @@ final class CorrectionsLogTests: XCTestCase {
         XCTAssertEqual(reloaded.records.first?.heard, "grok")
         XCTAssertEqual(reloaded.records.first?.replaced, "Groq")
     }
+
+    func testLearnAcceptedRoundTripRequiresEntryMetadata() {
+        let (log, url) = makeLog()
+        let entryID = UUID()
+        log.append([
+            CorrectionRecord(
+                heard: "Groq",
+                replaced: "Grok",
+                source: .learnAccepted,
+                entryID: entryID,
+                createdNewEntry: true
+            )
+        ])
+        log.flush()
+
+        let reloaded = CorrectionsLog(fileURL: url)
+        XCTAssertEqual(reloaded.records.count, 1)
+        XCTAssertEqual(reloaded.records.first?.source, .learnAccepted)
+        XCTAssertEqual(reloaded.records.first?.entryID, entryID)
+        XCTAssertEqual(reloaded.records.first?.createdNewEntry, true)
+    }
+
+    func testOldRecordsDecodeWithoutEntryMetadata() {
+        let (log, url) = makeLog()
+        log.append([
+            CorrectionRecord(heard: "legacy", replaced: "term", source: .dictionary)
+        ])
+        log.flush()
+        let reloaded = CorrectionsLog(fileURL: url)
+        XCTAssertNil(reloaded.records.first?.entryID)
+        XCTAssertNil(reloaded.records.first?.createdNewEntry)
+    }
 }

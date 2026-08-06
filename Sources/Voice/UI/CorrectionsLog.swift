@@ -5,6 +5,8 @@ enum CorrectionSource: String, Codable {
     case dictionary
     case phonetic
     case autoLearned
+    case learnAccepted
+    case learnRejected
 }
 
 struct CorrectionRecord: Codable, Identifiable, Equatable {
@@ -13,23 +15,43 @@ struct CorrectionRecord: Codable, Identifiable, Equatable {
     let replaced: String
     let source: CorrectionSource
     let date: Date
+    /// Present on new `learnAccepted` / `learnRejected` rows; nil for older records.
+    let entryID: UUID?
+    /// Present on new learn-outcome rows; nil for older records.
+    let createdNewEntry: Bool?
 
     init(
         id: UUID = UUID(),
         heard: String,
         replaced: String,
         source: CorrectionSource,
-        date: Date = Date()
+        date: Date = Date(),
+        entryID: UUID? = nil,
+        createdNewEntry: Bool? = nil
     ) {
         self.id = id
         self.heard = heard
         self.replaced = replaced
         self.source = source
         self.date = date
+        self.entryID = entryID
+        self.createdNewEntry = createdNewEntry
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        heard = try container.decode(String.self, forKey: .heard)
+        replaced = try container.decode(String.self, forKey: .replaced)
+        source = try container.decode(CorrectionSource.self, forKey: .source)
+        date = try container.decode(Date.self, forKey: .date)
+        entryID = try container.decodeIfPresent(UUID.self, forKey: .entryID)
+        createdNewEntry = try container.decodeIfPresent(Bool.self, forKey: .createdNewEntry)
     }
 }
 
-/// Persisted log of dictionary/phonetic corrections applied to transcripts.
+/// Persisted log of dictionary/phonetic corrections applied to transcripts
+/// and learn-time accept/reject outcomes.
 final class CorrectionsLog: ObservableObject {
 
     /// App-owned instance wired from `AppDelegate`; `DictionaryView` reads this
