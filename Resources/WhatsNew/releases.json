@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.1.24",
+    "build": "25",
+    "title": "What's New in 0.1.24",
+    "items": [
+      "Spoken capitalization commands still work when dictation glues a period onto the letter (e.g. capital S.)."
+    ]
+  },
+  {
     "version": "0.1.23",
     "build": "24",
     "title": "What's New in 0.1.23",
