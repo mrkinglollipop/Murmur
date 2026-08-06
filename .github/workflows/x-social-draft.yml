@@ -1,0 +1,89 @@
+# When a GitHub Release is published, create an X promo draft in King-Lollipop-Studio.
+# Requires repository secret STUDIO_PUSH_TOKEN: PAT with contents:write on
+# mrkinglollipop/King-Lollipop-Studio (no X API secrets in this workflow).
+
+name: X social draft (studio)
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  studio-draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require STUDIO_PUSH_TOKEN
+        env:
+          TOKEN: ${{ secrets.STUDIO_PUSH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::STUDIO_PUSH_TOKEN is not set. Add a PAT with contents:write on King-Lollipop-Studio (see CONTRIBUTING.md)."
+            exit 1
+          fi
+
+      - name: Checkout King-Lollipop-Studio
+        uses: actions/checkout@v4
+        with:
+          repository: mrkinglollipop/King-Lollipop-Studio
+          token: ${{ secrets.STUDIO_PUSH_TOKEN }}
+          path: studio
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create X draft from release
+        working-directory: studio
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          VERSION="${VERSION#V}"
+          export VERSION
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          subprocess.run(
+              [
+                  sys.executable,
+                  "-m",
+                  "tools.x_post",
+                  "draft-from-release",
+                  "--app",
+                  "murmur",
+                  "--version",
+                  os.environ["VERSION"],
+                  "--notes",
+                  os.environ.get("RELEASE_BODY") or "",
+              ],
+              check=True,
+          )
+          PY
+
+      - name: Commit and push draft
+        working-directory: studio
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          shopt -s nullglob
+          files=(social/x/drafts/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No draft JSON created"
+            exit 0
+          fi
+          git add -f social/x/drafts/*.json
+          if git diff --staged --quiet; then
+            echo "No new draft to commit"
+            exit 0
+          fi
+          git commit -m "chore(x): auto-draft Murmur ${{ github.event.release.tag_name }} release"
+          git push
