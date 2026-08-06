@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.1.25",
+    "build": "26",
+    "title": "What's New in 0.1.25",
+    "items": [
+      "Replacing selected mid-sentence words no longer leaves a stray period from short ASR clips when Smart leading space is on."
+    ]
+  },
+  {
     "version": "0.1.24",
     "build": "25",
     "title": "What's New in 0.1.24",
