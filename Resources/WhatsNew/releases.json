@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.26",
+    "build": "27",
+    "title": "What's New in 0.1.26",
+    "items": [
+      "Mid-sentence select-replace strips ASR trailing punctuation and false Title Case when Accessibility can read the field.",
+      "Code-aware mode is its own Settings toggle — no longer hidden under Cleanup.",
+      "When Accessibility cannot read the caret, Murmur no longer prepends an extra leading space."
+    ]
+  },
+  {
     "version": "0.1.25",
     "build": "26",
     "title": "What's New in 0.1.25",
