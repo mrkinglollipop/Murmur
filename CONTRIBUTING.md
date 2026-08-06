@@ -42,6 +42,15 @@ When shipping a version, bump [`Resources/WhatsNew/releases.json`](Resources/Wha
 with a newest-first entry (`version`, `build`, `title`, bullet `items`) so the
 in-app What's New sheet and Settings section stay current.
 
+### X promo draft (studio)
+
+Publishing a **GitHub Release** can auto-create an X post **draft** in
+[King-Lollipop-Studio](https://github.com/mrkinglollipop/King-Lollipop-Studio)
+via [`.github/workflows/x-social-draft.yml`](.github/workflows/x-social-draft.yml).
+Add repository secret **`STUDIO_PUSH_TOKEN`**: a PAT with `contents:write` on
+that studio repo. The workflow never uses X API keys; Matt approves and publishes
+from `social/x/` locally. Details: studio [`social/x/README.md`](https://github.com/mrkinglollipop/King-Lollipop-Studio/blob/main/social/x/README.md).
+
 ## Copyright headers
 
 Murmur source files intentionally omit per-file copyright headers. Do not
