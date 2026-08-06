@@ -1,5 +1,9 @@
 # Murmur
 
+<p align="center">
+  <img src="AppIcon.iconset/icon_256x256@2x.png" width="128" alt="Murmur app icon">
+</p>
+
 **Murmur** is a macOS menu-bar dictation app. Hold a push-to-talk key, speak, and release — Murmur transcribes your speech and inserts it at the cursor.
 
 It is built for people who dictate into real apps all day: local or cloud speech recognition, optional AI cleanup, a learned dictionary, snippets, and history you can search and export.
