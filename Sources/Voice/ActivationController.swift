@@ -294,16 +294,26 @@ final class ActivationController {
 
     // MARK: - Fn consumption + recording hooks
 
-    private func onRecordingWillStart() {
-        recorder.asrSelector.onRecordingStart?()
+    private func onRecordingWillStart() -> UInt64 {
+        let hop: () -> UInt64 = { [weak self] in
+            guard let self else { return 0 }
+            let token = self.recorder.asrSelector.holdCaretSnapshotFromRecordingWillStart()
+            self.recorder.asrSelector.onRecordingStart?()
+            return token
+        }
+        if Thread.isMainThread {
+            return hop()
+        } else {
+            return DispatchQueue.main.sync(execute: hop)
+        }
     }
 
     private func applyFnEffects(_ effects: [FnActivationLogic.Effect]) {
         for effect in effects {
             switch effect {
             case .startRecording:
-                onRecordingWillStart()
-                recorder.startRecording()
+                let heldToken = onRecordingWillStart()
+                recorder.startRecording(heldCaretToken: heldToken)
             case .stopRecording:
                 recorder.stopRecording()
             case .scheduleHoldTimer(let deadline):
@@ -463,8 +473,8 @@ final class ActivationController {
                 rightOptionRecording = true
                 logger.info("Push-to-talk: Right Option DOWN → starting recording")
                 vlog("rightOption DOWN → startRecording()")
-                onRecordingWillStart()
-                recorder.startRecording()
+                let heldToken = onRecordingWillStart()
+                recorder.startRecording(heldCaretToken: heldToken)
             } else if !keyDown && rightOptionRecording {
                 rightOptionRecording = false
                 logger.info("Push-to-talk: Right Option RELEASE → stopping recording")

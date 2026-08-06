@@ -190,6 +190,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return [] }
             return ElevenLabsRealtimeTranscriber.selectKeyterms(from: self.dictionaryStore.entries)
         }
+        activationController?.audioRecorder.asrSelector.capitalizedDictionaryTermsProvider = { [weak self] in
+            guard let self = self else { return [] }
+            return Set(
+                self.dictionaryStore.entries
+                    .map(\.term)
+                    .filter { term in
+                        guard let first = term.first else { return false }
+                        return first.isLetter && first.isUppercase
+                    }
+            )
+        }
         activationController?.audioRecorder.asrSelector.onTranscriptionLogged = { [weak self] text, engineID, injected, audioPath, failed, replaceEntryID in
             self?.historyStore.append(
                 text: text,

@@ -114,6 +114,33 @@ final class ASREngineSelector {
     /// over `DictionaryStore.entries`, mirroring how `apiKeyProvider` is wired.
     var keytermsProvider: (() -> [String])?
 
+    /// Dictionary terms that start with an uppercase letter — used at inject
+    /// time to keep proper-noun capitalization mid-sentence. Wired by
+    /// `AppDelegate` from `DictionaryStore.entries`.
+    var capitalizedDictionaryTermsProvider: (() -> Set<String>)?
+
+    /// Capture caret AX snapshot on the main thread at recording-will-start.
+    /// Returns the generation token for token-matched clear on failed start.
+    @discardableResult
+    func holdCaretSnapshotFromRecordingWillStart() -> UInt64 {
+        pipeline.holdCaretSnapshotFromRecordingWillStart()
+    }
+
+    /// Clear held caret snapshot (abort / cancel / stop without inject).
+    /// When `matching` is set, only clears if that session still owns the slot.
+    func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
+        pipeline.clearHeldCaretSnapshot(matching: token)
+    }
+
+    /// Package-visible held state for lifecycle unit tests.
+    var test_heldCaretToken: UInt64 { pipeline.test_heldCaretToken }
+    var test_heldCaretSnapshot: CaretContext.Snapshot? { pipeline.test_heldCaretSnapshot }
+
+    @discardableResult
+    func test_holdSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
+        pipeline.test_holdSnapshot(snapshot)
+    }
+
     /// The active Style profile's formality instruction, appended to the
     /// cleanup prompt when non-nil/non-empty. Only takes effect while cleanup
     /// is enabled (it's an instruction to the cleanup LLM, not a separate

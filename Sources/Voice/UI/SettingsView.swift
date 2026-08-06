@@ -211,14 +211,20 @@ struct SettingsView: View {
                                     .foregroundColor(Theme.amberText)
                                 }
                             }
-
-                            Divider().overlay(Theme.hairline)
-
-                            Toggle("Code-aware mode (for coding)", isOn: $settingsStore.codeAwareMode)
-                                .toggleStyle(.switch)
-                                .font(Theme.body(12))
-                                .foregroundColor(Theme.textPrimary)
                         }
+                    }
+                }
+
+                section(title: "Dictation text") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("Code-aware mode (for coding)", isOn: $settingsStore.codeAwareMode)
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("Turns spoken words like “dot” and “period” into symbols for coding. Does not require Cleanup — leave off for normal prose.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
                     }
                 }
 

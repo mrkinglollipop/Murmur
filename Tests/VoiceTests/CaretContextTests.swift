@@ -62,28 +62,20 @@ final class CaretContextTests: XCTestCase {
 
     // MARK: - Unknown (AX fallback)
 
-    func testShouldPrependSpace_unknownAlphanumericTranscript() {
-        XCTAssertTrue(
+    func testShouldPrependSpace_unknownNeverPrepends() {
+        // Prefer no glue-fix over double-space when AX-blind.
+        XCTAssertFalse(
             CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: "h")
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: "9")
         )
-    }
-
-    func testShouldPrependSpace_unknownPunctuationTranscript() {
         XCTAssertFalse(
             CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: ".")
         )
-    }
-
-    func testShouldPrependSpace_unknownWhitespaceTranscript() {
         XCTAssertFalse(
             CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: " ")
         )
-    }
-
-    func testShouldPrependSpace_unknownNilTranscript() {
         XCTAssertFalse(
             CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: nil)
         )
@@ -367,6 +359,316 @@ final class CaretContextTests: XCTestCase {
             )
         )
     }
+
+    // MARK: - Mid-sentence select-replace + decap
+
+    func testIsMidSentenceSelectReplace_gates() {
+        XCTAssertTrue(CaretContext.isMidSentenceSelectReplace(snapshot: selectReplaceSnapshot()))
+        XCTAssertFalse(CaretContext.isMidSentenceSelectReplace(snapshot: .unknown))
+        let midCaret = CaretContext.Snapshot(
+            value: "The quick brown fox.",
+            location: 4,
+            selectionLength: .readable(0),
+            precedingChar: .known(" "),
+            isUnknown: false
+        )
+        XCTAssertFalse(CaretContext.isMidSentenceSelectReplace(snapshot: midCaret))
+        let endField = selectReplaceSnapshot(value: "The end", location: 4, length: 3)
+        XCTAssertFalse(CaretContext.isMidSentenceSelectReplace(snapshot: endField))
+    }
+
+    func testDecapitalize_titleCaseMidSentence() {
+        let snap = selectReplaceSnapshot()
+        XCTAssertEqual(
+            CaretContext.decapitalizeFirstTokenIfNeeded(
+                snapshot: snap,
+                transcript: "Fast.",
+                capitalizedDictionaryTerms: []
+            ),
+            "fast."
+        )
+    }
+
+    func testDecapitalize_keepsAllowlistRussia() {
+        let snap = selectReplaceSnapshot()
+        XCTAssertEqual(
+            CaretContext.decapitalizeFirstTokenIfNeeded(
+                snapshot: snap,
+                transcript: "Russia",
+                capitalizedDictionaryTerms: []
+            ),
+            "Russia"
+        )
+    }
+
+    func testDecapitalize_keepsIAndNASA() {
+        let snap = selectReplaceSnapshot()
+        XCTAssertEqual(
+            CaretContext.decapitalizeFirstTokenIfNeeded(
+                snapshot: snap, transcript: "I", capitalizedDictionaryTerms: []
+            ),
+            "I"
+        )
+        XCTAssertEqual(
+            CaretContext.decapitalizeFirstTokenIfNeeded(
+                snapshot: snap, transcript: "NASA", capitalizedDictionaryTerms: []
+            ),
+            "NASA"
+        )
+    }
+
+    func testDecapitalize_keepsInjectedDictionaryTerm() {
+        let snap = selectReplaceSnapshot()
+        XCTAssertEqual(
+            CaretContext.decapitalizeFirstTokenIfNeeded(
+                snapshot: snap,
+                transcript: "Murmur",
+                capitalizedDictionaryTerms: ["Murmur"]
+            ),
+            "Murmur"
+        )
+        XCTAssertEqual(
+            CaretContext.decapitalizeFirstTokenIfNeeded(
+                snapshot: snap,
+                transcript: "Murmur",
+                capitalizedDictionaryTerms: []
+            ),
+            "murmur"
+        )
+    }
+
+    // MARK: - resolveInjectSnapshot
+
+    func testResolveInjectSnapshot_heldWinsWhenReadableSelection() {
+        let held = selectReplaceSnapshot()
+        let fresh = CaretContext.Snapshot.unknown
+        let resolved = CaretContext.resolveInjectSnapshot(
+            held: held,
+            fresh: fresh,
+            replaceHistoryEntryID: nil
+        )
+        XCTAssertEqual(resolved, held)
+    }
+
+    func testResolveInjectSnapshot_heldRejectedWhenUnknownOrZeroLength() {
+        let fresh = selectReplaceSnapshot(value: "fresh", location: 0, length: 2)
+        XCTAssertEqual(
+            CaretContext.resolveInjectSnapshot(
+                held: .unknown, fresh: fresh, replaceHistoryEntryID: nil
+            ),
+            fresh
+        )
+        let zeroLen = CaretContext.Snapshot(
+            value: "abc",
+            location: 1,
+            selectionLength: .readable(0),
+            precedingChar: .known("a"),
+            isUnknown: false
+        )
+        XCTAssertEqual(
+            CaretContext.resolveInjectSnapshot(
+                held: zeroLen, fresh: fresh, replaceHistoryEntryID: nil
+            ),
+            fresh
+        )
+        XCTAssertEqual(
+            CaretContext.resolveInjectSnapshot(
+                held: nil, fresh: fresh, replaceHistoryEntryID: nil
+            ),
+            fresh
+        )
+    }
+
+    func testResolveInjectSnapshot_historyRetryIgnoresHeld() {
+        let held = selectReplaceSnapshot()
+        let fresh = CaretContext.Snapshot(
+            value: "retry field",
+            location: 0,
+            selectionLength: .readable(3),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let resolved = CaretContext.resolveInjectSnapshot(
+            held: held,
+            fresh: fresh,
+            replaceHistoryEntryID: UUID()
+        )
+        XCTAssertEqual(resolved, fresh)
+    }
+
+    func testResolveInjectSnapshot_heldUnreadableFallsToFresh() {
+        let held = CaretContext.Snapshot(
+            value: "abc",
+            location: 1,
+            selectionLength: .unreadable,
+            precedingChar: .known("a"),
+            isUnknown: false
+        )
+        let fresh = selectReplaceSnapshot(value: "fresh", location: 0, length: 2)
+        XCTAssertEqual(
+            CaretContext.resolveInjectSnapshot(
+                held: held, fresh: fresh, replaceHistoryEntryID: nil
+            ),
+            fresh
+        )
+    }
+}
+
+// MARK: - Held caret lifecycle (token-scoped)
+
+final class HeldCaretLifecycleTests: XCTestCase {
+
+    private func selectReplaceSnapshot() -> CaretContext.Snapshot {
+        CaretContext.Snapshot(
+            value: "The quick brown fox.",
+            location: 4,
+            selectionLength: .readable(5),
+            precedingChar: .known(" "),
+            isUnknown: false
+        )
+    }
+
+    func testHoldThenClearLeavesNil() {
+        let pipeline = TranscriptionPipeline()
+        let token = pipeline.test_holdSnapshot(selectReplaceSnapshot())
+        XCTAssertNotNil(pipeline.test_heldCaretSnapshot)
+        XCTAssertEqual(pipeline.test_heldCaretToken, token)
+        pipeline.clearHeldCaretSnapshot(matching: token)
+        XCTAssertNil(pipeline.test_heldCaretSnapshot)
+    }
+
+    func testClearAfterHoldResolveFallsToFresh() {
+        let pipeline = TranscriptionPipeline()
+        let held = selectReplaceSnapshot()
+        let token = pipeline.test_holdSnapshot(held)
+        pipeline.clearHeldCaretSnapshot(matching: token)
+        let fresh = CaretContext.Snapshot(
+            value: "fresh",
+            location: 0,
+            selectionLength: .readable(2),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let resolved = CaretContext.resolveInjectSnapshot(
+            held: pipeline.test_heldCaretSnapshot,
+            fresh: fresh,
+            replaceHistoryEntryID: nil
+        )
+        XCTAssertEqual(resolved, fresh)
+    }
+
+    func testOverlappingHoldFinishADoesNotClearB() {
+        let pipeline = TranscriptionPipeline()
+        let snapA = selectReplaceSnapshot()
+        let tokenA = pipeline.test_holdSnapshot(snapA)
+        let snapB = CaretContext.Snapshot(
+            value: "session B field",
+            location: 0,
+            selectionLength: .readable(4),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let tokenB = pipeline.test_holdSnapshot(snapB)
+        XCTAssertNotEqual(tokenA, tokenB)
+        XCTAssertEqual(pipeline.test_heldCaretSnapshot, snapB)
+
+        // Finish A clears matching A's token — must not wipe B.
+        pipeline.clearHeldCaretSnapshot(matching: tokenA)
+        XCTAssertEqual(pipeline.test_heldCaretToken, tokenB)
+        XCTAssertEqual(pipeline.test_heldCaretSnapshot, snapB)
+
+        pipeline.clearHeldCaretSnapshot(matching: tokenB)
+        XCTAssertNil(pipeline.test_heldCaretSnapshot)
+    }
+
+    func testASREngineSelectorForwardsHoldClear() {
+        let selector = ASREngineSelector()
+        let token = selector.test_holdSnapshot(selectReplaceSnapshot())
+        XCTAssertNotNil(selector.test_heldCaretSnapshot)
+        selector.clearHeldCaretSnapshot(matching: token)
+        XCTAssertNil(selector.test_heldCaretSnapshot)
+    }
+
+    /// Documents the API footgun AudioRecorder must not use on teardown:
+    /// `matching: nil` (default) clears unconditionally and wipes a newer hold.
+    func testUnscopedClearWipesNewerHold() {
+        let pipeline = TranscriptionPipeline()
+        let tokenA = pipeline.test_holdSnapshot(selectReplaceSnapshot())
+        let snapB = CaretContext.Snapshot(
+            value: "session B field",
+            location: 0,
+            selectionLength: .readable(4),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let tokenB = pipeline.test_holdSnapshot(snapB)
+        XCTAssertNotEqual(tokenA, tokenB)
+
+        pipeline.clearHeldCaretSnapshot(matching: nil)
+        XCTAssertNil(pipeline.test_heldCaretSnapshot)
+        // Token number is unchanged by clear — only the snapshot is dropped.
+        XCTAssertEqual(pipeline.test_heldCaretToken, tokenB)
+    }
+
+    /// AudioRecorder teardown policy: prefer active, else pending — never
+    /// imply an unscoped clear when both are nil.
+    func testAudioRecorderTeardownClearTokenPrefersActive() {
+        XCTAssertEqual(
+            AudioRecorder.teardownHeldCaretClearToken(active: 7, pending: 3),
+            7
+        )
+        XCTAssertEqual(
+            AudioRecorder.teardownHeldCaretClearToken(active: nil, pending: 3),
+            3
+        )
+        XCTAssertNil(
+            AudioRecorder.teardownHeldCaretClearToken(active: nil, pending: nil)
+        )
+    }
+
+    /// WhisperKit stream-start promote then async fallback re-promote with
+    /// nil pending must leave the already-active token intact.
+    func testPromotePendingHeldCaretIsIdempotentWhenPendingNil() {
+        let first = AudioRecorder.heldCaretTokensAfterPromote(
+            active: nil,
+            pending: 11
+        )
+        XCTAssertEqual(first.active, 11)
+        XCTAssertNil(first.pending)
+
+        let fallback = AudioRecorder.heldCaretTokensAfterPromote(
+            active: first.active,
+            pending: nil
+        )
+        XCTAssertEqual(fallback.active, 11)
+        XCTAssertNil(fallback.pending)
+    }
+
+    /// Mimics older-session matched teardown after a newer hold promoted:
+    /// clear(matching: old) must leave the newer snapshot intact.
+    func testMatchedTeardownOfOlderSessionLeavesNewerHeld() {
+        let pipeline = TranscriptionPipeline()
+        let tokenOld = pipeline.test_holdSnapshot(selectReplaceSnapshot())
+        let snapNew = CaretContext.Snapshot(
+            value: "newer hold",
+            location: 1,
+            selectionLength: .readable(0),
+            precedingChar: .known("a"),
+            isUnknown: false
+        )
+        let tokenNew = pipeline.test_holdSnapshot(snapNew)
+
+        // AudioRecorder would call clear(matching: activeHeldCaretToken) with
+        // the older session's captured token — same as pipeline matching API.
+        let teardownToken = AudioRecorder.teardownHeldCaretClearToken(
+            active: tokenOld,
+            pending: nil
+        )
+        XCTAssertEqual(teardownToken, tokenOld)
+        pipeline.clearHeldCaretSnapshot(matching: teardownToken)
+        XCTAssertEqual(pipeline.test_heldCaretToken, tokenNew)
+        XCTAssertEqual(pipeline.test_heldCaretSnapshot, snapNew)
+    }
 }
 
 // MARK: - Inject transform seam
@@ -393,7 +695,8 @@ final class InjectTransformSeamTests: XCTestCase {
             snapshot: snap,
             secureInput: false,
             smartLeadingSpaceEnabled: false,
-            codeAware: false
+            codeAware: false,
+            accessibilityTrusted: true
         )
         XCTAssertEqual(out, "fast.")
     }
@@ -405,7 +708,8 @@ final class InjectTransformSeamTests: XCTestCase {
             snapshot: snap,
             secureInput: true,
             smartLeadingSpaceEnabled: true,
-            codeAware: false
+            codeAware: false,
+            accessibilityTrusted: true
         )
         XCTAssertEqual(out, "fast.")
     }
@@ -418,7 +722,8 @@ final class InjectTransformSeamTests: XCTestCase {
             snapshot: snap,
             secureInput: false,
             smartLeadingSpaceEnabled: true,
-            codeAware: false
+            codeAware: false,
+            accessibilityTrusted: true
         )
         XCTAssertEqual(out, " fast")
     }
@@ -430,7 +735,8 @@ final class InjectTransformSeamTests: XCTestCase {
             snapshot: snap,
             secureInput: false,
             smartLeadingSpaceEnabled: true,
-            codeAware: false
+            codeAware: false,
+            accessibilityTrusted: true
         )
         XCTAssertEqual(out, "fast")
     }
@@ -443,9 +749,84 @@ final class InjectTransformSeamTests: XCTestCase {
             snapshot: snap,
             secureInput: false,
             smartLeadingSpaceEnabled: true,
-            codeAware: false
+            codeAware: false,
+            accessibilityTrusted: true
         )
         XCTAssertEqual(textToInject, "fast")
         XCTAssertNotEqual(textToInject, "fast.")
+    }
+
+    func testApplyInjectTransforms_decapAndStripWithDictionaryKeep() {
+        let snap = selectReplaceSnapshot(preceding: .known(" "))
+        let out = TranscriptionPipeline.applyInjectTransforms(
+            expanded: "Fast.",
+            snapshot: snap,
+            secureInput: false,
+            smartLeadingSpaceEnabled: true,
+            codeAware: false,
+            capitalizedDictionaryTerms: [],
+            accessibilityTrusted: true
+        )
+        XCTAssertEqual(out, "fast")
+
+        let kept = TranscriptionPipeline.applyInjectTransforms(
+            expanded: "Murmur.",
+            snapshot: snap,
+            secureInput: false,
+            smartLeadingSpaceEnabled: true,
+            codeAware: false,
+            capitalizedDictionaryTerms: ["Murmur"],
+            accessibilityTrusted: true
+        )
+        XCTAssertEqual(kept, "Murmur")
+    }
+
+    func testApplyInjectTransforms_untrustedSkipsStripAndDecapKeepsSpace() {
+        let snap = selectReplaceSnapshot(preceding: .known("e"))
+        let out = TranscriptionPipeline.applyInjectTransforms(
+            expanded: "Fast.",
+            snapshot: snap,
+            secureInput: false,
+            smartLeadingSpaceEnabled: true,
+            codeAware: false,
+            accessibilityTrusted: false
+        )
+        // Fail-open: keep period + Title Case; leading space still runs.
+        XCTAssertEqual(out, " Fast.")
+    }
+
+    func testApplyInjectTransforms_unknownSnapshotNoLeadingSpace() {
+        let out = TranscriptionPipeline.applyInjectTransforms(
+            expanded: "hello",
+            snapshot: .unknown,
+            secureInput: false,
+            smartLeadingSpaceEnabled: true,
+            codeAware: false,
+            accessibilityTrusted: true
+        )
+        XCTAssertEqual(out, "hello")
+    }
+}
+
+// MARK: - Code-aware preprocess gate (independent of Cleanup)
+
+final class CodeAwarePreprocessGateTests: XCTestCase {
+
+    func testSpokenPunctuationRunsWhenCodeAwareRegardlessOfCleanup() {
+        // preprocessBeforeCleanup is the gate before optional LLM cleanup —
+        // codeAware alone must join spoken "period"/"dot".
+        let out = TranscriptionPipeline.preprocessBeforeCleanup(
+            "SettingsStore period swift",
+            codeAware: true
+        )
+        XCTAssertEqual(out, "SettingsStore.swift")
+    }
+
+    func testSpokenPunctuationSkippedWhenCodeAwareOff() {
+        let out = TranscriptionPipeline.preprocessBeforeCleanup(
+            "SettingsStore period swift",
+            codeAware: false
+        )
+        XCTAssertEqual(out, "SettingsStore period swift")
     }
 }
