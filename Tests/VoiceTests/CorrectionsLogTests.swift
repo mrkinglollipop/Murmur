@@ -82,4 +82,29 @@ final class CorrectionsLogTests: XCTestCase {
         XCTAssertNil(reloaded.records.first?.entryID)
         XCTAssertNil(reloaded.records.first?.createdNewEntry)
     }
+
+    func testRemoveByIDPersists() {
+        let (log, url) = makeLog()
+        let keep = CorrectionRecord(heard: "a", replaced: "A", source: .dictionary)
+        let drop = CorrectionRecord(heard: "b", replaced: "B", source: .learnAccepted)
+        log.append([keep, drop])
+        log.remove(id: drop.id)
+        log.flush()
+
+        XCTAssertEqual(log.records.count, 1)
+        XCTAssertEqual(log.records.first?.id, keep.id)
+
+        let reloaded = CorrectionsLog(fileURL: url)
+        XCTAssertEqual(reloaded.records.count, 1)
+        XCTAssertEqual(reloaded.records.first?.id, keep.id)
+    }
+
+    func testRemoveUnknownIDIsNoOp() {
+        let (log, _) = makeLog()
+        log.append([
+            CorrectionRecord(heard: "a", replaced: "A", source: .phonetic)
+        ])
+        log.remove(id: UUID())
+        XCTAssertEqual(log.records.count, 1)
+    }
 }

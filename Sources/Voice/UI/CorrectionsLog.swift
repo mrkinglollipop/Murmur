@@ -126,6 +126,17 @@ final class CorrectionsLog: ObservableObject {
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }
 
+    /// Removes a single record by id and persists. No-op when id is absent.
+    func remove(id: UUID) {
+        let mutate = {
+            let before = self.records.count
+            self.records.removeAll { $0.id == id }
+            guard self.records.count != before else { return }
+            self.scheduleSave()
+        }
+        Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
+    }
+
     func recent(days: Int = 7, now: Date = Date()) -> [CorrectionRecord] {
         let cutoff = now.addingTimeInterval(-Double(days) * 24 * 60 * 60)
         return records.filter { $0.date >= cutoff }.sorted { $0.date > $1.date }
