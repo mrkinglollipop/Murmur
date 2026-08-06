@@ -49,6 +49,11 @@ final class RecordingHUD {
     /// flash) without necessarily passing through `applyState`.
     var onHide: (() -> Void)?
 
+    /// Fires on show / resize / hide **after** `isVisible` reflects the new
+    /// state. AppDelegate uses this to re-stack LearnToastHUD. Chain with
+    /// `onHide` by calling this before `onHide` on hide (see `hide()`).
+    var onLayoutChange: (() -> Void)?
+
     private(set) var currentState: State = .listening
 
     /// Whether the HUD is in the post-release transcription phase.
@@ -64,8 +69,20 @@ final class RecordingHUD {
     private let pillListeningHeight: CGFloat = 40
     private let pillInterimExtraHeight: CGFloat = 36
 
-    /// Guards against overlapping show/hide animations.
-    private var isVisible = false
+    /// Whether the recording HUD panel is currently shown.
+    private(set) var isVisible = false
+
+    /// Panel frame for stacking LearnToastHUD above the waveform.
+    /// When visible, uses the resting origin (not a mid-entrance offset) so
+    /// toasts sit at the final pill position for the whole recording.
+    var frameForStacking: NSRect {
+        guard isVisible else { return panel.frame }
+        return NSRect(origin: mainScreenOrigin(), size: currentPillSize)
+    }
+
+    /// Y of the resting / `mainScreenOrigin` position (not the in-animation
+    /// offset used during entrance).
+    var restingOriginY: CGFloat { mainScreenOrigin().y }
 
     private var pendingHideTimer: Timer?
     private var transitionToken = HUDTransitionToken()
@@ -117,15 +134,19 @@ final class RecordingHUD {
         positionOnMainScreen(offsetBelowFinal: 8)
         panel.orderFrontRegardless()
         isVisible = true
+        notifyLayoutChange()
         waveformView.startAnimating()
 
         let finalOrigin = mainScreenOrigin()
-        NSAnimationContext.runAnimationGroup { ctx in
+        NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
             panel.animator().setFrameOrigin(finalOrigin)
-        }
+        }, completionHandler: { [weak self] in
+            guard let self, self.isVisible else { return }
+            self.notifyLayoutChange()
+        })
     }
 
     /// Switches to `.processing` state (indeterminate pulse) without
@@ -138,6 +159,7 @@ final class RecordingHUD {
         waveformView.setProcessingLabel(true)
         resizePanel(forInterim: true)
         positionOnMainScreen(offsetBelowFinal: 8)
+        notifyLayoutChange()
     }
 
     /// Shows the last 1–2 lines of live transcript preview below the waveform
@@ -150,6 +172,7 @@ final class RecordingHUD {
             self.waveformView.setInterimText(hasInterim ? trimmed : nil)
             self.resizePanel(forInterim: hasInterim)
             self.positionOnMainScreen(offsetBelowFinal: 8)
+            self.notifyLayoutChange()
         }
     }
 
@@ -181,16 +204,20 @@ final class RecordingHUD {
         positionOnMainScreen(offsetBelowFinal: 8)
         panel.orderFrontRegardless()
         isVisible = true
+        notifyLayoutChange()
         waveformView.startAnimating()
 
         let finalOrigin = mainScreenOrigin()
         panel.alphaValue = 0
-        NSAnimationContext.runAnimationGroup { ctx in
+        NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
             panel.animator().setFrameOrigin(finalOrigin)
-        }
+        }, completionHandler: { [weak self] in
+            guard let self, self.isVisible, self.transitionToken.isCurrent(generation) else { return }
+            self.notifyLayoutChange()
+        })
 
         scheduleAutoHide(after: 3.0, generation: generation)
     }
@@ -243,13 +270,18 @@ final class RecordingHUD {
     func hide() {
         let generation = beginTransition()
         panel.ignoresMouseEvents = true
-        onHide?()
         guard isVisible else {
             waveformView.setInterimText(nil)
             waveformView.setProcessingLabel(false)
+            // Still notify layout so stacked toasts can drop to resting Y.
+            notifyLayoutChange()
+            onHide?()
             return
         }
-        isVisible = false
+        // Menu-bar idle immediately. Keep `isVisible` true through the fade so
+        // LearnToastHUD does not snap to resting Y while the pill is still on
+        // screen; clear visibility + re-stack after the animation completes.
+        onHide?()
         var slidDown = panel.frame.origin
         slidDown.y -= 8
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -258,12 +290,14 @@ final class RecordingHUD {
             panel.animator().alphaValue = 0
             panel.animator().setFrameOrigin(slidDown)
         }, completionHandler: { [weak self] in
-            guard let self = self, self.transitionToken.isCurrent(generation), !self.isVisible else { return }
+            guard let self = self, self.transitionToken.isCurrent(generation), self.isVisible else { return }
+            self.isVisible = false
             self.waveformView.stopAnimating()
             self.panel.orderOut(nil)
             self.waveformView.setInterimText(nil)
             self.waveformView.setProcessingLabel(false)
             self.resizePanel(forInterim: false)
+            self.notifyLayoutChange()
         })
     }
 
@@ -319,6 +353,13 @@ final class RecordingHUD {
             panel.setFrame(frame, display: true)
         }
         waveformView.frame = NSRect(origin: .zero, size: NSSize(width: pillWidth, height: targetHeight))
+        if isVisible {
+            notifyLayoutChange()
+        }
+    }
+
+    private func notifyLayoutChange() {
+        onLayoutChange?()
     }
 
     private func mainScreenOrigin() -> NSPoint {

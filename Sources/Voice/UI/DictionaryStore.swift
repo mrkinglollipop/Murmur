@@ -35,8 +35,8 @@ struct DictionaryEntry: Codable, Identifiable, Equatable {
     }
 }
 
-/// A single variant→term mapping recorded by `learn(from:to:)`, surfaced to
-/// the UI so it can show a "Learned" pill with an undo affordance.
+/// A single variant→term mapping recorded by `learn(from:to:)`.
+/// Surfaced for toast Reject / Dictionary Revert undo.
 struct LearnedCorrection: Identifiable, Equatable {
     let id: UUID
     let variant: String
@@ -53,14 +53,51 @@ struct LearnedCorrection: Identifiable, Equatable {
     }
 }
 
-/// One or more corrections learned from a single History Save action,
-/// grouped so the pill can show/undo them together.
+/// Toast-strip identity for a single undone learn line.
+/// `entryID` alone is insufficient — one dictionary entry can contribute
+/// multiple variant lines in the same (or queued) Learn toast.
+struct UnlearnedCorrectionIdentity: Hashable {
+    let entryID: UUID
+    let variant: String
+    let term: String
+
+    init(entryID: UUID, variant: String, term: String) {
+        self.entryID = entryID
+        self.variant = variant
+        self.term = term
+    }
+
+    init(_ correction: LearnedCorrection) {
+        self.init(entryID: correction.entryID, variant: correction.variant, term: correction.term)
+    }
+
+    func matches(_ correction: LearnedCorrection) -> Bool {
+        entryID == correction.entryID
+            && variant.caseInsensitiveCompare(correction.variant) == .orderedSame
+            && term.caseInsensitiveCompare(correction.term) == .orderedSame
+    }
+
+    static func == (lhs: UnlearnedCorrectionIdentity, rhs: UnlearnedCorrectionIdentity) -> Bool {
+        lhs.entryID == rhs.entryID
+            && lhs.variant.caseInsensitiveCompare(rhs.variant) == .orderedSame
+            && lhs.term.caseInsensitiveCompare(rhs.term) == .orderedSame
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(entryID)
+        hasher.combine(variant.lowercased())
+        hasher.combine(term.lowercased())
+    }
+}
+
+/// One or more corrections learned from a single History Save (or Restore),
+/// grouped so toast Reject can undo them together.
 struct LearnBatch: Identifiable, Equatable {
     let id: UUID
     let corrections: [LearnedCorrection]
 
-    init(corrections: [LearnedCorrection]) {
-        self.id = UUID()
+    init(id: UUID = UUID(), corrections: [LearnedCorrection]) {
+        self.id = id
         self.corrections = corrections
     }
 }
@@ -78,9 +115,21 @@ final class DictionaryStore: ObservableObject {
     @Published private(set) var entries: [DictionaryEntry] = []
     @Published private(set) var blocklist: Set<BlockedPair> = []
 
-    /// Most recent batch of corrections learned from a History edit, for the
-    /// transient "Learned" pill + undo. Not persisted — purely a UI signal.
-    @Published var recentlyLearned: LearnBatch?
+    /// Fired when `learn()` records one or more corrections (including
+    /// `announce: false`). Empty learns do not fire. LearnEventsCoordinator
+    /// appends `learnAccepted` from this; toast display is separate
+    /// (`announce: true` → LearnToastHUD).
+    var onLearnBatch: ((LearnBatchEvent) -> Void)?
+
+    /// Fired after dictionary undo that should tear down matching toasts
+    /// (`unlearn` and legacy degrade Revert/Never). Not fired from
+    /// `rejectLearnedBatch` (toast already owns teardown). Identities are
+    /// entryID + variant + term so same-entry siblings stay on the toast.
+    var onUnlearn: ((Set<UnlearnedCorrectionIdentity>) -> Void)?
+
+    /// Fired after `rejectLearnedBatch` finishes unlearn + blocklist for at
+    /// least one still-present correction.
+    var onRejectCompleted: ((LearnBatch) -> Void)?
 
     /// Minimum normalized similarity (1 - editDistance/maxLen) a candidate
     /// variant→term pair must clear to be learned. See `learn(from:to:)`.
@@ -218,8 +267,39 @@ final class DictionaryStore: ObservableObject {
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }
 
+    /// Removes a blocklisted pair. Lowercases both sides; idempotent if absent.
+    func unblockPair(heard: String, replaced: String) {
+        let pair = BlockedPair(
+            heard: heard.lowercased(),
+            replaced: replaced.lowercased()
+        )
+        let mutate = {
+            self.blocklist.remove(pair)
+            self.scheduleBlocklistSave()
+        }
+        Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
+    }
+
     func isBlocklisted(heard: String, replaced: String) -> Bool {
         blocklist.contains(BlockedPair(heard: heard.lowercased(), replaced: replaced.lowercased()))
+    }
+
+    /// Toast Reject: unlearn each still-present correction, blocklist only
+    /// those pairs, then notify coordinator to append `learnRejected` for the
+    /// corrections that were actually removed. Already-unlearned (e.g.
+    /// Dictionary Revert first) → no blocklist, no `learnRejected` row.
+    func rejectLearnedBatch(_ batch: LearnBatch) {
+        let work = {
+            var rejected: [LearnedCorrection] = []
+            for correction in batch.corrections {
+                guard self.applyUnlearn(correction) else { continue }
+                self.blocklistPair(heard: correction.variant, replaced: correction.term)
+                rejected.append(correction)
+            }
+            guard !rejected.isEmpty else { return }
+            self.onRejectCompleted?(LearnBatch(corrections: rejected))
+        }
+        Thread.isMainThread ? work() : DispatchQueue.main.async(execute: work)
     }
 
     private func rebuildRegexCache() {
@@ -435,13 +515,21 @@ final class DictionaryStore: ObservableObject {
     ///
     /// When `userInitiated` is true (History Save), every changed word pair is
     /// learned — the user explicitly corrected the transcript and can undo via
-    /// the Learned pill. The similarity gate only applies to automated callers.
+    /// toast Reject or Dictionary Revert. The similarity gate only applies to
+    /// automated callers.
     ///
     /// User-initiated learning also handles word-count changes when ASR splits
     /// one term into several words (e.g. "Get ignore" → "gitignore") or vice
     /// versa, by aligning unchanged suffixes around the changed run.
+    /// - Parameter announce: When true (default), LearnEventsCoordinator shows
+    ///   the system toast. Restore uses `announce: false` so no toast fires.
     @discardableResult
-    func learn(from oldText: String, to newText: String, userInitiated: Bool = false) -> [LearnedCorrection] {
+    func learn(
+        from oldText: String,
+        to newText: String,
+        userInitiated: Bool = false,
+        announce: Bool = true
+    ) -> [LearnedCorrection] {
         let old = oldText.trimmingCharacters(in: .whitespacesAndNewlines)
         let new = newText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard old != new else { return [] }
@@ -459,13 +547,22 @@ final class DictionaryStore: ObservableObject {
             recorded = []
         }
 
+        let batch = LearnBatch(corrections: recorded)
+        // Skip empty batches (no-op learn / identical text) — coordinator
+        // would ignore them; callers should not observe empty events.
         if !recorded.isEmpty {
-            let batch = LearnBatch(corrections: recorded)
-            let publish = { self.recentlyLearned = batch }
-            Thread.isMainThread ? publish() : DispatchQueue.main.async(execute: publish)
+            emitLearnBatch(batch, announce: announce)
         }
 
         return recorded
+    }
+
+    private func emitLearnBatch(_ batch: LearnBatch, announce: Bool) {
+        let event = LearnBatchEvent(batch: batch, announce: announce)
+        let fire: () -> Void = {
+            self.onLearnBatch?(event)
+        }
+        Thread.isMainThread ? fire() : DispatchQueue.main.async(execute: fire)
     }
 
     private func learnSameWordCount(
@@ -684,29 +781,52 @@ final class DictionaryStore: ObservableObject {
         }
     }
 
+    /// Notifies toast teardown for correction identities undone outside
+    /// `rejectLearnedBatch` (Revert / Never / degrade).
+    func notifyUnlearned(_ identities: Set<UnlearnedCorrectionIdentity>) {
+        guard !identities.isEmpty else { return }
+        let fire: () -> Void = { self.onUnlearn?(identities) }
+        Thread.isMainThread ? fire() : DispatchQueue.main.async(execute: fire)
+    }
+
     /// Reverses a single learned correction: deletes the entry it created, or
     /// removes just the variant it appended to a pre-existing entry (keeping
-    /// the entry and its other variants intact). Also clears `recentlyLearned`
-    /// if the pill currently showing is the batch this correction belongs to,
-    /// so undoing doesn't leave a stale pill on screen.
-    func unlearn(_ correction: LearnedCorrection) {
-        if correction.createdNewEntry {
-            if let entry = entries.first(where: { $0.id == correction.entryID }) {
-                delete(entry)
-            }
-        } else {
-            guard let existing = entries.first(where: { $0.id == correction.entryID }) else { return }
-            var updated = existing
-            updated.variants.removeAll { $0.caseInsensitiveCompare(correction.variant) == .orderedSame }
-            update(updated)
+    /// the entry and its other variants intact). Fires `onUnlearn` when a
+    /// change was applied so LearnToastHUD can tear down matching toasts.
+    @discardableResult
+    func unlearn(_ correction: LearnedCorrection) -> Bool {
+        let work = { () -> Bool in
+            guard self.applyUnlearn(correction) else { return false }
+            self.notifyUnlearned([UnlearnedCorrectionIdentity(correction)])
+            return true
         }
+        if Thread.isMainThread {
+            return work()
+        }
+        var changed = false
+        DispatchQueue.main.sync { changed = work() }
+        return changed
+    }
 
-        let clearIfMatching = {
-            if let batch = self.recentlyLearned, batch.corrections.contains(where: { $0.id == correction.id }) {
-                self.recentlyLearned = nil
+    /// Applies unlearn without `onUnlearn` (used by toast Reject).
+    @discardableResult
+    private func applyUnlearn(_ correction: LearnedCorrection) -> Bool {
+        if correction.createdNewEntry {
+            guard let entry = entries.first(where: { $0.id == correction.entryID }) else {
+                return false
             }
+            delete(entry)
+            return true
         }
-        Thread.isMainThread ? clearIfMatching() : DispatchQueue.main.async(execute: clearIfMatching)
+        guard let existing = entries.first(where: { $0.id == correction.entryID }) else {
+            return false
+        }
+        let before = existing.variants.count
+        var updated = existing
+        updated.variants.removeAll { $0.caseInsensitiveCompare(correction.variant) == .orderedSame }
+        guard updated.variants.count != before else { return false }
+        update(updated)
+        return true
     }
 
     // MARK: - Tokenization

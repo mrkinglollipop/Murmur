@@ -86,30 +86,6 @@ struct RootView: View {
                 selectedTab = tab
             }
         }
-        .overlay(alignment: .bottom) {
-            if let batch = dictionaryStore.recentlyLearned {
-                LearnedPill(
-                    batch: batch,
-                    onUndo: {
-                        for correction in batch.corrections {
-                            dictionaryStore.unlearn(correction)
-                        }
-                        withAnimation(Theme.easeOutOrNil()) { dictionaryStore.recentlyLearned = nil }
-                    },
-                    onDismiss: {
-                        withAnimation(Theme.easeOutOrNil()) { dictionaryStore.recentlyLearned = nil }
-                    }
-                )
-                .padding(.bottom, 16)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .task(id: dictionaryStore.recentlyLearned?.id) {
-            guard let currentID = dictionaryStore.recentlyLearned?.id else { return }
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            guard dictionaryStore.recentlyLearned?.id == currentID else { return }
-            withAnimation(Theme.easeOutOrNil()) { dictionaryStore.recentlyLearned = nil }
-        }
         .task {
             if WhatsNewStore.shouldPresent() {
                 showWhatsNew = true

@@ -74,7 +74,9 @@ struct DictionaryView: View {
         )
         .confirmDelete(
             isPresented: $showRevertDeleteConfirmation,
-            title: "Revert auto-learned term?",
+            title: pendingRevertRecord?.source == .learnAccepted
+                ? "Remove learned dictionary entry?"
+                : "Revert auto-learned term?",
             onConfirm: {
                 if let record = pendingRevertRecord {
                     revertCorrection(record, deleteEntry: true)
@@ -132,19 +134,45 @@ struct DictionaryView: View {
 
             Spacer()
 
-            Button("Revert") {
-                handleRevert(record)
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: 12))
-            .foregroundColor(Theme.textSecondary)
+            switch record.source {
+            case .learnRejected:
+                Button("Restore") {
+                    handleRestore(record)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
 
-            Button("Never") {
-                store.blocklistPair(heard: record.heard, replaced: record.replaced)
+            case .learnAccepted:
+                Button("Revert") {
+                    handleLearnAcceptedRevert(record)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
+
+                Button("Never") {
+                    handleLearnAcceptedNever(record)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
+
+            case .dictionary, .phonetic, .autoLearned:
+                Button("Revert") {
+                    handleRevert(record)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
+
+                Button("Never") {
+                    store.blocklistPair(heard: record.heard, replaced: record.replaced)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
             }
-            .buttonStyle(.plain)
-            .font(.system(size: 12))
-            .foregroundColor(Theme.textSecondary)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -155,6 +183,85 @@ struct DictionaryView: View {
         case .dictionary: return "dictionary"
         case .phonetic: return "phonetic"
         case .autoLearned: return "auto-learned"
+        case .learnAccepted: return "learned"
+        case .learnRejected: return "rejected"
+        }
+    }
+
+    private func handleRestore(_ record: CorrectionRecord) {
+        store.unblockPair(heard: record.heard, replaced: record.replaced)
+        // announce: false — no toast; coordinator appends learnAccepted via onLearnBatch when non-empty.
+        _ = store.learn(
+            from: record.heard,
+            to: record.replaced,
+            userInitiated: true,
+            announce: false
+        )
+    }
+
+    private func handleLearnAcceptedRevert(_ record: CorrectionRecord) {
+        if let entryID = record.entryID,
+           let createdNew = record.createdNewEntry {
+            let correction = LearnedCorrection(
+                variant: record.heard,
+                term: record.replaced,
+                createdNewEntry: createdNew,
+                entryID: entryID
+            )
+            if createdNew {
+                pendingRevertRecord = record
+                showRevertDeleteConfirmation = true
+            } else {
+                store.unlearn(correction)
+            }
+            return
+        }
+        // Old records without entryID: blocklist + best-effort variant removal.
+        degradeRevertLearnAccepted(record)
+    }
+
+    private func handleLearnAcceptedNever(_ record: CorrectionRecord) {
+        if let entryID = record.entryID,
+           let createdNew = record.createdNewEntry {
+            let correction = LearnedCorrection(
+                variant: record.heard,
+                term: record.replaced,
+                createdNewEntry: createdNew,
+                entryID: entryID
+            )
+            store.unlearn(correction)
+        } else {
+            degradeRevertLearnAccepted(record)
+        }
+        store.blocklistPair(heard: record.heard, replaced: record.replaced)
+    }
+
+    /// Pre-migration learnAccepted rows: pure undo (remove matching variant by CI).
+    /// Never must call `blocklistPair` separately — Revert must not blocklist.
+    /// Tears down any active Learn toast for the undone variant only.
+    private func degradeRevertLearnAccepted(_ record: CorrectionRecord) {
+        if let entry = store.entries.first(where: {
+            $0.term.caseInsensitiveCompare(record.replaced) == .orderedSame
+        }) {
+            var updated = entry
+            let before = updated.variants.count
+            updated.variants.removeAll {
+                $0.caseInsensitiveCompare(record.heard) == .orderedSame
+            }
+            // Mirror `applyUnlearn`: no-op when the variant was already gone.
+            guard updated.variants.count != before else { return }
+            if updated.variants.isEmpty && entry.isAutoLearned {
+                store.delete(entry)
+            } else {
+                store.update(updated)
+            }
+            store.notifyUnlearned([
+                UnlearnedCorrectionIdentity(
+                    entryID: entry.id,
+                    variant: record.heard,
+                    term: record.replaced
+                )
+            ])
         }
     }
 
@@ -171,6 +278,18 @@ struct DictionaryView: View {
     }
 
     private func revertCorrection(_ record: CorrectionRecord, deleteEntry: Bool) {
+        if record.source == .learnAccepted,
+           let entryID = record.entryID,
+           let createdNew = record.createdNewEntry {
+            let correction = LearnedCorrection(
+                variant: record.heard,
+                term: record.replaced,
+                createdNewEntry: createdNew,
+                entryID: entryID
+            )
+            store.unlearn(correction)
+            return
+        }
         if deleteEntry,
            let entry = store.entries.first(where: {
                $0.term.caseInsensitiveCompare(record.replaced) == .orderedSame
