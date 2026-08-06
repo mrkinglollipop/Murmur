@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.22",
+    "build": "23",
+    "title": "What's New in 0.1.22",
+    "items": [
+      "When Murmur learns a correction, a system toast appears with Reject to undo and stop learning that pair.",
+      "Accepted and rejected learns show in Dictionary → Corrections, with Restore and Revert / Never actions."
+    ]
+  },
+  {
     "version": "0.1.21",
     "build": "22",
     "title": "What's New in 0.1.21",
