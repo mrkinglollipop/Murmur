@@ -200,14 +200,54 @@ enum CaretContext {
         case .startOfField:
             return false
         case .unknown:
-            guard let first = transcriptFirstChar else { return false }
-            return first.isLetter || first.isNumber
+            // Prefer no glue-fix over double-space when AX is blind
+            // (e.g. Electron select-replace that already has a space before the selection).
+            return false
         }
+    }
+
+    // MARK: - Inject snapshot resolution
+
+    /// Prefer a recording-will-start held snapshot when it had a readable
+    /// non-empty selection; otherwise use fresh. History-retry never prefers held.
+    static func resolveInjectSnapshot(
+        held: Snapshot?,
+        fresh: Snapshot,
+        replaceHistoryEntryID: UUID?
+    ) -> Snapshot {
+        if replaceHistoryEntryID != nil {
+            return fresh
+        }
+        guard let held, !held.isUnknown else { return fresh }
+        if case .readable(let n) = held.selectionLength, n > 0 {
+            return held
+        }
+        return fresh
     }
 
     // MARK: - Mid-sentence trailing sentence punctuation
 
     private static let sentencePunct: Set<Character> = [".", "!", "?"]
+
+    /// Proper nouns / commons that must stay Title Case mid-sentence.
+    /// SSOT for decap tests — expand coverage only by adding here.
+    private static let properNounAllowlist: Set<String> = [
+        "Russia", "America", "England", "France", "Germany", "Japan", "China",
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+
+    /// Select-replace mid-sentence gate shared by strip + Title Case decap.
+    static func isMidSentenceSelectReplace(snapshot: Snapshot) -> Bool {
+        guard !snapshot.isUnknown else { return false }
+        guard case .readable(let n) = snapshot.selectionLength, n > 0 else { return false }
+        return hasContinuingProse(
+            value: snapshot.value,
+            selectionLocation: snapshot.location,
+            selectionLength: n
+        )
+    }
 
     /// Transcript-tail rule: after trimming trailing WS, ends with exactly one
     /// of `.` `!` `?` whose previous char is not also sentence punct.
@@ -258,21 +298,7 @@ enum CaretContext {
         transcript: String,
         codeAware: Bool
     ) -> Bool {
-        guard !snapshot.isUnknown else { return false }
-
-        switch snapshot.selectionLength {
-        case .unreadable:
-            return false
-        case .readable(let length):
-            guard length > 0 else { return false }
-            guard hasContinuingProse(
-                value: snapshot.value,
-                selectionLocation: snapshot.location,
-                selectionLength: length
-            ) else {
-                return false
-            }
-        }
+        guard isMidSentenceSelectReplace(snapshot: snapshot) else { return false }
 
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -308,5 +334,76 @@ enum CaretContext {
         guard let last = trimmed.last, sentencePunct.contains(last) else { return transcript }
         trimmed.removeLast()
         return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Mid-sentence Title Case decapitalization
+
+    /// First whitespace-delimited token that looks like ASR Title Case
+    /// (leading uppercase letter, remaining letters lowercase).
+    static func firstTitleCaseToken(in transcript: String) -> String? {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw = trimmed.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).first else {
+            return nil
+        }
+        let token = String(raw)
+        guard isTitleCaseToken(token) else { return nil }
+        return token
+    }
+
+    static func isTitleCaseToken(_ token: String) -> Bool {
+        guard let first = token.first, first.isLetter, first.isUppercase else { return false }
+        let rest = token.dropFirst()
+        return rest.allSatisfy { ch in
+            !ch.isLetter || ch.isLowercase
+        }
+    }
+
+    static func shouldKeepCapitalizedToken(
+        _ token: String,
+        capitalizedDictionaryTerms: Set<String>
+    ) -> Bool {
+        if token == "I" { return true }
+        if properNounAllowlist.contains(token) { return true }
+        if capitalizedDictionaryTerms.contains(token) { return true }
+        // ALL-CAPS acronym length ≥ 2
+        if token.count >= 2, token.allSatisfy({ !$0.isLetter || $0.isUppercase }),
+           token.contains(where: \.isLetter) {
+            return true
+        }
+        return false
+    }
+
+    static func shouldDecapitalizeFirstToken(
+        snapshot: Snapshot,
+        transcript: String,
+        capitalizedDictionaryTerms: Set<String>
+    ) -> Bool {
+        guard isMidSentenceSelectReplace(snapshot: snapshot) else { return false }
+        guard let token = firstTitleCaseToken(in: transcript) else { return false }
+        return !shouldKeepCapitalizedToken(token, capitalizedDictionaryTerms: capitalizedDictionaryTerms)
+    }
+
+    /// Lowercases the first letter of a mid-sentence Title Case first token
+    /// unless allowlist / Dictionary / `I` / ALL-CAPS guards say keep it.
+    static func decapitalizeFirstTokenIfNeeded(
+        snapshot: Snapshot,
+        transcript: String,
+        capitalizedDictionaryTerms: Set<String>
+    ) -> String {
+        guard shouldDecapitalizeFirstToken(
+            snapshot: snapshot,
+            transcript: transcript,
+            capitalizedDictionaryTerms: capitalizedDictionaryTerms
+        ) else {
+            return transcript
+        }
+        guard let firstIdx = transcript.firstIndex(where: { !$0.isWhitespace && !$0.isNewline }) else {
+            return transcript
+        }
+        var chars = Array(transcript)
+        let offset = transcript.distance(from: transcript.startIndex, to: firstIdx)
+        guard offset < chars.count, chars[offset].isUppercase else { return transcript }
+        chars[offset] = Character(chars[offset].lowercased())
+        return String(chars)
     }
 }

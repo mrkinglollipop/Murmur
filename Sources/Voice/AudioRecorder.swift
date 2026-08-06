@@ -93,6 +93,17 @@ final class AudioRecorder {
     /// checks on the realtime audio-tap thread.
     private var secureInputPollTimer: Timer?
 
+    /// Held-caret generation from `onRecordingWillStart` for this start attempt.
+    /// Promoted to `activeHeldCaretToken` when capture actually starts; cleared
+    /// (token-matched) on start failure / skip before promote.
+    private var pendingHeldCaretToken: UInt64?
+
+    /// Held-caret generation for the in-flight recording session after capture
+    /// has started. Stop/abort/silence/empty/write-fail paths clear matching
+    /// this token only — never unscoped — so a late teardown cannot wipe a
+    /// newer hold from a rapid re-press.
+    private var activeHeldCaretToken: UInt64?
+
     /// Pure decision seam for the mid-hold secure-input abort — extracted so
     /// it can be exercised in unit tests, since `IsSecureEventInputEnabled`
     /// (Carbon) cannot be forced on in a test.
@@ -103,11 +114,84 @@ final class AudioRecorder {
         secureInput && isRecording
     }
 
+    /// Clears the held caret for this start attempt (token-matched). No-op when
+    /// pending is nil — never falls back to unscoped clear (that would wipe a
+    /// newer session's hold).
+    private func clearPendingHeldCaretSnapshot() {
+        if let token = pendingHeldCaretToken {
+            asrSelector.clearHeldCaretSnapshot(matching: token)
+        }
+        pendingHeldCaretToken = nil
+    }
+
+    /// Promotes pending → active when mic/stream capture actually begins.
+    /// Idempotent: a second call with nil pending (WhisperKit stream-start
+    /// promote, then async fallback → `startMicCapture`) must not wipe an
+    /// already-active session token.
+    private func promotePendingHeldCaretToActive() {
+        let next = Self.heldCaretTokensAfterPromote(
+            active: activeHeldCaretToken,
+            pending: pendingHeldCaretToken
+        )
+        activeHeldCaretToken = next.active
+        pendingHeldCaretToken = next.pending
+    }
+
+    /// Same-session stop/abort without inject: clear this session's hold via
+    /// `active ?? pending` (never unscoped), then nil both slots.
+    private func clearActiveHeldCaretSnapshot() {
+        if let token = Self.teardownHeldCaretClearToken(
+            active: activeHeldCaretToken,
+            pending: pendingHeldCaretToken
+        ) {
+            asrSelector.clearHeldCaretSnapshot(matching: token)
+        }
+        activeHeldCaretToken = nil
+        pendingHeldCaretToken = nil
+    }
+
+    /// Async write-fail / late teardown: clear matching a token captured when
+    /// the session owned the hold, then drop `active` / `pending` only if
+    /// they still match that token.
+    private func clearHeldCaretSnapshotMatchingSession(_ token: UInt64?) {
+        guard let token else { return }
+        asrSelector.clearHeldCaretSnapshot(matching: token)
+        if activeHeldCaretToken == token {
+            activeHeldCaretToken = nil
+        }
+        if pendingHeldCaretToken == token {
+            pendingHeldCaretToken = nil
+        }
+    }
+
+    /// Testable seam: promote is a no-op when pending is nil so an already-
+    /// active token survives WhisperKit fallback re-entry.
+    internal static func heldCaretTokensAfterPromote(
+        active: UInt64?,
+        pending: UInt64?
+    ) -> (active: UInt64?, pending: UInt64?) {
+        guard let pending else {
+            return (active, nil)
+        }
+        return (pending, nil)
+    }
+
+    /// Testable seam: teardown must never request an unscoped clear when a
+    /// session token is known (documents AudioRecorder policy for unit tests).
+    internal static func teardownHeldCaretClearToken(
+        active: UInt64?,
+        pending: UInt64?
+    ) -> UInt64? {
+        active ?? pending
+    }
+
     // MARK: - Public interface
 
-    func startRecording() {
+    func startRecording(heldCaretToken: UInt64? = nil) {
+        pendingHeldCaretToken = heldCaretToken
         if IsSecureEventInputEnabled() {
             logger.info("Secure input active — refusing to start capture.")
+            clearPendingHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in
                 self?.asrSelector.onFailure?(.secureInputBlocked)
             }
@@ -120,6 +204,7 @@ final class AudioRecorder {
             vlog("mic permission callback — granted=\(granted)")
             guard let self = self, granted else {
                 self?.logger.error("Microphone permission denied.")
+                self?.clearPendingHeldCaretSnapshot()
                 DispatchQueue.main.async {
                     self?.asrSelector.onFailure?(.micStartFailed)
                 }
@@ -128,6 +213,7 @@ final class AudioRecorder {
             DispatchQueue.main.async {
                 guard self.wantsRecording else {
                     self.logger.info("Mic permission resolved after stopRecording() — skipping start.")
+                    self.clearPendingHeldCaretSnapshot()
                     return
                 }
                 self.doStart()
@@ -258,6 +344,7 @@ final class AudioRecorder {
         ) else {
             logger.info("doStart skipped — recording no longer wanted")
             vlog("doStart skipped — wantsRecording=false")
+            clearPendingHeldCaretSnapshot()
             return
         }
         isStopping = false
@@ -290,6 +377,7 @@ final class AudioRecorder {
             fallbackToFileBased: { [weak self] in self?.startMicCapture() }
         ) {
             // WhisperKit owns the mic — still poll secure input mid-hold.
+            promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
             return
         }
@@ -318,6 +406,7 @@ final class AudioRecorder {
         ) else {
             logger.info("startMicCapture skipped — recording no longer wanted")
             vlog("startMicCapture skipped — wantsRecording=false")
+            clearPendingHeldCaretSnapshot()
             return
         }
 
@@ -400,6 +489,7 @@ final class AudioRecorder {
         do {
             try engine.start()
             logger.info("AVAudioEngine started — recording…")
+            promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
         } catch {
             logger.error("AVAudioEngine start failed: \(error.localizedDescription)")
@@ -407,6 +497,7 @@ final class AudioRecorder {
             // beginRecordingSession already ran above — clear so Settings does
             // not stick on "listening…" after a failed engine start.
             endVoiceGateRecordingSession()
+            clearPendingHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in
                 self?.asrSelector.onFailure?(.micStartFailed)
                 self?.hud.hide()
@@ -448,6 +539,7 @@ final class AudioRecorder {
         pcmBuffers.removeAll(keepingCapacity: false)
         pcmBuffersLock.unlock()
         streamingCoordinator.cancelAll()
+        clearActiveHeldCaretSnapshot()
         DispatchQueue.main.async { [weak self] in
             self?.hud.hide()
             self?.asrSelector.onFailure?(.secureInputBlocked)
@@ -497,6 +589,7 @@ final class AudioRecorder {
         if streamingCoordinator.handleStopXAI(
             context: xaiContext,
             onSilence: { [weak self] in
+                self?.clearActiveHeldCaretSnapshot()
                 DispatchQueue.main.async { self?.hud.hide() }
             },
             onStreamSuccess: { [weak self] text in
@@ -506,7 +599,11 @@ final class AudioRecorder {
             },
             onBatchFallback: { [weak self] buffers, duration in
                 guard let self = self else { return }
-                guard !buffers.isEmpty else { self.hud.hide(); return }
+                guard !buffers.isEmpty else {
+                    self.clearActiveHeldCaretSnapshot()
+                    self.hud.hide()
+                    return
+                }
                 self.writeToFile(duration: duration, buffers: buffers)
             }
         ) {
@@ -521,6 +618,7 @@ final class AudioRecorder {
         if streamingCoordinator.handleStopElevenLabs(
             context: elevenLabsContext,
             onSilence: { [weak self] in
+                self?.clearActiveHeldCaretSnapshot()
                 DispatchQueue.main.async { self?.hud.hide() }
             },
             onStreamSuccess: { [weak self] text in
@@ -530,7 +628,11 @@ final class AudioRecorder {
             },
             onBatchFallback: { [weak self] buffers, duration in
                 guard let self = self else { return }
-                guard !buffers.isEmpty else { self.hud.hide(); return }
+                guard !buffers.isEmpty else {
+                    self.clearActiveHeldCaretSnapshot()
+                    self.hud.hide()
+                    return
+                }
                 self.writeToFile(duration: duration, buffers: buffers)
             }
         ) {
@@ -539,6 +641,7 @@ final class AudioRecorder {
 
         if streamingCoordinator.handleStopWhisperKit(
             onEmpty: { [weak self] in
+                self?.clearActiveHeldCaretSnapshot()
                 DispatchQueue.main.async { self?.hud.hide() }
             },
             onSuccess: { [weak self] text in
@@ -559,6 +662,7 @@ final class AudioRecorder {
     /// always safe.
     private func stopFileBasedCapture() {
         guard isSetUp else {
+            clearActiveHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in self?.hud.hide() }
             return
         }
@@ -574,6 +678,7 @@ final class AudioRecorder {
 
         guard !capturedBuffers.isEmpty else {
             logger.warning("No audio captured.")
+            clearActiveHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in self?.hud.hide() }
             return
         }
@@ -582,6 +687,7 @@ final class AudioRecorder {
         // present, so Whisper can't hallucinate a stock caption on silence.
         guard recordingHadSpeech() else {
             vlog("no speech — skipping transcription (silence guard)")
+            clearActiveHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in self?.hud.hide() }
             return
         }
@@ -650,6 +756,9 @@ final class AudioRecorder {
         let format = first.format
         // Snapshot buffers for the IO queue — do not touch AVAudioFile / retain on main.
         let buffersCopy = buffers
+        // Capture this session's hold token before async IO so a late write-fail
+        // clears only this session even if a newer hold already promoted active.
+        let sessionHeldToken = activeHeldCaretToken
 
         audioIOQueue.async { [weak self] in
             guard let self = self else { return }
@@ -659,6 +768,7 @@ final class AudioRecorder {
             guard let combined = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else {
                 self.logger.error("Failed to allocate combined buffer (\(totalFrames) frames)")
                 DispatchQueue.main.async {
+                    self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
@@ -713,6 +823,7 @@ final class AudioRecorder {
                     self.logger.error("Failed to retain recording for transcription.")
                     try? FileManager.default.removeItem(at: tmpURL)
                     DispatchQueue.main.async {
+                        self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
                         self.asrSelector.onFailure?(.audioWriteFailed)
                         self.hud.hide()
                     }
@@ -729,6 +840,7 @@ final class AudioRecorder {
             } catch {
                 self.logger.error("Failed to write audio file: \(error.localizedDescription)")
                 DispatchQueue.main.async {
+                    self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
