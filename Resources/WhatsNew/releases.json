@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.28",
+    "build": "29",
+    "title": "What's New in 0.1.28",
+    "items": [
+      "Streaming holds that showed interim words no longer vanish without injecting or logging history.",
+      "Empty streaming commits keep the last partial transcript instead of wiping it.",
+      "Discarded silence or empty holds now appear as failed rows in History so ghosts are visible."
+    ]
+  },
+  {
     "version": "0.1.27",
     "build": "28",
     "title": "What's New in 0.1.27",

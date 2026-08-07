@@ -93,6 +93,20 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// convention of not assuming a queue).
     var onInterim: ((String) -> Void)?
 
+    /// Whether this session ever received non-empty stream text.
+    var hasEverHadNonEmptyStreamText: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return everHadNonEmptyStreamText
+    }
+
+    /// Stop-time joined transcript snapshot (confirmed + interim).
+    func joinedTranscriptSnapshot() -> String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return mergeConfirmedWithInterim()
+    }
+
     // MARK: - Shared state (NSLock-guarded)
 
     private let stateLock = NSLock()
@@ -103,6 +117,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var confirmedText: String = ""
     /// Most recent (not-yet-final) interim text, for `onInterim`'s running preview.
     private var latestInterim: String = ""
+    /// True once any non-empty interim/confirmed text arrived this session.
+    private var everHadNonEmptyStreamText = false
     /// Words committed by timestamp filter — used for boundary dedup only, not text rebuild.
     private var committedWords: [TranscriptWord] = []
     /// Latest `end` time among committed words (seconds).
@@ -418,6 +434,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private func resetTranscriptState() {
         confirmedText = ""
         latestInterim = ""
+        everHadNonEmptyStreamText = false
         committedWords = []
         lastCommittedEnd = 0
         hasLoggedWordTimestampSample = false
@@ -532,6 +549,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             stateLock.lock()
             if !partialText.isEmpty {
                 latestInterim = partialText
+                everHadNonEmptyStreamText = true
                 if isFinal {
                     ingestFinalSegment(text: partialText, words: words, speechFinal: speechFinal)
                     if confirmedText.localizedCaseInsensitiveContains(partialText) {
@@ -540,6 +558,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                 }
             }
             let running = mergeConfirmedWithInterim()
+            if !running.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                everHadNonEmptyStreamText = true
+            }
             stateLock.unlock()
 
             onInterim?(running)
@@ -556,6 +577,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             stateLock.lock()
             let resolved = bestResolvedTranscript(doneText: doneText)
             confirmedText = resolved
+            if !resolved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                everHadNonEmptyStreamText = true
+            }
             let continuation = doneResolved ? nil : doneContinuation
             doneResolved = true
             doneContinuation = nil

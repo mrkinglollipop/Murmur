@@ -96,6 +96,24 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     private var committedSegments: [String] = []
     /// Most recent (not-yet-committed) partial text, for `onInterim`'s preview.
     private var latestPartial: String = ""
+    /// True once any non-empty partial or committed text arrived this session.
+    /// Survives empty-commit clearing of `latestPartial` so stop can bypass
+    /// local RMS silence cancel after HUD showed words.
+    private var everHadNonEmptyStreamText = false
+
+    /// Whether this session ever received non-empty stream text (partial or commit).
+    var hasEverHadNonEmptyStreamText: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return everHadNonEmptyStreamText
+    }
+
+    /// Stop-time joined transcript snapshot (committed + in-flight partial).
+    func joinedTranscriptSnapshot() -> String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+    }
 
     /// Resolved exactly once by the receive loop when `session_started` arrives.
     private var readyContinuation: CheckedContinuation<Void, Error>?
@@ -367,6 +385,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     private func resetTranscriptState() {
         committedSegments = []
         latestPartial = ""
+        everHadNonEmptyStreamText = false
         finalizeRequested = false
     }
 
@@ -446,7 +465,8 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         }
     }
 
-    private func handleServerEvent(_ text: String) {
+    /// Package-visible for unit tests (`@testable`) — production receive loop only.
+    func handleServerEvent(_ text: String) {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let messageType = json["message_type"] as? String
@@ -468,7 +488,13 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         case "partial_transcript":
             let partialText = (json["text"] as? String) ?? ""
             stateLock.lock()
-            latestPartial = partialText
+            // Empty/whitespace partial must not wipe a prior non-empty
+            // latestPartial (mirrors empty committed_transcript retain).
+            let trimmedPartial = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedPartial.isEmpty {
+                latestPartial = partialText
+                everHadNonEmptyStreamText = true
+            }
             let running = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
             stateLock.unlock()
             onInterim?(running)
@@ -479,8 +505,11 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             let trimmed = committedText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 committedSegments.append(trimmed)
+                everHadNonEmptyStreamText = true
+                // Only clear in-flight partial after a real commit. Empty
+                // committed_transcript must not wipe HUD/finalize text.
+                latestPartial = ""
             }
-            latestPartial = ""
             let running = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
             // Only complete finalize()'s waiter after finalize requested
             // (post-release commit:true). Mid-hold commits accumulate only.

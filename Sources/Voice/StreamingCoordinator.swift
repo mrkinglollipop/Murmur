@@ -22,11 +22,57 @@ final class StreamingCoordinator {
     /// gated on the same `cloudModel` selection, which is a single value).
     private(set) var elevenLabsSession: ElevenLabsRealtimeTranscriber?
 
+    /// Coordinator-wide latch: any non-empty `onInterim` during the current
+    /// hold. Survives async start-failure clearing the session reference so
+    /// file-based fallthrough can still know stream text existed.
+    private(set) var coordinatorEverHadStreamText = false
+
     /// Soft floor for "looks truncated" — only force batch fallback when text
     /// is extremely short relative to hold length (false positives at 8 cps
     /// discarded good streams). Empty text already falls back separately.
     private static let streamMinCharsPerSecond: Double = 2.0
     private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
+
+    /// Silence cancel only when there was never stream text and no PCM buffers.
+    /// Non-empty buffers or any interim/commit bypass local RMS `hadSpeech`.
+    static func shouldTakeSilenceCancel(
+        everHadStreamText: Bool,
+        hasBufferedAudio: Bool
+    ) -> Bool {
+        !everHadStreamText && !hasBufferedAudio
+    }
+
+    /// After streaming finalize: prefer non-empty finalize text unless truncated.
+    /// If finalize is empty, recover a non-empty pre-finalize snapshot (Class A
+    /// residual — silence was bypassed for stream text, then finalize cleared /
+    /// returned empty). Returns success-path text, or `nil` for batch fallback.
+    static func streamSuccessTextOrBatchFallback(
+        finalizeText: String,
+        preFinalizeSnapshot: String,
+        truncated: Bool
+    ) -> String? {
+        if !finalizeText.isEmpty, !truncated {
+            return finalizeText
+        }
+        if finalizeText.isEmpty {
+            let recovered = preFinalizeSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !recovered.isEmpty {
+                return preFinalizeSnapshot
+            }
+        }
+        return nil
+    }
+
+    /// Clears per-hold stream-text latch. Call at the start of each new capture.
+    func resetStreamTextLatch() {
+        coordinatorEverHadStreamText = false
+    }
+
+    private func noteInterimText(_ text: String) {
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            coordinatorEverHadStreamText = true
+        }
+    }
 
     // MARK: - Start
 
@@ -39,7 +85,8 @@ final class StreamingCoordinator {
     ) -> Bool {
         guard let session = asrSelector.makeXAIStreamingSession() else { return false }
 
-        session.onInterim = { text in
+        session.onInterim = { [weak self] text in
+            self?.noteInterimText(text)
             asrSelector.onInterimTranscript?(text)
         }
         xaiSession = session
@@ -71,7 +118,8 @@ final class StreamingCoordinator {
     ) -> Bool {
         guard let session = asrSelector.makeElevenLabsStreamingSession() else { return false }
 
-        session.onInterim = { text in
+        session.onInterim = { [weak self] text in
+            self?.noteInterimText(text)
             asrSelector.onInterimTranscript?(text)
         }
         elevenLabsSession = session
@@ -152,6 +200,8 @@ final class StreamingCoordinator {
         let duration: TimeInterval
         let hadSpeech: Bool
         let bufferedAudio: [AVAudioPCMBuffer]
+        /// Optional pre-sampled latch from the recorder; OR'd with session/coordinator.
+        let streamTextEver: Bool
     }
 
     /// Handles xAI streaming stop. Returns `true` when this path consumed the stop.
@@ -163,13 +213,23 @@ final class StreamingCoordinator {
     ) -> Bool {
         guard let session = xaiSession else { return false }
 
+        // Read latch + transcript snapshot before tear-down / finalize clears state.
+        let everHad = context.streamTextEver
+            || session.hasEverHadNonEmptyStreamText
+            || coordinatorEverHadStreamText
+        let hasBuffers = !context.bufferedAudio.isEmpty
+        let preFinalizeSnapshot = session.joinedTranscriptSnapshot()
         xaiSession = nil
 
-        guard context.hadSpeech else {
-            vlog("xai streaming: no speech — skipping (silence guard)")
+        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, hasBufferedAudio: hasBuffers) {
+            vlog("xai streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) hadSpeech=\(context.hadSpeech)")
             session.cancel()
             onSilence()
             return true
+        }
+
+        if !context.hadSpeech {
+            vlog("xai streaming: silence bypass — everHad=\(everHad) buffers=\(context.bufferedAudio.count)")
         }
 
         let releaseAt = Date()
@@ -180,8 +240,15 @@ final class StreamingCoordinator {
             if truncated {
                 vlog("xai streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
             }
-            if !text.isEmpty, !truncated {
-                onStreamSuccess(text)
+            if let success = Self.streamSuccessTextOrBatchFallback(
+                finalizeText: text,
+                preFinalizeSnapshot: preFinalizeSnapshot,
+                truncated: truncated
+            ) {
+                if text.isEmpty {
+                    vlog("xai streaming: recovered pre-finalize snapshot (\(success.count) chars)")
+                }
+                onStreamSuccess(success)
             } else {
                 if text.isEmpty {
                     self.logger.warning("xAI streaming produced no text — falling back to buffered audio.")
@@ -203,6 +270,7 @@ final class StreamingCoordinator {
         let duration: TimeInterval
         let hadSpeech: Bool
         let bufferedAudio: [AVAudioPCMBuffer]
+        let streamTextEver: Bool
     }
 
     /// Handles ElevenLabs Scribe RT streaming stop. Returns `true` when this
@@ -215,13 +283,22 @@ final class StreamingCoordinator {
     ) -> Bool {
         guard let session = elevenLabsSession else { return false }
 
+        let everHad = context.streamTextEver
+            || session.hasEverHadNonEmptyStreamText
+            || coordinatorEverHadStreamText
+        let hasBuffers = !context.bufferedAudio.isEmpty
+        let preFinalizeSnapshot = session.joinedTranscriptSnapshot()
         elevenLabsSession = nil
 
-        guard context.hadSpeech else {
-            vlog("elevenlabs streaming: no speech — skipping (silence guard)")
+        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, hasBufferedAudio: hasBuffers) {
+            vlog("elevenlabs streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) hadSpeech=\(context.hadSpeech)")
             session.cancel()
             onSilence()
             return true
+        }
+
+        if !context.hadSpeech {
+            vlog("elevenlabs streaming: silence bypass — everHad=\(everHad) buffers=\(context.bufferedAudio.count)")
         }
 
         let releaseAt = Date()
@@ -232,8 +309,15 @@ final class StreamingCoordinator {
             if truncated {
                 vlog("elevenlabs streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
             }
-            if !text.isEmpty, !truncated {
-                onStreamSuccess(text)
+            if let success = Self.streamSuccessTextOrBatchFallback(
+                finalizeText: text,
+                preFinalizeSnapshot: preFinalizeSnapshot,
+                truncated: truncated
+            ) {
+                if text.isEmpty {
+                    vlog("elevenlabs streaming: recovered pre-finalize snapshot (\(success.count) chars)")
+                }
+                onStreamSuccess(success)
             } else {
                 if text.isEmpty {
                     self.logger.warning("ElevenLabs streaming produced no text — falling back to buffered audio.")

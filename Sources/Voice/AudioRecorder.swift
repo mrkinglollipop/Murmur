@@ -552,6 +552,7 @@ final class AudioRecorder {
             return
         }
         isStopping = false
+        streamingCoordinator.resetStreamTextLatch()
         playFeedbackSound(named: "Tink")
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -812,16 +813,24 @@ final class AudioRecorder {
             teardownMicEngine()
         }
 
+        let streamTextEver = streamingCoordinator.coordinatorEverHadStreamText
+            || (streamingCoordinator.xaiSession?.hasEverHadNonEmptyStreamText ?? false)
+            || (streamingCoordinator.elevenLabsSession?.hasEverHadNonEmptyStreamText ?? false)
+
         let xaiContext = StreamingCoordinator.XAIStopContext(
             duration: elapsed,
             hadSpeech: recordingHadSpeech(),
-            bufferedAudio: bufferedAudio
+            bufferedAudio: bufferedAudio,
+            streamTextEver: streamTextEver
         )
         if streamingCoordinator.handleStopXAI(
             context: xaiContext,
             onSilence: { [weak self] in
-                self?.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
-                DispatchQueue.main.async { self?.hud.hide() }
+                self?.finishDiscardedHold(
+                    reason: "silence-guard",
+                    engineID: "cloud:xai-streaming",
+                    sessionHeldToken: sessionHold.token
+                )
             },
             onStreamSuccess: { [weak self] text in
                 self?.asrSelector.logStreamedTranscription(
@@ -840,8 +849,11 @@ final class AudioRecorder {
             onBatchFallback: { [weak self] buffers, duration in
                 guard let self = self else { return }
                 guard !buffers.isEmpty else {
-                    self.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
-                    self.hud.hide()
+                    self.finishDiscardedHold(
+                        reason: "empty-buffer-abort",
+                        engineID: "cloud:xai-streaming",
+                        sessionHeldToken: sessionHold.token
+                    )
                     return
                 }
                 self.writeToFile(
@@ -859,13 +871,17 @@ final class AudioRecorder {
         let elevenLabsContext = StreamingCoordinator.ElevenLabsStopContext(
             duration: elapsed,
             hadSpeech: recordingHadSpeech(),
-            bufferedAudio: bufferedAudio
+            bufferedAudio: bufferedAudio,
+            streamTextEver: streamTextEver
         )
         if streamingCoordinator.handleStopElevenLabs(
             context: elevenLabsContext,
             onSilence: { [weak self] in
-                self?.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
-                DispatchQueue.main.async { self?.hud.hide() }
+                self?.finishDiscardedHold(
+                    reason: "silence-guard",
+                    engineID: "cloud:elevenlabs-streaming",
+                    sessionHeldToken: sessionHold.token
+                )
             },
             onStreamSuccess: { [weak self] text in
                 self?.asrSelector.logStreamedTranscription(
@@ -884,8 +900,11 @@ final class AudioRecorder {
             onBatchFallback: { [weak self] buffers, duration in
                 guard let self = self else { return }
                 guard !buffers.isEmpty else {
-                    self.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
-                    self.hud.hide()
+                    self.finishDiscardedHold(
+                        reason: "empty-buffer-abort",
+                        engineID: "cloud:elevenlabs-streaming",
+                        sessionHeldToken: sessionHold.token
+                    )
                     return
                 }
                 self.writeToFile(
@@ -902,8 +921,11 @@ final class AudioRecorder {
 
         if streamingCoordinator.handleStopWhisperKit(
             onEmpty: { [weak self] in
-                self?.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
-                DispatchQueue.main.async { self?.hud.hide() }
+                self?.finishDiscardedHold(
+                    reason: "stream-empty",
+                    engineID: "whisperKit:streaming",
+                    sessionHeldToken: sessionHold.token
+                )
             },
             onSuccess: { [weak self] text in
                 self?.asrSelector.logStreamedTranscription(
@@ -926,7 +948,9 @@ final class AudioRecorder {
         stopFileBasedCapture(
             sessionHeldToken: sessionHold.token,
             sessionHeldSnapshot: sessionHold.snapshot,
-            sessionHeldFrontmostPID: sessionHold.pid
+            sessionHeldFrontmostPID: sessionHold.pid,
+            everHadStreamText: streamTextEver
+                || streamingCoordinator.coordinatorEverHadStreamText
         )
     }
 
@@ -937,11 +961,15 @@ final class AudioRecorder {
     private func stopFileBasedCapture(
         sessionHeldToken: UInt64?,
         sessionHeldSnapshot: CaretContext.Snapshot?,
-        sessionHeldFrontmostPID: pid_t?
+        sessionHeldFrontmostPID: pid_t?,
+        everHadStreamText: Bool = false
     ) {
         guard isSetUp else {
-            clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
-            DispatchQueue.main.async { [weak self] in self?.hud.hide() }
+            finishDiscardedHold(
+                reason: "mic-not-setup",
+                engineID: "file",
+                sessionHeldToken: sessionHeldToken
+            )
             return
         }
 
@@ -956,18 +984,22 @@ final class AudioRecorder {
 
         guard !capturedBuffers.isEmpty else {
             logger.warning("No audio captured.")
-            clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
-            DispatchQueue.main.async { [weak self] in self?.hud.hide() }
+            vlog("file path: empty-buffer abort — no pcmBuffers")
+            finishDiscardedHold(
+                reason: "empty-buffer-abort",
+                engineID: "file",
+                sessionHeldToken: sessionHeldToken
+            )
             return
         }
 
-        // Silence guard: skip transcription entirely when no real speech was
-        // present, so Whisper can't hallucinate a stock caption on silence.
-        guard recordingHadSpeech() else {
-            vlog("no speech — skipping transcription (silence guard)")
-            clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
-            DispatchQueue.main.async { [weak self] in self?.hud.hide() }
-            return
+        // Non-empty pcmBuffers always proceed to writeToFile — RMS silence
+        // cancel only applies when buffers are empty (handled above). Logs
+        // quiet-mic bypass for VOICE_DEBUG correlation.
+        if !recordingHadSpeech() {
+            vlog(
+                "file path: silence bypass — buffers=\(capturedBuffers.count) everHadStream=\(everHadStreamText) maxRMS below threshold"
+            )
         }
 
         writeToFile(
@@ -977,6 +1009,31 @@ final class AudioRecorder {
             sessionHeldSnapshot: sessionHeldSnapshot,
             sessionHeldFrontmostPID: sessionHeldFrontmostPID
         )
+    }
+
+    /// Tombstone a hold that produced nothing injectable — failed history row
+    /// via existing `onTranscriptionLogged` (no parallel HistoryStore write).
+    /// Display-only (nil audioPath); does not play failure sound (avoids Basso
+    /// on every accidental empty hold).
+    private func finishDiscardedHold(
+        reason: String,
+        engineID: String,
+        sessionHeldToken: UInt64?
+    ) {
+        vlog("discarded hold — reason=\(reason) engine=\(engineID)")
+        clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.asrSelector.onTranscriptionLogged?(
+                "",
+                engineID,
+                false,
+                nil,
+                true,
+                nil
+            )
+            self.hud.hide()
+        }
     }
 
     /// Stops the engine and removes the mic tap. Shared by the file path's
@@ -1058,6 +1115,14 @@ final class AudioRecorder {
                 self.logger.error("Failed to allocate combined buffer (\(totalFrames) frames)")
                 DispatchQueue.main.async {
                     self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
+                    self.asrSelector.onTranscriptionLogged?(
+                        "",
+                        "file",
+                        false,
+                        nil,
+                        true,
+                        nil
+                    )
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
@@ -1113,6 +1178,14 @@ final class AudioRecorder {
                     try? FileManager.default.removeItem(at: tmpURL)
                     DispatchQueue.main.async {
                         self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
+                        self.asrSelector.onTranscriptionLogged?(
+                            "",
+                            "file",
+                            false,
+                            nil,
+                            true,
+                            nil
+                        )
                         self.asrSelector.onFailure?(.audioWriteFailed)
                         self.hud.hide()
                     }
@@ -1138,6 +1211,14 @@ final class AudioRecorder {
                 self.logger.error("Failed to write audio file: \(error.localizedDescription)")
                 DispatchQueue.main.async {
                     self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
+                    self.asrSelector.onTranscriptionLogged?(
+                        "",
+                        "file",
+                        false,
+                        nil,
+                        true,
+                        nil
+                    )
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
