@@ -30,6 +30,11 @@ final class AudioRecorder {
     /// to the file/batch path after streaming already owns the stop.
     private var isStopping = false
 
+    /// Bumped on every `stopRecording`. Captured into the queued `doStop` so a
+    /// stale stop (after a newer stop, or after re-press re-armed recording)
+    /// aborts without tearing down the newer session's mic/stream/hold/cache.
+    private var stopGeneration: UInt64 = 0
+
     /// Returns whether a subtle start/stop sound should play, read fresh at
     /// each call site rather than cached. Wired by `AppDelegate` to
     /// `SettingsStore.playDictationSound`.
@@ -104,6 +109,12 @@ final class AudioRecorder {
     /// newer hold from a rapid re-press.
     private var activeHeldCaretToken: UInt64?
 
+    /// AudioRecorder-owned hold triples keyed by session token, frozen when
+    /// each token is assigned. `sampleActiveSessionHold` reads this map —
+    /// never a live pipeline slot that a newer will-start can steal. Per-token
+    /// so session B's cache write cannot erase session A's frozen triple.
+    private var cachedSessionHolds: [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)] = [:]
+
     /// Pure decision seam for the mid-hold secure-input abort — extracted so
     /// it can be exercised in unit tests, since `IsSecureEventInputEnabled`
     /// (Carbon) cannot be forced on in a test.
@@ -120,6 +131,7 @@ final class AudioRecorder {
     private func clearPendingHeldCaretSnapshot() {
         if let token = pendingHeldCaretToken {
             asrSelector.clearHeldCaretSnapshot(matching: token)
+            clearCachedSessionHold(matching: token)
         }
         pendingHeldCaretToken = nil
     }
@@ -137,19 +149,6 @@ final class AudioRecorder {
         pendingHeldCaretToken = next.pending
     }
 
-    /// Same-session stop/abort without inject: clear this session's hold via
-    /// `active ?? pending` (never unscoped), then nil both slots.
-    private func clearActiveHeldCaretSnapshot() {
-        if let token = Self.teardownHeldCaretClearToken(
-            active: activeHeldCaretToken,
-            pending: pendingHeldCaretToken
-        ) {
-            asrSelector.clearHeldCaretSnapshot(matching: token)
-        }
-        activeHeldCaretToken = nil
-        pendingHeldCaretToken = nil
-    }
-
     /// Async write-fail / late teardown: clear matching a token captured when
     /// the session owned the hold, then drop `active` / `pending` only if
     /// they still match that token.
@@ -162,6 +161,78 @@ final class AudioRecorder {
         if pendingHeldCaretToken == token {
             pendingHeldCaretToken = nil
         }
+        clearCachedSessionHold(matching: token)
+    }
+
+    /// Freeze the pipeline hold into the session cache immediately when a
+    /// token is assigned (will-start → `startRecording`). Hops to main because
+    /// the event-tap path may call `startRecording` off-main.
+    private func cacheHoldForAssignedToken(_ token: UInt64?) {
+        guard let token else { return }
+        let store: () -> Void = { [weak self] in
+            guard let self else { return }
+            let (snapshot, pid) = self.asrSelector.copyHeldCaretMatching(token)
+            self.cachedSessionHolds = Self.insertCachedSessionHold(
+                into: self.cachedSessionHolds,
+                token: token,
+                snapshot: snapshot,
+                pid: pid
+            )
+        }
+        if Thread.isMainThread {
+            store()
+        } else {
+            DispatchQueue.main.sync(execute: store)
+        }
+    }
+
+    private func clearCachedSessionHold(matching token: UInt64) {
+        cachedSessionHolds = Self.removeCachedSessionHold(
+            from: cachedSessionHolds,
+            token: token
+        )
+    }
+
+    /// Sample this session's hold (token + snapshot + PID) on main at recording
+    /// stop — before streaming finalize / audio-IO async gaps that can race a
+    /// newer will-start hold. Prefers pending when both slots differ (stale
+    /// active from an uncleared prior take must not win); else active, else
+    /// pending (stop-before-promote). Does not re-query a live pipeline slot.
+    private func sampleActiveSessionHold() -> (
+        token: UInt64?,
+        snapshot: CaretContext.Snapshot?,
+        pid: pid_t?
+    ) {
+        assert(Thread.isMainThread, "sampleActiveSessionHold requires main thread")
+        return Self.sampleCachedSessionHold(
+            activeToken: Self.preferredSessionHoldToken(
+                active: activeHeldCaretToken,
+                pending: pendingHeldCaretToken
+            ),
+            cache: cachedSessionHolds
+        )
+    }
+
+    /// After inject pipeline finishes a take: drop that take's AudioRecorder
+    /// session slots + cache entry. Token-matched so a newer pending that
+    /// differs from the consumed token is preserved. Does not touch the live
+    /// pipeline hold (inject already cleared it on success paths).
+    private func clearConsumedSessionHold(sampledToken: UInt64?) {
+        let clearToken = Self.consumedSessionHoldClearToken(
+            sampled: sampledToken,
+            active: activeHeldCaretToken,
+            pending: pendingHeldCaretToken
+        )
+        guard let clearToken else { return }
+        let next = Self.sessionHoldStateAfterConsume(
+            active: activeHeldCaretToken,
+            pending: pendingHeldCaretToken,
+            cache: cachedSessionHolds,
+            clearToken: clearToken
+        )
+        activeHeldCaretToken = next.active
+        pendingHeldCaretToken = next.pending
+        cachedSessionHolds = next.cache
     }
 
     /// Testable seam: promote is a no-op when pending is nil so an already-
@@ -176,19 +247,148 @@ final class AudioRecorder {
         return (pending, nil)
     }
 
-    /// Testable seam: teardown must never request an unscoped clear when a
-    /// session token is known (documents AudioRecorder policy for unit tests).
+    /// Prefer pending when both slots are set and differ (newer session wins
+    /// over a stale uncleared active from a prior take). Otherwise
+    /// `active ?? pending` (stop-before-promote / single-slot cases).
+    internal static func preferredSessionHoldToken(
+        active: UInt64?,
+        pending: UInt64?
+    ) -> UInt64? {
+        if let pending, active != nil, pending != active {
+            return pending
+        }
+        return active ?? pending
+    }
+
+    /// Testable seam: teardown clear token selection — same preference as
+    /// sample (never unscoped when a session token is known).
     internal static func teardownHeldCaretClearToken(
         active: UInt64?,
         pending: UInt64?
     ) -> UInt64? {
-        active ?? pending
+        preferredSessionHoldToken(active: active, pending: pending)
+    }
+
+    /// Tokens to clear on mid-hold secure abort.
+    ///
+    /// When active≠pending and recording was still wanted (re-press already
+    /// armed a newer hold), clear **only** the aborted active capture so the
+    /// pending hold survives. When not re-armed and both differ, clear both
+    /// (full abort of in-flight holds). Otherwise the single preferred token
+    /// from `teardownHeldCaretClearToken`.
+    internal static func secureAbortClearTokens(
+        active: UInt64?,
+        pending: UInt64?,
+        wantsRecording: Bool
+    ) -> [UInt64] {
+        if let active, let pending, pending != active {
+            if wantsRecording {
+                return [active]
+            }
+            return [active, pending]
+        }
+        if let token = teardownHeldCaretClearToken(active: active, pending: pending) {
+            return [token]
+        }
+        return []
+    }
+
+    /// Token to clear after a take finishes inject: prefer the stop-sampled
+    /// token; when sampled is nil, same preference as
+    /// `preferredSessionHoldToken` (pending when active≠pending).
+    internal static func consumedSessionHoldClearToken(
+        sampled: UInt64?,
+        active: UInt64?,
+        pending: UInt64?
+    ) -> UInt64? {
+        if let sampled { return sampled }
+        return preferredSessionHoldToken(active: active, pending: pending)
+    }
+
+    /// Pure consume: nil matching slots + remove cache entry for `clearToken`
+    /// without wiping an unrelated newer pending/active that differs.
+    internal static func sessionHoldStateAfterConsume(
+        active: UInt64?,
+        pending: UInt64?,
+        cache: [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)],
+        clearToken: UInt64
+    ) -> (
+        active: UInt64?,
+        pending: UInt64?,
+        cache: [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)]
+    ) {
+        (
+            active == clearToken ? nil : active,
+            pending == clearToken ? nil : pending,
+            removeCachedSessionHold(from: cache, token: clearToken)
+        )
+    }
+
+    /// Testable seam: skip a queued `doStop` when a newer stop superseded it
+    /// or a re-press already re-armed `wantsRecording`.
+    internal static func shouldSkipStaleDoStop(
+        wantsRecording: Bool,
+        capturedGeneration: UInt64,
+        currentGeneration: UInt64
+    ) -> Bool {
+        wantsRecording || capturedGeneration != currentGeneration
+    }
+
+    /// Testable seam: one-entry cache map for a session token (mirrors the
+    /// insert performed by `cacheHoldForAssignedToken`).
+    internal static func makeCachedSessionHold(
+        token: UInt64,
+        snapshot: CaretContext.Snapshot?,
+        pid: pid_t?
+    ) -> [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)] {
+        [token: (snapshot, pid)]
+    }
+
+    /// Testable seam: insert/update one token without erasing other entries.
+    internal static func insertCachedSessionHold(
+        into cache: [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)],
+        token: UInt64,
+        snapshot: CaretContext.Snapshot?,
+        pid: pid_t?
+    ) -> [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)] {
+        var next = cache
+        next[token] = (snapshot, pid)
+        return next
+    }
+
+    /// Testable seam: remove one token's cache entry; leave others intact.
+    internal static func removeCachedSessionHold(
+        from cache: [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)],
+        token: UInt64
+    ) -> [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)] {
+        var next = cache
+        next.removeValue(forKey: token)
+        return next
+    }
+
+    /// Testable seam: stop-time sample prefers the cached triple for the
+    /// active (or pending) session token over any live pipeline slot a later
+    /// hold stole.
+    internal static func sampleCachedSessionHold(
+        activeToken: UInt64?,
+        cache: [UInt64: (snapshot: CaretContext.Snapshot?, pid: pid_t?)]
+    ) -> (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?) {
+        guard let activeToken else {
+            return (nil, nil, nil)
+        }
+        guard let entry = cache[activeToken] else {
+            return (activeToken, nil, nil)
+        }
+        return (activeToken, entry.snapshot, entry.pid)
     }
 
     // MARK: - Public interface
 
     func startRecording(heldCaretToken: UInt64? = nil) {
         pendingHeldCaretToken = heldCaretToken
+        // Freeze hold immediately while this token still owns the pipeline
+        // slot — a rapid re-press can steal the live slot before stop samples.
+        cacheHoldForAssignedToken(heldCaretToken)
         if IsSecureEventInputEnabled() {
             logger.info("Secure input active — refusing to start capture.")
             clearPendingHeldCaretSnapshot()
@@ -223,9 +423,13 @@ final class AudioRecorder {
 
     func stopRecording() {
         wantsRecording = false
+        stopGeneration &+= 1
+        let generation = stopGeneration
         invalidateSecureInputPollTimer()
         endVoiceGateRecordingSession()
-        DispatchQueue.main.async { [weak self] in self?.doStop() }
+        DispatchQueue.main.async { [weak self] in
+            self?.doStop(capturedGeneration: generation)
+        }
     }
 
     /// Pushes live speaker-gating settings from `SettingsStore`. Active only
@@ -529,6 +733,11 @@ final class AudioRecorder {
     /// Must not write a file, transcribe, or retain the recording.
     private func abortForSecureInput() {
         invalidateSecureInputPollTimer()
+        // Capture before clearing wantsRecording — a re-press may already own
+        // a newer pending hold that must not be wiped with the aborted active.
+        let abortWantsRecording = wantsRecording
+        let abortActive = activeHeldCaretToken
+        let abortPending = pendingHeldCaretToken
         wantsRecording = false
         isStopping = true
         logger.info("Secure input active mid-hold — aborting capture.")
@@ -539,14 +748,32 @@ final class AudioRecorder {
         pcmBuffers.removeAll(keepingCapacity: false)
         pcmBuffersLock.unlock()
         streamingCoordinator.cancelAll()
-        clearActiveHeldCaretSnapshot()
+        for token in Self.secureAbortClearTokens(
+            active: abortActive,
+            pending: abortPending,
+            wantsRecording: abortWantsRecording
+        ) {
+            clearHeldCaretSnapshotMatchingSession(token)
+        }
         DispatchQueue.main.async { [weak self] in
             self?.hud.hide()
             self?.asrSelector.onFailure?(.secureInputBlocked)
         }
     }
 
-    private func doStop() {
+    private func doStop(capturedGeneration: UInt64) {
+        // Re-press may have re-armed wantsRecording (or a newer stop bumped
+        // stopGeneration) before this queued stop drains — do not tear down
+        // the newer session's mic/stream/hold/cache.
+        if Self.shouldSkipStaleDoStop(
+            wantsRecording: wantsRecording,
+            capturedGeneration: capturedGeneration,
+            currentGeneration: stopGeneration
+        ) {
+            logger.info("doStop skipped — stale generation or recording re-armed")
+            vlog("doStop skipped — wantsRecording=\(wantsRecording) gen=\(capturedGeneration)/\(stopGeneration)")
+            return
+        }
         if isStopping {
             invalidateSecureInputPollTimer()
             logger.info("doStop ignored — stop already in progress")
@@ -577,6 +804,10 @@ final class AudioRecorder {
         pcmBuffersLock.unlock()
         let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
 
+        // Capture hold before streaming finalize / file-IO Tasks so a rapid
+        // re-press cannot poison inject with a newer will-start snapshot.
+        let sessionHold = sampleActiveSessionHold()
+
         if streamingCoordinator.xaiSession != nil || streamingCoordinator.elevenLabsSession != nil {
             teardownMicEngine()
         }
@@ -589,22 +820,37 @@ final class AudioRecorder {
         if streamingCoordinator.handleStopXAI(
             context: xaiContext,
             onSilence: { [weak self] in
-                self?.clearActiveHeldCaretSnapshot()
+                self?.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
                 DispatchQueue.main.async { self?.hud.hide() }
             },
             onStreamSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(text: text, engineID: "cloud:xai-streaming") { [weak self] injected in
-                    self?.finishHUDAfterPipeline(injected: injected)
+                self?.asrSelector.logStreamedTranscription(
+                    text: text,
+                    engineID: "cloud:xai-streaming",
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                ) { [weak self] result in
+                    self?.finishHUDAfterPipeline(
+                        result: result,
+                        sessionHeldToken: sessionHold.token
+                    )
                 }
             },
             onBatchFallback: { [weak self] buffers, duration in
                 guard let self = self else { return }
                 guard !buffers.isEmpty else {
-                    self.clearActiveHeldCaretSnapshot()
+                    self.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
                     self.hud.hide()
                     return
                 }
-                self.writeToFile(duration: duration, buffers: buffers)
+                self.writeToFile(
+                    duration: duration,
+                    buffers: buffers,
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                )
             }
         ) {
             return
@@ -618,22 +864,37 @@ final class AudioRecorder {
         if streamingCoordinator.handleStopElevenLabs(
             context: elevenLabsContext,
             onSilence: { [weak self] in
-                self?.clearActiveHeldCaretSnapshot()
+                self?.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
                 DispatchQueue.main.async { self?.hud.hide() }
             },
             onStreamSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(text: text, engineID: "cloud:elevenlabs-streaming") { [weak self] injected in
-                    self?.finishHUDAfterPipeline(injected: injected)
+                self?.asrSelector.logStreamedTranscription(
+                    text: text,
+                    engineID: "cloud:elevenlabs-streaming",
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                ) { [weak self] result in
+                    self?.finishHUDAfterPipeline(
+                        result: result,
+                        sessionHeldToken: sessionHold.token
+                    )
                 }
             },
             onBatchFallback: { [weak self] buffers, duration in
                 guard let self = self else { return }
                 guard !buffers.isEmpty else {
-                    self.clearActiveHeldCaretSnapshot()
+                    self.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
                     self.hud.hide()
                     return
                 }
-                self.writeToFile(duration: duration, buffers: buffers)
+                self.writeToFile(
+                    duration: duration,
+                    buffers: buffers,
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                )
             }
         ) {
             return
@@ -641,28 +902,45 @@ final class AudioRecorder {
 
         if streamingCoordinator.handleStopWhisperKit(
             onEmpty: { [weak self] in
-                self?.clearActiveHeldCaretSnapshot()
+                self?.clearHeldCaretSnapshotMatchingSession(sessionHold.token)
                 DispatchQueue.main.async { self?.hud.hide() }
             },
             onSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(text: text, engineID: "whisperKit:streaming") { [weak self] injected in
-                    self?.finishHUDAfterPipeline(injected: injected)
+                self?.asrSelector.logStreamedTranscription(
+                    text: text,
+                    engineID: "whisperKit:streaming",
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                ) { [weak self] result in
+                    self?.finishHUDAfterPipeline(
+                        result: result,
+                        sessionHeldToken: sessionHold.token
+                    )
                 }
             }
         ) {
             return
         }
 
-        stopFileBasedCapture()
+        stopFileBasedCapture(
+            sessionHeldToken: sessionHold.token,
+            sessionHeldSnapshot: sessionHold.snapshot,
+            sessionHeldFrontmostPID: sessionHold.pid
+        )
     }
 
     /// Teardown for the file-based (tap+buffer) path — only touches the
     /// `AVAudioEngine`/tap state if `startFileBasedCapture` actually set it
     /// up, so calling this when a streaming session was active instead is
     /// always safe.
-    private func stopFileBasedCapture() {
+    private func stopFileBasedCapture(
+        sessionHeldToken: UInt64?,
+        sessionHeldSnapshot: CaretContext.Snapshot?,
+        sessionHeldFrontmostPID: pid_t?
+    ) {
         guard isSetUp else {
-            clearActiveHeldCaretSnapshot()
+            clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
             DispatchQueue.main.async { [weak self] in self?.hud.hide() }
             return
         }
@@ -678,7 +956,7 @@ final class AudioRecorder {
 
         guard !capturedBuffers.isEmpty else {
             logger.warning("No audio captured.")
-            clearActiveHeldCaretSnapshot()
+            clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
             DispatchQueue.main.async { [weak self] in self?.hud.hide() }
             return
         }
@@ -687,12 +965,18 @@ final class AudioRecorder {
         // present, so Whisper can't hallucinate a stock caption on silence.
         guard recordingHadSpeech() else {
             vlog("no speech — skipping transcription (silence guard)")
-            clearActiveHeldCaretSnapshot()
+            clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
             DispatchQueue.main.async { [weak self] in self?.hud.hide() }
             return
         }
 
-        writeToFile(duration: elapsed, buffers: capturedBuffers)
+        writeToFile(
+            duration: elapsed,
+            buffers: capturedBuffers,
+            sessionHeldToken: sessionHeldToken,
+            sessionHeldSnapshot: sessionHeldSnapshot,
+            sessionHeldFrontmostPID: sessionHeldFrontmostPID
+        )
     }
 
     /// Stops the engine and removes the mic tap. Shared by the file path's
@@ -751,14 +1035,19 @@ final class AudioRecorder {
 
     // MARK: - Write captured audio
 
-    private func writeToFile(duration: TimeInterval, buffers: [AVAudioPCMBuffer]) {
+    private func writeToFile(
+        duration: TimeInterval,
+        buffers: [AVAudioPCMBuffer],
+        sessionHeldToken: UInt64?,
+        sessionHeldSnapshot: CaretContext.Snapshot?,
+        sessionHeldFrontmostPID: pid_t?
+    ) {
         guard let first = buffers.first else { return }
         let format = first.format
         // Snapshot buffers for the IO queue — do not touch AVAudioFile / retain on main.
         let buffersCopy = buffers
-        // Capture this session's hold token before async IO so a late write-fail
-        // clears only this session even if a newer hold already promoted active.
-        let sessionHeldToken = activeHeldCaretToken
+        // Hold triple was sampled at stop (before this async IO). Token alone
+        // still scopes write-fail clears if a newer hold already promoted.
 
         audioIOQueue.async { [weak self] in
             guard let self = self else { return }
@@ -832,9 +1121,17 @@ final class AudioRecorder {
 
                 DispatchQueue.main.async {
                     self.asrSelector.setLastRetainedRecordingURL(retainedURL)
-                    self.asrSelector.transcribeAndLog(audioURL: retainedURL) { [weak self] injected in
+                    self.asrSelector.transcribeAndLog(
+                        audioURL: retainedURL,
+                        sessionHeldToken: sessionHeldToken,
+                        sessionHeldSnapshot: sessionHeldSnapshot,
+                        sessionHeldFrontmostPID: sessionHeldFrontmostPID
+                    ) { [weak self] result in
                         try? FileManager.default.removeItem(at: tmpURL)
-                        self?.finishHUDAfterPipeline(injected: injected)
+                        self?.finishHUDAfterPipeline(
+                            result: result,
+                            sessionHeldToken: sessionHeldToken
+                        )
                     }
                 }
             } catch {
@@ -850,13 +1147,22 @@ final class AudioRecorder {
 
     // MARK: - Feedback sound
 
-    /// Success-path pipeline completions flash a checkmark; silent failures hide
-    /// only when the HUD is still in `.processing` (onFailure already set state).
-    private func finishHUDAfterPipeline(injected: Bool) {
-        if injected {
+    /// Inserted → success checkmark. Dedupe → neutral hide (no fake success).
+    /// Failed → hide only when still `.processing` (onFailure may already flash).
+    /// All terminal results clear the consumed session hold so the next press
+    /// cannot sample a stale active token / cache entry.
+    private func finishHUDAfterPipeline(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        sessionHeldToken: UInt64?
+    ) {
+        clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        switch result {
+        case .inserted:
             hud.showSuccessThenHide()
-        } else if hud.isProcessing {
-            hud.hide()
+        case .deduped, .failed:
+            if hud.isProcessing {
+                hud.hide()
+            }
         }
     }
 
