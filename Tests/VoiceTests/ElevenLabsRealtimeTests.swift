@@ -113,6 +113,73 @@ final class ElevenLabsRealtimeTests: XCTestCase {
         XCTAssertEqual(ElevenLabsRealtimeTranscriber.joinedTranscript(segments: [], partial: ""), "")
     }
 
+    // MARK: - Empty commit must not wipe in-flight partial (ghost Class A)
+
+    func testEmptyCommittedTranscriptRetainsPartialAndEverHadLatch() {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "test-key")
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":"hello there"}
+        """)
+        XCTAssertTrue(session.hasEverHadNonEmptyStreamText)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "hello there")
+
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript","text":""}
+        """)
+        XCTAssertTrue(
+            session.hasEverHadNonEmptyStreamText,
+            "empty commit must not clear everHad latch"
+        )
+        XCTAssertEqual(
+            session.joinedTranscriptSnapshot(),
+            "hello there",
+            "empty commit must not wipe latestPartial"
+        )
+    }
+
+    func testEmptyPartialTranscriptRetainsPriorPartialAndEverHadLatch() {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "test-key")
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":"hello there"}
+        """)
+        XCTAssertTrue(session.hasEverHadNonEmptyStreamText)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "hello there")
+
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":""}
+        """)
+        XCTAssertTrue(
+            session.hasEverHadNonEmptyStreamText,
+            "empty partial must not clear everHad latch"
+        )
+        XCTAssertEqual(
+            session.joinedTranscriptSnapshot(),
+            "hello there",
+            "empty partial must not wipe latestPartial"
+        )
+
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":"   "}
+        """)
+        XCTAssertEqual(
+            session.joinedTranscriptSnapshot(),
+            "hello there",
+            "whitespace-only partial must not wipe latestPartial"
+        )
+    }
+
+    func testNonEmptyCommittedTranscriptClearsPartial() {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "test-key")
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":"hello there friend"}
+        """)
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript","text":"hello there friend"}
+        """)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "hello there friend")
+        XCTAssertTrue(session.hasEverHadNonEmptyStreamText)
+    }
+
     // MARK: - tornDown / doneContinuation concurrency (audit item E)
 
     /// A start-failure `cancel()` racing a stop-triggered `finalize()` on the
