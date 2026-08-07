@@ -183,6 +183,9 @@ enum CaretContext {
 
     /// Pure, testable decision: should a single leading space be prepended to
     /// the transcript before injection?
+    ///
+    /// Prefer the snapshot-aware overload at inject time. This preceding-char
+    /// form remains for known/startOfField unit tests and non-unknown paths.
     static func shouldPrependSpace(precedingChar: PrecedingChar, transcriptFirstChar: Character?) -> Bool {
         switch precedingChar {
         case .known(let char):
@@ -200,10 +203,25 @@ enum CaretContext {
         case .startOfField:
             return false
         case .unknown:
-            // Prefer no glue-fix over double-space when AX is blind
-            // (e.g. Electron select-replace that already has a space before the selection).
+            // Non-wholesale unknown preceding (AX value readable but grapheme
+            // unreadable) — prefer no glue-fix. Wholesale AX-blind uses
+            // `shouldPrependSpace(snapshot:transcriptFirstChar:)` instead.
             return false
         }
+    }
+
+    /// Inject-time space decision. Wholesale `Snapshot.isUnknown` restores the
+    /// alphanumeric prepend heuristic (continuation glue). Residual: AX-blind
+    /// select-replace may double-space — accepted product tradeoff.
+    static func shouldPrependSpace(snapshot: Snapshot, transcriptFirstChar: Character?) -> Bool {
+        if snapshot.isUnknown {
+            guard let first = transcriptFirstChar else { return false }
+            return first.isLetter || first.isNumber
+        }
+        return shouldPrependSpace(
+            precedingChar: snapshot.precedingChar,
+            transcriptFirstChar: transcriptFirstChar
+        )
     }
 
     // MARK: - Inject snapshot resolution

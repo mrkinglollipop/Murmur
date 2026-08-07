@@ -92,8 +92,8 @@ final class WhatsNewTests: XCTestCase {
     func testBundledCatalogLoadsAtLeastOneRelease() {
         let releases = WhatsNewCatalog.load()
         XCTAssertFalse(releases.isEmpty)
-        XCTAssertEqual(releases[0].build, "26")
-        XCTAssertEqual(releases[0].version, "0.1.25")
+        XCTAssertEqual(releases[0].build, "28")
+        XCTAssertEqual(releases[0].version, "0.1.27")
     }
 
     func testReleasesWithBuildGreaterThanFiltersCorrectly() {

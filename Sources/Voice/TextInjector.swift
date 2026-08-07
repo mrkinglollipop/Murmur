@@ -29,13 +29,21 @@ final class TextInjector {
         /// Failed, or delivery unconfirmed (paste-blind / unverified pid fallback).
         case failed
 
-        /// History/HUD: treat dedupe like success (no failure badge); watch only on `.inserted`.
+        /// True only for confirmed field delivery. Dedupe is not a fresh paste.
         var wasInjectedForHistory: Bool {
             switch self {
-            case .inserted, .deduped: return true
-            case .failed: return false
+            case .inserted: return true
+            case .deduped, .failed: return false
             }
         }
+    }
+
+    /// Leaves transcript on the general pasteboard for manual paste (PID-mismatch
+    /// / failed inject). Package-visible for `TranscriptionPipeline`.
+    static func leaveTranscriptOnClipboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        log("left on clipboard for manual paste")
     }
 
     typealias DeliveryLane = (String) -> Bool
@@ -554,9 +562,7 @@ final class TextInjector {
     }
 
     private func leaveOnClipboard(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        Self.log("left on clipboard for manual paste")
+        Self.leaveTranscriptOnClipboard(text)
     }
 
     // MARK: - Debug log

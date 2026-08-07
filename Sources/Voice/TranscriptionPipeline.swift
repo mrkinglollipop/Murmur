@@ -1,12 +1,20 @@
 import Foundation
 import Carbon
 import ApplicationServices
+import AppKit
 import os.log
 
 /// Post-ASR pipeline: cleanup → dictionary-correct → snippet-expand → inject → history.
 /// `ASREngineSelector` owns engine cache/factory and delegates transcription
 /// completion work here so the selector stays focused on engine selection.
 final class TranscriptionPipeline {
+
+    /// Tri-state handed to HUD after inject — not a Bool collapse of success/fail.
+    enum InjectPipelineResult: Equatable {
+        case inserted
+        case deduped
+        case failed
+    }
 
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "transcription-pipeline")
 
@@ -26,6 +34,9 @@ final class TranscriptionPipeline {
     /// AX caret snapshot captured on the main thread at recording-will-start.
     /// Preferred at live inject when selection was readable; ignored for history-retry.
     private var heldCaretSnapshot: CaretContext.Snapshot?
+
+    /// Frontmost app PID captured with the caret at recording-will-start.
+    private var heldFrontmostPID: pid_t?
 
     /// Generation token for `heldCaretSnapshot`. Incremented on each hold so an
     /// older `finishTranscription` cannot clear a newer session's held.
@@ -57,35 +68,182 @@ final class TranscriptionPipeline {
     /// Terminal failure hook (transcription, injection, audio capture).
     var onFailure: ((DictationFailure) -> Void)?
 
-    /// Capture caret AX context on the main thread at recording-will-start.
-    /// Replaces any prior held snapshot and bumps the generation token.
+    /// Capture caret AX context + frontmost PID on the main thread at
+    /// recording-will-start. Replaces any prior hold and bumps the generation token.
+    /// Reads frontmost PID once so AX snapshot and held PID cannot desync.
     @discardableResult
     func holdCaretSnapshotFromRecordingWillStart() -> UInt64 {
         assert(Thread.isMainThread, "holdCaretSnapshotFromRecordingWillStart requires main thread")
         heldCaretToken &+= 1
-        heldCaretSnapshot = CaretContext.snapshot()
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        heldCaretSnapshot = CaretContext.snapshot(frontmostPID: pid)
+        heldFrontmostPID = pid
         return heldCaretToken
     }
 
-    /// Drop held snapshot (cancel / abort / stop without inject).
+    /// Drop held snapshot + PID (cancel / abort / stop without inject).
     /// When `matching` is set, clears only if the current token still matches
     /// that session — older finish/fail paths must not wipe a newer hold.
     func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
         if let token, heldCaretToken != token { return }
         heldCaretSnapshot = nil
+        heldFrontmostPID = nil
     }
 
     /// Package-visible held state for lifecycle unit tests.
     var test_heldCaretToken: UInt64 { heldCaretToken }
     var test_heldCaretSnapshot: CaretContext.Snapshot? { heldCaretSnapshot }
+    var test_heldFrontmostPID: pid_t? { heldFrontmostPID }
 
     /// Test hook: install a synthetic held snapshot (no AX) on the main thread.
     @discardableResult
-    func test_holdSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
+    func test_holdSnapshot(_ snapshot: CaretContext.Snapshot, frontmostPID: pid_t? = nil) -> UInt64 {
         assert(Thread.isMainThread, "test_holdSnapshot requires main thread")
         heldCaretToken &+= 1
         heldCaretSnapshot = snapshot
+        heldFrontmostPID = frontmostPID
         return heldCaretToken
+    }
+
+    /// Copy held snapshot + PID when `token` still owns the slot.
+    /// Call on the main thread (AudioRecorder samples at stop before async gaps).
+    func copyHeldCaretMatching(_ token: UInt64) -> (CaretContext.Snapshot?, pid_t?) {
+        assert(Thread.isMainThread, "copyHeldCaretMatching requires main thread")
+        guard heldCaretToken == token else { return (nil, nil) }
+        return (heldCaretSnapshot, heldFrontmostPID)
+    }
+
+    /// Pure seam: prefer an explicit session hold from recording-stop over a
+    /// later entry sample (which can race a newer `holdCaretSnapshot…`).
+    static func resolveSessionHold(
+        providedToken: UInt64?,
+        providedSnapshot: CaretContext.Snapshot?,
+        providedPID: pid_t?,
+        currentToken: UInt64,
+        currentSnapshot: CaretContext.Snapshot?,
+        currentPID: pid_t?
+    ) -> (token: UInt64, snapshot: CaretContext.Snapshot?, pid: pid_t?) {
+        if let providedToken {
+            return (providedToken, providedSnapshot, providedPID)
+        }
+        return (currentToken, currentSnapshot, currentPID)
+    }
+
+    /// Pure seam for `finishTranscription`: prefer a non-nil stop-time session
+    /// snapshot over the live pipeline slot. Token-matched clear still uses
+    /// `sessionHeldToken`; live is only a fallback when the stop sample was nil
+    /// (so clearing the live slot cannot wipe a good stop sample).
+    static func resolveHeldAtStart(
+        sessionHeldSnapshot: CaretContext.Snapshot?,
+        sessionHeldToken: UInt64,
+        liveToken: UInt64,
+        liveSnapshot: CaretContext.Snapshot?
+    ) -> CaretContext.Snapshot? {
+        if let sessionHeldSnapshot {
+            return sessionHeldSnapshot
+        }
+        if liveToken == sessionHeldToken {
+            return liveSnapshot
+        }
+        return nil
+    }
+
+    /// Pure helper: abort inject only when both PIDs are known and unequal.
+    /// Nil held or nil current → fail-open (allow insert).
+    static func shouldAbortInjectForFrontmostMismatch(held: pid_t?, current: pid_t?) -> Bool {
+        guard let held, let current else { return false }
+        return held != current
+    }
+
+    /// Pure helper: leave transcript on pasteboard only for app-switch abort,
+    /// never when secure input is active (password fields must not get clipboard).
+    ///
+    /// Callers MUST pass a **live** `secureInput` from `IsSecureEventInputEnabled()`
+    /// sampled on the main thread immediately before the clipboard/insert gate —
+    /// not an earlier pipeline sample (TOCTOU).
+    static func shouldLeaveTranscriptOnClipboard(
+        abortForAppSwitch: Bool,
+        secureInput: Bool
+    ) -> Bool {
+        abortForAppSwitch && !secureInput
+    }
+
+    /// Post-transform inject gate: secure input vs app-switch abort vs insert.
+    ///
+    /// `liveSecure` must be a fresh main-thread `IsSecureEventInputEnabled()`
+    /// sample taken immediately before this decision.
+    enum FinishInjectGate: Equatable {
+        case blockedSecureInput
+        case abortedAppSwitch
+        case proceedInsert
+    }
+
+    static func finishInjectGate(
+        abortForAppSwitch: Bool,
+        liveSecure: Bool
+    ) -> FinishInjectGate {
+        if liveSecure { return .blockedSecureInput }
+        if abortForAppSwitch { return .abortedAppSwitch }
+        return .proceedInsert
+    }
+
+    /// Pure plan: decide app-switch abort **before** wrong-app fresh AX /
+    /// caret transforms. History-retry (`replaceHistoryEntryID != nil`) never
+    /// takes the abort short path.
+    enum InjectAXPlan: Equatable {
+        /// Skip fresh AX; inject text is expanded (post dictionary/snippet)
+        /// without wrong-app caret transforms.
+        case abortWithoutFreshAX
+        /// Resolve held/fresh + applyInjectTransforms as usual.
+        case resolveWithOptionalFresh
+    }
+
+    static func injectAXPlan(
+        replaceHistoryEntryID: UUID?,
+        heldPID: pid_t?,
+        currentPID: pid_t?
+    ) -> InjectAXPlan {
+        if replaceHistoryEntryID == nil
+            && shouldAbortInjectForFrontmostMismatch(held: heldPID, current: currentPID)
+        {
+            return .abortWithoutFreshAX
+        }
+        return .resolveWithOptionalFresh
+    }
+
+    /// Late TOCTOU immediately before insert (after transforms). Same PID rules
+    /// as `injectAXPlan` abort — history-retry never aborts; nil PIDs fail-open.
+    static func shouldAbortInjectAfterTransforms(
+        replaceHistoryEntryID: UUID?,
+        heldPID: pid_t?,
+        latePID: pid_t?
+    ) -> Bool {
+        replaceHistoryEntryID == nil
+            && shouldAbortInjectForFrontmostMismatch(held: heldPID, current: latePID)
+    }
+
+    /// Call on main. App-switch abort leave: re-read secure; leave clipboard
+    /// only when clear. Returns true when secure blocked leave (elevate outcome).
+    static func appSwitchAbortLeaveOnMain(text: String) -> Bool {
+        let secureAtLeave = IsSecureEventInputEnabled()
+        if secureAtLeave { return true }
+        if shouldLeaveTranscriptOnClipboard(abortForAppSwitch: true, secureInput: false) {
+            TextInjector.leaveTranscriptOnClipboard(text)
+        }
+        return false
+    }
+
+    /// Pure seam for post-insert secure re-read (Carbon cannot flip in tests).
+    /// When insert ran and failed, prefer `liveSecureAfterInsert` if true so
+    /// outcome is `.secureInputBlocked` rather than `.injectionFailed`.
+    static func outcomeSecureAfterInsert(
+        proceeded: Bool,
+        insertFailed: Bool,
+        liveSecureAtGate: Bool,
+        liveSecureAfterInsert: Bool
+    ) -> Bool {
+        if proceeded, insertFailed, liveSecureAfterInsert { return true }
+        return liveSecureAtGate
     }
 
     /// Transcribes the audio file with the selected engine, applies dictionary
@@ -94,27 +252,34 @@ final class TranscriptionPipeline {
     /// - Parameter replaceHistoryEntryID: when set, history updates that row
     ///   instead of appending (failed-entry retry); concurrent live dictation
     ///   leaves this nil so retries never steal a live append.
+    /// - Parameters sessionHeldToken/Snapshot/FrontmostPID: when `sessionHeldToken`
+    ///   is non-nil, use that triple (sampled at recording-stop) instead of
+    ///   reading `heldCaret*` at entry — avoids poisoning across async IO/ASR
+    ///   gaps. History-retry leaves them nil and keeps entry-sample behavior.
     func transcribeAndLog(
         audioURL: URL,
         replaceHistoryEntryID: UUID? = nil,
-        completion: ((Bool) -> Void)? = nil
+        sessionHeldToken providedToken: UInt64? = nil,
+        sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
+        sessionHeldFrontmostPID providedPID: pid_t? = nil,
+        completion: ((InjectPipelineResult) -> Void)? = nil
     ) {
         guard let selector = engineSelector else {
-            completion?(false)
+            completion?(.failed)
             return
         }
 
         let audioPath = audioURL.path
         let replaceID = replaceHistoryEntryID
-        // Sample held generation + snapshot for this completion so finish/clear
-        // cannot use or wipe a newer recording-will-start hold that races mid-ASR.
-        let (sessionHeldToken, sessionHeldSnapshot): (UInt64, CaretContext.Snapshot?) = {
-            let sample: () -> (UInt64, CaretContext.Snapshot?) = {
-                (self.heldCaretToken, self.heldCaretSnapshot)
-            }
-            if Thread.isMainThread { return sample() }
-            return DispatchQueue.main.sync(execute: sample)
-        }()
+        // Prefer stop-sampled hold when provided; otherwise sample at entry
+        // (history-retry / legacy callers). Entry sample still races a newer
+        // hold — live dictation must pass the stop-time triple.
+        let (sessionHeldToken, sessionHeldSnapshot, sessionHeldFrontmostPID) =
+            sampleSessionHold(
+                providedToken: providedToken,
+                providedSnapshot: providedSnapshot,
+                providedPID: providedPID
+            )
         if let cloudModel = selector.cloudModel,
            let key = selector.apiKeyProvider?(cloudModel.provider),
            !key.isEmpty {
@@ -139,6 +304,7 @@ final class TranscriptionPipeline {
                         replaceHistoryEntryID: replaceID,
                         sessionHeldToken: sessionHeldToken,
                         sessionHeldSnapshot: sessionHeldSnapshot,
+                        sessionHeldFrontmostPID: sessionHeldFrontmostPID,
                         completion: completion
                     )
                 } catch {
@@ -150,6 +316,7 @@ final class TranscriptionPipeline {
                         replaceHistoryEntryID: replaceID,
                         sessionHeldToken: sessionHeldToken,
                         sessionHeldSnapshot: sessionHeldSnapshot,
+                        sessionHeldFrontmostPID: sessionHeldFrontmostPID,
                         completion: completion
                     )
                 }
@@ -163,19 +330,29 @@ final class TranscriptionPipeline {
             replaceHistoryEntryID: replaceID,
             sessionHeldToken: sessionHeldToken,
             sessionHeldSnapshot: sessionHeldSnapshot,
+            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
             completion: completion
         )
     }
 
     /// Streaming entry point: takes text already produced by a live session.
-    func logStreamedTranscription(text: String, engineID: String, completion: ((Bool) -> Void)? = nil) {
-        let (sessionHeldToken, sessionHeldSnapshot): (UInt64, CaretContext.Snapshot?) = {
-            let sample: () -> (UInt64, CaretContext.Snapshot?) = {
-                (self.heldCaretToken, self.heldCaretSnapshot)
-            }
-            if Thread.isMainThread { return sample() }
-            return DispatchQueue.main.sync(execute: sample)
-        }()
+    /// - Parameters sessionHeld*: when `sessionHeldToken` is non-nil, use that
+    ///   stop-sampled triple (before streaming finalize Tasks) instead of
+    ///   reading `heldCaret*` at entry.
+    func logStreamedTranscription(
+        text: String,
+        engineID: String,
+        sessionHeldToken providedToken: UInt64? = nil,
+        sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
+        sessionHeldFrontmostPID providedPID: pid_t? = nil,
+        completion: ((InjectPipelineResult) -> Void)? = nil
+    ) {
+        let (sessionHeldToken, sessionHeldSnapshot, sessionHeldFrontmostPID) =
+            sampleSessionHold(
+                providedToken: providedToken,
+                providedSnapshot: providedSnapshot,
+                providedPID: providedPID
+            )
         Task {
             let cleaned = await self.applyCleanup(text)
             let transformed = await self.applyAutoTransform(cleaned)
@@ -186,9 +363,26 @@ final class TranscriptionPipeline {
                 replaceHistoryEntryID: nil,
                 sessionHeldToken: sessionHeldToken,
                 sessionHeldSnapshot: sessionHeldSnapshot,
+                sessionHeldFrontmostPID: sessionHeldFrontmostPID,
                 completion: completion
             )
         }
+    }
+
+    /// Resolve provided stop-time hold, or sample `heldCaret*` once on main.
+    private func sampleSessionHold(
+        providedToken: UInt64?,
+        providedSnapshot: CaretContext.Snapshot?,
+        providedPID: pid_t?
+    ) -> (token: UInt64, snapshot: CaretContext.Snapshot?, pid: pid_t?) {
+        if let providedToken {
+            return (providedToken, providedSnapshot, providedPID)
+        }
+        let current: () -> (UInt64, CaretContext.Snapshot?, pid_t?) = {
+            (self.heldCaretToken, self.heldCaretSnapshot, self.heldFrontmostPID)
+        }
+        if Thread.isMainThread { return current() }
+        return DispatchQueue.main.sync(execute: current)
     }
 
     private func transcribeLocally(
@@ -197,10 +391,11 @@ final class TranscriptionPipeline {
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
-        completion: ((Bool) -> Void)? = nil
+        sessionHeldFrontmostPID: pid_t?,
+        completion: ((InjectPipelineResult) -> Void)? = nil
     ) {
         guard let selector = engineSelector else {
-            completion?(false)
+            completion?(.failed)
             return
         }
 
@@ -219,6 +414,7 @@ final class TranscriptionPipeline {
                     replaceHistoryEntryID: replaceHistoryEntryID,
                     sessionHeldToken: sessionHeldToken,
                     sessionHeldSnapshot: sessionHeldSnapshot,
+                    sessionHeldFrontmostPID: sessionHeldFrontmostPID,
                     completion: completion
                 )
             } catch {
@@ -240,7 +436,7 @@ final class TranscriptionPipeline {
         audioPath: String,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
-        completion: ((Bool) -> Void)?
+        completion: ((InjectPipelineResult) -> Void)?
     ) {
         DispatchQueue.main.async {
             if replaceHistoryEntryID == nil {
@@ -248,7 +444,7 @@ final class TranscriptionPipeline {
             }
             self.onFailure?(.transcriptionFailed)
             self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
-            completion?(false)
+            completion?(.failed)
         }
     }
 
@@ -333,7 +529,8 @@ final class TranscriptionPipeline {
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
-        completion: ((Bool) -> Void)?
+        sessionHeldFrontmostPID: pid_t?,
+        completion: ((InjectPipelineResult) -> Void)?
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
@@ -348,7 +545,7 @@ final class TranscriptionPipeline {
                 if let audioPath {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
-                completion?(false)
+                completion?(.failed)
             }
             return
         }
@@ -357,58 +554,139 @@ final class TranscriptionPipeline {
             let (corrected, records) = self.onTranscription?(trimmed, engineID) ?? (trimmed, [])
             if !records.isEmpty { self.onCorrectionsRecorded?(records) }
             let expanded = self.onSnippetExpand?(corrected) ?? corrected
-            let secureInput = IsSecureEventInputEnabled()
             let capitalizedTerms = self.engineSelector?.capitalizedDictionaryTermsProvider?() ?? []
-            // Atomically sample current held; if this session still owns the
-            // slot use that pair, else fall back to the entry-sampled copy so
-            // a newer hold cannot poison resolve or get cleared by us.
-            let heldAtStart: CaretContext.Snapshot?
-            let clearToken: UInt64
-            if self.heldCaretToken == sessionHeldToken {
-                heldAtStart = self.heldCaretSnapshot
-                clearToken = sessionHeldToken
-            } else {
-                heldAtStart = sessionHeldSnapshot
-                clearToken = sessionHeldToken
-            }
+            // Prefer the stop-time session snapshot when present. Token match
+            // for clear still uses sessionHeldToken; live held is only a
+            // fallback when the stop sample was nil — so clearHeldCaretSnapshot
+            // nilling the live slot cannot wipe a good stop sample.
+            let heldAtStart = Self.resolveHeldAtStart(
+                sessionHeldSnapshot: sessionHeldSnapshot,
+                sessionHeldToken: sessionHeldToken,
+                liveToken: self.heldCaretToken,
+                liveSnapshot: self.heldCaretSnapshot
+            )
+            let clearToken = sessionHeldToken
             let replaceID = replaceHistoryEntryID
+            // Entry-sampled will-start PID — do not re-read NSWorkspace as "held".
+            let heldPID = sessionHeldFrontmostPID
 
             // Insert blocks up to ~1s (event delivery + confirmation waits) —
             // run it off-main so HUD animations don't stall. Only the
             // completion (which drives finishHUDAfterPipeline) hops back to
             // main; correction/snippet steps above stay on main as before.
             DispatchQueue.global(qos: .utility).async {
-                let needsFresh: Bool = {
-                    if replaceID != nil { return true }
-                    guard let held = heldAtStart, !held.isUnknown else { return true }
-                    if case .readable(let n) = held.selectionLength, n > 0 { return false }
-                    return true
-                }()
-                let fresh: CaretContext.Snapshot
-                if needsFresh {
-                    // Fresh AX read must hop to main — do not call AX only off utility.
-                    fresh = DispatchQueue.main.sync {
-                        CaretContext.snapshot()
-                    }
-                } else {
-                    fresh = .unknown
+                // Sample frontmost PID + secure **before** fresh AX / transforms
+                // so app-switch abort never drives wrong-app caret reads.
+                let (currentPID, liveSecureAtSample): (pid_t?, Bool) = DispatchQueue.main.sync {
+                    (
+                        NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                        IsSecureEventInputEnabled()
+                    )
                 }
-                let resolved = CaretContext.resolveInjectSnapshot(
-                    held: heldAtStart,
-                    fresh: fresh,
-                    replaceHistoryEntryID: replaceID
+                let axPlan = Self.injectAXPlan(
+                    replaceHistoryEntryID: replaceID,
+                    heldPID: heldPID,
+                    currentPID: currentPID
                 )
+                let abortForAppSwitch = axPlan == .abortWithoutFreshAX
 
-                let textToInject = Self.applyInjectTransforms(
-                    expanded: expanded,
-                    snapshot: resolved,
-                    secureInput: secureInput,
-                    smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
-                    codeAware: self.codeAware,
-                    capitalizedDictionaryTerms: capitalizedTerms
-                )
-                let insertResult = secureInput ? TextInjector.InsertResult.failed : TextInjector().insert(textToInject)
-                let injected = insertResult.wasInjectedForHistory
+                let textToInject: String
+                let liveSecure: Bool
+                switch axPlan {
+                case .abortWithoutFreshAX:
+                    // Expanded only — no wrong-app fresh AX or caret transforms.
+                    textToInject = expanded
+                    liveSecure = liveSecureAtSample
+                case .resolveWithOptionalFresh:
+                    let needsFresh: Bool = {
+                        if replaceID != nil { return true }
+                        guard let held = heldAtStart, !held.isUnknown else { return true }
+                        if case .readable(let n) = held.selectionLength, n > 0 { return false }
+                        return true
+                    }()
+                    let fresh: CaretContext.Snapshot
+                    if needsFresh {
+                        // Fresh AX read must hop to main — do not call AX only off utility.
+                        fresh = DispatchQueue.main.sync {
+                            CaretContext.snapshot()
+                        }
+                    } else {
+                        fresh = .unknown
+                    }
+                    let resolved = CaretContext.resolveInjectSnapshot(
+                        held: heldAtStart,
+                        fresh: fresh,
+                        replaceHistoryEntryID: replaceID
+                    )
+                    // Re-sample secure immediately before transforms/gate (TOCTOU
+                    // vs the early PID sample). PID abort was already decided.
+                    liveSecure = DispatchQueue.main.sync {
+                        IsSecureEventInputEnabled()
+                    }
+                    textToInject = Self.applyInjectTransforms(
+                        expanded: expanded,
+                        snapshot: resolved,
+                        secureInput: liveSecure,
+                        smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
+                        codeAware: self.codeAware,
+                        capitalizedDictionaryTerms: capitalizedTerms
+                    )
+                }
+
+                // Secure input wins over app-switch abort: never put transcript
+                // on the pasteboard when typing into a password/secure field.
+                let insertResult: TextInjector.InsertResult
+                let proceededToInsert: Bool
+                // When abort leave re-reads secure=true, override outcome.
+                var abortLeaveBecameSecure = false
+                switch Self.finishInjectGate(
+                    abortForAppSwitch: abortForAppSwitch,
+                    liveSecure: liveSecure
+                ) {
+                case .blockedSecureInput:
+                    insertResult = .failed
+                    proceededToInsert = false
+                case .abortedAppSwitch:
+                    // Live secure re-read before pasteboard — skip leave when secure.
+                    DispatchQueue.main.sync {
+                        abortLeaveBecameSecure = Self.appSwitchAbortLeaveOnMain(
+                            text: textToInject
+                        )
+                    }
+                    insertResult = .failed
+                    proceededToInsert = false
+                case .proceedInsert:
+                    // Re-sample frontmost immediately before insert (TOCTOU vs
+                    // early PID). Late mismatch → same abort-leave as above.
+                    enum LateInjectDecision {
+                        case insert
+                        case abort(becameSecure: Bool)
+                    }
+                    let late: LateInjectDecision = DispatchQueue.main.sync {
+                        let latePID =
+                            NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        if Self.shouldAbortInjectAfterTransforms(
+                            replaceHistoryEntryID: replaceID,
+                            heldPID: heldPID,
+                            latePID: latePID
+                        ) {
+                            return .abort(
+                                becameSecure: Self.appSwitchAbortLeaveOnMain(text: textToInject)
+                            )
+                        }
+                        return .insert
+                    }
+                    switch late {
+                    case .abort(let becameSecure):
+                        abortLeaveBecameSecure = becameSecure
+                        insertResult = .failed
+                        proceededToInsert = false
+                    case .insert:
+                        insertResult = TextInjector().insert(textToInject)
+                        proceededToInsert = true
+                    }
+                }
+
                 if case .inserted(let delivered) = insertResult {
                     let notify = self.onTextInserted
                     DispatchQueue.main.async {
@@ -421,17 +699,49 @@ final class TranscriptionPipeline {
                     if replaceID == nil {
                         self.clearHeldCaretSnapshot(matching: clearToken)
                     }
-                    let outcome = Self.secureInputOutcome(secureInput: secureInput, injected: injected)
+                    // Gate sample, unless insert failed after secure flipped on,
+                    // or abort leave re-read found secure (clipboard skipped).
+                    let insertFailed: Bool = {
+                        if case .failed = insertResult { return true }
+                        return false
+                    }()
+                    let liveSecureAfterInsert =
+                        proceededToInsert && insertFailed
+                        ? IsSecureEventInputEnabled()
+                        : false
+                    let outcomeSecure: Bool
+                    if abortLeaveBecameSecure {
+                        outcomeSecure = true
+                    } else {
+                        outcomeSecure = Self.outcomeSecureAfterInsert(
+                            proceeded: proceededToInsert,
+                            insertFailed: insertFailed,
+                            liveSecureAtGate: liveSecure,
+                            liveSecureAfterInsert: liveSecureAfterInsert
+                        )
+                    }
+                    let outcome = Self.secureInputOutcome(
+                        secureInput: outcomeSecure,
+                        insertResult: insertResult
+                    )
                     if outcome.shouldLog {
                         // History matches inject intent (post-strip + leading space),
                         // not pasteboard bytes after TextInjector trailing-WS trim.
-                        self.onTranscriptionLogged?(textToInject, engineID, injected, audioPath, false, replaceID)
+                        // Dedupe skips history (shouldLog false).
+                        self.onTranscriptionLogged?(
+                            textToInject,
+                            engineID,
+                            insertResult.wasInjectedForHistory,
+                            audioPath,
+                            false,
+                            replaceID
+                        )
                     }
                     if let failure = outcome.failure {
                         self.onFailure?(failure)
                     }
 
-                    completion?(injected)
+                    completion?(outcome.pipelineResult)
                 }
             }
         }
@@ -469,27 +779,38 @@ final class TranscriptionPipeline {
             )
         }
         let shouldPrepend = CaretContext.shouldPrependSpace(
-            precedingChar: snapshot.precedingChar,
+            snapshot: snapshot,
             transcriptFirstChar: text.first
         )
         return shouldPrepend ? " " + text : text
     }
 
-    /// Pure decision seam for the secure-input / history-logging outcome at
-    /// finish time — extracted so it can be exercised in unit tests, since
+    /// Pure decision seam for the secure-input / history-logging / HUD outcome
+    /// at finish time — extracted so it can be exercised in unit tests, since
     /// `IsSecureEventInputEnabled` (Carbon) cannot be forced on in a test.
     ///
-    /// - `secureInput == true`: never log (transcript may contain a
-    ///   password), always surface `.secureInputBlocked`.
-    /// - `secureInput == false, injected == false`: log (nothing secret was
-    ///   suppressed), surface `.injectionFailed`.
-    /// - `secureInput == false, injected == true`: log, no failure.
-    static func secureInputOutcome(secureInput: Bool, injected: Bool)
-        -> (shouldLog: Bool, failure: DictationFailure?)
-    {
+    /// Pass the same `liveSecure` used for transforms / inject gate, except when
+    /// `outcomeSecureAfterInsert` (or abort-leave re-read) elevates to secure —
+    /// then pass `true` so outcome is `.secureInputBlocked` (not `.injectionFailed`).
+    ///
+    /// - `secureInput == true`: never log, `.secureInputBlocked`, HUD failed.
+    /// - `.inserted`: log, no failure, HUD success.
+    /// - `.deduped`: skip history, no failure, HUD neutral hide.
+    /// - `.failed`: log, `.injectionFailed`, HUD failed.
+    static func secureInputOutcome(
+        secureInput: Bool,
+        insertResult: TextInjector.InsertResult
+    ) -> (shouldLog: Bool, failure: DictationFailure?, pipelineResult: InjectPipelineResult) {
         if secureInput {
-            return (false, .secureInputBlocked)
+            return (false, .secureInputBlocked, .failed)
         }
-        return (true, injected ? nil : .injectionFailed)
+        switch insertResult {
+        case .inserted:
+            return (true, nil, .inserted)
+        case .deduped:
+            return (false, nil, .deduped)
+        case .failed:
+            return (true, .injectionFailed, .failed)
+        }
     }
 }

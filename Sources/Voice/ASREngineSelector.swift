@@ -141,6 +141,12 @@ final class ASREngineSelector {
         pipeline.test_holdSnapshot(snapshot)
     }
 
+    /// Copy held snapshot + PID when `token` still owns the pipeline slot.
+    /// Main-thread only — AudioRecorder samples at recording-stop.
+    func copyHeldCaretMatching(_ token: UInt64) -> (CaretContext.Snapshot?, pid_t?) {
+        pipeline.copyHeldCaretMatching(token)
+    }
+
     /// The active Style profile's formality instruction, appended to the
     /// cleanup prompt when non-nil/non-empty. Only takes effect while cleanup
     /// is enabled (it's an instruction to the cleanup LLM, not a separate
@@ -347,18 +353,38 @@ final class ASREngineSelector {
     func transcribeAndLog(
         audioURL: URL,
         replaceHistoryEntryID: UUID? = nil,
-        completion: ((Bool) -> Void)? = nil
+        sessionHeldToken: UInt64? = nil,
+        sessionHeldSnapshot: CaretContext.Snapshot? = nil,
+        sessionHeldFrontmostPID: pid_t? = nil,
+        completion: ((TranscriptionPipeline.InjectPipelineResult) -> Void)? = nil
     ) {
         pipeline.transcribeAndLog(
             audioURL: audioURL,
             replaceHistoryEntryID: replaceHistoryEntryID,
+            sessionHeldToken: sessionHeldToken,
+            sessionHeldSnapshot: sessionHeldSnapshot,
+            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
             completion: completion
         )
     }
 
     /// Streaming entry point: takes text ALREADY produced by a live session.
-    func logStreamedTranscription(text: String, engineID: String, completion: ((Bool) -> Void)? = nil) {
-        pipeline.logStreamedTranscription(text: text, engineID: engineID, completion: completion)
+    func logStreamedTranscription(
+        text: String,
+        engineID: String,
+        sessionHeldToken: UInt64? = nil,
+        sessionHeldSnapshot: CaretContext.Snapshot? = nil,
+        sessionHeldFrontmostPID: pid_t? = nil,
+        completion: ((TranscriptionPipeline.InjectPipelineResult) -> Void)? = nil
+    ) {
+        pipeline.logStreamedTranscription(
+            text: text,
+            engineID: engineID,
+            sessionHeldToken: sessionHeldToken,
+            sessionHeldSnapshot: sessionHeldSnapshot,
+            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+            completion: completion
+        )
     }
 
     /// Forwarded for test compatibility — see `TranscriptionPipeline.cleanupLooksSane`.

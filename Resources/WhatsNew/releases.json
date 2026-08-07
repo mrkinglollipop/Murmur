@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.27",
+    "build": "28",
+    "title": "What's New in 0.1.27",
+    "items": [
+      "Continuation dictation gets a leading space again when Accessibility cannot read the caret.",
+      "Switching apps mid-hold leaves the transcript on the clipboard with an error instead of pasting into the wrong app.",
+      "Rapid same-text re-dictation no longer flashes a fake success or adds a duplicate history row."
+    ]
+  },
+  {
     "version": "0.1.26",
     "build": "27",
     "title": "What's New in 0.1.26",

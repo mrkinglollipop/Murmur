@@ -62,22 +62,28 @@ final class CaretContextTests: XCTestCase {
 
     // MARK: - Unknown (AX fallback)
 
-    func testShouldPrependSpace_unknownNeverPrepends() {
-        // Prefer no glue-fix over double-space when AX-blind.
+    func testShouldPrependSpace_unknownPrecedingCharAloneNeverPrepends() {
+        // PrecedingChar.unknown (non-wholesale) still prefers no glue-fix.
         XCTAssertFalse(
             CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: "h")
         )
-        XCTAssertFalse(
-            CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: "9")
+    }
+
+    func testShouldPrependSpace_wholesaleUnknownAlphanumericPrepends() {
+        XCTAssertTrue(
+            CaretContext.shouldPrependSpace(snapshot: .unknown, transcriptFirstChar: "h")
+        )
+        XCTAssertTrue(
+            CaretContext.shouldPrependSpace(snapshot: .unknown, transcriptFirstChar: "9")
         )
         XCTAssertFalse(
-            CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: ".")
+            CaretContext.shouldPrependSpace(snapshot: .unknown, transcriptFirstChar: ".")
         )
         XCTAssertFalse(
-            CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: " ")
+            CaretContext.shouldPrependSpace(snapshot: .unknown, transcriptFirstChar: " ")
         )
         XCTAssertFalse(
-            CaretContext.shouldPrependSpace(precedingChar: .unknown, transcriptFirstChar: nil)
+            CaretContext.shouldPrependSpace(snapshot: .unknown, transcriptFirstChar: nil)
         )
     }
 
@@ -530,11 +536,13 @@ final class HeldCaretLifecycleTests: XCTestCase {
 
     func testHoldThenClearLeavesNil() {
         let pipeline = TranscriptionPipeline()
-        let token = pipeline.test_holdSnapshot(selectReplaceSnapshot())
+        let token = pipeline.test_holdSnapshot(selectReplaceSnapshot(), frontmostPID: 4242)
         XCTAssertNotNil(pipeline.test_heldCaretSnapshot)
         XCTAssertEqual(pipeline.test_heldCaretToken, token)
+        XCTAssertEqual(pipeline.test_heldFrontmostPID, 4242)
         pipeline.clearHeldCaretSnapshot(matching: token)
         XCTAssertNil(pipeline.test_heldCaretSnapshot)
+        XCTAssertNil(pipeline.test_heldFrontmostPID)
     }
 
     func testClearAfterHoldResolveFallsToFresh() {
@@ -612,14 +620,20 @@ final class HeldCaretLifecycleTests: XCTestCase {
 
     /// AudioRecorder teardown policy: prefer active, else pending — never
     /// imply an unscoped clear when both are nil.
-    func testAudioRecorderTeardownClearTokenPrefersActive() {
+    /// When active and pending differ, teardown prefers pending (newer
+    /// session). Single-slot / nil cases still resolve that token.
+    func testAudioRecorderTeardownClearTokenPrefersPendingWhenBothDiffer() {
         XCTAssertEqual(
             AudioRecorder.teardownHeldCaretClearToken(active: 7, pending: 3),
-            7
+            3
         )
         XCTAssertEqual(
             AudioRecorder.teardownHeldCaretClearToken(active: nil, pending: 3),
             3
+        )
+        XCTAssertEqual(
+            AudioRecorder.teardownHeldCaretClearToken(active: 7, pending: nil),
+            7
         )
         XCTAssertNil(
             AudioRecorder.teardownHeldCaretClearToken(active: nil, pending: nil)
@@ -668,6 +682,522 @@ final class HeldCaretLifecycleTests: XCTestCase {
         pipeline.clearHeldCaretSnapshot(matching: teardownToken)
         XCTAssertEqual(pipeline.test_heldCaretToken, tokenNew)
         XCTAssertEqual(pipeline.test_heldCaretSnapshot, snapNew)
+    }
+
+    /// Stop-sampled session hold must win over a later `test_holdSnapshot`
+    /// (simulates async IO/finalize gap before `transcribeAndLog` entry).
+    func testExplicitSessionHoldIgnoresLaterHold() {
+        let pipeline = TranscriptionPipeline()
+        let snapA = selectReplaceSnapshot()
+        let tokenA = pipeline.test_holdSnapshot(snapA, frontmostPID: 111)
+        let snapB = CaretContext.Snapshot(
+            value: "poison hold from re-press",
+            location: 0,
+            selectionLength: .readable(0),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let tokenB = pipeline.test_holdSnapshot(snapB, frontmostPID: 222)
+        XCTAssertNotEqual(tokenA, tokenB)
+
+        let resolved = TranscriptionPipeline.resolveSessionHold(
+            providedToken: tokenA,
+            providedSnapshot: snapA,
+            providedPID: 111,
+            currentToken: pipeline.test_heldCaretToken,
+            currentSnapshot: pipeline.test_heldCaretSnapshot,
+            currentPID: pipeline.test_heldFrontmostPID
+        )
+        XCTAssertEqual(resolved.token, tokenA)
+        XCTAssertEqual(resolved.snapshot, snapA)
+        XCTAssertEqual(resolved.pid, 111)
+
+        // Nil provided → entry sample sees the newer hold (history-retry path).
+        let entrySampled = TranscriptionPipeline.resolveSessionHold(
+            providedToken: nil,
+            providedSnapshot: nil,
+            providedPID: nil,
+            currentToken: pipeline.test_heldCaretToken,
+            currentSnapshot: pipeline.test_heldCaretSnapshot,
+            currentPID: pipeline.test_heldFrontmostPID
+        )
+        XCTAssertEqual(entrySampled.token, tokenB)
+        XCTAssertEqual(entrySampled.snapshot, snapB)
+        XCTAssertEqual(entrySampled.pid, 222)
+
+        // copyHeldCaretMatching only succeeds for the current owner.
+        let stale = pipeline.copyHeldCaretMatching(tokenA)
+        XCTAssertNil(stale.0)
+        XCTAssertNil(stale.1)
+        let live = pipeline.copyHeldCaretMatching(tokenB)
+        XCTAssertEqual(live.0, snapB)
+        XCTAssertEqual(live.1, 222)
+    }
+
+    /// AudioRecorder session cache must still return hold A's snapshot/PID
+    /// after a later hold steals the live pipeline slot (copyHeldCaretMatching
+    /// for A would fail).
+    func testCachedSessionHoldSurvivesLaterPipelineSteal() {
+        let pipeline = TranscriptionPipeline()
+        let snapA = selectReplaceSnapshot()
+        let tokenA = pipeline.test_holdSnapshot(snapA, frontmostPID: 111)
+        let cache = AudioRecorder.makeCachedSessionHold(
+            token: tokenA,
+            snapshot: snapA,
+            pid: 111
+        )
+
+        let snapB = CaretContext.Snapshot(
+            value: "stolen by re-press",
+            location: 0,
+            selectionLength: .readable(0),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let tokenB = pipeline.test_holdSnapshot(snapB, frontmostPID: 222)
+        XCTAssertNotEqual(tokenA, tokenB)
+        XCTAssertNil(pipeline.copyHeldCaretMatching(tokenA).0)
+        XCTAssertEqual(pipeline.copyHeldCaretMatching(tokenB).0, snapB)
+
+        let sampled = AudioRecorder.sampleCachedSessionHold(
+            activeToken: tokenA,
+            cache: cache
+        )
+        XCTAssertEqual(sampled.token, tokenA)
+        XCTAssertEqual(sampled.snapshot, snapA)
+        XCTAssertEqual(sampled.pid, 111)
+    }
+
+    /// Per-token cache: inserting B must not erase A's frozen triple.
+    func testPerTokenCachedSessionHoldSurvivesLaterInsert() {
+        let snapA = selectReplaceSnapshot()
+        let snapB = CaretContext.Snapshot(
+            value: "session B hold",
+            location: 2,
+            selectionLength: .readable(0),
+            precedingChar: .known("x"),
+            isUnknown: false
+        )
+        let tokenA: UInt64 = 101
+        let tokenB: UInt64 = 202
+
+        var cache = AudioRecorder.makeCachedSessionHold(
+            token: tokenA,
+            snapshot: snapA,
+            pid: 111
+        )
+        cache = AudioRecorder.insertCachedSessionHold(
+            into: cache,
+            token: tokenB,
+            snapshot: snapB,
+            pid: 222
+        )
+
+        let sampledA = AudioRecorder.sampleCachedSessionHold(
+            activeToken: tokenA,
+            cache: cache
+        )
+        XCTAssertEqual(sampledA.token, tokenA)
+        XCTAssertEqual(sampledA.snapshot, snapA)
+        XCTAssertEqual(sampledA.pid, 111)
+
+        let sampledB = AudioRecorder.sampleCachedSessionHold(
+            activeToken: tokenB,
+            cache: cache
+        )
+        XCTAssertEqual(sampledB.token, tokenB)
+        XCTAssertEqual(sampledB.snapshot, snapB)
+        XCTAssertEqual(sampledB.pid, 222)
+
+        // Token-matched remove leaves the other entry.
+        let afterClearA = AudioRecorder.removeCachedSessionHold(
+            from: cache,
+            token: tokenA
+        )
+        XCTAssertNil(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenA,
+                cache: afterClearA
+            ).snapshot
+        )
+        XCTAssertEqual(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenB,
+                cache: afterClearA
+            ).snapshot,
+            snapB
+        )
+    }
+
+    /// Stop-before-promote: sample token is preferredSessionHoldToken, so a
+    /// pending session still resolves its cached triple when active is nil.
+    func testSampleCachedSessionHoldUsesPendingWhenActiveNil() {
+        let snapA = selectReplaceSnapshot()
+        let tokenA: UInt64 = 303
+        let cache = AudioRecorder.makeCachedSessionHold(
+            token: tokenA,
+            snapshot: snapA,
+            pid: 333
+        )
+        let sampleToken = AudioRecorder.preferredSessionHoldToken(
+            active: nil,
+            pending: tokenA
+        )
+        XCTAssertEqual(sampleToken, tokenA)
+
+        let sampled = AudioRecorder.sampleCachedSessionHold(
+            activeToken: sampleToken,
+            cache: cache
+        )
+        XCTAssertEqual(sampled.token, tokenA)
+        XCTAssertEqual(sampled.snapshot, snapA)
+        XCTAssertEqual(sampled.pid, 333)
+    }
+
+    /// When active and pending differ, sample must prefer pending (newer
+    /// session) so a stale uncleared active from a prior take cannot win.
+    func testSamplePrefersPendingWhenActiveAndPendingDiffer() {
+        let snapActive = selectReplaceSnapshot()
+        let snapPending = CaretContext.Snapshot(
+            value: "newer pending hold",
+            location: 4,
+            selectionLength: .readable(0),
+            precedingChar: .known("n"),
+            isUnknown: false
+        )
+        let tokenActive: UInt64 = 401
+        let tokenPending: UInt64 = 402
+        var cache = AudioRecorder.makeCachedSessionHold(
+            token: tokenActive,
+            snapshot: snapActive,
+            pid: 111
+        )
+        cache = AudioRecorder.insertCachedSessionHold(
+            into: cache,
+            token: tokenPending,
+            snapshot: snapPending,
+            pid: 222
+        )
+
+        let preferred = AudioRecorder.preferredSessionHoldToken(
+            active: tokenActive,
+            pending: tokenPending
+        )
+        XCTAssertEqual(preferred, tokenPending)
+
+        let sampled = AudioRecorder.sampleCachedSessionHold(
+            activeToken: preferred,
+            cache: cache
+        )
+        XCTAssertEqual(sampled.token, tokenPending)
+        XCTAssertEqual(sampled.snapshot, snapPending)
+        XCTAssertEqual(sampled.pid, 222)
+    }
+
+    /// Teardown clear token must prefer pending when both slots differ.
+    func testTeardownTokenPrefersPendingWhenBothDiffer() {
+        let tokenActive: UInt64 = 501
+        let tokenPending: UInt64 = 502
+        XCTAssertEqual(
+            AudioRecorder.teardownHeldCaretClearToken(
+                active: tokenActive,
+                pending: tokenPending
+            ),
+            tokenPending
+        )
+        // Same-token / single-slot cases still resolve that token.
+        XCTAssertEqual(
+            AudioRecorder.teardownHeldCaretClearToken(
+                active: tokenActive,
+                pending: tokenActive
+            ),
+            tokenActive
+        )
+        XCTAssertEqual(
+            AudioRecorder.teardownHeldCaretClearToken(
+                active: tokenActive,
+                pending: nil
+            ),
+            tokenActive
+        )
+    }
+
+    /// Secure abort must not prefer-pending wipe a newer re-armed hold.
+    /// active≠pending + wantsRecording → clear only active; !wantsRecording → both.
+    func testSecureAbortClearTokensPreservesPendingWhenReArmed() {
+        let tokenActive: UInt64 = 701
+        let tokenPending: UInt64 = 702
+        XCTAssertEqual(
+            AudioRecorder.secureAbortClearTokens(
+                active: tokenActive,
+                pending: tokenPending,
+                wantsRecording: true
+            ),
+            [tokenActive]
+        )
+        XCTAssertEqual(
+            AudioRecorder.secureAbortClearTokens(
+                active: tokenActive,
+                pending: tokenPending,
+                wantsRecording: false
+            ),
+            [tokenActive, tokenPending]
+        )
+        // Single-slot / same-token still clear that session only.
+        XCTAssertEqual(
+            AudioRecorder.secureAbortClearTokens(
+                active: tokenActive,
+                pending: tokenActive,
+                wantsRecording: true
+            ),
+            [tokenActive]
+        )
+        XCTAssertEqual(
+            AudioRecorder.secureAbortClearTokens(
+                active: tokenActive,
+                pending: nil,
+                wantsRecording: false
+            ),
+            [tokenActive]
+        )
+        XCTAssertEqual(
+            AudioRecorder.secureAbortClearTokens(
+                active: nil,
+                pending: tokenPending,
+                wantsRecording: true
+            ),
+            [tokenPending]
+        )
+        XCTAssertEqual(
+            AudioRecorder.secureAbortClearTokens(
+                active: nil,
+                pending: nil,
+                wantsRecording: true
+            ),
+            []
+        )
+    }
+
+    /// Success-path consume clears the active token's cache entry and slot
+    /// without wiping an unrelated newer pending.
+    func testConsumeClearRemovesActiveCachePreservesNewerPending() {
+        let snapActive = selectReplaceSnapshot()
+        let snapPending = CaretContext.Snapshot(
+            value: "pending after re-press",
+            location: 0,
+            selectionLength: .readable(0),
+            precedingChar: .startOfField,
+            isUnknown: false
+        )
+        let tokenActive: UInt64 = 601
+        let tokenPending: UInt64 = 602
+        var cache = AudioRecorder.makeCachedSessionHold(
+            token: tokenActive,
+            snapshot: snapActive,
+            pid: 111
+        )
+        cache = AudioRecorder.insertCachedSessionHold(
+            into: cache,
+            token: tokenPending,
+            snapshot: snapPending,
+            pid: 222
+        )
+
+        let clearToken = AudioRecorder.consumedSessionHoldClearToken(
+            sampled: tokenActive,
+            active: tokenActive,
+            pending: tokenPending
+        )
+        XCTAssertEqual(clearToken, tokenActive)
+        guard let clearToken else {
+            return
+        }
+
+        let next = AudioRecorder.sessionHoldStateAfterConsume(
+            active: tokenActive,
+            pending: tokenPending,
+            cache: cache,
+            clearToken: clearToken
+        )
+        XCTAssertNil(next.active)
+        XCTAssertEqual(next.pending, tokenPending)
+        XCTAssertNil(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenActive,
+                cache: next.cache
+            ).snapshot
+        )
+        XCTAssertEqual(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenPending,
+                cache: next.cache
+            ).snapshot,
+            snapPending
+        )
+    }
+
+    /// Nil sampled consume token must prefer pending when active≠pending
+    /// (same rule as preferredSessionHoldToken) — not stale active.
+    func testConsumedClearTokenNilSampledPrefersPendingWhenBothDiffer() {
+        let tokenActive: UInt64 = 701
+        let tokenPending: UInt64 = 702
+        XCTAssertEqual(
+            AudioRecorder.consumedSessionHoldClearToken(
+                sampled: nil,
+                active: tokenActive,
+                pending: tokenPending
+            ),
+            tokenPending
+        )
+        XCTAssertEqual(
+            AudioRecorder.consumedSessionHoldClearToken(
+                sampled: nil,
+                active: tokenActive,
+                pending: nil
+            ),
+            tokenActive
+        )
+        XCTAssertEqual(
+            AudioRecorder.consumedSessionHoldClearToken(
+                sampled: nil,
+                active: nil,
+                pending: tokenPending
+            ),
+            tokenPending
+        )
+        // Explicit sampled still wins over prefer-pending.
+        XCTAssertEqual(
+            AudioRecorder.consumedSessionHoldClearToken(
+                sampled: tokenActive,
+                active: tokenActive,
+                pending: tokenPending
+            ),
+            tokenActive
+        )
+    }
+
+    /// Sampled token A, then B starts (active/pending B): token-matched clear
+    /// of A must not wipe B's slots or cache entry.
+    func testTokenMatchedClearOfOlderSessionPreservesNewerSlotsAndCache() {
+        let snapA = selectReplaceSnapshot()
+        let snapB = CaretContext.Snapshot(
+            value: "session B after re-press",
+            location: 2,
+            selectionLength: .readable(0),
+            precedingChar: .known("B"),
+            isUnknown: false
+        )
+        let tokenA: UInt64 = 801
+        let tokenB: UInt64 = 802
+        var cache = AudioRecorder.makeCachedSessionHold(
+            token: tokenA,
+            snapshot: snapA,
+            pid: 111
+        )
+        cache = AudioRecorder.insertCachedSessionHold(
+            into: cache,
+            token: tokenB,
+            snapshot: snapB,
+            pid: 222
+        )
+
+        // Late teardown of sampled A while active/pending already hold B.
+        let clearToken = AudioRecorder.consumedSessionHoldClearToken(
+            sampled: tokenA,
+            active: tokenB,
+            pending: tokenB
+        )
+        XCTAssertEqual(clearToken, tokenA)
+        guard let clearToken else {
+            return
+        }
+
+        let next = AudioRecorder.sessionHoldStateAfterConsume(
+            active: tokenB,
+            pending: tokenB,
+            cache: cache,
+            clearToken: clearToken
+        )
+        XCTAssertEqual(next.active, tokenB)
+        XCTAssertEqual(next.pending, tokenB)
+        XCTAssertNil(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenA,
+                cache: next.cache
+            ).snapshot
+        )
+        XCTAssertEqual(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenB,
+                cache: next.cache
+            ).snapshot,
+            snapB
+        )
+        XCTAssertEqual(
+            AudioRecorder.sampleCachedSessionHold(
+                activeToken: tokenB,
+                cache: next.cache
+            ).pid,
+            222
+        )
+    }
+
+    /// Queued doStop must skip when re-press re-armed wantsRecording or a
+    /// newer stop bumped the generation.
+    func testShouldSkipStaleDoStop() {
+        XCTAssertTrue(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: true,
+                capturedGeneration: 1,
+                currentGeneration: 1
+            ),
+            "re-armed wantsRecording must skip prior doStop"
+        )
+        XCTAssertTrue(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: false,
+                capturedGeneration: 1,
+                currentGeneration: 2
+            ),
+            "stale generation must skip prior doStop"
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: false,
+                capturedGeneration: 2,
+                currentGeneration: 2
+            ),
+            "matching generation with wantsRecording=false must proceed"
+        )
+    }
+
+    /// finishTranscription must prefer a non-nil stop-time session snapshot
+    /// even when the live slot still matches the session token but was cleared.
+    func testResolveHeldAtStartPrefersNonNilSessionSnapshot() {
+        let snapA = selectReplaceSnapshot()
+        let preferred = TranscriptionPipeline.resolveHeldAtStart(
+            sessionHeldSnapshot: snapA,
+            sessionHeldToken: 7,
+            liveToken: 7,
+            liveSnapshot: nil
+        )
+        XCTAssertEqual(preferred, snapA)
+
+        let fallback = TranscriptionPipeline.resolveHeldAtStart(
+            sessionHeldSnapshot: nil,
+            sessionHeldToken: 7,
+            liveToken: 7,
+            liveSnapshot: snapA
+        )
+        XCTAssertEqual(fallback, snapA)
+
+        let stale = TranscriptionPipeline.resolveHeldAtStart(
+            sessionHeldSnapshot: nil,
+            sessionHeldToken: 7,
+            liveToken: 9,
+            liveSnapshot: snapA
+        )
+        XCTAssertNil(stale)
     }
 }
 
@@ -795,7 +1325,7 @@ final class InjectTransformSeamTests: XCTestCase {
         XCTAssertEqual(out, " Fast.")
     }
 
-    func testApplyInjectTransforms_unknownSnapshotNoLeadingSpace() {
+    func testApplyInjectTransforms_unknownSnapshotContinuationLeadingSpace() {
         let out = TranscriptionPipeline.applyInjectTransforms(
             expanded: "hello",
             snapshot: .unknown,
@@ -804,7 +1334,19 @@ final class InjectTransformSeamTests: XCTestCase {
             codeAware: false,
             accessibilityTrusted: true
         )
-        XCTAssertEqual(out, "hello")
+        XCTAssertEqual(out, " hello")
+    }
+
+    func testApplyInjectTransforms_unknownSnapshotNonAlphanumericNoLeadingSpace() {
+        let out = TranscriptionPipeline.applyInjectTransforms(
+            expanded: "...",
+            snapshot: .unknown,
+            secureInput: false,
+            smartLeadingSpaceEnabled: true,
+            codeAware: false,
+            accessibilityTrusted: true
+        )
+        XCTAssertEqual(out, "...")
     }
 }
 
