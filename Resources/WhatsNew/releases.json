@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.1.29",
+    "build": "30",
+    "title": "What's New in 0.1.29",
+    "items": [
+      "Dictation no longer wipes images, files, or formatted text you had copied — the full clipboard is restored afterward.",
+      "The \"copied to clipboard\" flash only appears when the text really is on the clipboard, and failed injections now leave it there to paste yourself.",
+      "Cloud transcription, cleanup, and transforms time out instead of hanging indefinitely when the network stalls.",
+      "The recording storage limit in Settings is now the actual limit — retention was previously capped at 5 recordings regardless of the size you picked.",
+      "Transforms run on the cleanup backend you selected, including xAI Grok, instead of always using OpenAI.",
+      "The transform hotkey reports success or failure in the HUD, and the menu shows the correct version."
+    ]
+  },
+  {
     "version": "0.1.28",
     "build": "29",
     "title": "What's New in 0.1.28",
