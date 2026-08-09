@@ -469,7 +469,7 @@ final class SettingsStore: ObservableObject {
         let keep = historyStore?.protectedAudioPaths() ?? []
         RecordingRetention.pruneNow(
             keepPaths: keep,
-            maxCount: RecordingRetention.maxRetained,
+            maxCount: RecordingRetention.runawayFileCeiling,
             maxBytes: recordingBudgetBytes
         )
         historyStore?.clearMissingAudioPaths()
@@ -595,11 +595,22 @@ final class SettingsStore: ObservableObject {
     }
 
     /// The raw cleanup cloud API key, if any — used by `TransformRunner` via
-    /// `AppDelegate`'s `openAIKeyProvider`, which reuses cleanup's Keychain
+    /// `AppDelegate`'s transform-credentials wiring, which reuses cleanup's Keychain
     /// account rather than a separate one (a Transform run shares cleanup's
     /// backend-selection logic).
     func cleanupKeyValue() -> String? {
         keychain.key(for: Self.cleanupKeyAccount)
+    }
+
+    /// Backend choice + keys for a Transform run, resolved fresh so a Settings
+    /// change applies to the very next run. Wired into `ASREngineSelector`,
+    /// `HotkeyController`, and `TransformsView` as a single provider closure.
+    func transformCredentials() -> TransformCredentials {
+        TransformCredentials(
+            backend: cleanupBackend,
+            openAIKey: keychain.key(for: Self.cleanupKeyAccount),
+            xaiKey: keychain.key(for: CloudProvider.xai.keychainAccount)
+        )
     }
 
     /// Whether the on-device cleanup model is currently usable on this

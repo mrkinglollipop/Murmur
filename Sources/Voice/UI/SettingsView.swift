@@ -375,7 +375,7 @@ struct SettingsView: View {
             .pickerStyle(.menu)
             .labelsHidden()
 
-            Text("Keeps up to \(RecordingRetention.maxRetained) recent recordings within the budget. Oldest are deleted first. Audio kept for failed-dictation retry is protected.")
+            Text("Recordings are kept until they exceed this budget, then the oldest are deleted first. Audio kept for failed-dictation retry is protected and can push usage past the budget.")
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
 
