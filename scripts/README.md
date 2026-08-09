@@ -5,7 +5,6 @@
 | `install-local.sh` | Release build + Developer ID sign → `/Applications/Murmur.app` | Local maintainer install |
 | `make-dmg.sh` | Signed DMG (`NOTARIZE=1` recommended) | Package a distributable |
 | `publish-sparkle.sh` | Notarize, Sparkle-sign, publish DMG + appcast to `Murmur-updates` | Ship an in-app update |
-| `release.sh` | Legacy archive / export / zip | Prefer `make-dmg` + `publish-sparkle` |
 | `test-publish-sparkle-helpers.sh` | Offline oracle for publish helpers | After editing `publish-sparkle.sh` |
 | `generate-app-icon.sh` | Regenerate iconset + `AppIcon.icns` from source PNG | After changing icon artwork |
 | `test-app-icon-helpers.sh` | Offline oracle for icon geometry / drift | After editing icon assets or generator |
