@@ -264,6 +264,37 @@ Consequences, recorded so this is not re-litigated:
 4. ~~F-08~~ — closed: 0.1.27 already records unverified `postToPid` as
    not-injected.
 
+## Verification pass 2 — "make sure everything works, local = cloud" (2026-08-09)
+
+Maintainer reported unspecified issues and asked for a full works-check with
+local given equal weight to cloud. Evidence gathered:
+
+- **Cloud verified live:** last 50 history entries (through 13:03 today, on the
+  0.1.28 (29) verification build) are all `cloud:elevenlabs-streaming`,
+  `failed=false`, `injected=true`. One batch-fallback entry, also clean.
+- **No live-app crashes.** The six 2026-08-05 `.ips` reports are XCTest *host*
+  crashes (version 0.1.21, `libXCTestBundleInject` loaded) — an
+  index-out-of-range in `LearnEventsCoordinatorTests` from a dev session, not
+  the user's app. That test passes in the current suite.
+- **App healthy:** idle CPU, ~100 MB RSS, no process holds secure input, no
+  Murmur errors in 3 h of system logs. Sparkle appcast top is 0.1.28 (29) —
+  identical to the install, so no surprise update will replace it.
+- **Installed binary is current:** every commit after the install touched only
+  docs/tests.
+- **New coverage:** `testOtherDownloadedWhisperKitModelsTranscribeKnownSpeech`
+  extends the local integration check to every *downloaded* model (base +
+  turbo today), not just the default.
+
+**New finding — F-35 (M): the cloud→local fallback branch is untested.**
+`TranscriptionPipeline.transcribeAndLog` routes to `transcribeLocally` both
+when no key is stored AND when cloud transcription *throws*
+(`TranscriptionPipeline.swift:283-327`). Local is therefore the safety net for
+every cloud dictation, not just the no-key install. No unit test pins either
+branch, and there is no fake-engine seam to write one without a production
+refactor (`ASREngineSelector.engineCache` is private, `CloudTranscriberFactory`
+is static). Follow-up: add an engine seam, then a test that a failing cloud
+service lands on the local engine.
+
 ## Process note
 
 The archive checkout is named `Murmur`, its `CLAUDE.md` and `README` read as

@@ -87,6 +87,41 @@ final class LocalASRIntegrationTests: XCTestCase {
         }
     }
 
+    /// Every *other* downloaded WhisperKit model must also transcribe
+    /// correctly — users pick any of them in Settings, and "local works" has
+    /// to mean the model they chose, not just the default. Models not on disk
+    /// are skipped, so coverage automatically tracks what is downloaded.
+    func testOtherDownloadedWhisperKitModelsTranscribeKnownSpeech() async throws {
+        let others = LocalModel.allCases.filter {
+            $0 != LocalModel.default && $0.whisperKitModelID != nil
+        }
+        var exercised: [String] = []
+        for model in others {
+            guard let folder = ModelManager.modelFolderURL(for: model),
+                  FileManager.default.fileExists(atPath: folder.path) else { continue }
+
+            let engine = WhisperKitEngine(
+                modelID: try XCTUnwrap(model.whisperKitModelID),
+                displayName: model.displayName,
+                localModel: model,
+                language: "en"
+            )
+            let transcript = try await engine.transcribe(audioURL: fixtureURL)
+            let lowered = transcript.lowercased()
+            for phrase in ["quick brown fox", "lazy dog"] {
+                XCTAssertTrue(
+                    lowered.contains(phrase),
+                    "\(model.displayName): expected \(phrase.debugDescription) in transcript (got \(transcript.count) chars)"
+                )
+            }
+            exercised.append(model.displayName)
+        }
+        try XCTSkipIf(
+            exercised.isEmpty,
+            "no non-default WhisperKit models downloaded — nothing further to verify"
+        )
+    }
+
     /// Whisper emits subtitle-style sound captions on ambiguous audio;
     /// `stripSoundAnnotations` is what keeps them out of the injected text, and
     /// it runs on every local transcription.
