@@ -20,8 +20,19 @@ final class HotkeyController {
     /// Most recent dictation text from history.
     var lastDictationProvider: (() -> String?)?
 
-    /// BYO OpenAI key for cloud fallback in `TransformRunner`.
-    var openAIKeyProvider: (() -> String?)?
+    /// Backend choice + keys for `TransformRunner`.
+    var transformCredentialsProvider: (() -> TransformCredentials)?
+
+    /// Surfaces the outcome of a hotkey run. Wired by `AppDelegate` to the
+    /// recording HUD — the app's established feedback surface, and one that
+    /// needs no notification authorization.
+    var onResult: ((HotkeyOutcome) -> Void)?
+
+    enum HotkeyOutcome: Equatable {
+        /// Transform ran; result is on the clipboard.
+        case copiedToClipboard
+        case failed(String)
+    }
 
     func start() {
         guard hotKeyRef == nil else { return }
@@ -54,7 +65,10 @@ final class HotkeyController {
             &ref
         )
         guard regStatus == noErr, let ref else {
+            // A collision with another app's ⌃⌥⌘T lands here, and a log-only
+            // failure left the user with a hotkey that silently does nothing.
             logger.error("RegisterEventHotKey failed: \(regStatus)")
+            report(.failed("Transform hotkey ⌃⌥⌘T unavailable — already in use"))
             return
         }
         hotKeyRef = ref
@@ -76,7 +90,11 @@ final class HotkeyController {
         guard let transform = transformProvider?(),
               let text = lastDictationProvider?(),
               !text.isEmpty else {
-            notify(title: "Murmur", body: "No dictation or transform available.")
+            report(.failed("No dictation or transform available"))
+            return
+        }
+        guard let credentials = transformCredentialsProvider?() else {
+            report(.failed("Transform backend not configured"))
             return
         }
 
@@ -85,32 +103,33 @@ final class HotkeyController {
                 let result = try await TransformRunner.run(
                     prompt: transform.prompt,
                     over: text,
-                    openAIKey: openAIKeyProvider?()
+                    credentials: credentials
                 )
                 await MainActor.run {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(result, forType: .string)
-                    notify(title: "Transform copied", body: transform.name)
+                    self.report(.copiedToClipboard)
                 }
             } catch {
                 await MainActor.run {
-                    notify(title: "Transform failed", body: error.localizedDescription)
+                    self.report(.failed(error.localizedDescription))
                 }
             }
         }
     }
 
-    private func notify(title: String, body: String) {
-        // UNUserNotificationCenter needs user authorization and would add a
-        // first-run permission prompt for a low-stakes transform toast.
-        // NSUserNotification is deprecated but still delivers without that
-        // gate on macOS for this Developer-ID menu-bar app — keep until a
-        // dedicated notifications entitlement/UX pass lands.
-        let notification = NSUserNotification()
-        notification.title = title
-        notification.informativeText = body
-        NSUserNotificationCenter.default.deliver(notification)
+    /// Feedback previously went through `NSUserNotification`, deprecated since
+    /// macOS 11 against a macOS 26 deployment target — and it was the *only*
+    /// signal this hotkey produced, so a silent no-op made success and failure
+    /// indistinguishable. The HUD needs no authorization prompt (the reason the
+    /// deprecated API was chosen) and already has states for both outcomes.
+    private func report(_ outcome: HotkeyOutcome) {
+        if Thread.isMainThread {
+            onResult?(outcome)
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.onResult?(outcome) }
+        }
     }
 
     deinit {
