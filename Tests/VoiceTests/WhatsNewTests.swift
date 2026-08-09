@@ -89,11 +89,20 @@ final class WhatsNewTests: XCTestCase {
         XCTAssertEqual(WhatsNewStore.lastSeenBuild(defaults: defaults), build)
     }
 
-    func testBundledCatalogLoadsAtLeastOneRelease() {
+    /// The newest catalog entry must describe the build being shipped —
+    /// otherwise the What's New panel shows stale notes on first launch after
+    /// an update. Asserted against the bundle rather than a literal so a
+    /// release bump does not require editing this test; `publish-sparkle.sh`
+    /// enforces the same invariant and refuses to publish without it.
+    func testBundledCatalogHeadMatchesCurrentBuild() {
         let releases = WhatsNewCatalog.load()
         XCTAssertFalse(releases.isEmpty)
-        XCTAssertEqual(releases[0].build, "29")
-        XCTAssertEqual(releases[0].version, "0.1.28")
+        guard let head = releases.first else { return }
+
+        let info = Bundle.main.infoDictionary
+        XCTAssertEqual(head.build, info?["CFBundleVersion"] as? String)
+        XCTAssertEqual(head.version, info?["CFBundleShortVersionString"] as? String)
+        XCTAssertFalse(head.items.isEmpty, "shipped release notes must not be empty")
     }
 
     func testReleasesWithBuildGreaterThanFiltersCorrectly() {
