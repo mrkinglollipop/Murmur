@@ -92,16 +92,19 @@ final class HistoryStore: ObservableObject {
 
     /// Moves a corrupt on-disk file aside so the next save cannot silently
     /// clobber recoverable user data.
-    private func quarantineCorruptFile(error: Error) {
+    private func quarantineCorruptFile(error decodeError: Error) {
         let bak = URL(fileURLWithPath: fileURL.path + ".corrupt.\(Int(Date().timeIntervalSince1970))")
         do {
             if FileManager.default.fileExists(atPath: bak.path) {
                 try FileManager.default.removeItem(at: bak)
             }
             try FileManager.default.moveItem(at: fileURL, to: bak)
-            logger.error("Quarantined corrupt history.json → \(bak.lastPathComponent): \(error.localizedDescription)")
+            logger.error("Quarantined corrupt history.json → \(bak.lastPathComponent): \(decodeError.localizedDescription)")
         } catch {
-            logger.error("Failed to quarantine corrupt history.json: \(error.localizedDescription); original decode error: \(error.localizedDescription)")
+            // `decodeError` is deliberately named: an unqualified `error` here
+            // binds to the move failure and shadows the decode failure, which is
+            // the one that explains why history was quarantined at all.
+            logger.error("Failed to quarantine corrupt history.json: \(error.localizedDescription); original decode error: \(decodeError.localizedDescription)")
         }
         entries = []
     }
@@ -247,25 +250,6 @@ final class HistoryStore: ObservableObject {
         entries.compactMap { entry in
             guard entry.failed, let path = entry.audioPath, !path.isEmpty else { return nil }
             return path
-        }
-    }
-
-    /// Downgrades the most recent entry matching `text` to `injected = false`.
-    /// Used when injection is discovered to have failed AFTER the entry was
-    /// already optimistically logged as injected — history is always written
-    /// before injection is attempted, so this only ever corrects the flag,
-    /// never loses the transcript itself.
-    func markLastEntryNotInjected(text: String) {
-        func mutate() {
-            guard let idx = self.entries.firstIndex(where: { $0.text == text }) else { return }
-            self.entries[idx].injected = false
-            self.scheduleSave()
-        }
-
-        if Thread.isMainThread {
-            mutate()
-        } else {
-            DispatchQueue.main.async { mutate() }
         }
     }
 
