@@ -161,6 +161,26 @@ Notes worth keeping:
 Not started: **step 5** (F-16 permission panel, F-05 pause switch). Both add new
 UI surfaces and F-05 in particular needs a scope decision on what "paused" means.
 
+## Maintainer feedback — the transform hotkey (2026-08-09)
+
+⌃⌥⌘T is **not valued**: a four-key chord is more work than the task is worth,
+so the feature goes unused in practice.
+
+Consequences, recorded so this is not re-litigated:
+
+- **F-26's "make it configurable" half is dropped.** Do not build a hotkey
+  preference pane. If the chord is ever revisited, the useful direction is a
+  *simpler trigger* (or removing the feature), not more configuration.
+- The F-25 feedback fix in this pass still stands on its own merits — it removed
+  a deprecated API (`NSUserNotification`, deprecated since macOS 11) and made a
+  silent `RegisterEventHotKey` failure visible. That is worth keeping regardless
+  of whether the hotkey itself survives.
+- **The pill render stays unverified and probably always will**, because the
+  only person who would press the chord has no reason to. Treat "⌃⌥⌘T shows a
+  HUD pill" as code-correct and test-covered but never observed live.
+- Open question for the maintainer, not for an agent to decide: keep the
+  transform hotkey at all?
+
 ## Corrected order of work
 
 0. ~~Audit the 8 unaudited files + the 0.1.21→0.1.28 diffs~~ — **done, above.**
