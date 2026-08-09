@@ -147,7 +147,7 @@ final class OpenAITranscriptionService: CloudTranscriptionService {
             ]
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .openAI, body: String(data: data, encoding: .utf8))
@@ -182,7 +182,7 @@ final class GroqTranscriptionService: CloudTranscriptionService {
             ]
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .groq, body: String(data: data, encoding: .utf8))
@@ -223,7 +223,7 @@ final class DeepgramTranscriptionService: CloudTranscriptionService {
         request.setValue(payload.mimeType, forHTTPHeaderField: "Content-Type")
         request.httpBody = payload.data
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .deepgram, body: String(data: data, encoding: .utf8))
@@ -263,7 +263,7 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload.data
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .assemblyAI, body: String(data: data, encoding: .utf8))
@@ -283,7 +283,7 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
             "language_code": language
         ])
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .assemblyAI, body: String(data: data, encoding: .utf8))
@@ -302,7 +302,7 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
             var request = URLRequest(url: url)
             request.setValue(apiKey, forHTTPHeaderField: "Authorization") // raw key, no scheme
 
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await HTTPClient.session.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? -1
                 throw CloudTranscriptionError.httpStatus(status, provider: .assemblyAI, body: String(data: data, encoding: .utf8))
@@ -347,7 +347,7 @@ final class XAITranscriptionService: CloudTranscriptionService {
             ]
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .xai, body: String(data: data, encoding: .utf8))
@@ -390,7 +390,7 @@ final class ElevenLabsTranscriptionService: CloudTranscriptionService {
             ]
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .elevenLabs, body: String(data: data, encoding: .utf8))
