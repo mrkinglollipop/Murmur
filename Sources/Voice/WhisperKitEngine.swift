@@ -59,11 +59,48 @@ final class WhisperKitEngine: ASREngine {
 
     // MARK: - ASREngine
 
+    /// Ceiling on the model-load phase of a transcription. A cold large-v3-turbo
+    /// load measures seconds, not minutes; a load that blows past this is parked
+    /// (observed 2026-08-09: a cloud→local fallback whose load never returned —
+    /// no error, no thread, model resident — leaving the dictation hung forever).
+    /// Timing out turns that into a visible failure with the audio retained for
+    /// retry. The transcription itself is NOT bounded — long audio legitimately
+    /// takes long.
+    static let modelLoadTimeout: TimeInterval = 120
+
+    /// Races `operation` against a deadline. On timeout the group is cancelled
+    /// and `timeoutError()` is thrown; an uncancellable operation may linger in
+    /// the abandoned task, which is acceptable — the caller's path unblocks and
+    /// a late completion just leaves the engine warm for the next attempt.
+    static func withDeadline<T: Sendable>(
+        _ seconds: TimeInterval,
+        timeoutError: @escaping @Sendable () -> Error,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw timeoutError()
+            }
+            let first = try await group.next()!
+            group.cancelAll()
+            return first
+        }
+    }
+
     func transcribe(audioURL: URL) async throws -> String {
         let wasWarm = whisper != nil
         let loadStart = Date()
-        let wk = try await loadModelIfNeeded()
-        vlog(wasWarm ? "model warm" : "model cold-loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
+        vlog(wasWarm ? "whisperkit: model warm" : "whisperkit: cold load starting (\(modelID))")
+        let wk = try await Self.withDeadline(
+            Self.modelLoadTimeout,
+            timeoutError: { [displayName] in
+                WhisperKitEngineError.modelLoadTimedOut(displayName, Self.modelLoadTimeout)
+            },
+            operation: { [self] in try await loadModelIfNeeded() }
+        )
+        vlog(wasWarm ? "whisperkit: using warm model" : "whisperkit: cold-loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
 
         // Decoding options tuned to reject non-speech: suppressBlank drops
         // leading blank tokens; the default no-speech / log-prob / compression
@@ -171,6 +208,7 @@ final class WhisperKitEngine: ASREngine {
         }
 
         logger.info("WhisperKit: loading model '\(self.modelID)' from \(folder.path, privacy: .public)…")
+        vlog("whisperkit: WhisperKit(config) init begin (\(modelID))")
 
         let modelID = self.modelID
         let task = Task<WhisperKit, Error> {
@@ -192,9 +230,11 @@ final class WhisperKitEngine: ASREngine {
             whisper = wk
             loadTask = nil
             logger.info("WhisperKit: model ready.")
+            vlog("whisperkit: WhisperKit(config) init returned")
             return wk
         } catch {
             loadTask = nil
+            vlog("whisperkit: WhisperKit(config) init threw: \(error.localizedDescription)")
             throw error
         }
     }
@@ -203,6 +243,7 @@ final class WhisperKitEngine: ASREngine {
 enum WhisperKitEngineError: Error, LocalizedError {
     case noModelFolder(String)
     case noTokenizer
+    case modelLoadTimedOut(String, TimeInterval)
 
     var errorDescription: String? {
         switch self {
@@ -210,6 +251,8 @@ enum WhisperKitEngineError: Error, LocalizedError {
             return "Model '\(model)' is not downloaded yet. Download it from Settings → Local Model."
         case .noTokenizer:
             return "WhisperKit model loaded without a tokenizer — cannot start streaming transcription."
+        case .modelLoadTimedOut(let model, let seconds):
+            return "\(model) did not finish loading within \(Int(seconds))s. The recording is kept — retry from History."
         }
     }
 }

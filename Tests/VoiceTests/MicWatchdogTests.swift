@@ -79,6 +79,76 @@ final class MicWatchdogTests: XCTestCase {
         )
     }
 
+    // MARK: - Mid-hold configuration-change restart
+
+    func testConfigChangeRestartsMidHold() {
+        XCTAssertTrue(
+            AudioRecorder.shouldRestartCaptureOnConfigChange(
+                stillWanted: true, tapInstalled: true, alreadyRetried: false
+            )
+        )
+    }
+
+    func testConfigChangeOnlyFlagsWhenIdle() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRestartCaptureOnConfigChange(
+                stillWanted: false, tapInstalled: false, alreadyRetried: false
+            )
+        )
+    }
+
+    func testConfigChangeRespectsSharedRetryBudget() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRestartCaptureOnConfigChange(
+                stillWanted: true, tapInstalled: true, alreadyRetried: true
+            )
+        )
+    }
+
+    func testConfigChangeDoesNotRestartAfterTeardown() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRestartCaptureOnConfigChange(
+                stillWanted: true, tapInstalled: false, alreadyRetried: false
+            )
+        )
+    }
+
+    // MARK: - Model-load deadline
+
+    func testDeadlineReturnsValueWhenOperationFinishesFirst() async throws {
+        let value = try await WhisperKitEngine.withDeadline(
+            5,
+            timeoutError: { WhisperKitEngineError.modelLoadTimedOut("test", 5) },
+            operation: { "loaded" }
+        )
+        XCTAssertEqual(value, "loaded")
+    }
+
+    func testDeadlineThrowsWhenOperationParksForever() async {
+        do {
+            _ = try await WhisperKitEngine.withDeadline(
+                0.1,
+                timeoutError: { WhisperKitEngineError.modelLoadTimedOut("test-model", 0.1) },
+                operation: { () -> String in
+                    // Parked await that honors cancellation, standing in for a
+                    // model load that never returns.
+                    try await Task.sleep(nanoseconds: 60_000_000_000)
+                    return "never"
+                }
+            )
+            XCTFail("expected modelLoadTimedOut")
+        } catch let error as WhisperKitEngineError {
+            guard case .modelLoadTimedOut(let name, _) = error else {
+                XCTFail("wrong case: \(error)")
+                return
+            }
+            XCTAssertEqual(name, "test-model")
+            XCTAssertTrue(error.localizedDescription.contains("retry"), "user-facing message must mention retry")
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
+
     func testDeadFormatDetection() {
         XCTAssertTrue(AudioRecorder.inputFormatLooksDead(sampleRate: 0, channelCount: 1))
         XCTAssertTrue(AudioRecorder.inputFormatLooksDead(sampleRate: 48_000, channelCount: 0))

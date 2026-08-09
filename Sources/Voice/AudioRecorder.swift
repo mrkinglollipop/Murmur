@@ -64,9 +64,42 @@ final class AudioRecorder {
             object: engine,
             queue: .main
         ) { [weak self] _ in
-            vlog("audio engine configuration change — flagging engine rebuild")
-            self?.engineNeedsRebuild = true
+            self?.handleEngineConfigurationChange()
         }
+    }
+
+    /// Mid-hold, a configuration change means the tap is now feeding from a
+    /// dead or rerouted device — waiting for the next hold loses everything
+    /// the user says from here on (observed 2026-08-09: the change fired 2 s
+    /// into a 33 s hold; the remaining 31 s of speech never reached the mic).
+    /// Restart capture immediately, keeping the buffers already captured.
+    /// Idle, just flag the rebuild for the next capture start.
+    private func handleEngineConfigurationChange() {
+        guard Self.shouldRestartCaptureOnConfigChange(
+            stillWanted: wantsRecording,
+            tapInstalled: isSetUp,
+            alreadyRetried: watchdogRetriedThisTake
+        ) else {
+            vlog("audio engine configuration change — flagging engine rebuild")
+            engineNeedsRebuild = true
+            return
+        }
+        watchdogRetriedThisTake = true
+        vlog("audio engine configuration change MID-HOLD — rebuilding engine, restarting capture")
+        teardownMicEngine()
+        rebuildEngine()
+        startMicCapture(isWatchdogRetry: true)
+    }
+
+    /// Pure decision (unit-tested): restart mid-hold only while the hold is
+    /// live with a tap installed, and only once per hold (shared budget with
+    /// the zero-buffer watchdog so the two recovery paths cannot ping-pong).
+    static func shouldRestartCaptureOnConfigChange(
+        stillWanted: Bool,
+        tapInstalled: Bool,
+        alreadyRetried: Bool
+    ) -> Bool {
+        stillWanted && tapInstalled && !alreadyRetried
     }
 
     /// Replaces the engine (input-node device binding included) and
@@ -710,13 +743,19 @@ final class AudioRecorder {
         }
 
         vlog("startMicCapture — AVAudioEngine begins capture")
-        pcmBuffersLock.lock()
-        pcmBuffers.removeAll()
-        pcmBuffersLock.unlock()
+        // A recovery restart continues the SAME hold — the audio captured
+        // before the device died is real speech; dumping it would trade a
+        // dead tail for a dead head. Level max carries over for the same
+        // reason (the silence guard judges the whole hold).
+        if !isWatchdogRetry {
+            pcmBuffersLock.lock()
+            pcmBuffers.removeAll()
+            pcmBuffersLock.unlock()
 
-        levelLock.lock()
-        maxLevelObserved = 0
-        levelLock.unlock()
+            levelLock.lock()
+            maxLevelObserved = 0
+            levelLock.unlock()
+        }
 
         // A device mid-transition can report a dead format; a tap installed
         // against it never fires. Rebuild once before binding the input node.
