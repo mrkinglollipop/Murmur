@@ -49,7 +49,7 @@ final class ASREngineSelector {
     /// OpenAI key for transform auto-run and other LLM paths that reuse the
     /// cleanup Keychain account. Wired by `AppDelegate` to
     /// `SettingsStore.cleanupKeyValue()`.
-    var openAIKeyProvider: (() -> String?)?
+    var transformCredentialsProvider: (() -> TransformCredentials)?
 
     /// BCP-47 language code for cloud/local ASR (e.g. `"en"`). Pushed by
     /// `SettingsStore.applyLanguage()`.

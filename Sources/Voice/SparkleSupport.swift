@@ -22,14 +22,19 @@ enum SparkleSupport {
 
     static var isEnabled: Bool { status == .enabled }
 
-    static var status: Status {
-        classify(
-            hasFeed: hasRealFeedURL,
-            hasKey: hasNonEmptyPublicEDKey,
-            bundleSignatureValid: isBundleSignatureValid,
-            hasDeveloperID: hasDeveloperIDSignature
-        )
-    }
+    /// Computed once per launch. Both signature checks call
+    /// `SecStaticCodeCheckValidity` — one with `kSecCSCheckNestedCode` over
+    /// Sparkle's nested XPC services — and the launch path reads `status` four
+    /// times (`applicationDidFinishLaunching` plus `setupMainMenu`), so an
+    /// uncached property meant eight deep codesign validations on the main
+    /// thread before the first window appeared. The bundle cannot change
+    /// signature while the process runs, so caching is safe.
+    static let status: Status = classify(
+        hasFeed: hasRealFeedURL,
+        hasKey: hasNonEmptyPublicEDKey,
+        bundleSignatureValid: isBundleSignatureValid,
+        hasDeveloperID: hasDeveloperIDSignature
+    )
 
     /// Pure gate — unit-tested without Security.framework.
     static func classify(

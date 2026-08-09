@@ -3,8 +3,8 @@
 # drag-to-Applications layout. Release build + Developer ID sign + hdiutil
 # UDZO + sign the image. Uses built-in hdiutil (no create-dmg dependency).
 #
-# Notarization is opt-in (NOTARIZE=1), off by default — same stance as
-# release.sh. A signed-but-unnotarized DMG opens on this Mac but triggers a
+# Notarization is opt-in (NOTARIZE=1), off by default. A signed-but-
+# unnotarized DMG opens on this Mac but triggers a
 # Gatekeeper prompt (right-click > Open) on other machines.
 #
 # Assumes the Xcode project is generated (run `xcodegen generate` first if you
@@ -46,13 +46,20 @@ DMG="${DMG_PATH:-$ROOT/build/Murmur-$VERSION.dmg}"
 # Notary rejects those unless we deep-sign inside-out with our Developer ID.
 echo "==> Deep-signing Sparkle nested binaries + Murmur.app (Developer ID + timestamp)"
 SPARKLE="$PRODUCT/Contents/Frameworks/Sparkle.framework"
+# Sign through Versions/Current, not a hardcoded version letter: Sparkle picks
+# the letter, and a minor bump that changes it makes these paths vanish — under
+# `set -e` that aborts the release rather than degrading.
+SPARKLE_CURRENT="$SPARKLE/Versions/Current"
 sign_nested() {
   codesign --force --options runtime --timestamp --sign "$IDENTITY" "$1"
 }
-sign_nested "$SPARKLE/Versions/B/Autoupdate"
-sign_nested "$SPARKLE/Versions/B/Updater.app"
-sign_nested "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
-sign_nested "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+for nested in Autoupdate Updater.app XPCServices/Downloader.xpc XPCServices/Installer.xpc; do
+  if [[ ! -e "$SPARKLE_CURRENT/$nested" ]]; then
+    echo "error: expected Sparkle nested binary missing: $SPARKLE_CURRENT/$nested" >&2
+    exit 1
+  fi
+  sign_nested "$SPARKLE_CURRENT/$nested"
+done
 sign_nested "$SPARKLE"
 codesign --force --options runtime --timestamp \
   --entitlements "$ENTITLEMENTS" \

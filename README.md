@@ -10,6 +10,10 @@ It is built for people who dictate into real apps all day: local or cloud speech
 
 **Requirements:** macOS 26 or later · Apple Silicon or Intel Mac with a supported CoreML stack for local models.
 
+**Appearance:** Murmur's interface is **dark by design** and does not follow the
+system light/dark setting. That is a deliberate product decision, not a missing
+feature — the palette and Liquid Glass surfaces are tuned for a single look.
+
 **License:** [AGPL-3.0](LICENSE) · Copyright © 2026 Matthew Schwartz d/b/a [King Lollipop Studios](https://github.com/mrkinglollipop)
 
 ---

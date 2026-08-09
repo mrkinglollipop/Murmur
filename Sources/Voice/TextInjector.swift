@@ -90,6 +90,21 @@ final class TextInjector {
         case confirmedOnRetry
         case unverifiedFallback
         case clipboard
+
+        /// Whether delivery into the focused field was actually *observed*.
+        ///
+        /// Distinct from `resolveOutcome`'s `shouldReturnTrue`, which is about
+        /// whether the lane chain stops here. `.unverifiedFallback` posted
+        /// events to a pid and saw nothing come back, so it stops the chain but
+        /// proves nothing — the pasteboard decision must key on this, not on
+        /// `shouldReturnTrue`, or the user is told their transcript is on the
+        /// clipboard while the pre-insert clipboard is restored over it.
+        var isConfirmedDelivery: Bool {
+            switch self {
+            case .confirmed, .confirmedOnRetry: return true
+            case .unverifiedFallback, .clipboard: return false
+            }
+        }
     }
 
     enum SavedPasteboardRestoreDecision: Equatable {
@@ -145,9 +160,32 @@ final class TextInjector {
         return chunks
     }
 
-    /// Reads the current string on `pasteboard`, or nil when absent.
-    static func savedPasteboardString(from pasteboard: NSPasteboard) -> String? {
-        pasteboard.string(forType: .string)
+    /// One captured pasteboard item: every representation type it carried,
+    /// with its bytes. A whole pasteboard is an ordered list of these.
+    typealias PasteboardSnapshot = [[NSPasteboard.PasteboardType: Data]]
+
+    /// Captures every item and every representation currently on `pasteboard`.
+    ///
+    /// Reading only `.string` (as this used to) meant an ordinary dictation
+    /// destroyed any image, file URL, RTF, or multi-flavor payload the user had
+    /// copied: restore clears the pasteboard, and a plain-text-only snapshot has
+    /// nothing to put back. The paste lane is the primary injection lane, so
+    /// that ran on essentially every dictation.
+    ///
+    /// Lazily-promised data (file promises) cannot be captured this way —
+    /// `data(forType:)` returns nil for an unresolved promise, so those types
+    /// are dropped. Still strictly narrower than the previous behavior, which
+    /// dropped everything except plain text.
+    static func pasteboardSnapshot(from pasteboard: NSPasteboard) -> PasteboardSnapshot {
+        (pasteboard.pasteboardItems ?? []).compactMap { item in
+            var representations: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    representations[type] = data
+                }
+            }
+            return representations.isEmpty ? nil : representations
+        }
     }
 
     /// Writes transcript + concealed marker for paste injection.
@@ -194,14 +232,20 @@ final class TextInjector {
         pasteboardHoldsExpectedString(injectedText, on: pasteboard)
     }
 
-    /// Restores a prior snapshot: `setString` when there was content, else `clearContents`.
-    static func restorePasteboardSnapshot(_ savedString: String?, on pasteboard: NSPasteboard) {
-        if let savedString {
-            pasteboard.clearContents()
-            pasteboard.setString(savedString, forType: .string)
-        } else {
-            pasteboard.clearContents()
+    /// Restores a captured snapshot, rebuilding every item with all of its
+    /// representations. An empty snapshot means the pasteboard was empty before
+    /// we touched it, so it is left cleared.
+    static func restorePasteboardSnapshot(_ snapshot: PasteboardSnapshot, on pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        guard !snapshot.isEmpty else { return }
+        let items: [NSPasteboardItem] = snapshot.map { representations in
+            let item = NSPasteboardItem()
+            for (type, data) in representations {
+                item.setData(data, forType: type)
+            }
+            return item
         }
+        pasteboard.writeObjects(items)
     }
 
     /// Strips trailing whitespace/newlines only — preserves a deliberately-prepended leading space.
@@ -257,11 +301,11 @@ final class TextInjector {
 
     private func performInsert(_ trimmed: String) -> InsertResult {
         let utf16Count = trimmed.utf16.count
-        let savedPasteboardString = Self.savedPasteboardString(from: NSPasteboard.general)
+        let savedPasteboard = Self.pasteboardSnapshot(from: NSPasteboard.general)
 
         guard let observer = UnicodeDeliveryObserver.create() else {
             // Paste-blind is unconfirmed — fail closed for watch / InsertResult.
-            _ = insertViaPasteBlind(trimmed, savedPasteboardString: savedPasteboardString)
+            _ = insertViaPasteBlind(trimmed, savedPasteboard: savedPasteboard)
             return .failed
         }
         defer { observer.stop() }
@@ -270,7 +314,7 @@ final class TextInjector {
         if pasteSucceeded {
             Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
             if Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: NSPasteboard.general) {
-                Self.restorePasteboardSnapshot(savedPasteboardString, on: NSPasteboard.general)
+                Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
             } else {
                 Self.log("skip pasteboard restore — external overwrite after paste")
             }
@@ -319,15 +363,23 @@ final class TextInjector {
             retryConfirmed: retryConfirmed,
             pidFallbackSucceeded: pidFallbackSucceeded
         )
-        let unicodeSucceeded = outcome.shouldReturnTrue
+        // Keyed on observed delivery, NOT on `shouldReturnTrue`. The two differ
+        // only for `.unverifiedFallback`, and that difference is the bug: the
+        // pipeline maps it to `.failed`, which surfaces as the HUD's
+        // "it's on your clipboard" flash — so restoring the pre-insert
+        // pasteboard there told the user to paste something that was no longer
+        // there. When delivery is unconfirmed, the transcript stays put and the
+        // promise holds; if the pid fallback did land the text, the cost is a
+        // stale clipboard rather than a lost dictation.
+        let deliveryConfirmed = outcome.path.isConfirmedDelivery
 
         switch Self.resolveSavedPasteboardRestore(
             pasteSucceeded: false,
-            unicodeSucceeded: unicodeSucceeded,
-            allLanesFailed: !unicodeSucceeded
+            unicodeSucceeded: deliveryConfirmed,
+            allLanesFailed: !deliveryConfirmed
         ) {
         case .restoreSaved:
-            Self.restorePasteboardSnapshot(savedPasteboardString, on: NSPasteboard.general)
+            Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
         case .doNotRestoreLeaveTranscript:
             leaveOnClipboard(trimmed)
         case .deferRestore:
@@ -349,28 +401,33 @@ final class TextInjector {
 
     /// Paste without delivery confirmation. Returns `false` when the chord was
     /// not posted (unstable pasteboard or event creation failure).
+    ///
+    /// Every failure path leaves the transcript on the clipboard rather than
+    /// restoring the prior contents. `performInsert` maps a `false` here to
+    /// `.failed`, which the pipeline surfaces as `.injectionFailed` → the HUD's
+    /// clipboard flash, i.e. "your text is on the clipboard, paste it yourself".
+    /// Restoring here made that promise false and lost the dictation from every
+    /// surface except History.
     @discardableResult
-    private func insertViaPasteBlind(_ text: String, savedPasteboardString: String?) -> Bool {
+    private func insertViaPasteBlind(_ text: String, savedPasteboard: PasteboardSnapshot) -> Bool {
         guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
             Self.log("paste blind aborted — pasteboard unstable chars=\(text.utf16.count)")
-            Self.restorePasteboardSnapshot(savedPasteboardString, on: NSPasteboard.general)
+            leaveOnClipboard(text)
             return false
         }
         guard Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general) else {
             Self.log("paste blind aborted — pasteboard mismatch before chord")
-            Self.restorePasteboardSnapshot(savedPasteboardString, on: NSPasteboard.general)
+            leaveOnClipboard(text)
             return false
         }
         guard postPasteChord() else {
             Self.log("paste blind aborted — chord post failed chars=\(text.utf16.count)")
-            if Self.shouldRestoreSavedPasteboard(injectedText: text, on: NSPasteboard.general) {
-                Self.restorePasteboardSnapshot(savedPasteboardString, on: NSPasteboard.general)
-            }
+            leaveOnClipboard(text)
             return false
         }
         Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
         if Self.shouldRestoreSavedPasteboard(injectedText: text, on: NSPasteboard.general) {
-            Self.restorePasteboardSnapshot(savedPasteboardString, on: NSPasteboard.general)
+            Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
         }
         Self.log("paste blind chars=\(text.utf16.count)")
         return true

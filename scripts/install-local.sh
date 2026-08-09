@@ -50,5 +50,5 @@ rm -rf "$DEST"
 mv "$STAGING" "$DEST"
 
 open -a "$DEST"
-codesign -dv "$DEST" 2>&1 | rg "Identifier|TeamIdentifier|Signature" || true
+codesign -dv "$DEST" 2>&1 | grep -E "Identifier|TeamIdentifier|Signature" || true
 echo "==> Done (codesign verified)"

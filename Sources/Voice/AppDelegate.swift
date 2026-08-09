@@ -52,7 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scratchpadStore: scratchpadStore,
         settingsStore: settingsStore,
         modelManager: modelManager,
-        openAIKeyProvider: { [weak settingsStore] in settingsStore?.cleanupKeyValue() },
+        transformCredentialsProvider: { [weak settingsStore] in
+            settingsStore?.transformCredentials() ?? .unavailable
+        },
         asrEngineSelector: { [weak self] in self?.activationController?.audioRecorder.asrSelector },
         onReplayOnboarding: { [weak self] in self?.replayOnboarding() }
     )
@@ -97,8 +99,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyController?.lastDictationProvider = { [weak self] in
             self?.historyStore.entries.first?.text
         }
-        hotkeyController?.openAIKeyProvider = { [weak self] in
-            self?.settingsStore.cleanupKeyValue()
+        hotkeyController?.transformCredentialsProvider = { [weak self] in
+            self?.settingsStore.transformCredentials() ?? .unavailable
+        }
+        hotkeyController?.onResult = { [weak self] outcome in
+            switch outcome {
+            case .copiedToClipboard:
+                self?.activationController?.audioRecorder.hud.showClipboardFlashThenHide()
+            case .failed(let message):
+                self?.activationController?.audioRecorder.hud.showError(message)
+            }
         }
         hotkeyController?.start()
 
@@ -141,8 +151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         transformsStore.asrEngineSelector = activationController?.audioRecorder.asrSelector
         transformsStore.applyOnLaunch()
 
-        activationController?.audioRecorder.asrSelector.openAIKeyProvider = { [weak settingsStore] in
-            settingsStore?.cleanupKeyValue()
+        activationController?.audioRecorder.asrSelector.transformCredentialsProvider = { [weak settingsStore] in
+            settingsStore?.transformCredentials() ?? .unavailable
         }
 
         activationController?.audioRecorder.asrSelector.onRecordingStart = { [weak self] in
@@ -371,7 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(
-            withTitle: "Murmur v0.1",
+            withTitle: Self.versionMenuTitle(),
             action: nil,
             keyEquivalent: ""
         ).isEnabled = false
@@ -393,6 +403,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "q"
         )
         statusItem?.menu = menu
+    }
+
+    /// Menu-bar header line. Read from the bundle rather than written inline —
+    /// a literal here went stale at "v0.1" across twenty-eight releases, and it
+    /// is exactly the string a user quotes when reporting a bug.
+    ///
+    /// `nonisolated`: reading a bundle's Info.plist needs no main-actor hop, and
+    /// the delegate being `@MainActor` would otherwise make this pure helper
+    /// untestable from a synchronous test.
+    nonisolated static func versionMenuTitle(bundle: Bundle = .main) -> String {
+        let short = bundle.infoDictionary?["CFBundleShortVersionString"] as? String
+        let build = bundle.infoDictionary?["CFBundleVersion"] as? String
+        switch (short, build) {
+        case let (short?, build?): return "Murmur \(short) (\(build))"
+        case let (short?, nil):    return "Murmur \(short)"
+        default:                   return "Murmur"
+        }
     }
 
     @objc private func openVoiceMenuItemClicked() {

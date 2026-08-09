@@ -245,16 +245,18 @@ final class TextInjectorTests: XCTestCase {
 
     // MARK: - Pasteboard helpers (named test pasteboard only)
 
-    func testSavedPasteboardString_nilWhenEmpty() {
+    func testPasteboardSnapshot_emptyWhenPasteboardEmpty() {
         testPasteboard.clearContents()
-        XCTAssertNil(TextInjector.savedPasteboardString(from: testPasteboard))
+        XCTAssertTrue(TextInjector.pasteboardSnapshot(from: testPasteboard).isEmpty)
     }
 
-    func testSavedPasteboardString_roundTripsExistingContent() {
+    func testPasteboardSnapshot_capturesExistingString() {
         testPasteboard.clearContents()
         testPasteboard.setString("prior clipboard", forType: .string)
+        let snapshot = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        XCTAssertEqual(snapshot.count, 1)
         XCTAssertEqual(
-            TextInjector.savedPasteboardString(from: testPasteboard),
+            snapshot.first?[.string].flatMap { String(data: $0, encoding: .utf8) },
             "prior clipboard"
         )
     }
@@ -269,7 +271,7 @@ final class TextInjectorTests: XCTestCase {
     func testRestorePasteboardSnapshot_restoresPriorString() {
         testPasteboard.clearContents()
         testPasteboard.setString("saved snapshot", forType: .string)
-        let saved = TextInjector.savedPasteboardString(from: testPasteboard)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
 
         TextInjector.preparePasteboardForPaste("injected", on: testPasteboard)
         XCTAssertEqual(testPasteboard.string(forType: .string), "injected")
@@ -280,12 +282,82 @@ final class TextInjectorTests: XCTestCase {
 
     func testRestorePasteboardSnapshot_clearsWhenPriorWasEmpty() {
         testPasteboard.clearContents()
-        let saved = TextInjector.savedPasteboardString(from: testPasteboard)
-        XCTAssertNil(saved)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        XCTAssertTrue(saved.isEmpty)
 
         TextInjector.preparePasteboardForPaste("injected", on: testPasteboard)
         TextInjector.restorePasteboardSnapshot(saved, on: testPasteboard)
         XCTAssertNil(testPasteboard.string(forType: .string))
+    }
+
+    /// The regression this snapshot type exists for: a plain-text-only capture
+    /// silently destroyed any non-string payload on the user's clipboard.
+    func testPasteboardSnapshot_preservesNonStringRepresentations() {
+        let tiffType = NSPasteboard.PasteboardType.tiff
+        let imageBytes = Data([0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08])
+
+        testPasteboard.clearContents()
+        let original = NSPasteboardItem()
+        original.setData(imageBytes, forType: tiffType)
+        original.setString("alt text", forType: .string)
+        testPasteboard.writeObjects([original])
+
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+
+        TextInjector.preparePasteboardForPaste("injected", on: testPasteboard)
+        XCTAssertNil(testPasteboard.data(forType: tiffType), "precondition: injection clears the image")
+
+        TextInjector.restorePasteboardSnapshot(saved, on: testPasteboard)
+        XCTAssertEqual(testPasteboard.data(forType: tiffType), imageBytes)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "alt text")
+    }
+
+    func testPasteboardSnapshot_preservesMultipleItems() {
+        testPasteboard.clearContents()
+        let first = NSPasteboardItem()
+        first.setString("one", forType: .string)
+        let second = NSPasteboardItem()
+        second.setString("two", forType: .string)
+        testPasteboard.writeObjects([first, second])
+
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        XCTAssertEqual(saved.count, 2)
+
+        TextInjector.preparePasteboardForPaste("injected", on: testPasteboard)
+        TextInjector.restorePasteboardSnapshot(saved, on: testPasteboard)
+        XCTAssertEqual(testPasteboard.pasteboardItems?.count, 2)
+    }
+
+    // MARK: - Confirmed-delivery gate for the pasteboard decision (F-01)
+
+    /// `.unverifiedFallback` stops the lane chain but proves nothing, so it must
+    /// not drive a pasteboard restore — the pipeline maps it to `.failed`, which
+    /// the HUD renders as "your text is on the clipboard".
+    func testIsConfirmedDelivery_trueOnlyForObservedDelivery() {
+        XCTAssertTrue(TextInjector.InsertDeliveryPath.confirmed.isConfirmedDelivery)
+        XCTAssertTrue(TextInjector.InsertDeliveryPath.confirmedOnRetry.isConfirmedDelivery)
+        XCTAssertFalse(TextInjector.InsertDeliveryPath.unverifiedFallback.isConfirmedDelivery)
+        XCTAssertFalse(TextInjector.InsertDeliveryPath.clipboard.isConfirmedDelivery)
+    }
+
+    /// Guards the specific divergence: `shouldReturnTrue` and
+    /// `isConfirmedDelivery` agree everywhere except `.unverifiedFallback`.
+    func testUnverifiedFallbackDivergesFromShouldReturnTrue() {
+        let outcome = TextInjector.resolveOutcome(
+            confirmed: false,
+            retryConfirmed: false,
+            pidFallbackSucceeded: true
+        )
+        XCTAssertEqual(outcome.path, .unverifiedFallback)
+        XCTAssertTrue(outcome.shouldReturnTrue, "lane chain stops here")
+        XCTAssertFalse(outcome.path.isConfirmedDelivery, "but delivery was never observed")
+
+        let decision = TextInjector.resolveSavedPasteboardRestore(
+            pasteSucceeded: false,
+            unicodeSucceeded: outcome.path.isConfirmedDelivery,
+            allLanesFailed: !outcome.path.isConfirmedDelivery
+        )
+        XCTAssertEqual(decision, .doNotRestoreLeaveTranscript)
     }
 
     // MARK: - Pasteboard race helpers (Universal Clipboard gate)

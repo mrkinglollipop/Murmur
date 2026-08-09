@@ -4,6 +4,23 @@ import Foundation
 
 enum HTTPClient {
 
+    /// Every outbound request in the app goes through this session.
+    ///
+    /// `URLSession.shared` defaults to a 60 s request timeout and a **7 day**
+    /// resource timeout. A cloud provider that accepts the connection and then
+    /// stalls would pin the HUD in `.processing` with no cancel affordance for
+    /// as long as it liked. `timeoutIntervalForRequest` is an idle timeout
+    /// between packets, not a total budget, so 20 s does not penalise a slow
+    /// upload that is still making progress; `timeoutIntervalForResource` caps
+    /// the whole task.
+    static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 120
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
     static func multipartBody(
         boundary: String,
         fileData: Data,
@@ -43,7 +60,7 @@ enum HTTPClient {
         url: URL,
         body: [String: Any],
         headers: [String: String] = [:],
-        session: URLSession = .shared
+        session: URLSession = HTTPClient.session
     ) async throws -> JSONResponse {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

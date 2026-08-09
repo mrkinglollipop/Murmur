@@ -18,7 +18,7 @@ struct TransformsView: View {
     /// `TransformRunner.run` — wired by `AppDelegate` to the same Keychain
     /// account cleanup uses, since a Transform run reuses cleanup's backend
     /// selection.
-    var openAIKeyProvider: () -> String?
+    var transformCredentialsProvider: () -> TransformCredentials
 
     @State private var searchText: String = ""
     @State private var isCreating = false
@@ -66,8 +66,7 @@ struct TransformsView: View {
             return true
         }
         #endif
-        if let key = openAIKeyProvider(), !key.isEmpty { return true }
-        return false
+        return transformCredentialsProvider().backendAvailable
     }
 
     var body: some View {
@@ -343,7 +342,7 @@ struct TransformsView: View {
                 let result = try await TransformRunner.run(
                     prompt: transform.prompt,
                     over: text,
-                    openAIKey: openAIKeyProvider()
+                    credentials: transformCredentialsProvider()
                 )
                 await MainActor.run {
                     let pasteboard = NSPasteboard.general

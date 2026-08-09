@@ -1,13 +1,21 @@
 import Foundation
 
-/// Retains a bounded ring of recent dictation recordings for future retry.
-/// Copies from the ephemeral `/tmp` capture path into Application Support and
-/// prunes by **count** (newest `maxRetained`) and **size budget** (oldest
-/// first past `maxBytes`). Protected paths (failed history rows still
-/// eligible for retry) are never pruned.
+/// Retains recent dictation recordings for future retry. Copies from the
+/// ephemeral `/tmp` capture path into Application Support and prunes by
+/// **size budget** (oldest first past `maxBytes`) — the limit the user actually
+/// sets in Settings. Protected paths (failed history rows still eligible for
+/// retry) are never pruned.
 enum RecordingRetention {
 
-    static let maxRetained = 5
+    /// Runaway guard, **not** the user-facing limit.
+    ///
+    /// This used to be 5, which made it the limit that actually bound: a
+    /// typical hold is well under a megabyte, so five of them never approached
+    /// any budget option and the MB picker in Settings was decoration. The size
+    /// budget is now the governor; this only stops the directory growing without
+    /// bound if the budget is somehow never applied. At the 200 MB default,
+    /// float32 capture (~192 KB/s) puts the budget in charge well before this.
+    static let runawayFileCeiling = 5_000
 
     /// Default size budget when Settings has never been set — 200 MB.
     static let defaultBudgetMB = 200
@@ -39,7 +47,7 @@ enum RecordingRetention {
     static func retain(
         from tempURL: URL,
         keepPaths: [String] = [],
-        maxCount: Int = maxRetained,
+        maxCount: Int = runawayFileCeiling,
         maxBytes: Int64 = Int64(defaultBudgetMB) * 1024 * 1024
     ) -> URL? {
         let destination = recordingsDirectory.appendingPathComponent(tempURL.lastPathComponent)
@@ -83,7 +91,7 @@ enum RecordingRetention {
     /// Prune without retaining a new file — used when the budget setting drops.
     static func pruneNow(
         keepPaths: [String] = [],
-        maxCount: Int = maxRetained,
+        maxCount: Int = runawayFileCeiling,
         maxBytes: Int64
     ) {
         prune(
@@ -289,13 +297,14 @@ enum RecordingRetention {
         var total = survivors.reduce(Int64(0)) { $0 + fileSize($1) }
         guard maxBytes > 0, total > maxBytes else { return }
 
+        // Decorate-sort-undecorate: one `resourceValues` per file. Fetching
+        // inside the comparator costs O(n log n) syscalls, which was invisible
+        // at the old five-file ring and is not once the size budget governs.
         let unprotectedOldestFirst = survivors
             .filter { !protected.contains(normalizedPath($0.path)) }
-            .sorted { lhs, rhs in
-                let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return lhsDate < rhsDate
-            }
+            .map { (url: $0, date: modificationDate(of: $0)) }
+            .sorted { $0.date < $1.date }
+            .map(\.url)
 
         for url in unprotectedOldestFirst {
             guard total > maxBytes else { break }
@@ -310,17 +319,22 @@ enum RecordingRetention {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
-    /// Newest first.
+    private static func modificationDate(of url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            ?? .distantPast
+    }
+
+    /// Newest first. Reads each modification date exactly once — see the note on
+    /// the size-prune sort above; this runs after every dictation.
     private static func listedRecordings(in directory: URL) throws -> [URL] {
         let urls = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         )
-        return urls.sorted { lhs, rhs in
-            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return lhsDate > rhsDate
-        }
+        return urls
+            .map { (url: $0, date: modificationDate(of: $0)) }
+            .sorted { $0.date > $1.date }
+            .map(\.url)
     }
 }

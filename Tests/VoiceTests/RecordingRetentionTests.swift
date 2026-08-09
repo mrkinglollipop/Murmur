@@ -53,6 +53,34 @@ final class RecordingRetentionTests: XCTestCase {
         XCTAssertEqual(RecordingRetention.fileCount(), 5)
     }
 
+    /// The size budget is the governor, not the file count. This used to be
+    /// false: a hardcoded 5-file cap bound long before any MB option could, so
+    /// the Settings picker was decoration.
+    func testBudgetGovernsRatherThanFileCount() {
+        for i in 0 ..< 12 {
+            let src = writeTempSource(named: "governor-\(i).caf", bytes: 1_000)
+            let retained = RecordingRetention.retain(
+                from: src,
+                maxCount: RecordingRetention.runawayFileCeiling,
+                maxBytes: 10_000_000
+            )
+            XCTAssertNotNil(retained)
+            if let retained {
+                touch(retained, age: TimeInterval(12 - i) * 60)
+            }
+        }
+        // Well past the old 5-file ring, comfortably inside the byte budget.
+        XCTAssertEqual(RecordingRetention.fileCount(), 12)
+    }
+
+    func testRunawayCeilingIsNotTheUserFacingLimit() {
+        XCTAssertGreaterThan(
+            RecordingRetention.runawayFileCeiling,
+            1_000,
+            "ceiling must sit far above anything a budget option can hold"
+        )
+    }
+
     func testBudgetPrunesOldestUnprotected() {
         var urls: [URL] = []
         for i in 0 ..< 4 {
