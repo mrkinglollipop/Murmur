@@ -1,7 +1,12 @@
 # 024 — Repo audit: findings register
 
 **Status:** audit complete against `6b299a5` (0.1.28 / build 29); **fix pass 1 landed** — steps 1-4 of the plan below.
-**Oracle after fix pass:** `xcodebuild test -scheme VoiceTests` → **478 tests, 0 failures** (baseline was 465).
+**Oracle after fix pass:** `xcodebuild test -scheme VoiceTests` → **482 tests, 2 skipped, 0 failures** (baseline was 465).
+**Shipped in:** PR #18 (`fix/audit-024-pass-1`), 10 commits, not yet merged.
+**Local path verified end-to-end:** `LocalASRIntegrationTests` loads the real
+large-v3-turbo model and transcribes `say`-synthesised speech — passed in 160 s.
+Run it with `touch /tmp/.murmur-run-local-asr` (an env-var gate silently skips;
+xcodebuild does not forward environment to the test runner).
 **Baseline verified here:** `xcodebuild test -scheme VoiceTests` → **465 tests, 0 failures**.
 
 ## Provenance — read this first
