@@ -161,6 +161,55 @@ Notes worth keeping:
 Not started: **step 5** (F-16 permission panel, F-05 pause switch). Both add new
 UI surfaces and F-05 in particular needs a scope decision on what "paused" means.
 
+## F-06 decision — KEEP the local streaming path (2026-08-09)
+
+**Decision: do not delete.** Maintainer position: *local should be a complete
+option for people, so I don't want to hinder that.*
+
+### Why the path is disabled, verified against WhisperKit v0.18.0
+
+The rationale in `ASREngineSelector.streamingEnabled` was written against a much
+older WhisperKit. Re-checked against the resolved checkout (`v0.18.0`):
+
+- `AudioStreamTranscriber.transcribeCurrentBuffer` still has
+  `guard nextBufferSeconds > 1 else { … sleep 100ms }` (line 132). It refuses to
+  decode until a full second of *new* audio has accrued.
+- `stopStreamTranscription()` (line 89) only sets `isRecording = false` and stops
+  the audio processor. **There is no final flush or tail re-decode.**
+
+So the last sub-second of every utterance is never decoded. For push-to-talk,
+where holds are routinely 2-5 s, that silently truncates the injected text.
+
+### What this means for "local should be complete"
+
+The distinction that matters, and it cuts the other way from how it sounds:
+
+- **Local output quality is not degraded today.** The file-based path decodes the
+  *complete* audio at release. It is the accurate path, and it is the one that
+  runs.
+- **Enabling the dead streaming path would make local worse**, not better — it
+  would introduce the truncated tail into the text users actually receive.
+- The real local-vs-cloud gap is **live interim text in the HUD while speaking**.
+  xAI and ElevenLabs stream it; local shows none. That is a *preview* gap, not an
+  accuracy gap.
+
+### If live preview on local is wanted
+
+Two routes, and the obvious one is a trap:
+
+1. **Revive `AudioStreamTranscriber` for preview only** (what the original
+   comment suggested). Blocked by mic ownership: `startStreamTranscription()`
+   calls `audioProcessor.startRecordingLive` internally, so it becomes the sole
+   mic owner and cannot run alongside `AudioRecorder`'s own tap — which the
+   file-based decode needs.
+2. **Periodically decode `AudioRecorder`'s existing buffers** for the preview,
+   keeping the full decode at release as the authoritative text. Sidesteps both
+   the 1-second guard and the mic conflict entirely, because we never hand the
+   mic to WhisperKit. Cost is CPU: re-decoding a growing buffer every N seconds
+   on large-v3-turbo is not free, and would likely want a smaller preview model.
+
+Route 2 is the one worth scoping. Neither is in scope for pass 1.
+
 ## Maintainer feedback — the transform hotkey (2026-08-09)
 
 ⌃⌥⌘T is **not valued**: a four-key chord is more work than the task is worth,
@@ -202,8 +251,8 @@ Consequences, recorded so this is not re-litigated:
 
 ## Open decisions (maintainer)
 
-1. **F-06** — delete the dead WhisperKit streaming path, or revive it? Re-check
-   against 0.1.28's `shouldTakeSilenceCancel` work first.
+1. ~~F-06~~ — decided: **keep**. See the F-06 section above; deleting it would
+   foreclose the only route to local live-preview parity.
 2. **F-11** — commit to dark-only in the README, or build light mode?
 3. **F-13** — leave retention at 5 recordings, or make the MB budget govern
    (stores materially more voice audio on disk by default)?
