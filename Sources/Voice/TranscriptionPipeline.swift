@@ -222,6 +222,19 @@ final class TranscriptionPipeline {
             && shouldAbortInjectForFrontmostMismatch(held: heldPID, current: latePID)
     }
 
+    /// Diagnostic identity for an app-switch abort: which app the hold started
+    /// in vs. which app owned frontmost at injection time. Bundle identifiers
+    /// only — never window titles or content (transcript-privacy rule). Added
+    /// after two live aborts (2026-08-09) where the maintainer could not tell
+    /// what stole focus mid-dictation.
+    static func vlogAppSwitchAbort(heldPID: pid_t?, currentPID: pid_t?) {
+        func bundleID(_ pid: pid_t?) -> String {
+            guard let pid else { return "nil" }
+            return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "pid:\(pid)"
+        }
+        vlog("inject abort: frontmost changed mid-dictation — held=\(bundleID(heldPID)) current=\(bundleID(currentPID))")
+    }
+
     /// Call on main. App-switch abort leave: re-read secure; leave clipboard
     /// only when clear. Returns true when secure blocked leave (elevate outcome).
     static func appSwitchAbortLeaveOnMain(text: String) -> Bool {
@@ -649,6 +662,7 @@ final class TranscriptionPipeline {
                 case .abortedAppSwitch:
                     // Live secure re-read before pasteboard — skip leave when secure.
                     DispatchQueue.main.sync {
+                        Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
                         abortLeaveBecameSecure = Self.appSwitchAbortLeaveOnMain(
                             text: textToInject
                         )
@@ -670,6 +684,7 @@ final class TranscriptionPipeline {
                             heldPID: heldPID,
                             latePID: latePID
                         ) {
+                            Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: latePID)
                             return .abort(
                                 becameSecure: Self.appSwitchAbortLeaveOnMain(text: textToInject)
                             )
