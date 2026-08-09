@@ -14,11 +14,94 @@ final class AudioRecorder {
 
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "audio")
 
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var pcmBuffers: [AVAudioPCMBuffer] = []
     private let pcmBuffersLock = NSLock()
     private var startTime: Date?
     private var isSetUp = false
+
+    /// Set when the engine's device graph may be stale — a configuration-change
+    /// notification, a dead input format, or a zero-buffer watchdog trip. The
+    /// next capture start replaces the engine instance instead of reusing it.
+    /// Main-thread confined, like the rest of the control state here.
+    ///
+    /// The wedge this heals (observed 2026-08-09 via VOICE_DEBUG): another
+    /// app's voice session reroutes the input device; the long-lived engine
+    /// then "starts" without error but its tap delivers zero buffers for the
+    /// entire hold (log: `max RMS 0.0000 … buffers=0`), so the hold dies on
+    /// the silence guard. A fresh AVAudioEngine rebinds the device correctly.
+    private var engineNeedsRebuild = false
+
+    /// Instance-scoped observation of `AVAudioEngineConfigurationChange` —
+    /// must be re-registered whenever `engine` is replaced.
+    private var engineConfigObserver: NSObjectProtocol?
+
+    /// Bumped at each capture start so the zero-buffer watchdog can verify the
+    /// take it armed for is still the live one before acting.
+    private var captureGeneration: UInt64 = 0
+
+    /// One watchdog restart per hold: a genuinely dead input device must not
+    /// loop rebuilds — after one retry the hold is left to fail visibly on
+    /// the silence guard.
+    private var watchdogRetriedThisTake = false
+
+    init() {
+        registerEngineConfigObserver()
+    }
+
+    deinit {
+        if let engineConfigObserver {
+            NotificationCenter.default.removeObserver(engineConfigObserver)
+        }
+    }
+
+    private func registerEngineConfigObserver() {
+        if let engineConfigObserver {
+            NotificationCenter.default.removeObserver(engineConfigObserver)
+        }
+        engineConfigObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            vlog("audio engine configuration change — flagging engine rebuild")
+            self?.engineNeedsRebuild = true
+        }
+    }
+
+    /// Replaces the engine (input-node device binding included) and
+    /// re-registers the instance-scoped observer. Call only between captures
+    /// or after `teardownMicEngine()` — never with a live tap installed.
+    private func rebuildEngine() {
+        engine.stop()
+        engine = AVAudioEngine()
+        registerEngineConfigObserver()
+        engineNeedsRebuild = false
+    }
+
+    /// A CoreAudio device in transition can report a zero format; installing a
+    /// tap against it "succeeds" and never fires.
+    static func inputFormatLooksDead(sampleRate: Double, channelCount: UInt32) -> Bool {
+        sampleRate == 0 || channelCount == 0
+    }
+
+    /// Pure decision for the zero-buffer watchdog (unit-tested): restart only
+    /// when the armed take is still live, the tap really delivered nothing,
+    /// and we have not already retried this hold.
+    static func watchdogShouldRestartCapture(
+        generationMatches: Bool,
+        stillWanted: Bool,
+        tapInstalled: Bool,
+        buffersSeen: Int,
+        alreadyRetried: Bool
+    ) -> Bool {
+        generationMatches && stillWanted && tapInstalled
+            && buffersSeen == 0 && !alreadyRetried
+    }
+
+    /// A live input tap delivers a buffer roughly every 85 ms (4096 frames at
+    /// 48 kHz); 400 ms with none is a dead engine, not a quiet room.
+    private static let zeroBufferWatchdogDelay: TimeInterval = 0.4
 
     /// Tracks the most recent start/stop request. Guards against a stale
     /// permission-completion handler (fired after a later stopRecording())
@@ -597,7 +680,7 @@ final class AudioRecorder {
     /// — in file mode — copies it into `pcmBuffers` for a post-release .caf
     /// transcribe. One mic engine backs both paths so the live pill animates
     /// identically regardless of which transcription backend is active.
-    private func startMicCapture() {
+    private func startMicCapture(isWatchdogRetry: Bool = false) {
         // Defense in depth for WhisperKit fallback / late doStart: do not
         // begin a gate session (or start the engine) after the hold ended.
         // Keyed on wantsRecording only — sticky isStopping from a prior
@@ -615,6 +698,17 @@ final class AudioRecorder {
             return
         }
 
+        if !isWatchdogRetry {
+            watchdogRetriedThisTake = false
+        }
+        captureGeneration &+= 1
+
+        if engineNeedsRebuild {
+            vlog("mic engine flagged stale — rebuilding before capture")
+            teardownMicEngine()
+            rebuildEngine()
+        }
+
         vlog("startMicCapture — AVAudioEngine begins capture")
         pcmBuffersLock.lock()
         pcmBuffers.removeAll()
@@ -623,6 +717,18 @@ final class AudioRecorder {
         levelLock.lock()
         maxLevelObserved = 0
         levelLock.unlock()
+
+        // A device mid-transition can report a dead format; a tap installed
+        // against it never fires. Rebuild once before binding the input node.
+        let probeFormat = engine.inputNode.outputFormat(forBus: 0)
+        if Self.inputFormatLooksDead(
+            sampleRate: probeFormat.sampleRate,
+            channelCount: probeFormat.channelCount
+        ) {
+            vlog("input format dead (\(probeFormat.sampleRate) Hz, \(probeFormat.channelCount) ch) — rebuilding engine")
+            teardownMicEngine()
+            rebuildEngine()
+        }
 
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
@@ -696,6 +802,7 @@ final class AudioRecorder {
             logger.info("AVAudioEngine started — recording…")
             promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
+            armZeroBufferWatchdog()
         } catch {
             logger.error("AVAudioEngine start failed: \(error.localizedDescription)")
             invalidateSecureInputPollTimer()
@@ -707,6 +814,42 @@ final class AudioRecorder {
                 self?.asrSelector.onFailure?(.micStartFailed)
                 self?.hud.hide()
             }
+        }
+    }
+
+    /// Detects the silent-wedge case the config-change notification can miss:
+    /// `engine.start()` returned success but the tap never fires. One rebuild
+    /// + restart per hold; the tap's always-on pcmBuffers copy is the buffer
+    /// counter, so this works identically in streaming and file modes.
+    private func armZeroBufferWatchdog() {
+        let generation = captureGeneration
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.zeroBufferWatchdogDelay
+        ) { [weak self] in
+            guard let self else { return }
+            self.pcmBuffersLock.lock()
+            let buffersSeen = self.pcmBuffers.count
+            self.pcmBuffersLock.unlock()
+
+            guard Self.watchdogShouldRestartCapture(
+                generationMatches: generation == self.captureGeneration,
+                stillWanted: self.wantsRecording,
+                tapInstalled: self.isSetUp,
+                buffersSeen: buffersSeen,
+                alreadyRetried: self.watchdogRetriedThisTake
+            ) else {
+                if buffersSeen == 0, generation == self.captureGeneration,
+                   self.wantsRecording, self.watchdogRetriedThisTake {
+                    vlog("mic watchdog: still zero buffers after rebuild — leaving hold to the silence guard")
+                }
+                return
+            }
+
+            self.watchdogRetriedThisTake = true
+            vlog("mic watchdog: no buffers \(Int(Self.zeroBufferWatchdogDelay * 1000)) ms after engine start — rebuilding engine, restarting capture")
+            self.teardownMicEngine()
+            self.rebuildEngine()
+            self.startMicCapture(isWatchdogRetry: true)
         }
     }
 
