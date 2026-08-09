@@ -295,6 +295,34 @@ refactor (`ASREngineSelector.engineCache` is private, `CloudTranscriberFactory`
 is static). Follow-up: add an engine seam, then a test that a failing cloud
 service lands on the local engine.
 
+## Live incident — the post-Aegis hang (2026-08-09, VOICE_DEBUG)
+
+Maintainer repro: use another app's voice mode, return, dictate → hang.
+Caught live with VOICE_DEBUG after one failed repro attempt. Two distinct
+bugs, fixed in PRs #23 and #24:
+
+1. **Mic wedge (PR #23):** a hold after the external voice session logged
+   `engine.start()` success but `max RMS 0.0000 … buffers=0` — the
+   long-lived AVAudioEngine held a stale device binding. Fixed with a
+   config-change observer + dead-format probe + 400 ms zero-buffer
+   watchdog. **Verified live**: the next occurrence logged
+   `mic engine flagged stale — rebuilding before capture` and the
+   dictation succeeded.
+2. **Mid-hold device death + unbounded fallback load (PR #24):** the
+   config change fired 2 s INTO a 33 s hold (31 s of speech lost to a
+   dead device), the stream died, batch returned no transcript, and the
+   cloud→local fallback parked forever inside the WhisperKit load — no
+   error, no running thread, 632 MB resident, no history row. Fixed:
+   mid-hold capture restart preserving captured buffers (shared
+   once-per-hold budget with the watchdog), and a 120 s deadline on the
+   model-load phase with vlog brackets so any future park names its
+   frame. **Unverified live** — needs the next real occurrence.
+
+Where the load parks remains unproven (tokenizer exists locally at the
+default HubApi path; no open sockets at park time; no thread in WhisperKit
+frames — signature of an unresumed continuation). The vlog brackets around
+`WhisperKit(config)` will convict on the next occurrence.
+
 ## Process note
 
 The archive checkout is named `Murmur`, its `CLAUDE.md` and `README` read as
