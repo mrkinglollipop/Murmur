@@ -4,54 +4,123 @@ import os.log
 import FoundationModels
 #endif
 
+/// Everything a Transform run needs to pick a backend: the user's configured
+/// cleanup backend plus the keys behind the cloud options. Passed as one value
+/// so callers wire a single provider closure instead of one per key, and so the
+/// Settings choice reaches every call site.
+struct TransformCredentials {
+    let backend: CleanupBackend
+    let openAIKey: String?
+    let xaiKey: String?
+
+    /// Placeholder for the window where the settings store is gone (weak
+    /// reference cleared during teardown).
+    static let unavailable = TransformCredentials(backend: .onDevice, openAIKey: nil, xaiKey: nil)
+
+    /// Whether a Transform can run right now — used to disable the Run button up
+    /// front rather than spinning and failing with `.noBackendAvailable`.
+    var backendAvailable: Bool {
+        switch backend {
+        case .onDevice: return TransformRunner.onDeviceModelAvailable
+        case .cloud:    return !(openAIKey ?? "").isEmpty
+        case .xaiGrok:  return !(xaiKey ?? "").isEmpty
+        }
+    }
+}
+
 /// Runs an arbitrary rewrite instruction over a block of text — the apply
-/// path for saved Transforms. Mirrors `CleanupFactory`'s backend-selection
-/// logic (on-device first, cloud OpenAI key as fallback) but takes a
+/// path for saved Transforms. Backend selection follows the user's configured
+/// `CleanupBackend`, the same choice `CleanupFactory` honors, but with a
 /// caller-supplied prompt instead of the fixed cleanup instructions, since a
-/// Transform's instruction is user-authored, not the cleanup grammar/filler
-/// pass.
+/// Transform's instruction is user-authored.
 enum TransformRunner {
 
     private static let logger = Logger(subsystem: "com.matt.voice-dictation", category: "transform-runner")
 
-    /// Runs `prompt` as the instruction over `text` and returns the rewritten
-    /// result. Backend selection: on-device (FoundationModels) if available,
-    /// else cloud (BYO OpenAI key from Keychain) if a key is present, else
-    /// throws — mirroring the cleanup fail-safe posture, except a Transform
-    /// run has no "fall back to raw text" caller path of its own, so the
-    /// caller (TransformsView) is responsible for surfacing the failure
-    /// rather than silently swallowing it.
-    static func run(prompt: String, over text: String, openAIKey: String?) async throws -> String {
-        guard !text.isEmpty else { return text }
-
+    static var onDeviceModelAvailable: Bool {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *), case .available = SystemLanguageModel.default.availability {
-            let session = LanguageModelSession(instructions: prompt)
-            let response = try await session.respond(to: text)
-            let result = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            return result.isEmpty ? text : result
+            return true
         }
+        return false
+        #else
+        return false
         #endif
-
-        guard let key = openAIKey, !key.isEmpty else {
-            logger.error("Transform run failed: no on-device model and no cloud key configured")
-            throw TransformRunnerError.noBackendAvailable
-        }
-
-        return try await runCloud(prompt: prompt, text: text, apiKey: key)
     }
 
-    /// Cloud path — same OpenAI chat-completions shape as `CloudLLMCleanup`,
-    /// but with the Transform's own prompt as the system instruction.
-    private static func runCloud(prompt: String, text: String, apiKey: String) async throws -> String {
-        let endpoint = URL(string: "https://api.openai.com/v1/chat/completions")!
+    /// Runs `prompt` as the instruction over `text` and returns the rewritten
+    /// result.
+    ///
+    /// Honors `credentials.backend`. This previously tried on-device first
+    /// unconditionally, silently overriding a user who had deliberately selected
+    /// Cloud or xAI Grok, and left xAI unusable for Transforms even with a
+    /// working key stored. A selected backend that cannot run falls back to any
+    /// other configured one rather than failing outright — a Transform has no
+    /// "use the raw text" path of its own, so the caller must surface a hard
+    /// failure.
+    static func run(prompt: String, over text: String, credentials: TransformCredentials) async throws -> String {
+        guard !text.isEmpty else { return text }
+
+        for backend in orderedBackends(preferring: credentials.backend) {
+            switch backend {
+            case .onDevice:
+                #if canImport(FoundationModels)
+                if #available(macOS 26.0, *), case .available = SystemLanguageModel.default.availability {
+                    let session = LanguageModelSession(instructions: prompt)
+                    let response = try await session.respond(to: text)
+                    let result = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return result.isEmpty ? text : result
+                }
+                #endif
+            case .cloud:
+                if let key = credentials.openAIKey, !key.isEmpty {
+                    return try await runCloud(
+                        prompt: prompt,
+                        text: text,
+                        apiKey: key,
+                        endpoint: URL(string: "https://api.openai.com/v1/chat/completions")!,
+                        model: "gpt-4o-mini"
+                    )
+                }
+            case .xaiGrok:
+                if let key = credentials.xaiKey, !key.isEmpty {
+                    return try await runCloud(
+                        prompt: prompt,
+                        text: text,
+                        apiKey: key,
+                        endpoint: URL(string: "https://api.x.ai/v1/chat/completions")!,
+                        model: GrokCleanupSettings.modelID
+                    )
+                }
+            }
+        }
+
+        logger.error("Transform run failed: no usable backend for the current settings")
+        throw TransformRunnerError.noBackendAvailable
+    }
+
+    /// Preferred backend first, then the others as fallbacks. Pure so the
+    /// ordering is testable without a model or a key.
+    static func orderedBackends(preferring preferred: CleanupBackend) -> [CleanupBackend] {
+        [preferred] + CleanupBackend.allCases.filter { $0 != preferred }
+    }
+
+    /// Cloud path — the OpenAI-compatible chat-completions shape shared by both
+    /// cloud backends, with the Transform's own prompt as the system instruction.
+    private static func runCloud(
+        prompt: String,
+        text: String,
+        apiKey: String,
+        endpoint: URL,
+        model: String
+    ) async throws -> String {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let body: [String: Any] = [
-            "model": "gpt-4o-mini",
+            "model": model,
             "messages": [
                 ["role": "system", "content": prompt],
                 ["role": "user", "content": text]
@@ -60,7 +129,7 @@ enum TransformRunner {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await HTTPClient.session.data(for: request)
 
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1

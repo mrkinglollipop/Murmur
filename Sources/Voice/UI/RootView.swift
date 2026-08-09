@@ -60,7 +60,7 @@ struct RootView: View {
 
     /// Resolves the BYO cloud (OpenAI) key for Transforms' cloud fallback —
     /// wired by `AppDelegate`, forwarded straight through to `TransformsView`.
-    var openAIKeyProvider: () -> String?
+    var transformCredentialsProvider: () -> TransformCredentials
 
     /// Resolves the live ASR selector for History retry — wired by `AppDelegate`.
     var asrEngineSelector: () -> ASREngineSelector?
@@ -130,7 +130,7 @@ struct RootView: View {
                 case .style:
                     StyleView(store: styleStore, settingsStore: settingsStore)
                 case .transforms:
-                    TransformsView(store: transformsStore, historyStore: historyStore, openAIKeyProvider: openAIKeyProvider)
+                    TransformsView(store: transformsStore, historyStore: historyStore, transformCredentialsProvider: transformCredentialsProvider)
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
                 case .settings:

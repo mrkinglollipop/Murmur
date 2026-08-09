@@ -17,7 +17,7 @@ final class MainWindowController: NSWindowController {
         scratchpadStore: ScratchpadStore,
         settingsStore: SettingsStore,
         modelManager: ModelManager,
-        openAIKeyProvider: @escaping () -> String?,
+        transformCredentialsProvider: @escaping () -> TransformCredentials,
         asrEngineSelector: @escaping () -> ASREngineSelector?,
         onReplayOnboarding: @escaping () -> Void
     ) {
@@ -30,7 +30,7 @@ final class MainWindowController: NSWindowController {
             scratchpadStore: scratchpadStore,
             settingsStore: settingsStore,
             modelManager: modelManager,
-            openAIKeyProvider: openAIKeyProvider,
+            transformCredentialsProvider: transformCredentialsProvider,
             asrEngineSelector: asrEngineSelector,
             onReplayOnboarding: onReplayOnboarding
         )

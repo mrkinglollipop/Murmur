@@ -495,7 +495,7 @@ final class TranscriptionPipeline {
             let result = try await TransformRunner.run(
                 prompt: transform.prompt,
                 over: text,
-                openAIKey: engineSelector?.openAIKeyProvider?()
+                credentials: engineSelector?.transformCredentialsProvider?() ?? .unavailable
             )
             return result.isEmpty ? text : result
         } catch {
