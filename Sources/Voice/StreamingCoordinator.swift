@@ -33,13 +33,33 @@ final class StreamingCoordinator {
     private static let streamMinCharsPerSecond: Double = 2.0
     private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
 
-    /// Silence cancel only when there was never stream text and no PCM buffers.
-    /// Non-empty buffers or any interim/commit bypass local RMS `hadSpeech`.
+    /// Below this much captured audio, a hold with no stream text is discarded
+    /// as silence instead of entering the batch→local fallback chain. Evidence
+    /// (2026-08-10 log): a 0.33 s dead-silent tap cascaded through batch
+    /// "No transcript" into a cold WhisperKit load and a 120 s timeout error,
+    /// while a 1.93 s *quiet* hold (also under the RMS threshold) was
+    /// legitimately rescued by the same fallback (14 injected chars). Duration
+    /// separates those two; loudness does not — do NOT gate this on `hadSpeech`.
+    static let silenceCancelMaxBufferedSeconds: TimeInterval = 0.5
+
+    /// Silence cancel only when there was never stream text and the captured
+    /// audio is absent or shorter than `silenceCancelMaxBufferedSeconds`.
+    /// Longer buffers bypass local RMS `hadSpeech` — quiet real speech below
+    /// the RMS threshold has been rescued by the batch fallback in the field.
     static func shouldTakeSilenceCancel(
         everHadStreamText: Bool,
-        hasBufferedAudio: Bool
+        bufferedSeconds: TimeInterval
     ) -> Bool {
-        !everHadStreamText && !hasBufferedAudio
+        !everHadStreamText && bufferedSeconds < silenceCancelMaxBufferedSeconds
+    }
+
+    /// Total captured seconds across PCM buffers (frames ÷ sample rate).
+    static func bufferedSeconds(_ buffers: [AVAudioPCMBuffer]) -> TimeInterval {
+        buffers.reduce(0) { total, buf in
+            let rate = buf.format.sampleRate
+            guard rate > 0 else { return total }
+            return total + Double(buf.frameLength) / rate
+        }
     }
 
     /// After streaming finalize: prefer non-empty finalize text unless truncated.
@@ -217,12 +237,12 @@ final class StreamingCoordinator {
         let everHad = context.streamTextEver
             || session.hasEverHadNonEmptyStreamText
             || coordinatorEverHadStreamText
-        let hasBuffers = !context.bufferedAudio.isEmpty
+        let bufferedSecs = Self.bufferedSeconds(context.bufferedAudio)
         let preFinalizeSnapshot = session.joinedTranscriptSnapshot()
         xaiSession = nil
 
-        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, hasBufferedAudio: hasBuffers) {
-            vlog("xai streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) hadSpeech=\(context.hadSpeech)")
+        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, bufferedSeconds: bufferedSecs) {
+            vlog("xai streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) bufferedSecs=\(String(format: "%.2f", bufferedSecs)) hadSpeech=\(context.hadSpeech)")
             session.cancel()
             onSilence()
             return true
@@ -286,12 +306,12 @@ final class StreamingCoordinator {
         let everHad = context.streamTextEver
             || session.hasEverHadNonEmptyStreamText
             || coordinatorEverHadStreamText
-        let hasBuffers = !context.bufferedAudio.isEmpty
+        let bufferedSecs = Self.bufferedSeconds(context.bufferedAudio)
         let preFinalizeSnapshot = session.joinedTranscriptSnapshot()
         elevenLabsSession = nil
 
-        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, hasBufferedAudio: hasBuffers) {
-            vlog("elevenlabs streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) hadSpeech=\(context.hadSpeech)")
+        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, bufferedSeconds: bufferedSecs) {
+            vlog("elevenlabs streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) bufferedSecs=\(String(format: "%.2f", bufferedSecs)) hadSpeech=\(context.hadSpeech)")
             session.cancel()
             onSilence()
             return true

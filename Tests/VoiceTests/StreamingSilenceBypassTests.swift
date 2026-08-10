@@ -3,55 +3,98 @@ import XCTest
 @testable import Voice
 
 /// Silence-cancel predicate + Class A residual recovery for ghost dictation.
+///
+/// The predicate gained a duration floor on 2026-08-10: a 0.33 s dead-silent
+/// tap cascaded through batch "No transcript" into a cold WhisperKit load and
+/// a 120 s timeout error, while a 1.93 s quiet hold (also under the RMS
+/// threshold) was legitimately rescued by the same fallback. Duration is the
+/// discriminator; loudness is deliberately NOT consulted.
 final class StreamingSilenceBypassTests: XCTestCase {
 
-    func testSilenceCancelOnlyWhenNoStreamTextAndNoBuffers() {
+    private let floor = StreamingCoordinator.silenceCancelMaxBufferedSeconds
+
+    func testSilenceCancelWhenNoStreamTextAndNoAudio() {
         XCTAssertTrue(
             StreamingCoordinator.shouldTakeSilenceCancel(
                 everHadStreamText: false,
-                hasBufferedAudio: false
+                bufferedSeconds: 0
             )
         )
         XCTAssertFalse(
             StreamingCoordinator.shouldTakeSilenceCancel(
                 everHadStreamText: true,
-                hasBufferedAudio: false
+                bufferedSeconds: 0
             ),
             "Class A: interim words must bypass silence cancel"
         )
-        XCTAssertFalse(
+    }
+
+    func testTinyHoldBelowFloorIsDiscarded() {
+        // The live 2026-08-10 cascade: 0.33 s of dead air must not summon
+        // the batch→local fallback chain.
+        XCTAssertTrue(
             StreamingCoordinator.shouldTakeSilenceCancel(
                 everHadStreamText: false,
-                hasBufferedAudio: true
-            ),
-            "Class B: non-empty pcmBuffers must bypass silence cancel"
-        )
-        XCTAssertFalse(
-            StreamingCoordinator.shouldTakeSilenceCancel(
-                everHadStreamText: true,
-                hasBufferedAudio: true
+                bufferedSeconds: 0.33
             )
         )
     }
 
-    /// Production file path (`stopFileBasedCapture`): empty buffers abort;
-    /// non-empty buffers always proceed (no dead bypass helper).
-    func testFilePathProceedsWhenBuffersNonEmpty() {
-        // Empty buffers → silence cancel would apply only when also no stream text.
-        XCTAssertTrue(
-            StreamingCoordinator.shouldTakeSilenceCancel(
-                everHadStreamText: false,
-                hasBufferedAudio: false
-            ),
-            "empty buffers + no stream text → cancel/discard path"
-        )
-        // Non-empty buffers always bypass silence cancel — file path writes them.
+    func testQuietButRealHoldAboveFloorIsRescued() {
+        // The live counter-case: 1.93 s under the RMS threshold produced 14
+        // injected chars via batch fallback. Must keep bypassing.
         XCTAssertFalse(
             StreamingCoordinator.shouldTakeSilenceCancel(
                 everHadStreamText: false,
-                hasBufferedAudio: true
+                bufferedSeconds: 1.93
+            )
+        )
+    }
+
+    func testStreamTextAlwaysBypassesEvenWhenTiny() {
+        XCTAssertFalse(
+            StreamingCoordinator.shouldTakeSilenceCancel(
+                everHadStreamText: true,
+                bufferedSeconds: 0.1
+            )
+        )
+    }
+
+    func testFloorBoundary() {
+        XCTAssertTrue(
+            StreamingCoordinator.shouldTakeSilenceCancel(
+                everHadStreamText: false,
+                bufferedSeconds: floor - 0.01
+            )
+        )
+        XCTAssertFalse(
+            StreamingCoordinator.shouldTakeSilenceCancel(
+                everHadStreamText: false,
+                bufferedSeconds: floor
             ),
-            "non-empty buffers always proceed to writeToFile"
+            "exactly at the floor proceeds — the floor is a strict less-than"
+        )
+    }
+
+    func testBufferedSecondsSumsFrames() {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        func buffer(frames: AVAudioFrameCount) -> AVAudioPCMBuffer {
+            let b = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+            b.frameLength = frames
+            return b
+        }
+        XCTAssertEqual(StreamingCoordinator.bufferedSeconds([]), 0)
+        XCTAssertEqual(
+            StreamingCoordinator.bufferedSeconds([buffer(frames: 24_000)]),
+            0.5,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            StreamingCoordinator.bufferedSeconds(
+                [buffer(frames: 48_000), buffer(frames: 24_000)]
+            ),
+            1.5,
+            accuracy: 0.0001
         )
     }
 
