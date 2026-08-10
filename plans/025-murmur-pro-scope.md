@@ -151,15 +151,27 @@ return 200 anonymously. Rules that remain:
    permission. Local diarization stays parked; cloud diarization ships in
    phase 4.
 
+## Decided 2026-08-10 (Matt)
+
+- **Free trial: yes** — 14 days, no card.
+- **Usage warnings: 75% (amber), 90% (red), 100%** — ambient only (menu bar +
+  Account pane), never modal. At 100%: spend top-up balance if any; otherwise
+  fall back to local with one toast carrying a "Buy minutes…" action.
+- **Top-up minutes: purchasable** — one-time Paddle products credited as
+  non-expiring `topups` rows; metering drains the monthly pool first, then
+  top-ups oldest-first (migration 002, applied).
+- **Transcripts takes ⌘8; Settings moves to ⌘9.**
+- **Accounts + xAI-for-files** — earlier same-day decisions, see §3–4.
+
 ## Open decisions
 
 - **Dictation engine:** xAI streaming vs ElevenLabs realtime — quality call
   from live use; server-side routing makes it reversible.
 - **Pool size:** recommend 1,500 min/mo (funded by xAI batch pricing).
-- **Price:** recommend $4.99/mo · $39/yr.
+- **Price:** recommend $4.99/mo · $39/yr; top-up pack price TBD (~$2.99 per
+  +500 min keeps healthy margin at xAI batch rates).
 - **Grandfathering:** recommend existing BYO keys work forever; optionally
   gift early users 6 months of Pro at launch.
-- **Free trial:** recommend 14-day, no card.
 - **Launch-day source strategy:** moot while the repo is private; revisit
   only if it ever goes public again (see Pre-launch secrecy).
 
