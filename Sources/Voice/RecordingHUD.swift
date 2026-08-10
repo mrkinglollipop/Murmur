@@ -67,7 +67,7 @@ final class RecordingHUD {
 
     private let pillWidth: CGFloat = 260
     private let pillListeningHeight: CGFloat = 40
-    private let pillInterimExtraHeight: CGFloat = 36
+    private let pillInterimExtraHeight: CGFloat = 50
 
     /// Whether the recording HUD panel is currently shown.
     private(set) var isVisible = false
@@ -239,7 +239,9 @@ final class RecordingHUD {
         applyState(.success)
         collapseToCompactPill()
         waveformView.startAnimating()
-        scheduleAutoHide(after: 0.6, generation: generation)
+        // Plain success is a quick flash; a fix count is information the
+        // user should actually get to read before the pill fades.
+        scheduleAutoHide(after: count > 0 ? 2.0 : 0.6, generation: generation)
     }
 
     /// Flashes a clipboard icon briefly, then runs the normal hide animation.
@@ -252,7 +254,9 @@ final class RecordingHUD {
         applyState(.clipboardFlash)
         collapseToCompactPill()
         waveformView.startAnimating()
-        scheduleAutoHide(after: 0.6, generation: generation)
+        // "Left on clipboard" means the text did NOT inject — give the cue
+        // enough screen time to register before fading.
+        scheduleAutoHide(after: 1.5, generation: generation)
     }
 
     /// Animates the expanded (interim/processing) pill down to the compact
@@ -487,7 +491,7 @@ private final class WaveformView: NSView {
         interim.textColor = NSColor(calibratedRed: 0.75, green: 0.78, blue: 0.84, alpha: 1.0)
         interim.alignment = .center
         interim.lineBreakMode = .byTruncatingTail
-        interim.maximumNumberOfLines = 2
+        interim.maximumNumberOfLines = 3
         interim.isHidden = true
         self.interimLabel = interim
 

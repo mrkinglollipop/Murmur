@@ -297,8 +297,8 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    /// Removes the entry with the given `id`. One-click delete, no undo — a
-    /// single transcript line isn't worth a confirmation dialog.
+    /// Removes the entry with the given `id`. No undo — the view gates this
+    /// behind a confirmation dialog.
     func delete(id: UUID) {
         func mutate() {
             self.entries.removeAll { $0.id == id }

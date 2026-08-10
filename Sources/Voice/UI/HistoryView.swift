@@ -215,7 +215,6 @@ struct HistoryView: View {
                     .padding(6)
                     .murmurGlassCard()
                     .focused($focusedEditID, equals: entry.id)
-                    .onSubmit { saveEdit(for: entry) }
             } else {
                 Text(entry.text)
                     .font(Theme.body(13))

@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.1.33",
+    "build": "34",
+    "title": "What's New in 0.1.33",
+    "items": [
+      "Editing a dictionary term, snippet, or transform can no longer blank out the field that does the work — a change that would have quietly deleted words from later dictations is now refused.",
+      "Per-app Style assignment now applies to the app you were last working in, instead of always assigning to Murmur itself.",
+      "Opening a Scratchpad note no longer marks it as edited just for looking at it.",
+      "The confirmation pill stays up long enough to read: dictionary fix counts and the “left on clipboard” warning no longer vanish in half a second, and the live preview shows a third line of text."
+    ]
+  },
+  {
     "version": "0.1.32",
     "build": "33",
     "title": "What's New in 0.1.32",

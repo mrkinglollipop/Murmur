@@ -543,6 +543,7 @@ struct DictionaryView: View {
                     .tint(Theme.lavender)
                     .font(.system(size: 12, weight: .semibold))
                     .keyboardShortcut(.return, modifiers: [])
+                    .disabled(editTerm.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding(.horizontal, 16)
@@ -579,8 +580,12 @@ struct DictionaryView: View {
     }
 
     private func saveEdit(for entry: DictionaryEntry) {
+        // A blank term would make correct() replace this entry's variants
+        // with empty string — silently deleting words from dictations.
+        let term = editTerm.trimmingCharacters(in: .whitespaces)
+        guard !term.isEmpty else { return }
         var updated = entry
-        updated.term = editTerm.trimmingCharacters(in: .whitespaces)
+        updated.term = term
         updated.variants = editVariants
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }

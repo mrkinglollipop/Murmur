@@ -348,6 +348,9 @@ final class DictionaryStore: ObservableObject {
     }
 
     func update(_ entry: DictionaryEntry) {
+        // Backstop: an empty term turns correct() into a word deleter
+        // (variants replaced with ""). The edit UI guards this too.
+        guard !entry.term.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let mutate = {
             guard let idx = self.entries.firstIndex(where: { $0.id == entry.id }) else { return }
             self.entries[idx] = entry
