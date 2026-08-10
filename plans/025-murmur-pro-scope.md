@@ -64,6 +64,13 @@ mid-dictation.
 - **Auth + user store:** Supabase — Auth ships Apple + Google sign-in;
   Postgres holds users, subscription state, usage counters. OAuth only, no
   passwords.
+- **Sign-in mechanism (spike settled 2026-08-10):** browser OAuth with PKCE
+  for BOTH providers, deep-linking back to `murmur://auth-callback`. Native
+  `ASAuthorization` Sign in with Apple is **unavailable to Developer ID
+  apps** — Apple DTS confirms the capability is App Store only and the
+  entitlement is stripped from Developer ID provisioning profiles. Upside:
+  one code path instead of two, and **no entitlement or provisioning change**,
+  so existing TCC grants are untouched.
 - **Billing:** Paddle as merchant of record (VAT handled). Checkout in the
   browser tied to the signed-in email; Paddle webhooks update subscription
   state in Supabase. "Manage subscription" opens Paddle's hosted customer
@@ -118,11 +125,12 @@ return 200 anonymously. Rules that remain:
 
 ## Build order — one-session slices (briefs point here; do not restate)
 
-1. **Accounts + billing** (`Murmur-server`) — opens with the **SIWA spike**:
-   Sign in with Apple in a Developer ID (non-App-Store) app wired to Supabase
-   — the least-verified assumption in this plan; kill it first. Then Supabase
-   project, Paddle product + portal, webhook → sub state. Exit: sign in on a
-   test build, subscribe, cancel from portal, state visible in Postgres.
+1. **Accounts + billing** (`Murmur-server`) — **SIWA spike done**: native
+   Sign in with Apple is dead for Developer ID; browser OAuth + PKCE replaces
+   it for both providers. Brief: `Murmur-server/plans/001-phase-1-accounts-billing.md`.
+   Supabase project, Apple Services ID, Google client, Paddle product +
+   portal, webhook → sub state, draft schema with RLS. Exit: sign in on a test
+   build, subscribe, cancel from portal, state visible in Postgres.
 2. **Proxy + metering** (`Murmur-server`) — includes a spike verifying the
    chosen host can originate/relay WSS to the ASR provider. JWT validation,
    realtime relay, batch endpoint, cleanup relay, minute counter. Exit: a
@@ -161,7 +169,10 @@ return 200 anonymously. Rules that remain:
   Mitigation: BYO fallback, boring infra, quarterly price re-check.
 - **Accounts widen the surface** — token refresh bugs, account deletion (a
   legal requirement), support email. OAuth-only keeps the worst out.
-- **SIWA-outside-App-Store** — phase-1 spike kills or confirms it first.
+- ~~**SIWA-outside-App-Store**~~ — **retired 2026-08-10**: confirmed
+  unsupported, browser OAuth adopted instead. The risk it was guarding
+  against (a provisioning-profile change disturbing TCC grants) is now
+  structurally impossible.
 - **Local becomes load-bearing for Free** — hardening rides with phase 3.
 - **Pool abuse** — xAI batch pricing caps a maxed 1,500-min pool at $2.50.
 - **Premature merge to `main`** — Pro code on `main` ships in the next free
