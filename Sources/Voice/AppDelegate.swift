@@ -38,6 +38,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// main-thread) rather than as a stored-property initializer.
     private var modelManager: ModelManager!
 
+    /// Pro sign-in: owns the browser OAuth round trip and the restored
+    /// session. Deep links (`murmur://auth-callback`) route here via
+    /// `application(_:open:)`.
+    let authFlow = AuthFlowController()
+
     /// Lazily constructed so the window (and its SwiftUI hierarchy) is only
     /// built once, on first need — not at every Dock-icon click. First
     /// accessed from `openMainWindow()`, which runs after `modelManager` is
@@ -275,6 +280,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// menu-bar item.
     private func openMainWindow() {
         mainWindowController.showAndFocus()
+    }
+
+    /// Deep links. Currently only the Pro sign-in callback
+    /// (`murmur://auth-callback`) — anything else is logged and dropped.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            if authFlow.handleCallback(url) { continue }
+            vlog("deep link ignored: unrecognized murmur:// URL")
+        }
     }
 
     /// Clicking the Dock icon (app running, no visible windows) reopens the

@@ -80,6 +80,13 @@ targets:
         CFBundleExecutable: "$(EXECUTABLE_NAME)"
         CFBundlePackageType: APPL
         CFBundleSignature: "????"
+        # murmur:// deep link — carries the OAuth PKCE callback from the
+        # browser back into the app (Pro sign-in). Native Sign in with Apple
+        # is unavailable to Developer ID apps, so the browser round trip is
+        # the only auth path; see Murmur-server/plans/001.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.matt.voice-dictation.auth
+            CFBundleURLSchemes: [murmur]
         NSPrincipalClass: NSApplication
         # Normal Dock app (NOT LSUIElement): the app shows in the Dock while
         # running and quits with Cmd-Q / Dock → Quit, like Wispr. It still
