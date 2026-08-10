@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.34",
+    "build": "35",
+    "title": "What's New in 0.1.34",
+    "items": [
+      "Dictionary terms and snippet triggers that begin or end with punctuation — “.net”, “@work”, “c++” — now actually apply. They could always be saved, but they never matched anything you said.",
+      "Corrections no longer double up punctuation: dictating “we ship on .net” could come back as “we ship on ..NET”."
+    ]
+  },
+  {
     "version": "0.1.33",
     "build": "34",
     "title": "What's New in 0.1.33",
