@@ -323,6 +323,17 @@ default HubApi path; no open sockets at park time; no thread in WhisperKit
 frames — signature of an unresumed continuation). The vlog brackets around
 `WhisperKit(config)` will convict on the next occurrence.
 
+3. **App-switch abort instrumentation (PR #25):** two long holds ended with
+   `inject: left on clipboard for manual paste` — the frontmost-PID guard
+   working as designed, but with no record of *which* app took focus. Both
+   abort sites now log held vs. current bundle identifiers. Whether the guard
+   needs a grace window is an open question pending those identities.
+
+**Shipped as 0.1.30 (build 31)** on 2026-08-10 — published to the Sparkle feed
+and verified from the published artifacts (downloaded DMG mounted: app version,
+bundled release notes, Developer ID signature, notarization all confirmed; feed
+head correct with 29 items, history intact).
+
 ## Process note
 
 The archive checkout is named `Murmur`, its `CLAUDE.md` and `README` read as
