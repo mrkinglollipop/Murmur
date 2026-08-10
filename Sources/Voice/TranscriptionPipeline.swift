@@ -222,17 +222,18 @@ final class TranscriptionPipeline {
             && shouldAbortInjectForFrontmostMismatch(held: heldPID, current: latePID)
     }
 
-    /// Diagnostic identity for an app-switch abort: which app the hold started
-    /// in vs. which app owned frontmost at injection time. Bundle identifiers
-    /// only — never window titles or content (transcript-privacy rule). Added
-    /// after two live aborts (2026-08-09) where the maintainer could not tell
-    /// what stole focus mid-dictation.
+    /// Diagnostic identity for an app-switch abort: the target app (anchored
+    /// at hotkey release by AudioRecorder) vs. which app owned frontmost at
+    /// injection time. Bundle identifiers only — never window titles or
+    /// content (transcript-privacy rule). Added after two live aborts
+    /// (2026-08-09); re-worded when targeting moved from hold-start to
+    /// release (2026-08-10).
     static func vlogAppSwitchAbort(heldPID: pid_t?, currentPID: pid_t?) {
         func bundleID(_ pid: pid_t?) -> String {
             guard let pid else { return "nil" }
             return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "pid:\(pid)"
         }
-        vlog("inject abort: frontmost changed mid-dictation — held=\(bundleID(heldPID)) current=\(bundleID(currentPID))")
+        vlog("inject abort: frontmost changed between release and insert — target=\(bundleID(heldPID)) current=\(bundleID(currentPID))")
     }
 
     /// Call on main. App-switch abort leave: re-read secure; leave clipboard
