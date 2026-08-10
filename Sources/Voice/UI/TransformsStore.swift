@@ -172,6 +172,12 @@ final class TransformsStore: ObservableObject {
     }
 
     func applyOnLaunch() {
+        // A persisted auto-run id can outlive its transform (deleted in a
+        // prior session, or a corrupt-file reseed). Clear it so the Picker
+        // doesn't render an empty selection and the UserDefaults key resets.
+        if let id = autoRunTransformID, transform(withID: id) == nil {
+            autoRunTransformID = nil
+        }
         pushAutoRunTransform()
     }
 

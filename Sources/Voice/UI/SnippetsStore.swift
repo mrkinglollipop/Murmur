@@ -120,6 +120,10 @@ final class SnippetsStore: ObservableObject {
     }
 
     func update(_ snippet: Snippet) {
+        // Backstop: an empty trigger/expansion turns expand() into a phrase
+        // deleter (trigger replaced with ""). The edit UI guards this too.
+        guard !snippet.trigger.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !snippet.expansion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let mutate = {
             guard let idx = self.snippets.firstIndex(where: { $0.id == snippet.id }) else { return }
             self.snippets[idx] = snippet

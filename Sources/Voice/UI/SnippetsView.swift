@@ -211,6 +211,10 @@ struct SnippetsView: View {
                     .tint(Theme.lavender)
                     .font(.system(size: 12, weight: .semibold))
                     .keyboardShortcut(.return, modifiers: [])
+                    .disabled(
+                        editTrigger.trimmingCharacters(in: .whitespaces).isEmpty ||
+                        editExpansion.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
             }
         }
         .padding(.horizontal, 16)
@@ -248,9 +252,14 @@ struct SnippetsView: View {
     }
 
     private func saveEdit(for snippet: Snippet) {
+        // A blank expansion would make expand() replace the trigger phrase
+        // with empty string — silently deleting it from dictations.
+        let trigger = editTrigger.trimmingCharacters(in: .whitespaces)
+        let expansion = editExpansion.trimmingCharacters(in: .whitespaces)
+        guard !trigger.isEmpty, !expansion.isEmpty else { return }
         var updated = snippet
-        updated.trigger = editTrigger.trimmingCharacters(in: .whitespaces)
-        updated.expansion = editExpansion.trimmingCharacters(in: .whitespaces)
+        updated.trigger = trigger
+        updated.expansion = expansion
         store.update(updated)
         editingID = nil
         focusedEditID = nil

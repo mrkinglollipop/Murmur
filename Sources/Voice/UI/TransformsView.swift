@@ -144,7 +144,7 @@ struct TransformsView: View {
             .pickerStyle(.menu)
             .labelsHidden()
 
-            Text("Global hotkey: ⌃⌥⌘T runs the first transform on your last dictation and copies the result.")
+            Text("Global hotkey: ⌃⌥⌘T runs your auto-run transform (or the first one, if none is set) on your last dictation and copies the result.")
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
         }
@@ -397,6 +397,10 @@ struct TransformsView: View {
                     .tint(Theme.lavender)
                     .font(.system(size: 12, weight: .semibold))
                     .keyboardShortcut(.return, modifiers: [])
+                    .disabled(
+                        editName.trimmingCharacters(in: .whitespaces).isEmpty ||
+                        editPrompt.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
             }
         }
         .padding(14)
@@ -434,9 +438,12 @@ struct TransformsView: View {
     }
 
     private func saveEdit(for transform: Transform) {
+        let name = editName.trimmingCharacters(in: .whitespaces)
+        let prompt = editPrompt.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !prompt.isEmpty else { return }
         var updated = transform
-        updated.name = editName.trimmingCharacters(in: .whitespaces)
-        updated.prompt = editPrompt.trimmingCharacters(in: .whitespaces)
+        updated.name = name
+        updated.prompt = prompt
         store.update(updated)
         editingID = nil
         focusedEditID = nil
