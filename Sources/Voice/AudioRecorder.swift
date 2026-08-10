@@ -329,6 +329,43 @@ final class AudioRecorder {
         )
     }
 
+    /// Pure seam: re-anchor the session hold at hotkey release only when the
+    /// release-time frontmost is known AND differs from the start-time PID.
+    /// Same app (or unknown release identity) keeps the start-time hold, so
+    /// the long-verified same-app path is byte-for-byte unchanged.
+    internal static func shouldRetargetSessionHoldAtRelease(
+        startPID: pid_t?,
+        releasePID: pid_t?
+    ) -> Bool {
+        guard let releasePID else { return false }
+        return startPID != releasePID
+    }
+
+    /// Release-time targeting: the app the user is in when the hotkey is
+    /// RELEASED is the inject destination, not the app the hold started in.
+    /// (2026-08-10 live abort: a hold began while switching away from
+    /// another app, so a perfectly good transcript landed on the clipboard
+    /// instead of the frontmost textbox.) Replaces the cached snapshot + PID
+    /// with a fresh same-moment sample so caret transforms can never mix
+    /// apps. The pre-insert TOCTOU guard in TranscriptionPipeline still
+    /// aborts if focus changes between release and insert (cloud finalize
+    /// can take seconds).
+    private func retargetedSessionHoldAtRelease(
+        _ startHold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?)
+    ) -> (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?) {
+        assert(Thread.isMainThread, "retargetedSessionHoldAtRelease requires main thread")
+        guard startHold.token != nil else { return startHold }
+        let releasePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        guard Self.shouldRetargetSessionHoldAtRelease(
+            startPID: startHold.pid,
+            releasePID: releasePID
+        ) else {
+            return startHold
+        }
+        vlog("inject target re-anchored at release — frontmost changed during hold")
+        return (startHold.token, CaretContext.snapshot(frontmostPID: releasePID), releasePID)
+    }
+
     /// After inject pipeline finishes a take: drop that take's AudioRecorder
     /// session slots + cache entry. Token-matched so a newer pending that
     /// differs from the consumed token is preserved. Does not touch the live
@@ -989,7 +1026,12 @@ final class AudioRecorder {
 
         // Capture hold before streaming finalize / file-IO Tasks so a rapid
         // re-press cannot poison inject with a newer will-start snapshot.
-        let sessionHold = sampleActiveSessionHold()
+        // Then re-anchor it to the app frontmost NOW: releasing the hotkey is
+        // the targeting gesture — a hold may legitimately start in one app
+        // and end in the one the user wants the text in (multi-screen
+        // roaming, press-while-switching). Same app or unknown release
+        // identity keeps the start-time hold unchanged.
+        let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold())
 
         if streamingCoordinator.xaiSession != nil || streamingCoordinator.elevenLabsSession != nil {
             teardownMicEngine()
