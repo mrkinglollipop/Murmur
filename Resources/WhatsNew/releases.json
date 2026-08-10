@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.30",
+    "build": "31",
+    "title": "What's New in 0.1.30",
+    "items": [
+      "Dictation recovers automatically when another app's voice feature leaves the microphone silently dead — no more empty holds after switching back to Murmur.",
+      "If the microphone is rerouted mid-dictation, capture restarts in place and keeps what you already said instead of losing the rest of the hold.",
+      "The on-device fallback can no longer hang forever loading its model — a stuck load now fails visibly and keeps the recording so you can retry from History."
+    ]
+  },
+  {
     "version": "0.1.29",
     "build": "30",
     "title": "What's New in 0.1.29",
