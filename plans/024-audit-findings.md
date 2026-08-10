@@ -334,6 +334,37 @@ and verified from the published artifacts (downloaded DMG mounted: app version,
 bundled release notes, Developer ID signature, notarization all confirmed; feed
 head correct with 29 items, history intact).
 
+### Inject target anchored at release (PR #27, shipped 0.1.31)
+
+The instrumentation from PR #25 answered its own question on the next abort:
+
+```
+inject abort: frontmost changed mid-dictation —
+  held=com.matthewschwartz.aegis current=com.anthropic.claudefordesktop
+```
+
+No app self-activated. The maintainer starts a hold while switching away from
+another app and continues dictating while moving across screens, so the app
+frontmost at *hold start* was never the intended target — the app frontmost at
+*hotkey release* is. 247 transcribed characters went to the clipboard because
+the anchor was taken at the wrong moment.
+
+`AudioRecorder.doStop` now re-anchors the session hold (PID **and** a
+same-moment `CaretContext` snapshot, so caret transforms can never mix apps) to
+the release-time frontmost app, behind the pure seam
+`shouldRetargetSessionHoldAtRelease`. Same app at press and release, or an
+unknown release identity, keeps the start-time hold — the long-verified path is
+unchanged. The pre-insert TOCTOU guard is untouched and still diverts to the
+clipboard when focus changes between release and insert, which is the genuine
+stolen-focus case (cloud finalize stretched to 7.2 s in the logged incident).
+
+**Shipped as 0.1.31 (build 32)** on 2026-08-10 — feed head verified with 30
+items and history intact; downloaded DMG mounted and confirmed at 0.1.31 (32)
+with matching bundled notes, `accepted / source=Notarized Developer ID`, and
+the expected Developer ID authority. The roaming case itself is **unverified
+live** — it needs a real multi-screen dictation, which logs
+`inject target re-anchored at release` under `VOICE_DEBUG`.
+
 ## Process note
 
 The archive checkout is named `Murmur`, its `CLAUDE.md` and `README` read as
