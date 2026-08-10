@@ -97,7 +97,7 @@ final class SnippetsStore: ObservableObject {
         for snippet in snippets {
             let trigger = snippet.trigger.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trigger.isEmpty else { continue }
-            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: trigger))\\b"
+            let pattern = PhraseBoundaryPattern.wholePhrase(for: trigger)
             if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
                 cache[trigger] = regex
             }

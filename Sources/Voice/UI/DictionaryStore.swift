@@ -307,11 +307,16 @@ final class DictionaryStore: ObservableObject {
         var index: [String: [UUID]] = [:]
         for entry in entries {
             for variant in entry.variants where !variant.isEmpty {
-                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: variant))\\b"
+                let pattern = PhraseBoundaryPattern.wholePhrase(for: variant)
                 if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
                     cache[variant] = regex
                 }
             }
+            // The phonetic pass swaps a bare word token for the term verbatim,
+            // so a term with edge punctuation would duplicate punctuation the
+            // text already has (".net" -> "..NET"). Those terms are reachable
+            // through the literal variant pass above only.
+            guard PhraseBoundaryPattern.hasWordCharacterEdges(entry.term) else { continue }
             let encoded = PhoneticMatcher.encode(entry.term)
             for code in [encoded.primary, encoded.secondary].compactMap({ $0 }) where !code.isEmpty {
                 index[code, default: []].append(entry.id)
