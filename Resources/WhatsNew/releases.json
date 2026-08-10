@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.31",
+    "build": "32",
+    "title": "What's New in 0.1.31",
+    "items": [
+      "Dictation now types into whatever app you are in when you release the key. Start a thought in one window, walk to another, and the text lands where you finish — no more transcripts left on the clipboard because you moved.",
+      "If another app steals focus while Murmur is still transcribing, the text is still left on the clipboard rather than pasted into the wrong window."
+    ]
+  },
+  {
     "version": "0.1.30",
     "build": "31",
     "title": "What's New in 0.1.30",
