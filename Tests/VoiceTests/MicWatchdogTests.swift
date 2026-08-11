@@ -7,6 +7,34 @@ import XCTest
 /// as `max RMS 0.0000 … buffers=0` after another app's voice session).
 final class MicWatchdogTests: XCTestCase {
 
+    // MARK: - Dead-mic reporting
+    //
+    // A wedged input device (another app taking Sound input — observed
+    // 2026-08-11 with Jump Desktop) delivers zero buffers while the engine and
+    // socket both report success. The RMS silence guard cannot tell that from
+    // a quiet room, so the hold used to be discarded with no visible sign.
+
+    func testReportsDeadMicWhenNoBuffersOverARealHold() {
+        XCTAssertTrue(AudioRecorder.shouldReportDeadMic(buffersSeen: 0, holdDuration: 3.0))
+    }
+
+    func testDeadMicBoundaryIsInclusive() {
+        XCTAssertTrue(AudioRecorder.shouldReportDeadMic(buffersSeen: 0, holdDuration: 1.0))
+    }
+
+    /// 0.1.32 shipped a floor so an accidental split-second tap is ignored
+    /// rather than erroring. A dead-mic report must not undo that.
+    func testAccidentalTapStaysSilent() {
+        XCTAssertFalse(AudioRecorder.shouldReportDeadMic(buffersSeen: 0, holdDuration: 0.2))
+        XCTAssertFalse(AudioRecorder.shouldReportDeadMic(buffersSeen: 0, holdDuration: 0.9))
+    }
+
+    /// Buffers arrived and were merely quiet — that is the silence guard's
+    /// job, and it must stay silent.
+    func testQuietRoomIsNotReportedAsDeadMic() {
+        XCTAssertFalse(AudioRecorder.shouldReportDeadMic(buffersSeen: 42, holdDuration: 3.0))
+    }
+
     func testRestartsWhenTakeLiveAndNoBuffers() {
         XCTAssertTrue(
             AudioRecorder.watchdogShouldRestartCapture(
