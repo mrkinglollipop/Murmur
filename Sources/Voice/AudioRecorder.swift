@@ -136,6 +136,25 @@ final class AudioRecorder {
     /// 48 kHz); 400 ms with none is a dead engine, not a quiet room.
     private static let zeroBufferWatchdogDelay: TimeInterval = 0.4
 
+    /// A hold this long that produced zero buffers did not capture quiet
+    /// speech — the input device delivered nothing at all (wedged device, or
+    /// another app holding the input). Comfortably above an accidental
+    /// split-second tap, which must stay silent: see the tiny-tap floor
+    /// shipped in 0.1.32.
+    private static let deadMicMinimumHoldSeconds: TimeInterval = 1.0
+
+    /// Whether a discarded hold should be reported as a dead microphone
+    /// rather than silently dropped. Zero buffers means the tap never fired
+    /// even once, which the RMS-based silence guard cannot distinguish from a
+    /// genuinely quiet room.
+    static func shouldReportDeadMic(buffersSeen: Int, holdDuration: TimeInterval) -> Bool {
+        buffersSeen == 0 && holdDuration >= deadMicMinimumHoldSeconds
+    }
+
+    /// Wall-clock length of the hold being finished, recorded at release so
+    /// the discard path can tell a dead mic from an accidental tap.
+    private var lastHoldDuration: TimeInterval = 0
+
     /// Tracks the most recent start/stop request. Guards against a stale
     /// permission-completion handler (fired after a later stopRecording())
     /// resurrecting a recording the caller already cancelled.
@@ -1023,6 +1042,7 @@ final class AudioRecorder {
         let bufferedAudio = pcmBuffers
         pcmBuffersLock.unlock()
         let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
+        lastHoldDuration = elapsed
 
         // Capture hold before streaming finalize / file-IO Tasks so a rapid
         // re-press cannot poison inject with a newer will-start snapshot.
@@ -1204,6 +1224,7 @@ final class AudioRecorder {
         pcmBuffersLock.unlock()
 
         let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
+        lastHoldDuration = elapsed
         logger.info("Recording stopped — duration \(String(format: "%.2f", elapsed))s, \(capturedBuffers.count) buffers")
 
         guard !capturedBuffers.isEmpty else {
@@ -1244,7 +1265,17 @@ final class AudioRecorder {
         engineID: String,
         sessionHeldToken: UInt64?
     ) {
-        vlog("discarded hold — reason=\(reason) engine=\(engineID)")
+        pcmBuffersLock.lock()
+        let buffersSeen = pcmBuffers.count
+        pcmBuffersLock.unlock()
+        // Zero buffers over a hold long enough to have produced some is a dead
+        // input device, not a quiet room — the user must be told, or every
+        // dictation looks like it worked and silently vanishes.
+        let deadMic = Self.shouldReportDeadMic(
+            buffersSeen: buffersSeen,
+            holdDuration: lastHoldDuration
+        )
+        vlog("discarded hold — reason=\(reason) engine=\(engineID) buffers=\(buffersSeen) deadMic=\(deadMic)")
         clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -1256,7 +1287,13 @@ final class AudioRecorder {
                 true,
                 nil
             )
-            self.hud.hide()
+            if deadMic {
+                // Routes through the standard failure path: error pill,
+                // failure sound, menu-bar badge.
+                self.asrSelector.onFailure?(.micDeliveredNoAudio)
+            } else {
+                self.hud.hide()
+            }
         }
     }
 

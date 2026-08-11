@@ -7,6 +7,7 @@ enum DictationFailure: Equatable {
     case injectionFailed
     case audioWriteFailed
     case micStartFailed
+    case micDeliveredNoAudio
     case secureInputBlocked
 
     /// User-facing copy for the HUD error pill.
@@ -20,6 +21,8 @@ enum DictationFailure: Equatable {
             return "Couldn't save audio"
         case .micStartFailed:
             return "Microphone unavailable"
+        case .micDeliveredNoAudio:
+            return "No mic audio — check Sound input"
         case .secureInputBlocked:
             return "Secure field — can't paste"
         }
