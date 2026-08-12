@@ -17,6 +17,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var pollTask: Task<Void, Never>?
     private var startTimeoutTask: Task<Void, Never>?
     private var lastSpaceTap: ContinuousClock.Instant?
+    private let autocorrect = AutocorrectController()
 
     var enableInputClicksWhenVisible: Bool { true }
 
@@ -48,6 +49,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.onSpaceDrag = { [weak self] delta in
             self?.textDocumentProxy.adjustTextPosition(byCharacterOffset: delta)
         }
+        root.onCandidate = { [weak self] index in self?.applyCandidate(at: index) }
         root.setShowsGlobe(needsInputModeSwitchKey)
         applyDocumentState()
     }
@@ -66,6 +68,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         consumeHandoffIfReady()
         applyDocumentState()
         if session == .waiting { startPolling() }
+        requestSupplementaryLexicon { [weak self] lexicon in
+            self?.autocorrect.setLexicon(lexicon)
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -133,18 +138,91 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             textDocumentProxy.deleteBackward()
             textDocumentProxy.insertText(". ")
             lastSpaceTap = nil
-        } else {
-            textDocumentProxy.insertText(text)
-            lastSpaceTap = text == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
+            updateCapitalization()
+            refreshSuggestions()
+            return
+        }
+        applyAutocorrectIfNeeded(beforeInserting: text)
+        textDocumentProxy.insertText(text)
+        lastSpaceTap = text == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
+        if autocorrect.suppressUntilWhitespace, AutocorrectEngine.isCommitText(text) {
+            autocorrect.suppressUntilWhitespace = false
         }
         updateCapitalization()
+        refreshSuggestions()
     }
 
     private func deleteFromKeyboard() {
         UIDevice.current.playInputClick()
         lastSpaceTap = nil
         textDocumentProxy.deleteBackward()
+        autocorrect.clearUndo()
         updateCapitalization()
+        refreshSuggestions()
+    }
+
+    private func applyAutocorrectIfNeeded(beforeInserting text: String) {
+        guard phase != .secure, phase != .waiting else { return }
+        guard AutocorrectEngine.isCommitText(text) else { return }
+        guard !autocorrect.suppressUntilWhitespace else { return }
+        let context = textDocumentProxy.documentContextBeforeInput ?? ""
+        let span = AutocorrectEngine.wordSpan(beforeInput: context)
+        guard let correction = autocorrect.correction(for: span), correction != span else { return }
+        let replacement = AutocorrectEngine.replacement(span: span, correction: correction)
+        for _ in 0..<replacement.deleteCount {
+            textDocumentProxy.deleteBackward()
+        }
+        textDocumentProxy.insertText(replacement.insert)
+        autocorrect.noteAutocorrect(original: span, corrected: replacement.insert)
+    }
+
+    private func applyCandidate(at index: Int) {
+        guard phase != .secure, phase != .waiting else { return }
+        let choices = autocorrect.displayed
+        guard index >= 0, index < choices.count else { return }
+        let chosen = choices[index]
+        let context = textDocumentProxy.documentContextBeforeInput ?? ""
+        let active = AutocorrectEngine.wordSpan(beforeInput: context)
+        let target: String
+        let trailing: String
+        if !active.isEmpty {
+            target = active
+            trailing = ""
+        } else {
+            let committed = AutocorrectEngine.committedSpan(beforeInput: context)
+            target = committed.word
+            trailing = committed.trailing
+        }
+        guard !target.isEmpty else { return }
+        for _ in 0..<(trailing.count + target.count) {
+            textDocumentProxy.deleteBackward()
+        }
+        textDocumentProxy.insertText(chosen + trailing)
+        if let original = autocorrect.undoOriginal, chosen.lowercased() == original.lowercased() {
+            autocorrect.ignore(original)
+        }
+        autocorrect.clearUndo()
+        updateCapitalization()
+        refreshSuggestions()
+    }
+
+    private func refreshSuggestions() {
+        guard phase != .secure, phase != .waiting else { return }
+        let context = textDocumentProxy.documentContextBeforeInput ?? ""
+        let span = AutocorrectEngine.wordSpan(beforeInput: context)
+        if let corrected = autocorrect.lastCorrected {
+            if span == corrected {
+                root.setCandidates(autocorrect.displayed)
+                return
+            }
+            let committed = AutocorrectEngine.committedSpan(beforeInput: context)
+            if span.isEmpty, committed.word == corrected {
+                root.setCandidates(autocorrect.displayed)
+                return
+            }
+            autocorrect.clearUndo()
+        }
+        root.setCandidates(autocorrect.suggestions(for: span))
     }
 
     private func shouldReplaceSecondSpaceWithPeriod() -> Bool {
@@ -191,17 +269,25 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             break
         case .setup:
             root.setRecording(false)
-            if !hasFullAccess {
-                root.setStatus("Turn on Full Access in Settings")
+            let span = AutocorrectEngine.wordSpan(
+                beforeInput: textDocumentProxy.documentContextBeforeInput ?? ""
+            )
+            if span.isEmpty {
+                if !hasFullAccess {
+                    root.setStatus("Turn on Full Access in Settings")
+                } else {
+                    root.setStatus("Add an ElevenLabs key in Murmur")
+                }
             } else {
-                root.setStatus("Add an ElevenLabs key in Murmur")
+                root.setStatus(" ")
+                refreshSuggestions()
             }
         case .waiting:
             applyLiveStatus()
         case .idle:
             root.setRecording(false)
             root.setStatus(" ")
-            root.setCandidates([])
+            refreshSuggestions()
         }
     }
 
@@ -422,6 +508,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             let text = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
                 textDocumentProxy.insertText(text)
+                autocorrect.suppressUntilWhitespace = true
+                autocorrect.clearUndo()
                 HandoffDiagnostics.record(
                     "keyboard.insertion.acknowledged",
                     detail: "\(payload.id) characters=\(text.count)"

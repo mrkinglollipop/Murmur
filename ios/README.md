@@ -23,11 +23,21 @@ xcodegen generate
 xcodebuild -project MurmurIOS.xcodeproj -scheme MurmurIOS \
   -destination 'generic/platform=iOS' -configuration Debug \
   DEVELOPMENT_TEAM=XGLHMG3629 -derivedDataPath build build
+
+# Autocorrect unit tests (iOS 27 simulator)
+xcodebuild test -project MurmurIOS.xcodeproj -scheme MurmurKeyboardTests \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=27.0' \
+  CODE_SIGNING_ALLOWED=NO
 ```
 
 Keyboard mic opens Murmur (`extensionContext.open`) so the host can record.
 Stay on the swipe interstitial, swipe back to Notes/Messages, then speak.
 Tap the keyboard mic again to send. Do not dictate inside Murmur.
+
+Typing uses `UITextChecker` plus a bundled frequency list. `teh` + space
+becomes `the`; the original stays in the candidate bar as undo. Autocorrect
+runs with Full Access off. It does not run in secure fields, and the first
+space after a dictation insert does not respell the transcript.
 
 > Distribution note: the keyboard launch/return handoff currently relies on responder-chain and private system APIs. This build is for private sideload testing and is not App Store-ready.
 
@@ -47,5 +57,6 @@ Swift toolchain or fake a build; use a Mac with Xcode.
 
 This README is the in-repo worksheet. Next slice is whatever the continuing
 thread asks for. Out of scope until explicitly pulled in: Pro/subscription,
-Murmur-server, IAP, local Whisper on iOS, full QWERTY, Mac target changes, App
-Store submit.
+Murmur-server, IAP, local Whisper on iOS, Mac target changes, App
+Store submit. GIPHY is blocked on an iOS Giphy API key. Swipe-to-type is
+ship-gated after a device bake-off.

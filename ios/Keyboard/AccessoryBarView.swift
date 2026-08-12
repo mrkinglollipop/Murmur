@@ -86,6 +86,13 @@ final class AccessoryBarView: UIView {
     }
 
     func setCandidates(_ words: [String]) {
+        let hasWords = words.contains { !$0.isEmpty }
+        if hasWords {
+            caption = ""
+            captionLabel.text = ""
+            captionLabel.isHidden = true
+            candidateButtons.forEach { $0.isHidden = false }
+        }
         for (index, button) in candidateButtons.enumerated() {
             let word = index < words.count ? words[index] : ""
             button.setTitle(word, for: .normal)

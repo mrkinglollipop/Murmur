@@ -93,6 +93,8 @@ targets:
           - MicRecorder.swift
           - ElevenLabsBatch.swift
           - WAVTranscoder.swift
+      - path: Resources
+        buildPhase: resources
     info:
       path: Keyboard/Info.plist
       properties:
@@ -156,3 +158,19 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: "Murmur Widget Development"
         SKIP_INSTALL: YES
         TARGETED_DEVICE_FAMILY: "1"
+
+  MurmurKeyboardTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KeyboardTests
+      - path: Keyboard/AutocorrectEngine.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboardtests
+        GENERATE_INFOPLIST_FILE: YES
+        IPHONEOS_DEPLOYMENT_TARGET: "27.0"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        PROVISIONING_PROFILE_SPECIFIER: ""
