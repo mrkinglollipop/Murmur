@@ -52,10 +52,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         root.setShowsGlobe(needsInputModeSwitchKey)
-        if let host = HostAppProbe.bundleID(from: self) {
+        if let host = HostAppProbe.probedBundleID(from: self) {
             HostAppProbe.remember(host)
-            HandoffDiagnostics.record("keyboard.host.detected", detail: host)
+            HandoffDiagnostics.record("keyboard.host.detected", detail: "probed=\(host)")
+        } else {
+            HandoffDiagnostics.record("keyboard.host.detected", detail: "empty=")
         }
+        signalHostReadyIfGated()
         _ = adoptExistingSession()
         consumeHandoffIfReady()
         applyDocumentState()
@@ -207,7 +210,11 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         switch payload.status {
         case .pending:
             root.setRecording(true)
-            root.setStatus("Starting…")
+            if !AppGroupStore.listenGateRequestID.isEmpty {
+                root.setStatus("Murmur is on — swipe back to speak")
+            } else {
+                root.setStatus("Starting…")
+            }
         case .recording:
             root.setRecording(true)
             root.setStatus("Listening… tap mic to send")
@@ -290,11 +297,21 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func startHandoff() {
+        root.dismissError()
         let id = UUID().uuidString
-        let detectedHost = HostAppProbe.bundleID(from: self) ?? AppGroupStore.lastHostBundleID
-        let host = detectedHost.isEmpty ? "com.apple.MobileSMS" : detectedHost
+        let probed = HostAppProbe.probedBundleID(from: self)
+        if let probed {
+            HostAppProbe.remember(probed)
+            HandoffDiagnostics.record("keyboard.host.handoff", detail: "probed=\(probed)")
+        } else {
+            // Kill a persisted Messages default from older builds so it cannot leak.
+            HostAppProbe.forget()
+            HandoffDiagnostics.record("keyboard.host.handoff", detail: "empty=")
+        }
+        // This-take probe only. lastHost is poison — a prior Messages take must
+        // not send a Notes take to iMessage.
+        let host = probed ?? ""
         let lease = DictationHandoff.readLease()
-        HostAppProbe.remember(host)
         DictationHandoff.write(.init(
             id: id,
             status: .pending,
@@ -304,9 +321,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         ))
         waitingID = id
         session = .waiting
-        HandoffDiagnostics.record("keyboard.request.created", detail: "\(id) host=\(host)")
+        HandoffDiagnostics.record("keyboard.request.created", detail: "\(id) host=\(host.isEmpty ? "empty" : host)")
         refreshChrome()
-        let url = DictationHandoff.dictateURL(id: id, hostBundleID: host, keyboardStack: true)
+        let url = DictationHandoff.dictateURL(id: id, hostBundleID: host.isEmpty ? nil : host, keyboardStack: true)
         if let lease {
             HandoffDiagnostics.record(
                 "keyboard.lease.reusing",
@@ -319,6 +336,17 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             startSubmissionTimeout(for: id)
         }
         startPolling()
+    }
+
+    /// Tell the host the originating keyboard is on screen so listen-gate can open the segment.
+    private func signalHostReadyIfGated() {
+        let gatedID = AppGroupStore.listenGateRequestID
+        guard !gatedID.isEmpty else { return }
+        guard let payload = DictationHandoff.read(),
+              payload.id == gatedID,
+              payload.status == .pending else { return }
+        HandoffDiagnostics.record("keyboard.hostReady", detail: gatedID)
+        DictationBridge.post(.hostReady)
     }
 
     private func startReuseTimeout(for id: String, url: URL) {
@@ -399,8 +427,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             refreshChrome()
         case .failed:
             finishWait()
-            root.setStatus(payload.error.isEmpty ? "Dictation failed" : payload.error)
+            let message = payload.error.isEmpty
+                ? "Couldn't start audio capture. Tap the mic to try again, or quit and reopen Murmur if it keeps happening."
+                : payload.error
+            root.showError(message)
             DictationHandoff.clear()
+            refreshChrome()
         case .cancelled:
             finishWait()
             DictationHandoff.clear()

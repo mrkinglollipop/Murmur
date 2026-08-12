@@ -6,6 +6,7 @@ enum AppGroupStore {
     static let languageKey = "languageCode"
     static let lastHostKey = "lastHostBundleID"
     static let microphoneLevelKey = "microphoneLevel"
+    static let listenGateRequestIDKey = "listenGateRequestID"
 
     private static var suite: UserDefaults? {
         UserDefaults(suiteName: suiteName)
@@ -32,5 +33,12 @@ enum AppGroupStore {
     static var microphoneLevel: Double {
         get { suite?.double(forKey: microphoneLevelKey) ?? 0 }
         set { suite?.set(min(1, max(0, newValue)), forKey: microphoneLevelKey) }
+    }
+
+    /// Non-empty while a keyboard-initiated take has the input graph armed but is
+    /// waiting for the keyboard to reappear before opening the WAV segment.
+    static var listenGateRequestID: String {
+        get { suite?.string(forKey: listenGateRequestIDKey) ?? "" }
+        set { suite?.set(newValue, forKey: listenGateRequestIDKey) }
     }
 }

@@ -13,6 +13,8 @@ final class DictationController: ObservableObject {
     @Published var isPaused = false
     @Published var isBusy = false
     @Published var transcript = ""
+    /// Keyboard-initiated take: input graph armed, waiting for swipe-back / hostReady.
+    @Published var isAwaitingHostReturn = false
 
     private let recorder = MicRecorder()
     private var requestID = ""
@@ -24,7 +26,9 @@ final class DictationController: ObservableObject {
     private var leaseExpiryTask: Task<Void, Never>?
     private var leaseHeartbeatTask: Task<Void, Never>?
     private var meteringTask: Task<Void, Never>?
+    private var listenGateTimeoutTask: Task<Void, Never>?
     private var keepaliveEligible = false
+    private var listenGated = false
 
     private init() {
         let pointer = Unmanaged.passUnretained(self).toOpaque()
@@ -89,6 +93,20 @@ final class DictationController: ObservableObject {
             nil,
             .deliverImmediately
         )
+        CFNotificationCenterAddObserver(
+            center,
+            pointer,
+            { _, _, _, _, _ in
+                Task { @MainActor in
+                    _ = DictationBridge.take()
+                    HandoffDiagnostics.record("app.command.hostReady.received")
+                    DictationController.shared.hostKeyboardReady()
+                }
+            },
+            DictationBridge.hostReadyName,
+            nil,
+            .deliverImmediately
+        )
     }
 
     func becomeActive() {
@@ -102,6 +120,10 @@ final class DictationController: ObservableObject {
             discard()
             return
         }
+        if command == .hostReady {
+            hostKeyboardReady()
+            return
+        }
         guard isArmed, !isBusy else {
             return
         }
@@ -110,7 +132,7 @@ final class DictationController: ObservableObject {
             send()
         case .toggle:
             toggleMic()
-        case .start, .cancel:
+        case .start, .cancel, .hostReady:
             break
         case nil:
             break
@@ -133,7 +155,7 @@ final class DictationController: ObservableObject {
         if let payload, payload.status == .pending {
             let age = DictationHandoff.pendingAge() ?? .infinity
             HandoffDiagnostics.record("app.pending.observed", detail: "\(payload.id) age=\(age)")
-            if age > 12 {
+            if age > 12 && AppGroupStore.listenGateRequestID != payload.id {
                 DictationHandoff.write(.init(
                     id: payload.id,
                     status: .failed,
@@ -142,6 +164,19 @@ final class DictationController: ObservableObject {
                     hostBundleID: payload.hostBundleID
                 ))
                 HandoffDiagnostics.record("app.pending.expired", detail: payload.id)
+                return
+            }
+            if AppGroupStore.listenGateRequestID == payload.id {
+                requestID = payload.id
+                hostBundleID = payload.hostBundleID
+                keyboardStack = true
+                listenGated = true
+                isAwaitingHostReturn = true
+                isArmed = true
+                isRecording = false
+                statusText = "Murmur is on"
+                HandoffDiagnostics.record("app.listenGate.restored", detail: payload.id)
+                scheduleListenGateTimeout()
             }
             return
         }
@@ -180,30 +215,35 @@ final class DictationController: ObservableObject {
         }
         if recorder.isRecording || recorder.canResume {
             isArmed = true
-            HostReturn.bounceBack(keyboardStack: keyboardStack, hostBundleID: hostBundleID)
             return
         }
         leaseExpiryTask?.cancel()
         leaseHeartbeatTask?.cancel()
         DictationHandoff.clearLease()
-        let host = [hostBundleID, AppGroupStore.lastHostBundleID].first { !$0.isEmpty }
-            ?? ""
+        let host = hostBundleID
         requestID = id
         self.hostBundleID = host
         self.keyboardStack = keyboardStack
-        AppGroupStore.lastHostBundleID = host
+        if !host.isEmpty {
+            HostAppProbe.remember(host)
+        }
         isArmed = true
         isBusy = false
         isPaused = false
         transcript = ""
-        statusText = "Listening…"
+        statusText = keyboardStack
+            ? "Murmur is on"
+            : "Listening…"
         write(.pending, text: "", error: "")
-        beginRecording(bounce: true, retryByForeground: false)
+        beginRecording(bounce: true, retryByForeground: false, gateListen: keyboardStack)
     }
 
     func toggleMic() {
         restoreIfNeeded()
         guard !isBusy else { return }
+        if listenGated {
+            return
+        }
         if recorder.isRecording {
             recorder.pause()
             isRecording = false
@@ -281,7 +321,7 @@ final class DictationController: ObservableObject {
                     guard self.requestID == id else { return }
                     self.transcript = text
                     self.isBusy = false
-                    self.statusText = "Inserted — check Messages"
+                    self.statusText = "Inserted"
                     self.write(.done, text: text, error: "")
                     HandoffDiagnostics.record(
                         "app.transcription.succeeded",
@@ -313,6 +353,7 @@ final class DictationController: ObservableObject {
     }
 
     func discard() {
+        clearListenGate()
         stopMetering()
         recorder.cancel()
         if !requestID.isEmpty {
@@ -330,8 +371,23 @@ final class DictationController: ObservableObject {
         endLiveActivity()
     }
 
+    /// Keyboard reappeared in the originating app — open the segment and start Listening.
+    func hostKeyboardReady() {
+        let gatedID = AppGroupStore.listenGateRequestID
+        guard listenGated,
+              !requestID.isEmpty,
+              gatedID == requestID,
+              !recorder.isRecording,
+              !isBusy else {
+            return
+        }
+        HandoffDiagnostics.record("app.hostReady", detail: requestID)
+        openGatedSegment()
+    }
+
     private func startFreshTake() {
         clearLease()
+        clearListenGate()
         let id = UUID().uuidString
         requestID = id
         isArmed = true
@@ -339,7 +395,7 @@ final class DictationController: ObservableObject {
         isPaused = false
         transcript = ""
         write(.pending, text: "", error: "")
-        beginRecording(bounce: false, retryByForeground: false)
+        beginRecording(bounce: false, retryByForeground: false, gateListen: false)
     }
 
     private func startLeasedTake() {
@@ -356,6 +412,7 @@ final class DictationController: ObservableObject {
         leaseHeartbeatTask?.cancel()
         leaseHeartbeatTask = nil
         DictationHandoff.clearLease()
+        clearListenGate()
         requestID = payload.id
         hostBundleID = payload.hostBundleID.isEmpty ? lease.hostBundleID : payload.hostBundleID
         keyboardStack = true
@@ -365,10 +422,14 @@ final class DictationController: ObservableObject {
         transcript = ""
         statusText = "Listening…"
         HandoffDiagnostics.record("app.lease.startAccepted", detail: payload.id)
-        beginRecording(bounce: false, retryByForeground: true)
+        beginRecording(bounce: false, retryByForeground: true, gateListen: false)
     }
 
-    private func beginRecording(bounce: Bool, retryByForeground: Bool) {
+    private func beginRecording(bounce _: Bool, retryByForeground: Bool, gateListen: Bool) {
+        if gateListen {
+            beginGatedRecording()
+            return
+        }
         HandoffDiagnostics.record("app.recording.starting", detail: requestID)
         do {
             try recorder.start()
@@ -390,6 +451,75 @@ final class DictationController: ObservableObject {
             requestID = ""
             return
         }
+        markListeningLive()
+        // Keyboard takes stay in Murmur. Auto-return (suspend/workspace) sent
+        // Notes users to Home or Messages. Swipe-right is the product.
+    }
+
+    /// Arm the input graph in Murmur foreground, bounce/swipe, open the file only
+    /// after the keyboard signals hostReady.
+    private func beginGatedRecording() {
+        HandoffDiagnostics.record("app.recording.arming", detail: "\(requestID) listenGated=yes")
+        do {
+            try recorder.armInputGraph()
+        } catch {
+            HandoffDiagnostics.record(
+                "app.recording.armFailed",
+                detail: "\(error.localizedDescription) — degrade to immediate capture"
+            )
+            // Degrade: mic must start in Murmur if we cannot arm a gated graph.
+            HandoffDiagnostics.record("app.listenGate.degrade", detail: requestID)
+            beginRecording(bounce: false, retryByForeground: false, gateListen: false)
+            return
+        }
+        listenGated = true
+        isAwaitingHostReturn = true
+        keepaliveEligible = true
+        AppGroupStore.listenGateRequestID = requestID
+        isRecording = false
+        isPaused = false
+        statusText = "Murmur is on"
+        write(.pending, text: "", error: "")
+        if activity == nil {
+            startLiveActivity(recording: false, label: "Return to app")
+        } else {
+            updateLiveActivity(recording: false, label: "Return to app")
+        }
+        HandoffDiagnostics.record("app.listenGate.armed", detail: requestID)
+        scheduleListenGateTimeout()
+        // Stay on the interstitial. suspend/workspace dumps to Home or Messages.
+        // User swipes back to Notes; keyboard viewWillAppear posts hostReady.
+    }
+
+    private func openGatedSegment() {
+        listenGateTimeoutTask?.cancel()
+        listenGateTimeoutTask = nil
+        HandoffDiagnostics.record("app.recording.starting", detail: "\(requestID) listenGated=open")
+        do {
+            try recorder.start()
+        } catch {
+            HandoffDiagnostics.record(
+                "app.recording.failed",
+                detail: "\(error.localizedDescription) listenGate=open"
+            )
+            // Background open failed — degrade note for device AC; fail this take cleanly.
+            HandoffDiagnostics.record("app.listenGate.openFailed", detail: requestID)
+            statusText = error.localizedDescription
+            write(.failed, text: "", error: error.localizedDescription)
+            clearListenGate()
+            isArmed = false
+            clearLease()
+            endLiveActivity()
+            requestID = ""
+            return
+        }
+        clearListenGate()
+        markListeningLive()
+        HandoffDiagnostics.record("app.listenGate.opened", detail: requestID)
+    }
+
+    private func markListeningLive() {
+        isAwaitingHostReturn = false
         isRecording = true
         keepaliveEligible = true
         startMetering()
@@ -402,9 +532,43 @@ final class DictationController: ObservableObject {
             updateLiveActivity(recording: true, label: "Listening")
         }
         write(.recording, text: "", error: "")
-        if bounce {
-            HostReturn.bounceBack(keyboardStack: keyboardStack, hostBundleID: hostBundleID)
+    }
+
+    private func scheduleListenGateTimeout() {
+        listenGateTimeoutTask?.cancel()
+        let id = requestID
+        listenGateTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(60))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self,
+                      self.listenGated,
+                      self.requestID == id,
+                      !self.recorder.isRecording else { return }
+                HandoffDiagnostics.record("app.listenGate.timeout", detail: id)
+                self.statusText = "Return timed out. Tap the keyboard mic to try again."
+                self.write(
+                    .failed,
+                    text: "",
+                    error: "Return to the app timed out before listening started. Tap the keyboard mic to try again."
+                )
+                self.clearListenGate()
+                self.isArmed = false
+                self.requestID = ""
+                self.clearLease()
+                self.endLiveActivity()
+            }
         }
+    }
+
+    private func clearListenGate() {
+        listenGateTimeoutTask?.cancel()
+        listenGateTimeoutTask = nil
+        if AppGroupStore.listenGateRequestID == requestID || requestID.isEmpty {
+            AppGroupStore.listenGateRequestID = ""
+        }
+        listenGated = false
+        isAwaitingHostReturn = false
     }
 
     private func publishLease(completedRequestID: String) {
@@ -478,6 +642,7 @@ final class DictationController: ObservableObject {
 
     private func sessionBecameUnavailable() {
         HandoffDiagnostics.record("app.audio.sessionUnavailable", detail: requestID)
+        clearListenGate()
         stopMetering()
         keepaliveEligible = false
         if isBusy, transcribeTask != nil, !requestID.isEmpty {

@@ -25,7 +25,9 @@ xcodebuild -project MurmurIOS.xcodeproj -scheme MurmurIOS \
   DEVELOPMENT_TEAM=XGLHMG3629 -derivedDataPath build build
 ```
 
-Keyboard mic flashes Murmur (`extensionContext.open`), starts background mic + island, then bounces back to the host. Talk in Messages; tap mic again to send. Do not dictate inside Murmur.
+Keyboard mic opens Murmur (`extensionContext.open`) so the host can record.
+Stay on the swipe interstitial, swipe back to Notes/Messages, then speak.
+Tap the keyboard mic again to send. Do not dictate inside Murmur.
 
 > Distribution note: the keyboard launch/return handoff currently relies on responder-chain and private system APIs. This build is for private sideload testing and is not App Store-ready.
 

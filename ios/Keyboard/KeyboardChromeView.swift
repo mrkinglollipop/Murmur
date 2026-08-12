@@ -25,6 +25,10 @@ final class KeyboardChromeView: UIView {
     private let listeningStatusLabel = UILabel()
     private let microphoneLabel = UILabel()
 
+    private let errorBanner = UIView()
+    private let errorLabel = UILabel()
+    private let errorDismissButton = UIButton(type: .system)
+
     private var page: Page = .letters
     private enum ShiftState { case off, once, locked }
     private var shiftState: ShiftState = .once
@@ -58,9 +62,11 @@ final class KeyboardChromeView: UIView {
             listeningStatusLabel.text = "Transcribing…"
             microphoneLabel.text = "Please wait"
             setListeningActionsEnabled(false)
-        } else if lowered.contains("starting") {
-            listeningStatusLabel.text = "Starting…"
-            microphoneLabel.text = "Opening Murmur"
+        } else if lowered.contains("starting") || lowered.contains("murmur is on") {
+            listeningStatusLabel.text = lowered.contains("murmur is on") ? "Murmur is on" : "Starting…"
+            microphoneLabel.text = lowered.contains("murmur is on")
+                ? "Swipe back to your app"
+                : "Opening Murmur"
             cancelButton.isEnabled = true
             finishButton.isEnabled = false
         } else if lowered.contains("paused") {
@@ -128,6 +134,19 @@ final class KeyboardChromeView: UIView {
         rebuild()
     }
 
+    /// Wispr-style dismissible capture-failure card over the keyboard.
+    func showError(_ message: String) {
+        errorLabel.text = message
+        errorBanner.isHidden = false
+        bringSubviewToFront(errorBanner)
+        setNeedsLayout()
+    }
+
+    func dismissError() {
+        errorBanner.isHidden = true
+        errorLabel.text = nil
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         let side: CGFloat = 8
@@ -153,6 +172,30 @@ final class KeyboardChromeView: UIView {
         waveformView.frame = CGRect(x: bounds.midX - 58, y: bounds.midY - 38, width: 116, height: 48)
         listeningStatusLabel.frame = CGRect(x: 44, y: waveformView.frame.maxY + 9, width: bounds.width - 88, height: 23)
         microphoneLabel.frame = CGRect(x: 44, y: listeningStatusLabel.frame.maxY - 2, width: bounds.width - 88, height: 20)
+
+        if !errorBanner.isHidden {
+            let maxWidth = min(bounds.width - 32, 340)
+            let labelWidth = maxWidth - 24
+            let labelHeight = errorLabel.sizeThatFits(
+                CGSize(width: labelWidth, height: 200)
+            ).height
+            let bannerHeight = min(bounds.height - 24, max(96, labelHeight + 52))
+            errorBanner.frame = CGRect(
+                x: (bounds.width - maxWidth) / 2,
+                y: max(12, (bounds.height - bannerHeight) / 2),
+                width: maxWidth,
+                height: bannerHeight
+            )
+            errorLabel.frame = CGRect(x: 12, y: 12, width: labelWidth, height: labelHeight)
+            errorDismissButton.frame = CGRect(
+                x: 12,
+                y: bannerHeight - 40,
+                width: maxWidth - 24,
+                height: 32
+            )
+            bringSubviewToFront(errorBanner)
+        }
+
         bringSubviewToFront(globeButton)
         layoutKeys()
     }
@@ -171,6 +214,26 @@ final class KeyboardChromeView: UIView {
         listeningPanel.addSubview(waveformView)
         listeningPanel.addSubview(listeningStatusLabel)
         listeningPanel.addSubview(microphoneLabel)
+
+        addSubview(errorBanner)
+        errorBanner.addSubview(errorLabel)
+        errorBanner.addSubview(errorDismissButton)
+        errorBanner.isHidden = true
+        errorBanner.layer.cornerRadius = 14
+        errorBanner.layer.cornerCurve = .continuous
+        errorBanner.clipsToBounds = true
+        errorBanner.accessibilityIdentifier = "murmur.keyboard.error"
+
+        errorLabel.font = .systemFont(ofSize: 15, weight: .regular)
+        errorLabel.textAlignment = .center
+        errorLabel.numberOfLines = 0
+        errorLabel.accessibilityIdentifier = "murmur.keyboard.error.message"
+
+        errorDismissButton.setTitle("Dismiss", for: .normal)
+        errorDismissButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
+        errorDismissButton.addTarget(self, action: #selector(tapDismissError), for: .touchUpInside)
+        errorDismissButton.accessibilityLabel = "Dismiss error"
+        errorDismissButton.accessibilityIdentifier = "murmur.keyboard.error.dismiss"
 
         menuButton.setImage(UIImage(systemName: "line.3.horizontal"), for: .normal)
         menuButton.isEnabled = false
@@ -277,6 +340,10 @@ final class KeyboardChromeView: UIView {
         finishButton.tintColor = .white
         formatButton.setTitleColor(UIColor.black.withAlphaComponent(0.18), for: .disabled)
         waveformView.tintColor = .black
+
+        errorBanner.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.96)
+        errorLabel.textColor = .label
+        errorDismissButton.setTitleColor(.systemBlue, for: .normal)
         listeningStatusLabel.textColor = .black
         microphoneLabel.textColor = .black
     }
@@ -390,6 +457,7 @@ final class KeyboardChromeView: UIView {
 
     @objc private func tapMic() { onMic?() }
     @objc private func tapCancel() { onCancel?() }
+    @objc private func tapDismissError() { dismissError() }
     @objc private func tapGlobe() { onGlobe?() }
 
     @objc private func beginDelete(_: KeyView) {

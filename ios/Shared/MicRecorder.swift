@@ -48,6 +48,16 @@ final class MicRecorder: NSObject {
         stateLock.withLock { segmentFile != nil && segmentPaused }
     }
 
+    /// Arms AVAudioSession + AVAudioEngine without opening a segment file.
+    /// Buffers are discarded until `start()` opens a sink (listen-gate).
+    func armInputGraph() throws {
+        try ensureInputGraph()
+    }
+
+    var isInputGraphArmed: Bool {
+        stateLock.withLock { engine?.isRunning == true && sessionActive }
+    }
+
     /// Called in the foreground for the first take, then from the background only
     /// while the already-running input graph is covered by a fresh readiness lease.
     func start() throws {
@@ -154,14 +164,24 @@ final class MicRecorder: NSObject {
         if reusable { return }
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
-        try session.setActive(true)
+        do {
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
+            try session.setActive(true)
+        } catch {
+            if session.isOtherAudioPlaying || session.secondaryAudioShouldBeSilencedHint {
+                throw RecorderError.micBusy
+            }
+            throw RecorderError.startFailed
+        }
 
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0 else {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            if session.isOtherAudioPlaying {
+                throw RecorderError.micBusy
+            }
             throw RecorderError.startFailed
         }
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
@@ -173,7 +193,10 @@ final class MicRecorder: NSObject {
         } catch {
             input.removeTap(onBus: 0)
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
-            throw error
+            if session.isOtherAudioPlaying {
+                throw RecorderError.micBusy
+            }
+            throw RecorderError.startFailed
         }
         stateLock.withLock {
             self.engine = engine
@@ -276,12 +299,16 @@ enum RecorderError: Error, LocalizedError {
     case noAudio
     case startFailed
     case writeFailed
+    case micBusy
 
     var errorDescription: String? {
         switch self {
         case .noAudio: return "No audio"
-        case .startFailed: return "Couldn't start the microphone"
+        case .startFailed:
+            return "Couldn't start audio capture. Tap the mic to try again, or quit and reopen Murmur if it keeps happening."
         case .writeFailed: return "Couldn't save the recording"
+        case .micBusy:
+            return "Couldn't start audio capture. Another app may be using the mic (a phone call will do this). Tap the mic to try again when it's free."
         }
     }
 }
