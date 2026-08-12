@@ -30,3 +30,20 @@ Keyboard mic flashes Murmur (`extensionContext.open`), starts background mic + i
 > Distribution note: the keyboard launch/return handoff currently relies on responder-chain and private system APIs. This build is for private sideload testing and is not App Store-ready.
 
 Install needs the iPhone unlocked and trusted.
+
+## Shipped (PR #35)
+
+Private sideload spike is on GitHub `main`. Batch STT is ElevenLabs
+(`scribe_v2`) via 16-bit / 16 kHz mono WAV. The original “record inside the
+appex / host never backgrounds” P0 is **not** what shipped — do not silently
+revert the bounce path without an explicit new decision.
+
+Linux cloud agents cannot compile, sign, or device-test this. Do not install a
+Swift toolchain or fake a build; use a Mac with Xcode.
+
+## Continued work
+
+This README is the in-repo worksheet. Next slice is whatever the continuing
+thread asks for. Out of scope until explicitly pulled in: Pro/subscription,
+Murmur-server, IAP, local Whisper on iOS, full QWERTY, Mac target changes, App
+Store submit.
