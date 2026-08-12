@@ -452,8 +452,6 @@ final class DictationController: ObservableObject {
             return
         }
         markListeningLive()
-        // Keyboard takes stay in Murmur. Auto-return (suspend/workspace) sent
-        // Notes users to Home or Messages. Swipe-right is the product.
     }
 
     /// Arm the input graph in Murmur foreground, bounce/swipe, open the file only
@@ -487,8 +485,9 @@ final class DictationController: ObservableObject {
         }
         HandoffDiagnostics.record("app.listenGate.armed", detail: requestID)
         scheduleListenGateTimeout()
-        // Stay on the interstitial. suspend/workspace dumps to Home or Messages.
-        // User swipes back to Notes; keyboard viewWillAppear posts hostReady.
+        if keyboardStack, !hostBundleID.isEmpty {
+            HostReturn.bounceBack(keyboardStack: true, hostBundleID: hostBundleID)
+        }
     }
 
     private func openGatedSegment() {

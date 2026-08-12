@@ -31,8 +31,10 @@ xcodebuild test -project MurmurIOS.xcodeproj -scheme MurmurKeyboardTests \
 ```
 
 Keyboard mic opens Murmur (`extensionContext.open`) so the host can record.
-Stay on the swipe interstitial, swipe back to Notes/Messages, then speak.
-Tap the keyboard mic again to send. Do not dictate inside Murmur.
+If this take’s host ID is known (Messages usually), Murmur bounces back
+automatically. Otherwise it stays on the swipe interstitial — swipe right
+across the **bottom edge**, then speak. Tap the keyboard mic again to send.
+Do not dictate inside Murmur.
 
 Typing uses `UITextChecker` plus a bundled frequency list. `teh` + space
 becomes `the`; the original stays in the candidate bar as undo. Autocorrect

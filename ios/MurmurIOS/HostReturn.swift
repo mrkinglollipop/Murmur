@@ -1,21 +1,21 @@
 import UIKit
 
 /// Returns to the keyboard host after the containing app arms the microphone.
-/// LSApplicationWorkspace / suspend are private API, used here for sideload testing.
+/// `LSApplicationWorkspace` is private API, used here for sideload testing.
 @MainActor
 enum HostReturn {
     static let messagesBundle = "com.apple.MobileSMS"
 
-    /// Workspace-open only this take’s probed host. Empty probe → `suspend` (previous
-    /// app, whatever it was). Never lastHost — that is how Notes became Messages.
+    /// Workspace-open only this take’s probed host. Empty probe stays on the
+    /// interstitial — never `suspend` (that sent Notes to Home) and never guess
+    /// Messages.
     static func bounceBack(keyboardStack: Bool, hostBundleID: String?) {
         let host = hostBundleID ?? ""
-        if host.isEmpty {
+        guard !host.isEmpty else {
             HandoffDiagnostics.record(
-                "app.return.requested",
-                detail: "host=empty stack=\(keyboardStack) — suspend then swipe"
+                "app.return.skipped",
+                detail: "host=empty stack=\(keyboardStack) — interstitial"
             )
-            trySuspend()
             return
         }
         HandoffDiagnostics.record(
@@ -24,16 +24,6 @@ enum HostReturn {
         )
         HostAppProbe.remember(host)
         openWorkspace(host)
-    }
-
-    private static func trySuspend() {
-        let selector = NSSelectorFromString("suspend")
-        guard UIApplication.shared.responds(to: selector) else {
-            HandoffDiagnostics.record("app.return.suspend.unavailable")
-            return
-        }
-        HandoffDiagnostics.record("app.return.suspend.attempted")
-        UIApplication.shared.perform(selector)
     }
 
     private static func openWorkspace(_ bundleID: String) {

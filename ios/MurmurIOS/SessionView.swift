@@ -5,6 +5,7 @@ import SwiftUI
 /// Live take: mic / stop / discard controls.
 struct SessionView: View {
     @ObservedObject private var session = DictationController.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let coral = Color(red: 0.847, green: 0.353, blue: 0.188) // #D85A30
     private let ink = Color(red: 0.11, green: 0.11, blue: 0.12)
@@ -21,106 +22,57 @@ struct SessionView: View {
         .onAppear { session.becomeActive() }
     }
 
-    /// Match Wispr’s “Flow is on / swipe bottom edge” interstitial — Murmur coral accent.
+    /// Match Wispr’s “Flow is on / swipe bottom edge” interstitial — Murmur coral.
     private var swipeInterstitial: some View {
         ZStack(alignment: .bottom) {
             Color.white.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                Spacer(minLength: 48)
+                Spacer(minLength: 36)
 
-                VStack(spacing: 10) {
+                VStack(spacing: 12) {
                     (Text("Murmur is ") + Text("on").foregroundColor(coral))
-                        .font(.system(size: 34, weight: .bold))
+                        .font(.system(size: 36, weight: .bold))
                         .foregroundStyle(ink)
 
-                    Text("You can start dictating once you’re back")
+                    Text("Swipe back to your app, then speak")
                         .font(.system(size: 17, weight: .regular))
                         .foregroundStyle(muted)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 28)
                 }
 
-                Spacer(minLength: 28)
+                Spacer(minLength: 20)
 
-                phoneDiagram
-                    .padding(.horizontal, 36)
+                PhoneSwipeDiagram(coral: coral, reduceMotion: reduceMotion)
+                    .padding(.horizontal, 52)
 
-                Spacer(minLength: 28)
+                Spacer(minLength: 24)
 
                 (
                     Text("Swipe right across the ")
                         + Text("bottom edge").foregroundColor(coral)
                         + Text(" to continue")
                 )
-                .font(.system(size: 22, weight: .semibold))
+                .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(ink)
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
+                .padding(.horizontal, 28)
 
-                Spacer(minLength: 80)
+                Spacer(minLength: 64)
 
                 Button("Discard") {
                     session.discard()
                 }
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(muted)
-                .padding(.bottom, 12)
+                .padding(.bottom, 8)
             }
 
-            swipeHintBar
+            BottomSwipeCoach(coral: coral, reduceMotion: reduceMotion)
         }
-    }
-
-    private var phoneDiagram: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 36, style: .continuous)
-                .fill(Color(red: 0.96, green: 0.96, blue: 0.97))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 36, style: .continuous)
-                        .stroke(Color.black.opacity(0.06), lineWidth: 1)
-                )
-                .frame(height: 280)
-
-            VStack {
-                Spacer()
-                Image(systemName: "waveform")
-                    .font(.system(size: 36, weight: .medium))
-                    .foregroundStyle(Color.black.opacity(0.28))
-                Spacer()
-                Capsule()
-                    .fill(Color.black.opacity(0.55))
-                    .frame(width: 110, height: 5)
-                    .padding(.bottom, 18)
-            }
-            .frame(height: 280)
-
-            Circle()
-                .fill(Color.black.opacity(0.12))
-                .frame(width: 54, height: 54)
-                .offset(y: 98)
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Swipe right across the bottom edge to return to your app")
-    }
-
-    private var swipeHintBar: some View {
-        HStack {
-            Text("Swipe")
-                .font(.system(size: 17, weight: .semibold))
-            Spacer()
-            Circle()
-                .stroke(coral.opacity(0.85), lineWidth: 2.5)
-                .frame(width: 28, height: 28)
-            Spacer()
-            Text("here")
-                .font(.system(size: 17, weight: .semibold))
-        }
-        .foregroundStyle(coral)
-        .padding(.horizontal, 28)
-        .frame(height: 52)
-        .background(coral.opacity(0.14).ignoresSafeArea(edges: .bottom))
-        .accessibilityHidden(true)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Murmur is on. Swipe right across the bottom edge to return to your app, then speak.")
     }
 
     private var activeSession: some View {
@@ -169,4 +121,117 @@ struct SessionView: View {
             }
         }
     }
+}
+
+/// Bottom half of a phone with a finger target sliding on the home indicator.
+private struct PhoneSwipeDiagram: View {
+    var coral: Color
+    var reduceMotion: Bool
+    @State private var sliding = false
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            RoundedRectangle(cornerRadius: 42, style: .continuous)
+                .stroke(Color.black.opacity(0.88), lineWidth: 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 42, style: .continuous)
+                        .fill(Color(red: 0.97, green: 0.97, blue: 0.98))
+                )
+                .frame(height: 268)
+
+            VStack(spacing: 0) {
+                Spacer()
+                Image(systemName: "waveform")
+                    .font(.system(size: 34, weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.28))
+                Spacer()
+                ZStack {
+                    Capsule()
+                        .fill(Color.black.opacity(0.55))
+                        .frame(width: 128, height: 5)
+                    Circle()
+                        .fill(Color.black.opacity(0.18))
+                        .frame(width: 52, height: 52)
+                        .offset(x: reduceMotion ? 0 : (sliding ? 36 : -36))
+                    Circle()
+                        .fill(coral)
+                        .frame(width: 18, height: 18)
+                        .offset(x: reduceMotion ? 0 : (sliding ? 36 : -36))
+                }
+                .padding(.bottom, 22)
+            }
+            .frame(height: 268)
+        }
+        .onAppear { startMotion() }
+        .accessibilityHidden(true)
+    }
+
+    private func startMotion() {
+        guard !reduceMotion else { return }
+        sliding = false
+        withAnimation(.easeInOut(duration: 1.15).repeatForever(autoreverses: true)) {
+            sliding = true
+        }
+    }
+}
+
+/// Sits on the real home-indicator edge: “Swipe” → moving finger → “here”.
+private struct BottomSwipeCoach: View {
+    var coral: Color
+    var reduceMotion: Bool
+    @State private var sliding = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text("Swipe")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 64, alignment: .leading)
+
+                GeometryReader { geo in
+                    let start = geo.size.width * 0.04
+                    let end = max(start, geo.size.width - 30)
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(coral.opacity(0.22))
+                            .frame(height: 4)
+                        Circle()
+                            .fill(coral)
+                            .frame(width: 26, height: 26)
+                            .shadow(color: coral.opacity(0.4), radius: 6, y: 1)
+                            .offset(x: reduceMotion ? (start + end) / 2 - 13 : (sliding ? end - 26 : start))
+                    }
+                    .frame(maxHeight: .infinity)
+                }
+                .frame(height: 36)
+
+                Text("here")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 48, alignment: .trailing)
+            }
+            .foregroundStyle(coral)
+            .padding(.horizontal, 22)
+            .padding(.top, 10)
+            .padding(.bottom, 18)
+        }
+        .frame(maxWidth: .infinity)
+        .background(coral.opacity(0.14).ignoresSafeArea(edges: .bottom))
+        .onAppear { startMotion() }
+        .accessibilityHidden(true)
+    }
+
+    private func startMotion() {
+        guard !reduceMotion else { return }
+        sliding = false
+        withAnimation(.easeInOut(duration: 1.15).repeatForever(autoreverses: true)) {
+            sliding = true
+        }
+    }
+}
+
+#Preview("Swipe interstitial") {
+    SessionView()
+        .onAppear {
+            DictationController.shared.isAwaitingHostReturn = true
+        }
 }
