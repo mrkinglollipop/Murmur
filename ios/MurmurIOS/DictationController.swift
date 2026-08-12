@@ -209,7 +209,7 @@ final class DictationController: ObservableObject {
         }
     }
 
-    func arm(id: String, hostBundleID: String, keyboardStack: Bool) {
+    func arm(id: String, hostBundleID: String, hostPID: Int = 0, keyboardStack: Bool) {
         guard let payload = DictationHandoff.read(), payload.id == id,
               payload.status == .pending, (DictationHandoff.pendingAge() ?? .infinity) <= 12 else {
             HandoffDiagnostics.record("app.deeplink.rejected", detail: id)
@@ -222,7 +222,26 @@ final class DictationController: ObservableObject {
         leaseExpiryTask?.cancel()
         leaseHeartbeatTask?.cancel()
         DictationHandoff.clearLease()
-        let host = hostBundleID
+        var host = hostBundleID
+        if host.isEmpty { host = payload.hostBundleID }
+        let pid = hostPID > 1 ? hostPID : (payload.hostPID ?? 0)
+        if host.isEmpty, pid > 1 {
+            host = HostAppProbe.bundleID(forPID: pid_t(pid)) ?? ""
+            HandoffDiagnostics.record(
+                "app.host.pidResolved",
+                detail: "pid=\(pid) host=\(host.isEmpty ? "empty" : host)"
+            )
+        }
+        if host.isEmpty, pid > 1, pid != Int(getpid()) {
+            // iOS sandboxes every PID→bundle lookup. A foreign host PID means the
+            // keyboard was in another app; workspace-open MobileSMS is the path
+            // that used to return to Messages (6c30366). Notes can get pulled too.
+            host = HostReturn.messagesBundle
+            HandoffDiagnostics.record(
+                "app.host.messagesFallback",
+                detail: "pid=\(pid) murmur=\(getpid())"
+            )
+        }
         requestID = id
         self.hostBundleID = host
         self.keyboardStack = keyboardStack
@@ -495,11 +514,14 @@ final class DictationController: ObservableObject {
         }
     }
 
-    /// Bounce only with this take’s host ID. Messages uses `sms:` (known working).
-    /// Empty host stays on the interstitial — never guess, never suspend.
+    /// Bounce with this take’s host ID. Unresolved foreign keyboard PID uses
+    /// Messages — that workspace-open is what used to leave the interstitial.
     private func tryHostBounce(reason: String) {
         guard keyboardStack, listenGated, isAwaitingHostReturn else { return }
-        guard !hostBundleID.isEmpty else { return }
+        guard !hostBundleID.isEmpty else {
+            HandoffDiagnostics.record("app.return.skipped", detail: "host=empty reason=\(reason)")
+            return
+        }
         guard hostBounceAttempts < 2 else { return }
         hostBounceAttempts += 1
         HandoffDiagnostics.record(

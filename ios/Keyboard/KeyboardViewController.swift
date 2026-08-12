@@ -1,4 +1,5 @@
 import UIKit
+import UniformTypeIdentifiers
 
 /// Custom keyboard. Hands dictation to the containing app (iOS blocks in-appex mic),
 /// then inserts the App Group result. Opens murmur://dictate.
@@ -50,12 +51,16 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             self?.textDocumentProxy.adjustTextPosition(byCharacterOffset: delta)
         }
         root.onCandidate = { [weak self] index in self?.applyCandidate(at: index) }
+        root.onGif = { [weak self] in self?.toggleGifTray() }
+        root.onGifSelect = { [weak self] gif in self?.insertGif(gif) }
         root.setShowsGlobe(needsInputModeSwitchKey)
+        AppGroupStore.consumeGiphySeedIfNeeded()
         applyDocumentState()
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        AppGroupStore.consumeGiphySeedIfNeeded()
         root.setShowsGlobe(needsInputModeSwitchKey)
         if let host = HostAppProbe.probedBundleID(from: self) {
             HostAppProbe.remember(host)
@@ -133,6 +138,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func insertFromKeyboard(_ text: String) {
+        if root.handleGifTyping(text) {
+            UIDevice.current.playInputClick()
+            return
+        }
         UIDevice.current.playInputClick()
         if text == " ", shouldReplaceSecondSpaceWithPeriod() {
             textDocumentProxy.deleteBackward()
@@ -153,6 +162,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func deleteFromKeyboard() {
+        if root.handleGifDelete() {
+            UIDevice.current.playInputClick()
+            return
+        }
         UIDevice.current.playInputClick()
         lastSpaceTap = nil
         textDocumentProxy.deleteBackward()
@@ -261,9 +274,76 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
     }
 
+    private func toggleGifTray() {
+        guard hasFullAccess, !AppGroupStore.giphyAPIKey.isEmpty else { return }
+        guard phase != .secure, phase != .waiting else { return }
+        root.setGifTrayVisible(!root.isGifTrayVisible)
+        refreshChrome()
+    }
+
+    private func insertGif(_ gif: GiphyClient.GIF) {
+        Task {
+            var pasted = false
+            if hasFullAccess {
+                pasted = await copyGIFToPasteboard(from: gif.sendURL)
+            }
+            await MainActor.run {
+                self.textDocumentProxy.insertText(gif.sendURL.absoluteString + " ")
+                HandoffDiagnostics.record(
+                    "keyboard.gif.inserted",
+                    detail: "p2a url p2b=\(pasted)"
+                )
+                self.root.setGifTrayVisible(false)
+                self.updateCapitalization()
+                self.refreshSuggestions()
+                self.refreshChrome()
+            }
+        }
+    }
+
+    private func copyGIFToPasteboard(from url: URL) async -> Bool {
+        do {
+            let data = try await GiphyClient.fetchData(from: url)
+            guard data.count > 16 else { return false }
+            await MainActor.run {
+                UIPasteboard.general.setItems(
+                    [[
+                        UTType.gif.identifier: data,
+                        UTType.url.identifier: url
+                    ]],
+                    options: [:]
+                )
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func refreshChrome() {
         root.setSecure(phase == .secure)
         root.setFullAccess(hasFullAccess)
+        root.setGiphyAPIKey(AppGroupStore.giphyAPIKey)
+        let gifOK = hasFullAccess
+            && !AppGroupStore.giphyAPIKey.isEmpty
+            && phase != .secure
+            && phase != .waiting
+        let gifReason: String
+        if phase == .secure {
+            gifReason = "GIFs are off in secure fields"
+        } else if !hasFullAccess {
+            gifReason = "Turn on Full Access for GIFs."
+        } else if AppGroupStore.giphyAPIKey.isEmpty {
+            gifReason = "Add a Giphy key in Murmur."
+        } else {
+            gifReason = "GIFs"
+        }
+        root.setGifAvailable(gifOK, reason: gifReason)
+        if root.isGifTrayVisible {
+            root.setReturnTitle("search")
+        } else {
+            root.setReturnTitle(returnTitle)
+        }
         switch phase {
         case .secure:
             break
@@ -390,17 +470,18 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.dismissError()
         let id = UUID().uuidString
         let probed = HostAppProbe.probedBundleID(from: self)
+        let hostPID = HostAppProbe.discoveredPIDs(from: self).first.map { Int($0) }
         if let probed {
             HostAppProbe.remember(probed)
             HandoffDiagnostics.record(
                 "keyboard.host.handoff",
-                detail: "probed=\(probed) return=\(textDocumentProxy.returnKeyType?.rawValue ?? -1)"
+                detail: "probed=\(probed) pid=\(hostPID ?? 0) return=\(textDocumentProxy.returnKeyType?.rawValue ?? -1)"
             )
         } else {
             HostAppProbe.forget()
             HandoffDiagnostics.record(
                 "keyboard.host.handoff",
-                detail: "empty= return=\(textDocumentProxy.returnKeyType?.rawValue ?? -1)"
+                detail: "empty= pid=\(hostPID ?? 0) return=\(textDocumentProxy.returnKeyType?.rawValue ?? -1)"
             )
         }
         let host = probed ?? ""
@@ -410,13 +491,22 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             status: .pending,
             text: "",
             error: "",
-            hostBundleID: host
+            hostBundleID: host,
+            hostPID: hostPID
         ))
         waitingID = id
         session = .waiting
-        HandoffDiagnostics.record("keyboard.request.created", detail: "\(id) host=\(host.isEmpty ? "empty" : host)")
+        HandoffDiagnostics.record(
+            "keyboard.request.created",
+            detail: "\(id) host=\(host.isEmpty ? "empty" : host) pid=\(hostPID ?? 0)"
+        )
         refreshChrome()
-        let url = DictationHandoff.dictateURL(id: id, hostBundleID: host.isEmpty ? nil : host, keyboardStack: true)
+        let url = DictationHandoff.dictateURL(
+            id: id,
+            hostBundleID: host.isEmpty ? nil : host,
+            hostPID: hostPID,
+            keyboardStack: true
+        )
         if let lease {
             HandoffDiagnostics.record(
                 "keyboard.lease.reusing",

@@ -59,6 +59,10 @@ targets:
           - audio
         NSSupportsLiveActivities: true
         NSMicrophoneUsageDescription: "Murmur records your voice from the keyboard so it can transcribe what you say. Grant microphone access here, then enable Full Access for the Murmur keyboard in Settings."
+        LSApplicationQueriesSchemes:
+          - sms
+          - mobilenotes
+          - message
     entitlements:
       path: MurmurIOS/MurmurIOS.entitlements
       properties:
@@ -165,6 +169,9 @@ targets:
     sources:
       - path: KeyboardTests
       - path: Keyboard/AutocorrectEngine.swift
+      - path: Shared/HostFingerprint.swift
+      - path: Shared/GiphyClient.swift
+      - path: Shared/AppGroupStore.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboardtests

@@ -6,6 +6,7 @@ import UIKit
 /// No accounts. Dark by design.
 struct OnboardingView: View {
     @State private var apiKey = AppGroupStore.apiKey
+    @State private var giphyAPIKey = AppGroupStore.giphyAPIKey
     @State private var micStatus: String = "Not requested"
     @State private var rehearsal = ""
     @FocusState private var rehearsalFocused: Bool
@@ -60,7 +61,20 @@ struct OnboardingView: View {
                             .foregroundStyle(Color(red: 0.604, green: 0.604, blue: 0.635))
                     }
 
-                    step(5, title: "Rehearse") {
+                    step(5, title: "Giphy API key") {
+                        SecureField("Giphy iOS key", text: $giphyAPIKey)
+                            .textContentType(.password)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .onChange(of: giphyAPIKey) { _, value in
+                                AppGroupStore.giphyAPIKey = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                        Text("Optional. Full Access plus this key turns on the GIF button. Stored in the App Group; the keyboard calls Giphy’s REST API directly.")
+                            .font(.footnote)
+                            .foregroundStyle(Color(red: 0.604, green: 0.604, blue: 0.635))
+                    }
+
+                    step(6, title: "Rehearse") {
                         TextField("Tap here, switch to Murmur keyboard", text: $rehearsal, axis: .vertical)
                             .lineLimit(3...6)
                             .focused($rehearsalFocused)
@@ -73,7 +87,11 @@ struct OnboardingView: View {
             .background(Color(red: 0.063, green: 0.063, blue: 0.078).ignoresSafeArea())
             .foregroundStyle(Color(red: 0.961, green: 0.961, blue: 0.969))
             .navigationTitle("Murmur")
-            .onAppear { refreshMicStatus() }
+            .onAppear {
+                AppGroupStore.consumeGiphySeedIfNeeded()
+                giphyAPIKey = AppGroupStore.giphyAPIKey
+                refreshMicStatus()
+            }
         }
         .preferredColorScheme(.dark)
     }

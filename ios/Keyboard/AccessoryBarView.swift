@@ -1,6 +1,6 @@
 import UIKit
 
-/// Top accessory row: GIF (disabled until P2) · three candidate slots · Start.
+/// Top accessory row: GIF · three candidate slots · Start.
 final class AccessoryBarView: UIView {
     var onMic: (() -> Void)?
     var onGif: (() -> Void)?
@@ -12,6 +12,7 @@ final class AccessoryBarView: UIView {
     private let startButton = UIButton(type: .system)
     private var dark = true
     private var gifEnabled = false
+    private var gifTrayOpen = false
     private var caption = ""
 
     override init(frame: CGRect) {
@@ -67,13 +68,24 @@ final class AccessoryBarView: UIView {
         applyColors()
     }
 
-    func setGifEnabled(_ enabled: Bool) {
+    func setGifEnabled(_ enabled: Bool, reason: String? = nil) {
         gifEnabled = enabled
         gifButton.isEnabled = enabled
         gifButton.alpha = enabled ? 1 : 0.45
-        gifButton.accessibilityLabel = enabled
-            ? "GIFs"
-            : "GIFs need Full Access and a Giphy key"
+        if enabled {
+            gifButton.accessibilityLabel = gifTrayOpen ? "Close GIFs" : "GIFs"
+        } else {
+            gifButton.accessibilityLabel = reason ?? "GIFs need Full Access and a Giphy key"
+        }
+        applyColors()
+    }
+
+    func setGifTrayOpen(_ open: Bool) {
+        gifTrayOpen = open
+        if gifEnabled {
+            gifButton.accessibilityLabel = open ? "Close GIFs" : "GIFs"
+        }
+        applyColors()
     }
 
     func setCaption(_ text: String) {
@@ -136,7 +148,9 @@ final class AccessoryBarView: UIView {
     }
 
     private func applyColors() {
-        gifButton.backgroundColor = KeyboardChromeTokens.candidateFill(dark: dark)
+        gifButton.backgroundColor = gifTrayOpen
+            ? KeyboardChromeTokens.coral.withAlphaComponent(0.35)
+            : KeyboardChromeTokens.candidateFill(dark: dark)
         gifButton.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
         gifButton.setTitleColor(KeyboardChromeTokens.glyphColor(dark: dark), for: .normal)
         captionLabel.textColor = KeyboardChromeTokens.glyphColor(dark: dark).withAlphaComponent(0.7)

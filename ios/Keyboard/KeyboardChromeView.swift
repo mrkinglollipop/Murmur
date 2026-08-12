@@ -9,6 +9,8 @@ final class KeyboardChromeView: UIView {
     var onInsert: ((String) -> Void)?
     var onSpaceDrag: ((Int) -> Void)?
     var onCandidate: ((Int) -> Void)?
+    var onGif: (() -> Void)?
+    var onGifSelect: ((GiphyClient.GIF) -> Void)?
 
     private enum Page { case letters, numbers, symbols }
 
@@ -28,6 +30,7 @@ final class KeyboardChromeView: UIView {
     private let errorBanner = UIView()
     private let errorLabel = UILabel()
     private let errorDismissButton = UIButton(type: .system)
+    private let gifTray = GiphyTrayView()
 
     private var page: Page = .letters
     private enum ShiftState { case off, once, locked }
@@ -44,6 +47,9 @@ final class KeyboardChromeView: UIView {
     private let keyHaptic = UIImpactFeedbackGenerator(style: .light)
     private var spaceTrackpadUsed = false
     private var lastSpaceOffset = 0
+    private var gifTrayVisible = false
+    private var gifAvailable = false
+    private var gifReason = "GIFs need Full Access and a Giphy key"
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -90,6 +96,10 @@ final class KeyboardChromeView: UIView {
 
     func setRecording(_ on: Bool) {
         sessionActive = on
+        if on {
+            gifTrayVisible = false
+            gifTray.resetMode()
+        }
         updateVisibility()
     }
 
@@ -123,12 +133,61 @@ final class KeyboardChromeView: UIView {
     func setFullAccess(_ ok: Bool) {
         micEnabled = ok
         topBar.setMicEnabled(ok)
-        topBar.setGifEnabled(false)
+        refreshGifControl()
+    }
+
+    func setGifAvailable(_ available: Bool, reason: String) {
+        gifAvailable = available
+        gifReason = reason
+        if !available {
+            gifTrayVisible = false
+            gifTray.resetMode()
+        }
+        refreshGifControl()
+    }
+
+    func setGiphyAPIKey(_ key: String) {
+        gifTray.apiKey = key
+    }
+
+    func setGifTrayVisible(_ visible: Bool) {
+        gifTrayVisible = visible && gifAvailable && !sessionActive && !micHidden
+        if gifTrayVisible {
+            gifTray.appear()
+        } else {
+            gifTray.resetMode()
+        }
+        updateVisibility()
+    }
+
+    var isGifTrayVisible: Bool { gifTrayVisible }
+
+    func handleGifTyping(_ text: String) -> Bool {
+        guard gifTrayVisible else { return false }
+        gifTray.insertSearchText(text)
+        updateVisibility()
+        setNeedsLayout()
+        return true
+    }
+
+    func handleGifDelete() -> Bool {
+        guard gifTrayVisible else { return false }
+        if gifTray.isSearchMode || !gifTray.searchText.isEmpty {
+            gifTray.deleteSearchText()
+            updateVisibility()
+            setNeedsLayout()
+            return true
+        }
+        return false
     }
 
     func setSecure(_ secure: Bool) {
         micHidden = secure
-        if secure { setStatus("Dictation off in secure fields") }
+        if secure {
+            gifTrayVisible = false
+            gifTray.resetMode()
+            setStatus("Dictation off in secure fields")
+        }
         updateVisibility()
     }
 
@@ -169,12 +228,34 @@ final class KeyboardChromeView: UIView {
         glassBackdrop.frame = bounds
 
         globeButton.frame = CGRect(x: side + 2, y: bounds.height - globeHeight, width: 42, height: globeHeight)
-        grid.frame = CGRect(
+        let gridFrame = CGRect(
             x: side,
             y: topBar.frame.maxY,
             width: bounds.width - side * 2,
-            height: max(0, (showsGlobe ? globeButton.frame.minY : bounds.height - 3) - topBar.frame.maxY)
+            height: max(0, (showsGlobe && !gifTrayVisible ? globeButton.frame.minY : bounds.height - 3) - topBar.frame.maxY)
         )
+        if gifTrayVisible {
+            let searchStrip: CGFloat = gifTray.isSearchMode ? 40 : gridFrame.height
+            gifTray.frame = CGRect(
+                x: gridFrame.minX,
+                y: gridFrame.minY,
+                width: gridFrame.width,
+                height: searchStrip
+            )
+            if gifTray.isSearchMode {
+                grid.frame = CGRect(
+                    x: gridFrame.minX,
+                    y: gifTray.frame.maxY,
+                    width: gridFrame.width,
+                    height: max(0, gridFrame.maxY - gifTray.frame.maxY)
+                )
+            } else {
+                grid.frame = gridFrame
+            }
+        } else {
+            gifTray.frame = .zero
+            grid.frame = gridFrame
+        }
         listeningPanel.frame = bounds
         cancelButton.frame = CGRect(x: 10, y: 12, width: 44, height: 44)
         formatButton.frame = CGRect(x: bounds.midX - 44, y: 17, width: 88, height: 32)
@@ -216,7 +297,15 @@ final class KeyboardChromeView: UIView {
         addSubview(topBar)
         topBar.onMic = { [weak self] in self?.onMic?() }
         topBar.onCandidate = { [weak self] index in self?.onCandidate?(index) }
+        topBar.onGif = { [weak self] in self?.onGif?() }
         addSubview(grid)
+        addSubview(gifTray)
+        gifTray.isHidden = true
+        gifTray.onSelect = { [weak self] gif in self?.onGifSelect?(gif) }
+        gifTray.onModeChange = { [weak self] in
+            self?.updateVisibility()
+            self?.setNeedsLayout()
+        }
         addSubview(globeButton)
         addSubview(listeningPanel)
         listeningPanel.addSubview(cancelButton)
@@ -297,17 +386,28 @@ final class KeyboardChromeView: UIView {
 
     private func updateVisibility() {
         let showPanel = sessionActive && !micHidden
+        let showTray = gifTrayVisible && !showPanel && !micHidden
+        let searchTyping = showTray && gifTray.isSearchMode
         listeningPanel.isHidden = !showPanel
         topBar.isHidden = showPanel
-        grid.isHidden = showPanel
-        globeButton.isHidden = !showsGlobe
+        grid.isHidden = showPanel || (showTray && !searchTyping)
+        gifTray.isHidden = !showTray
+        globeButton.isHidden = !showsGlobe || showTray
         topBar.setMicHidden(micHidden)
+        refreshGifControl()
         setNeedsLayout()
+    }
+
+    private func refreshGifControl() {
+        let enabled = gifAvailable && !micHidden && !sessionActive
+        topBar.setGifEnabled(enabled, reason: gifReason)
+        topBar.setGifTrayOpen(gifTrayVisible && enabled)
     }
 
     private func applyColors() {
         backgroundColor = KeyboardChromeTokens.keyboardBackdrop(dark: dark)
         topBar.setAppearance(dark: dark)
+        gifTray.setAppearance(dark: dark)
         globeButton.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
 
         listeningPanel.backgroundColor = KeyboardChromeTokens.listeningFill(dark: dark)

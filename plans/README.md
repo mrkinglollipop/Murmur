@@ -37,7 +37,7 @@ current setup and contribution guidance.
 | 023 | Open-source readiness | SHIPPED (Phases 1–5) |
 | 024 | Repo audit findings | archival (fix pass 1 landed) |
 | 025 | Murmur Pro scope | approved direction; not started |
-| 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe ship-gated) | PARTIAL — P0-host + P0-chrome + P1 in PR #37; P2 blocked on Giphy key; P3 ship-gated |
+| 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe ship-gated) | PARTIAL — P0-host + P0-chrome + P1 + P2 REST tray in PR #37; P2b Messages bubble is a device spike; P3 ship-gated |
 
 ## Notes for maintainers
 
@@ -50,7 +50,7 @@ current setup and contribution guidance.
 
 # 026 — iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe ship-gated)
 
-**Status:** PARTIAL — P0-host, P0-chrome, and P1 autocorrect are in PR #37. P2 is blocked on a Giphy iOS API key. P3 swipe remains ship-gated.
+**Status:** PARTIAL — P0-host, P0-chrome, P1 autocorrect, and P2 Giphy REST tray are in PR #37. P2b Messages GIF bubble is a device spike. P3 swipe remains ship-gated.
 **Written against:** `cf13857` (`main`, 2026-08-12).
 **Canonical home:** this section in `plans/README.md` until split to `plans/026-ios-keyboard-upgrade.md`.
 **Does not authorize App Store submit, Mac target changes, Pro/IAP, or Murmur-server.**

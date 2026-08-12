@@ -6,6 +6,7 @@ struct MurmurApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        AppGroupStore.consumeGiphySeedIfNeeded()
         HandoffDiagnostics.record("app.initializing")
     }
 
@@ -25,6 +26,7 @@ struct MurmurApp: App {
                     session.arm(
                         id: request.id,
                         hostBundleID: request.hostBundleID,
+                        hostPID: request.hostPID,
                         keyboardStack: request.keyboardStack
                     )
                 }

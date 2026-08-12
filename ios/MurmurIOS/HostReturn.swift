@@ -23,10 +23,8 @@ enum HostReturn {
             detail: "host=\(host) via=explicit stack=\(keyboardStack)"
         )
         HostAppProbe.remember(host)
-        if host == messagesBundle {
-            openScheme(host, reason: "messages")
-            return
-        }
+        // Workspace-open is the path that actually foregrounds Messages.
+        // `sms:` stays the timeout / reject fallback — do not skip workspace.
         openWorkspace(host)
     }
 

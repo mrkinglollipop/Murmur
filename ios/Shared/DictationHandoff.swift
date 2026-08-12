@@ -21,6 +21,7 @@ enum DictationHandoff {
         var text: String
         var error: String
         var hostBundleID: String
+        var hostPID: Int? = nil
     }
 
     struct Lease: Codable, Equatable {
@@ -34,7 +35,7 @@ enum DictationHandoff {
         }
     }
 
-    static func dictateURL(id: String, hostBundleID: String?, keyboardStack: Bool) -> URL {
+    static func dictateURL(id: String, hostBundleID: String?, hostPID: Int? = nil, keyboardStack: Bool) -> URL {
         var parts = URLComponents()
         parts.scheme = scheme
         parts.host = "dictate"
@@ -45,17 +46,21 @@ enum DictationHandoff {
         if let hostBundleID, !hostBundleID.isEmpty {
             items.append(URLQueryItem(name: "host", value: hostBundleID))
         }
+        if let hostPID, hostPID > 1 {
+            items.append(URLQueryItem(name: "hostpid", value: String(hostPID)))
+        }
         parts.queryItems = items
         return parts.url!
     }
 
-    static func request(from url: URL) -> (id: String, hostBundleID: String, keyboardStack: Bool)? {
+    static func request(from url: URL) -> (id: String, hostBundleID: String, hostPID: Int, keyboardStack: Bool)? {
         guard url.scheme == scheme, url.host == "dictate" else { return nil }
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         guard let id = items.first(where: { $0.name == "id" })?.value, !id.isEmpty else { return nil }
         let host = items.first(where: { $0.name == "host" })?.value ?? ""
+        let hostPID = Int(items.first(where: { $0.name == "hostpid" })?.value ?? "") ?? 0
         let stack = items.first(where: { $0.name == "stack" })?.value == "ext"
-        return (id, host, stack)
+        return (id, host, hostPID, stack)
     }
 
     static func write(_ payload: Payload) {
