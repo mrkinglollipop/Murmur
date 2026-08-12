@@ -35,6 +35,8 @@ current setup and contribution guidance.
 | 021 | FluidVoice-inspired scope | DRAFT |
 | 022 | Speaker-gating spike report | DONE (spike) |
 | 023 | Open-source readiness | SHIPPED (Phases 1–5) |
+| 024 | Repo audit findings | archival (fix pass 1 landed) |
+| 025 | Murmur Pro scope | approved direction; not started |
 
 ## Notes for maintainers
 

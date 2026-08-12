@@ -11,6 +11,12 @@ rename the module, bundle ID (`com.matt.voice-dictation`), Keychain service
 (`~/Library/Application Support/Voice/`). TCC grants, stored API keys, and
 user data are keyed to these identifiers.
 
+## iOS keyboard
+
+Separate XcodeGen project under [`ios/`](ios/README.md). Do **not** add those
+targets to the Mac `project.yml`. Spike shipped in PR #35; that README is the
+in-repo worksheet. Linux cloud agents cannot build or device-test it.
+
 ## Setup
 
 ```bash
