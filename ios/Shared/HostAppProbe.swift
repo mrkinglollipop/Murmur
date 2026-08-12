@@ -1,28 +1,41 @@
+import Darwin
 import UIKit
 
 /// Best-effort host bundle ID. iOS exposes no public keyboard-host identity API.
 enum HostAppProbe {
-    /// KVC first, then the frontmost app from `LSApplicationWorkspace`.
-    /// Never invents Messages or falls back to lastHost.
+    static let messagesBundle = "com.apple.MobileSMS"
+
+    /// KVC, SpringBoard frontmost, then Messages-composer inference.
+    /// Never falls back to lastHost. Notes (Return key) stays empty → interstitial.
     static func probedBundleID(from controller: UIInputViewController) -> String? {
         if let id = sanitize(kvcBundleID(from: controller)) {
             HandoffDiagnostics.record("keyboard.host.probe", detail: "kvc=\(id)")
             return id
         }
-        if let id = sanitize(frontmostBundleID()) {
-            HandoffDiagnostics.record("keyboard.host.probe", detail: "frontmost=\(id)")
+        if let id = sanitize(sbsFrontmostBundleID()) {
+            HandoffDiagnostics.record("keyboard.host.probe", detail: "sbs=\(id)")
             return id
+        }
+        if let id = sanitize(applicationFrontmostBundleID(from: controller)) {
+            HandoffDiagnostics.record("keyboard.host.probe", detail: "uiapp=\(id)")
+            return id
+        }
+        if let id = sanitize(workspaceFrontmostBundleID()) {
+            HandoffDiagnostics.record("keyboard.host.probe", detail: "workspace=\(id)")
+            return id
+        }
+        if looksLikeMessagesComposer(controller) {
+            HandoffDiagnostics.record("keyboard.host.probe", detail: "inferred=\(messagesBundle)")
+            return messagesBundle
         }
         HandoffDiagnostics.record("keyboard.host.probe", detail: "empty")
         return nil
     }
 
-    /// Probe this take only. lastHost is not a host identity.
     static func bundleID(from controller: UIInputViewController) -> String? {
         probedBundleID(from: controller)
     }
 
-    /// Persist only a real probed host.
     static func remember(_ bundleID: String) {
         guard sanitize(bundleID) != nil else { return }
         AppGroupStore.lastHostBundleID = bundleID
@@ -38,6 +51,19 @@ enum HostAppProbe {
         if value.hasPrefix("com.apple.springboard") { return nil }
         if value.contains("keyboard-service") { return nil }
         return value
+    }
+
+    /// Messages uses Send. Notes uses Return. Do not treat email/URL pads as Messages.
+    private static func looksLikeMessagesComposer(_ controller: UIInputViewController) -> Bool {
+        let proxy = controller.textDocumentProxy
+        guard proxy.returnKeyType == .send else { return false }
+        switch proxy.keyboardType {
+        case .emailAddress, .URL, .webSearch, .phonePad, .numberPad,
+             .decimalPad, .asciiCapableNumberPad:
+            return false
+        default:
+            return true
+        }
     }
 
     private static func kvcBundleID(from controller: UIInputViewController) -> String? {
@@ -64,8 +90,38 @@ enum HostAppProbe {
         return nil
     }
 
-    /// Sideload-only. The keyboard overlays the host, so frontmost is often Notes/Messages.
-    private static func frontmostBundleID() -> String? {
+    private static func sbsFrontmostBundleID() -> String? {
+        let path = "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
+        guard let handle = dlopen(path, RTLD_NOW) else { return nil }
+        defer { dlclose(handle) }
+        guard let symbol = dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier") else { return nil }
+        typealias CopyFn = @convention(c) () -> Unmanaged<CFString>?
+        let fn = unsafeBitCast(symbol, to: CopyFn.self)
+        return fn()?.takeRetainedValue() as String?
+    }
+
+    private static func applicationFrontmostBundleID(from controller: UIInputViewController) -> String? {
+        var responder: UIResponder? = controller
+        while let current = responder {
+            if let application = current as? UIApplication {
+                let selector = NSSelectorFromString("_accessibilityFrontMostApplication")
+                if application.responds(to: selector),
+                   let app = application.perform(selector)?.takeUnretainedValue() as? NSObject {
+                    for key in ["bundleIdentifier", "displayIdentifier", "applicationIdentifier"] {
+                        let idSelector = NSSelectorFromString(key)
+                        if app.responds(to: idSelector),
+                           let value = app.perform(idSelector)?.takeUnretainedValue() as? String {
+                            return value
+                        }
+                    }
+                }
+            }
+            responder = current.next
+        }
+        return nil
+    }
+
+    private static func workspaceFrontmostBundleID() -> String? {
         let defaultSelector = NSSelectorFromString("defaultWorkspace")
         guard let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
               workspaceClass.responds(to: defaultSelector),

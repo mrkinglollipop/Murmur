@@ -23,6 +23,10 @@ enum HostReturn {
             detail: "host=\(host) via=explicit stack=\(keyboardStack)"
         )
         HostAppProbe.remember(host)
+        if host == messagesBundle {
+            openScheme(host, reason: "messages")
+            return
+        }
         openWorkspace(host)
     }
 

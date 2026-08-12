@@ -397,15 +397,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 detail: "probed=\(probed) return=\(textDocumentProxy.returnKeyType?.rawValue ?? -1)"
             )
         } else {
-            // Kill a persisted Messages default from older builds so it cannot leak.
             HostAppProbe.forget()
             HandoffDiagnostics.record(
                 "keyboard.host.handoff",
                 detail: "empty= return=\(textDocumentProxy.returnKeyType?.rawValue ?? -1)"
             )
         }
-        // This-take probe only. lastHost is poison — a prior Messages take must
-        // not send a Notes take to iMessage.
         let host = probed ?? ""
         let lease = DictationHandoff.readLease()
         DictationHandoff.write(.init(

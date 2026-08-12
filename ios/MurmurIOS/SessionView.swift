@@ -59,18 +59,19 @@ struct SessionView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 28)
 
-                Spacer(minLength: 64)
+                Spacer(minLength: 48)
 
                 Button("Discard") {
                     session.discard()
                 }
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(muted)
-                .padding(.bottom, 8)
+                .padding(.bottom, 72)
             }
 
             BottomSwipeCoach(coral: coral, reduceMotion: reduceMotion)
         }
+        .ignoresSafeArea(edges: .bottom)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Murmur is on. Swipe right across the bottom edge to return to your app, then speak.")
     }
@@ -175,7 +176,7 @@ private struct PhoneSwipeDiagram: View {
     }
 }
 
-/// Sits on the real home-indicator edge: “Swipe” → moving finger → “here”.
+/// Sits on the home indicator: labels above, finger on the actual swipe edge.
 private struct BottomSwipeCoach: View {
     var coral: Color
     var reduceMotion: Bool
@@ -183,39 +184,42 @@ private struct BottomSwipeCoach: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
+            HStack {
                 Text("Swipe")
                     .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 64, alignment: .leading)
-
-                GeometryReader { geo in
-                    let start = geo.size.width * 0.04
-                    let end = max(start, geo.size.width - 30)
-                    ZStack(alignment: .leading) {
-                        Capsule()
-                            .fill(coral.opacity(0.22))
-                            .frame(height: 4)
-                        Circle()
-                            .fill(coral)
-                            .frame(width: 26, height: 26)
-                            .shadow(color: coral.opacity(0.4), radius: 6, y: 1)
-                            .offset(x: reduceMotion ? (start + end) / 2 - 13 : (sliding ? end - 26 : start))
-                    }
-                    .frame(maxHeight: .infinity)
-                }
-                .frame(height: 36)
-
+                Spacer()
                 Text("here")
                     .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 48, alignment: .trailing)
             }
             .foregroundStyle(coral)
-            .padding(.horizontal, 22)
-            .padding(.top, 10)
-            .padding(.bottom, 18)
+            .padding(.horizontal, 28)
+            .padding(.top, 6)
+            .padding(.bottom, 4)
+
+            GeometryReader { geo in
+                let start = geo.size.width * 0.12
+                let end = geo.size.width * 0.78
+                ZStack(alignment: .bottomLeading) {
+                    Capsule()
+                        .fill(Color.black.opacity(0.22))
+                        .frame(width: 134, height: 5)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.bottom, 8)
+                    Circle()
+                        .fill(coral)
+                        .frame(width: 22, height: 22)
+                        .shadow(color: coral.opacity(0.45), radius: 6, y: 1)
+                        .offset(
+                            x: reduceMotion ? (start + end) / 2 - 11 : (sliding ? end : start),
+                            y: -2
+                        )
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            }
+            .frame(height: 34)
         }
         .frame(maxWidth: .infinity)
-        .background(coral.opacity(0.14).ignoresSafeArea(edges: .bottom))
+        .background(coral.opacity(0.16))
         .onAppear { startMotion() }
         .accessibilityHidden(true)
     }

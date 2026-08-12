@@ -29,6 +29,7 @@ final class DictationController: ObservableObject {
     private var listenGateTimeoutTask: Task<Void, Never>?
     private var keepaliveEligible = false
     private var listenGated = false
+    private var hostBounceAttempts = 0
 
     private init() {
         let pointer = Unmanaged.passUnretained(self).toOpaque()
@@ -137,6 +138,7 @@ final class DictationController: ObservableObject {
         case nil:
             break
         }
+        tryHostBounce(reason: "becomeActive")
     }
 
     func restoreIfNeeded() {
@@ -485,9 +487,26 @@ final class DictationController: ObservableObject {
         }
         HandoffDiagnostics.record("app.listenGate.armed", detail: requestID)
         scheduleListenGateTimeout()
-        if keyboardStack, !hostBundleID.isEmpty {
-            HostReturn.bounceBack(keyboardStack: true, hostBundleID: hostBundleID)
+        hostBounceAttempts = 0
+        tryHostBounce(reason: "armed")
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(280))
+            self.tryHostBounce(reason: "armed-delayed")
         }
+    }
+
+    /// Bounce only with this take’s host ID. Messages uses `sms:` (known working).
+    /// Empty host stays on the interstitial — never guess, never suspend.
+    private func tryHostBounce(reason: String) {
+        guard keyboardStack, listenGated, isAwaitingHostReturn else { return }
+        guard !hostBundleID.isEmpty else { return }
+        guard hostBounceAttempts < 2 else { return }
+        hostBounceAttempts += 1
+        HandoffDiagnostics.record(
+            "app.return.try",
+            detail: "\(hostBundleID) reason=\(reason) n=\(hostBounceAttempts)"
+        )
+        HostReturn.bounceBack(keyboardStack: true, hostBundleID: hostBundleID)
     }
 
     private func openGatedSegment() {
@@ -568,6 +587,7 @@ final class DictationController: ObservableObject {
         }
         listenGated = false
         isAwaitingHostReturn = false
+        hostBounceAttempts = 0
     }
 
     private func publishLease(completedRequestID: String) {
