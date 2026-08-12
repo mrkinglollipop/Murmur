@@ -7,13 +7,13 @@ final class KeyboardChromeView: UIView {
     var onDelete: (() -> Void)?
     var onGlobe: (() -> Void)?
     var onInsert: ((String) -> Void)?
+    var onSpaceDrag: ((Int) -> Void)?
+    var onCandidate: ((Int) -> Void)?
 
     private enum Page { case letters, numbers, symbols }
 
-    private let topBar = UIView()
-    private let menuButton = UIButton(type: .system)
-    private let statusLabel = UILabel()
-    private let startButton = UIButton(type: .system)
+    private let glassBackdrop = UIVisualEffectView(effect: UIGlassContainerEffect())
+    private let topBar = AccessoryBarView()
     private let grid = UIView()
     private let globeButton = UIButton(type: .system)
 
@@ -41,6 +41,9 @@ final class KeyboardChromeView: UIView {
     private var showsGlobe = false
     private var keyViews: [KeyView] = []
     private var deleteRepeatTask: Task<Void, Never>?
+    private let keyHaptic = UIImpactFeedbackGenerator(style: .light)
+    private var spaceTrackpadUsed = false
+    private var lastSpaceOffset = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -56,7 +59,12 @@ final class KeyboardChromeView: UIView {
     }
 
     func setStatus(_ text: String) {
-        statusLabel.text = text
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sessionActive || trimmed.isEmpty {
+            topBar.setCaption("")
+        } else {
+            topBar.setCaption(text)
+        }
         let lowered = text.lowercased()
         if lowered.contains("transcribing") {
             listeningStatusLabel.text = "Transcribing…"
@@ -108,10 +116,14 @@ final class KeyboardChromeView: UIView {
         setNeedsLayout()
     }
 
+    func setCandidates(_ words: [String]) {
+        topBar.setCandidates(words)
+    }
+
     func setFullAccess(_ ok: Bool) {
         micEnabled = ok
-        startButton.isEnabled = ok
-        startButton.alpha = ok ? 1 : 0.4
+        topBar.setMicEnabled(ok)
+        topBar.setGifEnabled(false)
     }
 
     func setSecure(_ secure: Bool) {
@@ -154,9 +166,7 @@ final class KeyboardChromeView: UIView {
         let globeHeight: CGFloat = showsGlobe ? 28 : 0
 
         topBar.frame = CGRect(x: side, y: 3, width: bounds.width - side * 2, height: topHeight)
-        menuButton.frame = .zero
-        startButton.frame = CGRect(x: topBar.bounds.width - 108, y: 2, width: 106, height: 44)
-        statusLabel.frame = CGRect(x: 4, y: 6, width: max(0, topBar.bounds.width - 116), height: 36)
+        glassBackdrop.frame = bounds
 
         globeButton.frame = CGRect(x: side + 2, y: bounds.height - globeHeight, width: 42, height: globeHeight)
         grid.frame = CGRect(
@@ -201,10 +211,11 @@ final class KeyboardChromeView: UIView {
     }
 
     private func configureChrome() {
+        insertSubview(glassBackdrop, at: 0)
+        glassBackdrop.isUserInteractionEnabled = false
         addSubview(topBar)
-        topBar.addSubview(menuButton)
-        topBar.addSubview(statusLabel)
-        topBar.addSubview(startButton)
+        topBar.onMic = { [weak self] in self?.onMic?() }
+        topBar.onCandidate = { [weak self] index in self?.onCandidate?(index) }
         addSubview(grid)
         addSubview(globeButton)
         addSubview(listeningPanel)
@@ -234,32 +245,6 @@ final class KeyboardChromeView: UIView {
         errorDismissButton.addTarget(self, action: #selector(tapDismissError), for: .touchUpInside)
         errorDismissButton.accessibilityLabel = "Dismiss error"
         errorDismissButton.accessibilityIdentifier = "murmur.keyboard.error.dismiss"
-
-        menuButton.setImage(UIImage(systemName: "line.3.horizontal"), for: .normal)
-        menuButton.isEnabled = false
-        menuButton.isHidden = true
-        menuButton.accessibilityLabel = "Murmur menu"
-        menuButton.accessibilityIdentifier = "murmur.keyboard.menu"
-
-        statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        statusLabel.textAlignment = .center
-        statusLabel.adjustsFontSizeToFitWidth = true
-        statusLabel.text = " "
-
-        var startConfiguration = UIButton.Configuration.plain()
-        startConfiguration.title = "Start"
-        startConfiguration.image = UIImage(systemName: "waveform")
-        startConfiguration.imagePlacement = .trailing
-        startConfiguration.imagePadding = 8
-        startConfiguration.baseForegroundColor = .white
-        startButton.configuration = startConfiguration
-        startButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        startButton.titleLabel?.numberOfLines = 1
-        startButton.titleLabel?.lineBreakMode = .byClipping
-        startButton.layer.cornerRadius = 22
-        startButton.addTarget(self, action: #selector(tapMic), for: .touchUpInside)
-        startButton.accessibilityLabel = "Start dictation"
-        startButton.accessibilityIdentifier = "murmur.keyboard.start"
 
         configureCircle(cancelButton, symbol: "xmark", action: #selector(tapCancel))
         cancelButton.accessibilityLabel = "Cancel dictation"
@@ -316,36 +301,31 @@ final class KeyboardChromeView: UIView {
         topBar.isHidden = showPanel
         grid.isHidden = showPanel
         globeButton.isHidden = !showsGlobe
-        startButton.isHidden = micHidden
+        topBar.setMicHidden(micHidden)
         setNeedsLayout()
     }
 
     private func applyColors() {
-        let base = dark
-            ? UIColor(red: 0.17, green: 0.17, blue: 0.18, alpha: 1)
-            : UIColor(red: 0.82, green: 0.83, blue: 0.85, alpha: 1)
-        backgroundColor = base
-        topBar.backgroundColor = .clear
-        statusLabel.textColor = dark ? .white : .darkGray
-        menuButton.tintColor = dark ? .white : .black
-        globeButton.tintColor = dark ? .white : .black
-        startButton.backgroundColor = .black
-        startButton.tintColor = .white
-        startButton.setTitleColor(.white, for: .normal)
+        backgroundColor = KeyboardChromeTokens.keyboardBackdrop(dark: dark)
+        topBar.setAppearance(dark: dark)
+        globeButton.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
 
-        listeningPanel.backgroundColor = UIColor(red: 0.88, green: 0.89, blue: 0.91, alpha: 1)
-        cancelButton.backgroundColor = .white
-        cancelButton.tintColor = .black
-        finishButton.backgroundColor = .black
-        finishButton.tintColor = .white
-        formatButton.setTitleColor(UIColor.black.withAlphaComponent(0.18), for: .disabled)
-        waveformView.tintColor = .black
+        listeningPanel.backgroundColor = KeyboardChromeTokens.listeningFill(dark: dark)
+        cancelButton.backgroundColor = dark ? UIColor(white: 0.22, alpha: 1) : .white
+        cancelButton.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
+        finishButton.backgroundColor = dark ? .white : .black
+        finishButton.tintColor = dark ? .black : .white
+        formatButton.setTitleColor(
+            KeyboardChromeTokens.glyphColor(dark: dark).withAlphaComponent(0.22),
+            for: .disabled
+        )
+        waveformView.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
 
         errorBanner.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.96)
         errorLabel.textColor = .label
         errorDismissButton.setTitleColor(.systemBlue, for: .normal)
-        listeningStatusLabel.textColor = .black
-        microphoneLabel.textColor = .black
+        listeningStatusLabel.textColor = KeyboardChromeTokens.glyphColor(dark: dark)
+        microphoneLabel.textColor = KeyboardChromeTokens.glyphColor(dark: dark).withAlphaComponent(0.65)
     }
 
     private func rebuild() {
@@ -362,7 +342,13 @@ final class KeyboardChromeView: UIView {
                     for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit]
                 )
             } else {
+                key.addTarget(self, action: #selector(hapticDown), for: .touchDown)
                 key.addTarget(self, action: #selector(tapKey(_:)), for: .touchUpInside)
+            }
+            if spec.title == "Murmur" {
+                let pan = UIPanGestureRecognizer(target: self, action: #selector(spacePan(_:)))
+                pan.cancelsTouchesInView = false
+                key.addGestureRecognizer(pan)
             }
             grid.addSubview(key)
             return key
@@ -374,8 +360,8 @@ final class KeyboardChromeView: UIView {
 
     private func layoutKeys() {
         let rows = Dictionary(grouping: keyViews) { $0.spec.row }
-        let gap: CGFloat = 5
-        let rowGap: CGFloat = 7
+        let gap: CGFloat = KeyboardChromeTokens.keyGap
+        let rowGap: CGFloat = KeyboardChromeTokens.rowGap
         let rowCount: CGFloat = 4
         let height = max(36, (grid.bounds.height - rowGap * (rowCount - 1)) / rowCount)
         for row in 0..<Int(rowCount) {
@@ -455,12 +441,37 @@ final class KeyboardChromeView: UIView {
         ]
     }
 
+    @objc private func hapticDown() {
+        guard !UIAccessibility.isReduceMotionEnabled else { return }
+        keyHaptic.impactOccurred(intensity: 0.55)
+    }
+
+    @objc private func spacePan(_ gesture: UIPanGestureRecognizer) {
+        let translation = gesture.translation(in: self).x
+        switch gesture.state {
+        case .began:
+            spaceTrackpadUsed = false
+            lastSpaceOffset = 0
+        case .changed:
+            let offset = Int((translation / 8).rounded())
+            if abs(translation) > 8 { spaceTrackpadUsed = true }
+            let delta = offset - lastSpaceOffset
+            if delta != 0 {
+                lastSpaceOffset = offset
+                onSpaceDrag?(delta)
+            }
+        default:
+            break
+        }
+    }
+
     @objc private func tapMic() { onMic?() }
     @objc private func tapCancel() { onCancel?() }
     @objc private func tapDismissError() { dismissError() }
     @objc private func tapGlobe() { onGlobe?() }
 
     @objc private func beginDelete(_: KeyView) {
+        hapticDown()
         onDelete?()
         deleteRepeatTask?.cancel()
         deleteRepeatTask = Task { [weak self] in
@@ -482,6 +493,10 @@ final class KeyboardChromeView: UIView {
         case .spacer:
             return
         case .insert(let text):
+            if text == " ", spaceTrackpadUsed {
+                spaceTrackpadUsed = false
+                return
+            }
             lastShiftTap = nil
             onInsert?(text)
             if page == .letters, text.count == 1, text != " ", text != "\n", shiftState == .once {
@@ -553,14 +568,17 @@ private final class KeyView: UIButton {
     init(spec: KeySpec, dark: Bool) {
         self.spec = spec
         normalFill = Self.fill(spec: spec, dark: dark)
-        pressedFill = dark ? UIColor(white: 0.62, alpha: 1) : UIColor(white: 0.82, alpha: 1)
+        pressedFill = KeyboardChromeTokens.pressedKeyFill(dark: dark)
         super.init(frame: .zero)
         isUserInteractionEnabled = !spec.isSpacer
         isAccessibilityElement = !spec.isSpacer
         accessibilityLabel = spec.title
         accessibilityIdentifier = spec.title == "Murmur" ? "murmur.keyboard.space" : nil
-        layer.cornerRadius = 5.5
-        titleLabel?.font = .systemFont(ofSize: spec.action.isSpecial ? 15 : 22, weight: .regular)
+        layer.cornerRadius = KeyboardChromeTokens.keyCornerRadius
+        titleLabel?.font = .systemFont(
+            ofSize: spec.action.isSpecial ? KeyboardChromeTokens.specialFontSize : KeyboardChromeTokens.letterFontSize,
+            weight: .regular
+        )
         titleLabel?.adjustsFontSizeToFitWidth = true
         setTitleColor(dark ? .white : .black, for: .normal)
         tintColor = dark ? .white : .black
@@ -582,16 +600,16 @@ private final class KeyView: UIButton {
     private static func fill(spec: KeySpec, dark: Bool) -> UIColor {
         switch spec.action {
         case .insert(" "), .insert("\n"):
-            return dark ? UIColor(white: 0.36, alpha: 1) : .white
+            return KeyboardChromeTokens.specialKeyFill(dark: dark)
         case .insert:
-            return dark ? UIColor(white: 0.42, alpha: 1) : .white
+            return KeyboardChromeTokens.letterKeyFill(dark: dark)
         case .spacer:
             return .clear
         default:
             if spec.isSelected {
                 return dark ? .white : UIColor(white: 0.16, alpha: 1)
             }
-            return dark ? UIColor(white: 0.28, alpha: 1) : UIColor(red: 0.68, green: 0.70, blue: 0.73, alpha: 1)
+            return KeyboardChromeTokens.specialKeyFill(dark: dark)
         }
     }
 }
@@ -619,11 +637,17 @@ private final class MeterWaveformView: UIView {
         }
     }
 
+    override var tintColor: UIColor! {
+        didSet {
+            bars.forEach { $0.backgroundColor = tintColor.cgColor }
+        }
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         isOpaque = false
         bars.forEach {
-            $0.backgroundColor = UIColor.black.cgColor
+            $0.backgroundColor = tintColor.cgColor
             $0.cornerRadius = 2
             layer.addSublayer($0)
         }

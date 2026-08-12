@@ -2,7 +2,7 @@ name: MurmurIOS
 options:
   bundleIdPrefix: com.matt.murmur
   deploymentTarget:
-    iOS: "26.0"
+    iOS: "27.0"
   createIntermediateGroups: true
   defaultConfig: Debug
 
@@ -17,7 +17,7 @@ configFiles:
 settings:
   base:
     PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios
-    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "27.0"
     SDKROOT: iphoneos
     SWIFT_VERSION: "5.10"
     TARGETED_DEVICE_FAMILY: "1"
@@ -90,6 +90,9 @@ targets:
         excludes:
           - DictationAttributes.swift
           - DictationIntents.swift
+          - MicRecorder.swift
+          - ElevenLabsBatch.swift
+          - WAVTranscoder.swift
     info:
       path: Keyboard/Info.plist
       properties:

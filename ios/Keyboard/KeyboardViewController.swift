@@ -45,6 +45,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.onDelete = { [weak self] in self?.deleteFromKeyboard() }
         root.onGlobe = { [weak self] in self?.advanceToNextInputMode() }
         root.onInsert = { [weak self] text in self?.insertFromKeyboard(text) }
+        root.onSpaceDrag = { [weak self] delta in
+            self?.textDocumentProxy.adjustTextPosition(byCharacterOffset: delta)
+        }
         root.setShowsGlobe(needsInputModeSwitchKey)
         applyDocumentState()
     }
@@ -198,6 +201,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         case .idle:
             root.setRecording(false)
             root.setStatus(" ")
+            root.setCandidates([])
         }
     }
 
