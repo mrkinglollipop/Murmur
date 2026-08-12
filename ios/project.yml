@@ -1,0 +1,155 @@
+name: MurmurIOS
+options:
+  bundleIdPrefix: com.matt.murmur
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  defaultConfig: Debug
+
+configs:
+  Debug: debug
+  Release: release
+
+configFiles:
+  Debug: ../Config/Team.xcconfig
+  Release: ../Config/Team.xcconfig
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    SDKROOT: iphoneos
+    SWIFT_VERSION: "5.10"
+    TARGETED_DEVICE_FAMILY: "1"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Apple Development"
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.0"
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  MurmurIOS:
+    type: application
+    platform: iOS
+    productName: Murmur
+    sources:
+      - path: MurmurIOS
+      - path: Shared
+    info:
+      path: MurmurIOS/Info.plist
+      properties:
+        CFBundleDisplayName: Murmur
+        CFBundleName: Murmur
+        CFBundleIdentifier: com.matt.murmur.ios
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundlePackageType: APPL
+        CFBundleIconName: AppIcon
+        LSRequiresIPhoneOS: true
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: com.matt.murmur.ios
+            CFBundleURLSchemes:
+              - murmur
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - audio
+        NSSupportsLiveActivities: true
+        NSMicrophoneUsageDescription: "Murmur records your voice from the keyboard so it can transcribe what you say. Grant microphone access here, then enable Full Access for the Murmur keyboard in Settings."
+    entitlements:
+      path: MurmurIOS/MurmurIOS.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.matt.murmur.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios
+        INFOPLIST_FILE: MurmurIOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MurmurIOS/MurmurIOS.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "Murmur iOS Development"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+    dependencies:
+      - target: MurmurKeyboard
+        embed: true
+        codeSign: true
+      - target: MurmurActivity
+        embed: true
+        codeSign: true
+
+  MurmurKeyboard:
+    type: app-extension
+    platform: iOS
+    productName: MurmurKeyboard
+    sources:
+      - path: Keyboard
+      - path: Shared
+        excludes:
+          - DictationAttributes.swift
+          - DictationIntents.swift
+    info:
+      path: Keyboard/Info.plist
+      properties:
+        CFBundleDisplayName: Murmur
+        CFBundleName: MurmurKeyboard
+        CFBundleIdentifier: com.matt.murmur.ios.keyboard
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundlePackageType: XPC!
+        NSMicrophoneUsageDescription: "Murmur records your voice from the keyboard so it can transcribe what you say. Grant microphone access in the Murmur app, then enable Full Access for the Murmur keyboard in Settings."
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.keyboard-service
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).KeyboardViewController"
+          NSExtensionAttributes:
+            IsASCIICapable: true
+            PrefersRightToLeft: false
+            PrimaryLanguage: en-US
+            RequestsOpenAccess: true
+    entitlements:
+      path: Keyboard/Keyboard.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.matt.murmur.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboard
+        INFOPLIST_FILE: Keyboard/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Keyboard/Keyboard.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "Murmur Keyboard Development"
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1"
+
+  MurmurActivity:
+    type: app-extension
+    platform: iOS
+    productName: MurmurActivity
+    sources:
+      - path: Activity
+      - path: Shared/DictationAttributes.swift
+    info:
+      path: Activity/Info.plist
+      properties:
+        CFBundleDisplayName: Murmur
+        CFBundleName: MurmurActivity
+        CFBundleIdentifier: com.matt.murmur.ios.widget
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundlePackageType: XPC!
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Activity/Activity.entitlements
+      properties: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.widget
+        INFOPLIST_FILE: Activity/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Activity/Activity.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "Murmur Widget Development"
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1"
