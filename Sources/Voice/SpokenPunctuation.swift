@@ -89,9 +89,6 @@ enum SpokenPunctuation {
         ("hash sign", "#"),
         ("pound sign", "#"),
         ("number sign", "#"),
-        ("exclamation mark", "!"),
-        ("exclamation point", "!"),
-        ("question mark", "?"),
         ("ampersand sign", "&"),
         ("vertical bar", "|"),
         ("pipe symbol", "|"),
@@ -124,19 +121,131 @@ enum SpokenPunctuation {
         ("double colon", "::"),
     ]
 
+    /// Code-aware full mapping. `!` / `?` commands use mention guards even here
+    /// (`a question mark` stays words; `question mark optional` still maps).
     static func apply(_ text: String) -> String {
+        apply(text, codeAware: true)
+    }
+
+    /// `codeAware` runs joiners + the symbol table. Prose still converts
+    /// sentence-end commands (`exclamation point` → `!`) with mention guards.
+    static func apply(_ text: String, codeAware: Bool) -> String {
         var result = text
-        result = applyPhraseReplacements(result, phrases: preJoinerPhrases)
-        result = applyWordJoiners(result)
-        // After `conduct dot m` → `conduct.m`, ASR often leaves the rest of a
-        // letter-spelled extension spaced: `conduct.m d c` → `conduct.mdc`.
-        result = collapseSpacedFileExtensions(result)
-        // `conduct Dot Mdc` joins as `conduct.Mdc` — normalize known extensions.
-        result = lowercaseKnownFileExtensions(result)
-        let postJoiner = phraseReplacements
-            .filter { pair in !preJoinerPhrases.contains(where: { $0.0 == pair.0 }) }
-            .sorted { $0.0.count > $1.0.count }
-        result = applyPhraseReplacements(result, phrases: postJoiner)
+        if codeAware {
+            result = applyPhraseReplacements(result, phrases: preJoinerPhrases)
+            result = applyWordJoiners(result)
+            // After `conduct dot m` → `conduct.m`, ASR often leaves the rest of a
+            // letter-spelled extension spaced: `conduct.m d c` → `conduct.mdc`.
+            result = collapseSpacedFileExtensions(result)
+            // `conduct Dot Mdc` joins as `conduct.Mdc` — normalize known extensions.
+            result = lowercaseKnownFileExtensions(result)
+            let postJoiner = phraseReplacements
+                .filter { pair in !preJoinerPhrases.contains(where: { $0.0 == pair.0 }) }
+                .sorted { $0.0.count > $1.0.count }
+            result = applyPhraseReplacements(result, phrases: postJoiner)
+        }
+        return applyPunctuationCommands(result, allowMidSentence: codeAware)
+    }
+
+    /// Longest first so `exclamation point` wins over a future shorter alias.
+    private static let sentencePunctuationCommands: [(String, String)] = [
+        ("exclamation point", "!"),
+        ("exclamation mark", "!"),
+        ("question mark", "?"),
+    ]
+
+    /// Command vs mention: `I need one of these, exclamation point.` → `!`,
+    /// but `a question mark` / `an exclamation point` stay words. Mid-sentence
+    /// unguarded maps (`? optional`) only when `allowMidSentence` (code-aware).
+    private static func applyPunctuationCommands(_ text: String, allowMidSentence: Bool) -> String {
+        var result = text
+        let commands = sentencePunctuationCommands.sorted { $0.0.count > $1.0.count }
+        for (spoken, symbol) in commands {
+            result = replacePunctuationCommand(
+                in: result,
+                spoken: spoken,
+                symbol: symbol,
+                allowMidSentence: allowMidSentence
+            )
+        }
+        return result
+    }
+
+    private static func replacePunctuationCommand(
+        in text: String,
+        spoken: String,
+        symbol: String,
+        allowMidSentence: Bool
+    ) -> String {
+        let pattern = "\\b\(NSRegularExpression.escapedPattern(for: spoken))\\b"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return text
+        }
+        var result = text
+        while true {
+            let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+            let matches = regex.matches(in: result, options: [], range: nsRange)
+            var didReplace = false
+            for match in matches.reversed() {
+                guard let range = Range(match.range, in: result) else { continue }
+                let prefix = String(result[..<range.lowerBound])
+                let suffix = String(result[range.upperBound...])
+                if isPunctuationMention(prefix: prefix) { continue }
+                let terminal = isSentenceTerminal(suffix: suffix)
+                if !allowMidSentence && !terminal { continue }
+                if terminal {
+                    result = gluePrefix(prefix) + symbol + droppingCommandPeriod(suffix)
+                } else {
+                    result.replaceSubrange(range, with: symbol)
+                }
+                didReplace = true
+                break
+            }
+            if !didReplace { break }
+        }
+        return result
+    }
+
+    /// `a` / `an` / `the` immediately before the phrase means naming the mark.
+    private static func isPunctuationMention(prefix: String) -> Bool {
+        let pattern = #"\b(a|an|the)\s+\z"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return false
+        }
+        let range = NSRange(prefix.startIndex..<prefix.endIndex, in: prefix)
+        return regex.firstMatch(in: prefix, options: [], range: range) != nil
+    }
+
+    /// End of string, or a period that is the sentence terminator (ASR often
+    /// appends `.` after the spoken command).
+    private static func isSentenceTerminal(suffix: String) -> Bool {
+        let trimmed = suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        guard trimmed.hasPrefix(".") else { return false }
+        let rest = trimmed.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+        if rest.isEmpty { return true }
+        if let first = rest.first, first.isUppercase || first.isNewline { return true }
+        return false
+    }
+
+    /// Glue `!`/`?` to the preceding word; eat a command comma (`these, !`).
+    private static func gluePrefix(_ prefix: String) -> String {
+        if let range = prefix.range(of: #",\s*\z"#, options: .regularExpression) {
+            return String(prefix[..<range.lowerBound])
+        }
+        if let range = prefix.range(of: #"[ \t]+\z"#, options: .regularExpression) {
+            return String(prefix[..<range.lowerBound])
+        }
+        return prefix
+    }
+
+    /// Drop the period ASR stuck on the command so `!.` does not survive.
+    private static func droppingCommandPeriod(_ suffix: String) -> String {
+        guard let range = suffix.range(of: #"^\s*\."#, options: .regularExpression) else {
+            return suffix
+        }
+        var result = suffix
+        result.removeSubrange(range)
         return result
     }
 

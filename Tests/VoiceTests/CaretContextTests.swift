@@ -1371,4 +1371,12 @@ final class CodeAwarePreprocessGateTests: XCTestCase {
         )
         XCTAssertEqual(out, "SettingsStore period swift")
     }
+
+    func testProseExclamationCommandRunsWhenCodeAwareOff() {
+        let out = TranscriptionPipeline.preprocessBeforeCleanup(
+            "I need one of these, exclamation point.",
+            codeAware: false
+        )
+        XCTAssertEqual(out, "I need one of these!")
+    }
 }
