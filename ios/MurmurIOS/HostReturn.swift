@@ -1,22 +1,31 @@
 import UIKit
 
-/// Returns to the keyboard host after the containing app activates the microphone.
-/// LSApplicationWorkspace is private API, used here for sideload testing.
+/// Returns to the keyboard host after the containing app arms the microphone.
+/// `LSApplicationWorkspace` is private API, used here for sideload testing.
 @MainActor
 enum HostReturn {
     static let messagesBundle = "com.apple.MobileSMS"
 
+    /// Workspace-open only this take’s probed host. Empty probe stays on the
+    /// interstitial — never `suspend` (that sent Notes to Home) and never guess
+    /// Messages.
     static func bounceBack(keyboardStack: Bool, hostBundleID: String?) {
-        let host = resolvedHost(hostBundleID)
-        HandoffDiagnostics.record("app.return.requested", detail: "host=\(host) stack=\(keyboardStack)")
-        AppGroupStore.lastHostBundleID = host
+        let host = hostBundleID ?? ""
+        guard !host.isEmpty else {
+            HandoffDiagnostics.record(
+                "app.return.skipped",
+                detail: "host=empty stack=\(keyboardStack) — interstitial"
+            )
+            return
+        }
+        HandoffDiagnostics.record(
+            "app.return.requested",
+            detail: "host=\(host) via=explicit stack=\(keyboardStack)"
+        )
+        HostAppProbe.remember(host)
+        // Workspace-open is the path that actually foregrounds Messages.
+        // `sms:` stays the timeout / reject fallback — do not skip workspace.
         openWorkspace(host)
-    }
-
-    private static func resolvedHost(_ bundleID: String?) -> String {
-        if let bundleID, !bundleID.isEmpty { return bundleID }
-        let last = AppGroupStore.lastHostBundleID
-        return last.isEmpty ? messagesBundle : last
     }
 
     private static func openWorkspace(_ bundleID: String) {
@@ -57,6 +66,7 @@ enum HostReturn {
         function(workspace, openSelector, bundleID as NSString, nil, completion)
     }
 
+    /// Scheme fallback only for the probed host. `sms:` only when that host is Messages.
     private static func openScheme(_ bundleID: String, reason: String) {
         guard let url = schemeURL(for: bundleID) else {
             HandoffDiagnostics.record("app.return.noFallback", detail: "\(bundleID) reason=\(reason)")
@@ -73,7 +83,7 @@ enum HostReturn {
 
     private static func schemeURL(for bundleID: String) -> URL? {
         let schemes = [
-            "com.apple.MobileSMS": "sms:",
+            messagesBundle: "sms:",
             "com.apple.mobilenotes": "mobilenotes://",
             "com.apple.mail": "message://",
             "com.apple.mobilemail": "message://"

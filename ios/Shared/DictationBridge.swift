@@ -5,6 +5,7 @@ enum DictationBridge {
     static let stopName = "com.matt.murmur.ios.dictation.stop" as CFString
     static let startName = "com.matt.murmur.ios.dictation.start" as CFString
     static let cancelName = "com.matt.murmur.ios.dictation.cancel" as CFString
+    static let hostReadyName = "com.matt.murmur.ios.dictation.hostReady" as CFString
     private static let commandKey = "dictationCommand"
 
     enum Command: String {
@@ -12,6 +13,7 @@ enum DictationBridge {
         case stop
         case start
         case cancel
+        case hostReady
     }
 
     static func post(_ command: Command) {
@@ -21,6 +23,7 @@ enum DictationBridge {
         case .stop: stopName
         case .start: startName
         case .cancel: cancelName
+        case .hostReady: hostReadyName
         }
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),

@@ -2,7 +2,7 @@ name: MurmurIOS
 options:
   bundleIdPrefix: com.matt.murmur
   deploymentTarget:
-    iOS: "26.0"
+    iOS: "27.0"
   createIntermediateGroups: true
   defaultConfig: Debug
 
@@ -17,7 +17,7 @@ configFiles:
 settings:
   base:
     PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios
-    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "27.0"
     SDKROOT: iphoneos
     SWIFT_VERSION: "5.10"
     TARGETED_DEVICE_FAMILY: "1"
@@ -35,6 +35,8 @@ targets:
     sources:
       - path: MurmurIOS
       - path: Shared
+      - path: ../Sources/Voice/SpokenCapitalization.swift
+      - path: ../Sources/Voice/DotCompoundNumberNormalizer.swift
     info:
       path: MurmurIOS/Info.plist
       properties:
@@ -59,6 +61,10 @@ targets:
           - audio
         NSSupportsLiveActivities: true
         NSMicrophoneUsageDescription: "Murmur records your voice from the keyboard so it can transcribe what you say. Grant microphone access here, then enable Full Access for the Murmur keyboard in Settings."
+        LSApplicationQueriesSchemes:
+          - sms
+          - mobilenotes
+          - message
     entitlements:
       path: MurmurIOS/MurmurIOS.entitlements
       properties:
@@ -90,6 +96,19 @@ targets:
         excludes:
           - DictationAttributes.swift
           - DictationIntents.swift
+          - MicRecorder.swift
+          - ElevenLabsBatch.swift
+          - WAVTranscoder.swift
+          - SnippetsStore.swift
+          - ScratchpadStore.swift
+          - StyleStore.swift
+          - StyleProfile.swift
+          - StyleFormatter.swift
+          - HistoryStore.swift
+          - MurmurStores.swift
+          - TranscriptPostProcessor.swift
+      - path: Resources
+        buildPhase: resources
     info:
       path: Keyboard/Info.plist
       properties:
@@ -130,6 +149,9 @@ targets:
     sources:
       - path: Activity
       - path: Shared/DictationAttributes.swift
+      - path: Shared/DictationIntents.swift
+      - path: Shared/DictationBridge.swift
+      - path: Shared/AppGroupStore.swift
     info:
       path: Activity/Info.plist
       properties:
@@ -153,3 +175,35 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: "Murmur Widget Development"
         SKIP_INSTALL: YES
         TARGETED_DEVICE_FAMILY: "1"
+
+  MurmurKeyboardTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KeyboardTests
+      - path: Keyboard/AutocorrectEngine.swift
+      - path: Keyboard/AutocorrectController.swift
+      - path: Keyboard/SwipeTypingEngine.swift
+      - path: Resources
+        buildPhase: resources
+      - path: Shared/HostFingerprint.swift
+      - path: Shared/GiphyClient.swift
+      - path: Shared/AppGroupStore.swift
+      - path: Shared/PhraseBoundaryPattern.swift
+      - path: Shared/DictionaryStore.swift
+      - path: Shared/SnippetsStore.swift
+      - path: Shared/StyleProfile.swift
+      - path: Shared/StyleFormatter.swift
+      - path: ../Sources/Voice/SpokenCapitalization.swift
+      - path: ../Sources/Voice/DotCompoundNumberNormalizer.swift
+      - path: Shared/TranscriptPostProcessor.swift
+      - path: Shared/LearnedWordStore.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboardtests
+        GENERATE_INFOPLIST_FILE: YES
+        IPHONEOS_DEPLOYMENT_TARGET: "27.0"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        PROVISIONING_PROFILE_SPECIFIER: ""
