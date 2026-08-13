@@ -37,7 +37,7 @@ current setup and contribution guidance.
 | 023 | Open-source readiness | SHIPPED (Phases 1–5) |
 | 024 | Repo audit findings | archival (fix pass 1 landed) |
 | 025 | Murmur Pro scope | approved direction; not started |
-| 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe ship-gated) | PARTIAL — P0-host + P0-chrome + P1 + P2 REST tray in PR #37; P2b Messages bubble is a device spike; P3 ship-gated |
+| 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe bake-off gated) | PARTIAL — P0–P2 in tree; swipe is in the build (Settings toggle, default on), still bake-off gated; P2b Messages bubble is a device spike |
 
 ## Notes for maintainers
 
@@ -50,7 +50,7 @@ current setup and contribution guidance.
 
 # 026 — iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe ship-gated)
 
-**Status:** PARTIAL — P0-host, P0-chrome, P1 autocorrect, and P2 Giphy REST tray are in PR #37. P2b Messages GIF bubble is a device spike. P3 swipe remains ship-gated.
+**Status:** PARTIAL — P0-host, P0-chrome, P1 autocorrect, P2 Giphy REST tray, and swipe-to-type are in the tree. P2b Messages GIF bubble is a device spike. Swipe is bake-off gated (not missing).
 **Written against:** `cf13857` (`main`, 2026-08-12).
 **Canonical home:** this section in `plans/README.md` until split to `plans/026-ios-keyboard-upgrade.md`.
 **Does not authorize App Store submit, Mac target changes, Pro/IAP, or Murmur-server.**
@@ -69,16 +69,18 @@ Verified by reading `ios/Keyboard/` this session. Do **not** trust the memory to
 
 | Surface | What exists |
 |---|---|
-| Entry | `KeyboardViewController` (`UIInputViewController`), height **248pt** (never updated) |
+| Entry | `KeyboardViewController` (`UIInputViewController`), height **296pt** (`KeyboardChromeTokens.portraitHeight`) |
 | Chrome | `KeyboardChromeView` — UIKit only, “Wispr-shaped QWERTY” |
 | Top bar | 48pt: `statusLabel` + **Start** (waveform) on the right. `menuButton` exists but is **hidden, disabled, `frame = .zero`** |
 | Keys | Real `textDocumentProxy.insertText` / `deleteBackward`. Letters / 123 / #+= . Shift once/locked. Space labeled **“Murmur”**. Return title from `returnKeyType` |
-| Already shipped typing niceties | Sentence/word/all-caps from `autocapitalizationType`; double-space → `. `; input clicks |
-| Missing | Swipe, candidate bar, `UITextChecker`, GIF, haptics beyond clicks, space-bar cursor, key callouts |
+| Already shipped typing niceties | Sentence/word/all-caps from `autocapitalizationType`; double-space → `. `; input clicks; candidate bar; `UITextChecker` |
+| Swipe | In the build (`SwipeTypingEngine`, Settings toggle, default on). Still bake-off gated — not missing. |
+| GIF | Giphy REST tray from the accessory row (3-column thumbs). Messages pasteboard bubble is a device spike. |
+| Missing | Space-bar cursor, key callouts; haptics beyond clicks |
 | Dictation | Mic does **not** record in the appex. `murmur://dictate` via `extensionContext.open`, fallback responder-chain `UIApplication.open` (sideload). Host records + ElevenLabs `scribe_v2`. Poll `handoff.json` 80ms → `insertText` |
 | Listening overlay | Replaces grid; **Format** disabled; palette is **light gray even in dark mode** |
 | Full Access | `RequestsOpenAccess: true`. No Full Access / no API key → `.setup`, mic dead, **keys still type** |
-| Packaging | `ios/project.yml` — **iOS 26.0 today**; this build bumps the floor to **iOS 27.0** (SDK `iphoneos27.0` on this machine, Xcode-beta, verified 2026-08-12). iPhone only, **zero SPM**. App Group `group.com.matt.murmur.ios`. No iOS test target |
+| Packaging | `ios/project.yml` — **iOS 27.0** floor (SDK `iphoneos27.0` on this machine, Xcode-beta). iPhone only, **zero SPM**. App Group `group.com.matt.murmur.ios`. Test target `MurmurKeyboardTests` |
 | Host return (bug) | `KeyboardViewController.startHandoff` **defaults an empty probe to `com.apple.MobileSMS`**, then `HostAppProbe.remember` persists it. `HostReturn.resolvedHost` defaults empty → Messages again. Scheme fallback only knows Messages / Notes / Mail. Matt’s report (always returns to Messages) matches this path. |
 | Visual tokens | No shared iOS design-token file. Coral `#D85A30` duplicated in onboarding / Live Activity. Mac `Sources/Voice/UI/Theme.swift` is **AppKit** — do not import it into the appex |
 
@@ -203,7 +205,7 @@ ios/project.yml                     — iOS 27.0 floor, new test target, no Giph
 - **P3:** introduce a single `UIGestureRecognizer` owner on `grid` that dispatches tap vs swipe vs space-drag vs delete-hold, and **absorbs** the P0 space-key pan. Letter keys may then become non-`UIButton` layers under that owner so `UIButton` highlights and the pan recognizer do not fight. Translation under about 16pt → tap (preserve current key behavior); translation across **2 or more letter keys** → swipe path; cancel the tap. Swipe **never** starts on delete / shift / 123 / return / space (space is trackpad, not swipe).
 - **Do not add a second type named `KeyView`.** If P3 replaces the UIButton subclass, rename or convert the existing type in place — never two `KeyView`s.
 
-**Height:** idle typing stays **248pt** if the accessory row remains 48pt. GIF tray is a **sheet inside the keyboard** (grid replaced by a collection view, same bounds) — not a taller keyboard. If candidates feel cramped, raise to **276pt** (48+ extra 28) as a measured P0 tweak, not a guess in code review.
+**Height:** idle typing is **296pt** (`KeyboardChromeTokens.portraitHeight`). GIF search tray shares that height with a compressed key row; it is not a taller keyboard.
 
 **Jetsam budget (P2/P3), on top of the current keyboard baseline:**
 

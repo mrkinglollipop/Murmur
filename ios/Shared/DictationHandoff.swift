@@ -3,7 +3,10 @@ import Foundation
 /// App Group IPC between keyboard and containing app. The keyboard cannot record.
 enum DictationHandoff {
     static let scheme = "murmur"
-    static let leaseDuration: TimeInterval = 300
+    /// Sliding window. Heartbeats keep this pushed forward until the user taps Off.
+    static let leaseDuration: TimeInterval = 8 * 60 * 60
+    /// Background timer coalescing can skip a beat; 3s was killing reuse.
+    static let heartbeatGrace: TimeInterval = 60
 
     struct Payload: Codable, Equatable {
         enum Status: String, Codable {
@@ -31,7 +34,7 @@ enum DictationHandoff {
         var heartbeatAt: Date
 
         var isValid: Bool {
-            expiresAt > .now && Date().timeIntervalSince(heartbeatAt) < 3
+            expiresAt > .now && Date().timeIntervalSince(heartbeatAt) < heartbeatGrace
         }
     }
 

@@ -5,11 +5,14 @@ import UIKit
 
 /// Walks XPC / view-service ivars for a host PID or bundle ID.
 /// ChatKit classes are not visible in the keyboard process; `_hostPID` is.
+/// PID→name is sandboxed; NSXPCConnection descriptions often still name the host.
 enum HostIvarScanner {
     struct Hit {
         var bundleIDs: [String] = []
         var pids: [pid_t] = []
         var inventory: [String] = []
+        var xpcDescriptions: [String] = []
+        var connections: [NSXPCConnection] = []
     }
 
     static func scan(_ objects: [NSObject]) -> Hit {
@@ -33,10 +36,13 @@ enum HostIvarScanner {
     ) {
         let identity = ObjectIdentifier(object)
         guard seen.insert(identity).inserted else { return }
+        if let connection = object as? NSXPCConnection {
+            harvestXPC(connection, label: NSStringFromClass(type(of: object)), into: &hit)
+        }
         let typeName = NSStringFromClass(type(of: object))
         var cls: AnyClass? = object_getClass(object)
         while let current = cls {
-            if current == UIViewController.self || current == UIView.self || current == NSObject.self {
+            if current == UIView.self || current == NSObject.self {
                 break
             }
             var count: UInt32 = 0
@@ -47,10 +53,6 @@ enum HostIvarScanner {
                 }
             }
             cls = class_getSuperclass(current)
-        }
-        if let connection = object as? NSXPCConnection {
-            append(pid: connection.processIdentifier, into: &hit)
-            hit.inventory.append("\(typeName).processIdentifier=\(connection.processIdentifier)")
         }
     }
 
@@ -73,7 +75,7 @@ enum HostIvarScanner {
             }
             if let string = value as? String {
                 hit.inventory.append("\(typeName).\(name)=str:\(string.prefix(48))")
-                if string.contains(".") { hit.bundleIDs.append(string) }
+                rememberHint(string, into: &hit)
                 return
             }
             if let number = value as? NSNumber {
@@ -84,13 +86,15 @@ enum HostIvarScanner {
                 return
             }
             if let connection = value as? NSXPCConnection {
-                append(pid: connection.processIdentifier, into: &hit)
-                hit.inventory.append("\(typeName).\(name)=xpc:\(connection.processIdentifier)")
+                harvestXPC(connection, label: "\(typeName).\(name)", into: &hit)
+                if depth < 2 {
+                    scan(connection, depth: depth + 1, into: &hit, seen: &seen)
+                }
                 return
             }
             let nestedName = NSStringFromClass(type(of: value as AnyObject))
             hit.inventory.append("\(typeName).\(name)=\(nestedName)")
-            guard depth < 1, let nested = value as? NSObject else { return }
+            guard depth < 2, let nested = value as? NSObject else { return }
             if shouldRecurse(nestedName) {
                 scan(nested, depth: depth + 1, into: &hit, seen: &seen)
             }
@@ -99,6 +103,29 @@ enum HostIvarScanner {
         if looksLikePIDName(lowered), let number = integer(ivar, from: object, encoding: encoding) {
             hit.inventory.append("\(typeName).\(name)=\(number)")
             append(pid: pid_t(truncatingIfNeeded: number), into: &hit)
+        }
+    }
+
+    private static func harvestXPC(
+        _ connection: NSXPCConnection,
+        label: String,
+        into hit: inout Hit
+    ) {
+        append(pid: connection.processIdentifier, into: &hit)
+        hit.connections.append(connection)
+        let description = connection.debugDescription
+        hit.xpcDescriptions.append(String(description.prefix(160)))
+        hit.inventory.append("\(label)=xpc:\(connection.processIdentifier) \(description.prefix(80))")
+        rememberHint(description, into: &hit)
+    }
+
+    private static func rememberHint(_ string: String, into hit: inout Hit) {
+        if let mapped = HostFingerprint.bundleID(fromProcessPath: string) {
+            hit.bundleIDs.append(mapped)
+            return
+        }
+        if HostFingerprint.dictationHostBundleIDs.contains(string) {
+            hit.bundleIDs.append(string)
         }
     }
 
@@ -115,6 +142,7 @@ enum HostIvarScanner {
         if className.contains("Interface") { return true }
         if className.contains("Connection") { return true }
         if className.contains("Host") { return true }
+        if className.contains("State") { return true }
         return false
     }
 

@@ -1,6 +1,7 @@
 import ActivityKit
 import AVFoundation
 import Foundation
+import UIKit
 
 /// Flash-opens from the keyboard, starts the microphone, then returns to the host app.
 @MainActor
@@ -30,6 +31,11 @@ final class DictationController: ObservableObject {
     private var keepaliveEligible = false
     private var listenGated = false
     private var hostBounceAttempts = 0
+    private var pendingHostReady = false
+    private var murmurForeground = true
+    private var hostPID = 0
+    private var learnTask: Task<Void, Never>?
+    private var fromActionButton = false
 
     private init() {
         let pointer = Unmanaged.passUnretained(self).toOpaque()
@@ -110,6 +116,26 @@ final class DictationController: ObservableObject {
         )
     }
 
+    /// Home toggle. Does not start a take. Turning off ends the island session.
+    func setSessionEnabled(_ on: Bool) {
+        if !on {
+            discard()
+            return
+        }
+        guard !isArmed else { return }
+        isArmed = true
+        statusText = "Murmur is on"
+        presentLiveActivity(recording: false, label: "On")
+        HandoffDiagnostics.record("app.session.enabledIdle")
+    }
+
+    /// Action Button / Shortcuts. Records in Murmur; stop copies to the clipboard.
+    func startFromActionButton() {
+        guard !isRecording, !isBusy, !isAwaitingHostReturn else { return }
+        startFreshTake(fromActionButton: true)
+        HandoffDiagnostics.record("app.actionButton.start")
+    }
+
     func becomeActive() {
         restoreIfNeeded()
         let command = DictationBridge.take()
@@ -150,6 +176,10 @@ final class DictationController: ObservableObject {
         let existing = Activity<DictationAttributes>.activities.first
         if let lease = DictationHandoff.readLease() {
             activity = existing
+            isArmed = true
+            statusText = "Murmur is on"
+            hostBundleID = lease.hostBundleID
+            presentLiveActivity(recording: false, label: "On")
             scheduleLeaseExpiration(lease)
             HandoffDiagnostics.record("app.lease.restored", detail: lease.sessionID)
             return
@@ -209,10 +239,28 @@ final class DictationController: ObservableObject {
         }
     }
 
-    func arm(id: String, hostBundleID: String, hostPID: Int = 0, keyboardStack: Bool) {
+    func arm(
+        id: String,
+        hostBundleID: String,
+        hostPID: Int = 0,
+        keyboardStack: Bool,
+        sourceApplication: String = ""
+    ) {
         guard let payload = DictationHandoff.read(), payload.id == id,
               payload.status == .pending, (DictationHandoff.pendingAge() ?? .infinity) <= 12 else {
             HandoffDiagnostics.record("app.deeplink.rejected", detail: id)
+            return
+        }
+        if isArmed, requestID == id {
+            if self.hostBundleID.isEmpty,
+               let source = HostAppProbe.sanitizeForHost(sourceApplication) {
+                self.hostBundleID = source
+                if self.hostPID > 1 {
+                    HostAppProbe.remember(pid: pid_t(self.hostPID), bundleID: source)
+                }
+                HandoffDiagnostics.record("app.host.sourceLate", detail: source)
+                tryHostBounce(reason: "source-late")
+            }
             return
         }
         if recorder.isRecording || recorder.canResume {
@@ -225,6 +273,11 @@ final class DictationController: ObservableObject {
         var host = hostBundleID
         if host.isEmpty { host = payload.hostBundleID }
         let pid = hostPID > 1 ? hostPID : (payload.hostPID ?? 0)
+        let probe = HostAppProbe.frontmostProbe()
+        HandoffDiagnostics.record(
+            "app.host.frontmostProbe",
+            detail: "pid=\(pid) sbs=\(probe.sbs ?? "nil") ws=\(probe.workspace ?? "nil") ok=\(probe.sanitized ?? "nil") src=\(sourceApplication.isEmpty ? "nil" : sourceApplication)"
+        )
         if host.isEmpty, pid > 1 {
             host = HostAppProbe.bundleID(forPID: pid_t(pid)) ?? ""
             HandoffDiagnostics.record(
@@ -232,25 +285,33 @@ final class DictationController: ObservableObject {
                 detail: "pid=\(pid) host=\(host.isEmpty ? "empty" : host)"
             )
         }
-        if host.isEmpty, pid > 1, pid != Int(getpid()) {
-            // iOS sandboxes every PID→bundle lookup. A foreign host PID means the
-            // keyboard was in another app; workspace-open MobileSMS is the path
-            // that used to return to Messages (6c30366). Notes can get pulled too.
-            host = HostReturn.messagesBundle
-            HandoffDiagnostics.record(
-                "app.host.messagesFallback",
-                detail: "pid=\(pid) murmur=\(getpid())"
-            )
+        if host.isEmpty, pid > 1, let learned = HostAppProbe.rememberedBundleID(forPID: pid_t(pid)) {
+            host = learned
+            HandoffDiagnostics.record("app.host.pidLearned", detail: "pid=\(pid) host=\(host)")
+        }
+        if host.isEmpty, let source = HostAppProbe.sanitizeForHost(sourceApplication) {
+            host = source
+            HandoffDiagnostics.record("app.host.sourceApplication", detail: host)
+            if pid > 1 { HostAppProbe.remember(pid: pid_t(pid), bundleID: host) }
+        }
+        if host.isEmpty, let front = probe.sanitized {
+            host = front
+            HandoffDiagnostics.record("app.host.frontmost", detail: host)
+            if pid > 1 { HostAppProbe.remember(pid: pid_t(pid), bundleID: host) }
         }
         requestID = id
         self.hostBundleID = host
+        self.hostPID = pid
         self.keyboardStack = keyboardStack
-        if !host.isEmpty {
+        if host.isEmpty {
+            HostAppProbe.forget()
+        } else {
             HostAppProbe.remember(host)
         }
         isArmed = true
         isBusy = false
         isPaused = false
+        fromActionButton = false
         transcript = ""
         statusText = keyboardStack
             ? "Murmur is on"
@@ -271,7 +332,7 @@ final class DictationController: ObservableObject {
             isPaused = true
             statusText = "Paused"
             write(.paused, text: "", error: "")
-            updateLiveActivity(recording: false, label: "Paused")
+            presentLiveActivity(recording: false, label: "Paused")
             return
         }
         if recorder.canResume {
@@ -281,7 +342,7 @@ final class DictationController: ObservableObject {
                 isPaused = false
                 statusText = "Listening…"
                 write(.recording, text: "", error: "")
-                updateLiveActivity(recording: true, label: "Listening")
+                presentLiveActivity(recording: true, label: "Listening")
             } catch {
                 statusText = error.localizedDescription
             }
@@ -325,7 +386,7 @@ final class DictationController: ObservableObject {
         isBusy = true
         statusText = "Transcribing…"
         write(.transcribing, text: "", error: "")
-        updateLiveActivity(recording: false, label: "Transcribing")
+        presentLiveActivity(recording: false, label: "Transcribing")
         let key = AppGroupStore.apiKey
         let language = AppGroupStore.languageCode
         let id = requestID
@@ -333,28 +394,47 @@ final class DictationController: ObservableObject {
         transcribeTask = Task {
             defer { try? FileManager.default.removeItem(at: url) }
             do {
-                let text = try await ElevenLabsBatch.transcribe(
+                let raw = try await ElevenLabsBatch.transcribe(
                     audioURL: url,
                     apiKey: key,
-                    language: language
+                    language: language,
+                    noVerbatim: true,
+                    keyterms: DictionaryStore.selectKeyterms(from: MurmurStores.dictionary.entries)
                 )
                 await MainActor.run {
                     guard self.requestID == id else { return }
+                    let spoken = TranscriptPostProcessor.applySpokenPasses(raw)
+                    let corrected = MurmurStores.dictionary.correct(spoken)
+                    let styled = StyleFormatter.apply(
+                        corrected,
+                        profile: MurmurStores.style.selected,
+                        preserveTerms: MurmurStores.dictionary.entries.map(\.term)
+                    )
+                    let text = MurmurStores.snippets.expand(styled)
                     self.transcript = text
                     self.isBusy = false
-                    self.statusText = "Inserted"
                     self.write(.done, text: text, error: "")
+                    MurmurStores.history.append(text: text, failed: false)
+                    if self.fromActionButton {
+                        UIPasteboard.general.string = text
+                        self.statusText = "Copied to clipboard"
+                    } else {
+                        self.statusText = "Inserted"
+                    }
+                    self.fromActionButton = false
                     HandoffDiagnostics.record(
                         "app.transcription.succeeded",
                         detail: "\(id) characters=\(text.count)"
                     )
                     if self.keepaliveEligible {
+                        self.isArmed = true
+                        self.statusText = "Murmur is on"
                         self.publishLease(completedRequestID: id)
                     } else {
                         HandoffDiagnostics.record("app.lease.skipped", detail: "\(id) audioSessionUnavailable")
+                        self.isArmed = false
                         self.endLiveActivity()
                     }
-                    self.isArmed = false
                     self.requestID = ""
                 }
             } catch {
@@ -364,6 +444,8 @@ final class DictationController: ObservableObject {
                     self.isArmed = false
                     self.statusText = error.localizedDescription
                     self.write(.failed, text: "", error: error.localizedDescription)
+                    MurmurStores.history.append(text: error.localizedDescription, failed: true)
+                    self.fromActionButton = false
                     HandoffDiagnostics.record("app.transcription.failed", detail: "\(id) \(error.localizedDescription)")
                     self.clearLease()
                     self.endLiveActivity()
@@ -388,11 +470,14 @@ final class DictationController: ObservableObject {
         isPaused = false
         isBusy = false
         transcript = ""
+        fromActionButton = false
         clearLease()
         endLiveActivity()
     }
 
     /// Keyboard reappeared in the originating app — open the segment and start Listening.
+    /// Only after Murmur is backgrounded. `applicationState != .active` is not enough
+    /// (launch is `.inactive` and was opening the mic on the interstitial).
     func hostKeyboardReady() {
         let gatedID = AppGroupStore.listenGateRequestID
         guard listenGated,
@@ -402,11 +487,77 @@ final class DictationController: ObservableObject {
               !isBusy else {
             return
         }
+        if murmurForeground {
+            pendingHostReady = true
+            HandoffDiagnostics.record("app.hostReady.deferred", detail: "foreground \(requestID)")
+            return
+        }
+        pendingHostReady = false
+        learnHostFromFrontmost()
         HandoffDiagnostics.record("app.hostReady", detail: requestID)
         openGatedSegment()
     }
 
-    private func startFreshTake() {
+    func setForeground(_ on: Bool) {
+        let wasForeground = murmurForeground
+        murmurForeground = on
+        if wasForeground && !on {
+            learnHostFromFrontmost()
+            scheduleLearnRetries()
+            murmurDidResign()
+        }
+    }
+
+    /// Interstitial control: user says this take is Messages. Remembers the PID
+    /// so the next Start with that PID bounces. Does not guess for Notes.
+    func returnToMessages() {
+        let id = HostReturn.messagesBundle
+        hostBundleID = id
+        if hostPID > 1 {
+            HostAppProbe.remember(pid: pid_t(hostPID), bundleID: id)
+        }
+        HostAppProbe.remember(id)
+        HandoffDiagnostics.record("app.return.messagesButton", detail: "pid=\(hostPID)")
+        hostBounceAttempts = 0
+        tryHostBounce(reason: "messages-button")
+    }
+
+    /// User left Murmur (swipe or bounce). If the keyboard already appeared, start capture.
+    func murmurDidResign() {
+        guard pendingHostReady else { return }
+        pendingHostReady = false
+        HandoffDiagnostics.record("app.hostReady.flushed", detail: requestID)
+        hostKeyboardReady()
+    }
+
+    private func learnHostFromFrontmost() {
+        guard hostPID > 1 else { return }
+        let probe = HostAppProbe.frontmostProbe()
+        HandoffDiagnostics.record(
+            "app.host.frontmostProbe",
+            detail: "pid=\(hostPID) sbs=\(probe.sbs ?? "nil") ws=\(probe.workspace ?? "nil") ok=\(probe.sanitized ?? "nil")"
+        )
+        if let id = probe.sanitized {
+            HostAppProbe.remember(pid: pid_t(hostPID), bundleID: id)
+            if hostBundleID.isEmpty { hostBundleID = id }
+            HandoffDiagnostics.record("app.host.learned", detail: "pid=\(hostPID) \(id)")
+        }
+    }
+
+    private func scheduleLearnRetries() {
+        learnTask?.cancel()
+        let pid = hostPID
+        learnTask = Task { @MainActor in
+            for delay in [0.35, 0.8, 1.6, 3.0] {
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled, hostPID == pid, pid > 1 else { return }
+                if HostAppProbe.rememberedBundleID(forPID: pid_t(pid)) != nil { return }
+                learnHostFromFrontmost()
+            }
+        }
+    }
+
+    private func startFreshTake(fromActionButton action: Bool = false) {
         clearLease()
         clearListenGate()
         let id = UUID().uuidString
@@ -415,8 +566,12 @@ final class DictationController: ObservableObject {
         isBusy = false
         isPaused = false
         transcript = ""
+        fromActionButton = action
         write(.pending, text: "", error: "")
         beginRecording(bounce: false, retryByForeground: false, gateListen: false)
+        if action {
+            statusText = "Listening… Stop to copy."
+        }
     }
 
     private func startLeasedTake() {
@@ -440,6 +595,7 @@ final class DictationController: ObservableObject {
         isArmed = true
         isBusy = false
         isPaused = false
+        fromActionButton = false
         transcript = ""
         statusText = "Listening…"
         HandoffDiagnostics.record("app.lease.startAccepted", detail: payload.id)
@@ -499,11 +655,7 @@ final class DictationController: ObservableObject {
         isPaused = false
         statusText = "Murmur is on"
         write(.pending, text: "", error: "")
-        if activity == nil {
-            startLiveActivity(recording: false, label: "Return to app")
-        } else {
-            updateLiveActivity(recording: false, label: "Return to app")
-        }
+        presentLiveActivity(recording: false, label: "On")
         HandoffDiagnostics.record("app.listenGate.armed", detail: requestID)
         scheduleListenGateTimeout()
         hostBounceAttempts = 0
@@ -514,8 +666,8 @@ final class DictationController: ObservableObject {
         }
     }
 
-    /// Bounce with this take’s host ID. Unresolved foreign keyboard PID uses
-    /// Messages — that workspace-open is what used to leave the interstitial.
+    /// Bounce only with this take’s probed host. Unknown host → interstitial.
+    /// Never invent Messages — that kidnapped Notes (and every other app).
     private func tryHostBounce(reason: String) {
         guard keyboardStack, listenGated, isAwaitingHostReturn else { return }
         guard !hostBundleID.isEmpty else {
@@ -566,11 +718,7 @@ final class DictationController: ObservableObject {
         HandoffDiagnostics.record("app.recording.started", detail: requestID)
         isPaused = false
         statusText = "Listening…"
-        if activity == nil {
-            startLiveActivity(recording: true, label: "Listening")
-        } else {
-            updateLiveActivity(recording: true, label: "Listening")
-        }
+        presentLiveActivity(recording: true, label: "Listening")
         write(.recording, text: "", error: "")
     }
 
@@ -604,12 +752,15 @@ final class DictationController: ObservableObject {
     private func clearListenGate() {
         listenGateTimeoutTask?.cancel()
         listenGateTimeoutTask = nil
+        learnTask?.cancel()
+        learnTask = nil
         if AppGroupStore.listenGateRequestID == requestID || requestID.isEmpty {
             AppGroupStore.listenGateRequestID = ""
         }
         listenGated = false
         isAwaitingHostReturn = false
         hostBounceAttempts = 0
+        pendingHostReady = false
     }
 
     private func publishLease(completedRequestID: String) {
@@ -624,32 +775,35 @@ final class DictationController: ObservableObject {
             "app.lease.ready",
             detail: "\(lease.sessionID) expires=\(lease.expiresAt.timeIntervalSince1970) segment=idle inputGraph=active privacyIndicator=on"
         )
-        updateLiveActivity(recording: false, label: "Ready")
+        presentLiveActivity(recording: false, label: "On")
         scheduleLeaseExpiration(lease)
     }
 
     private func scheduleLeaseExpiration(_ lease: DictationHandoff.Lease) {
         leaseExpiryTask?.cancel()
         leaseHeartbeatTask?.cancel()
-        leaseHeartbeatTask = Task {
-            var refreshed = lease
+        leaseHeartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled, refreshed.expiresAt > .now else { return }
-                refreshed.heartbeatAt = .now
-                DictationHandoff.writeLease(refreshed)
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self else { return }
+                    guard self.recorder.isInputGraphArmed else {
+                        self.clearLease()
+                        self.isArmed = false
+                        self.endLiveActivity()
+                        HandoffDiagnostics.record("app.lease.expired", detail: "graph-dead")
+                        return
+                    }
+                    let next = DictationHandoff.Lease(
+                        sessionID: DictationHandoff.readLease()?.sessionID ?? lease.sessionID,
+                        hostBundleID: self.hostBundleID.isEmpty ? lease.hostBundleID : self.hostBundleID,
+                        expiresAt: .now.addingTimeInterval(DictationHandoff.leaseDuration),
+                        heartbeatAt: .now
+                    )
+                    DictationHandoff.writeLease(next)
+                }
             }
-        }
-        leaseExpiryTask = Task { [weak self] in
-            let delay = max(0, lease.expiresAt.timeIntervalSinceNow)
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled,
-                  DictationHandoff.readLease()?.sessionID == lease.sessionID else { return }
-            DictationHandoff.clearLease()
-            self?.recorder.deactivateSession()
-            AppGroupStore.microphoneLevel = 0
-            self?.endLiveActivity()
-            HandoffDiagnostics.record("app.lease.expired", detail: lease.sessionID)
         }
     }
 
@@ -725,10 +879,20 @@ final class DictationController: ObservableObject {
         ))
     }
 
+    private func presentLiveActivity(recording: Bool, label: String) {
+        if activity == nil {
+            activity = Activity<DictationAttributes>.activities.first
+        }
+        if activity != nil {
+            updateLiveActivity(recording: recording, label: label)
+            return
+        }
+        startLiveActivity(recording: recording, label: label)
+    }
+
     private func startLiveActivity(recording: Bool, label: String) {
-        endLiveActivity()
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        let attributes = DictationAttributes(requestID: requestID)
+        let attributes = DictationAttributes(requestID: requestID.isEmpty ? "lease" : requestID)
         let state = DictationAttributes.ContentState(
             isRecording: recording,
             startedAt: Date(),

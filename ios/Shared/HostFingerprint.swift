@@ -35,6 +35,11 @@ enum HostFingerprint {
     }
 
     static func bundleID(fromProcessPath path: String) -> String? {
+        let last = (path as NSString).lastPathComponent.lowercased()
+        if last == "mobilesms" || last == "messages" { return messagesBundle }
+        if last == "mobilenotes" || last == "notes" { return notesBundle }
+        if last == "mobilemail" || last == "mail" { return mailBundle }
+        if last == "mobilesafari" || last == "safari" { return safariBundle }
         let lowered = path.lowercased()
         if lowered.contains("mobilesms") { return messagesBundle }
         if lowered.contains("mobilenotes") { return notesBundle }

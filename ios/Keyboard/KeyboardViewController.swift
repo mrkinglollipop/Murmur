@@ -19,6 +19,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var startTimeoutTask: Task<Void, Never>?
     private var lastSpaceTap: ContinuousClock.Instant?
     private let autocorrect = AutocorrectController()
+    private let dictionary = DictionaryStore()
+    private var swipeCommittedWord: String?
+    private var lexiconDocuments: [String] = []
 
     var enableInputClicksWhenVisible: Bool { true }
 
@@ -30,9 +33,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        view.backgroundColor = .clear
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
-        let height = view.heightAnchor.constraint(equalToConstant: 248)
+        let height = view.heightAnchor.constraint(equalToConstant: KeyboardChromeTokens.portraitHeight)
         height.priority = .defaultHigh
         heightConstraint = height
         NSLayoutConstraint.activate([
@@ -53,6 +57,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.onCandidate = { [weak self] index in self?.applyCandidate(at: index) }
         root.onGif = { [weak self] in self?.toggleGifTray() }
         root.onGifSelect = { [weak self] gif in self?.insertGif(gif) }
+        root.onSwipe = { [weak self] words in self?.insertSwipe(words) }
         root.setShowsGlobe(needsInputModeSwitchKey)
         AppGroupStore.consumeGiphySeedIfNeeded()
         applyDocumentState()
@@ -61,6 +66,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         AppGroupStore.consumeGiphySeedIfNeeded()
+        root.swipeTypingEnabled = AppGroupStore.swipeTypingEnabled
+        dictionary.reload()
+        rebuildSwipeLexicon(uiLexicon: nil)
         root.setShowsGlobe(needsInputModeSwitchKey)
         if let host = HostAppProbe.probedBundleID(from: self) {
             HostAppProbe.remember(host)
@@ -72,9 +80,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         _ = adoptExistingSession()
         consumeHandoffIfReady()
         applyDocumentState()
+        updateKeyboardHeight()
+        autocorrect.seedLearnedSpellings()
         if session == .waiting { startPolling() }
         requestSupplementaryLexicon { [weak self] lexicon in
-            self?.autocorrect.setLexicon(lexicon)
+            guard let self else { return }
+            self.autocorrect.setLexicon(lexicon)
+            self.rebuildSwipeLexicon(uiLexicon: lexicon)
         }
     }
 
@@ -93,6 +105,23 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
         applyDocumentState()
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        updateKeyboardHeight()
+    }
+
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        updateKeyboardHeight()
+    }
+
+    private func updateKeyboardHeight() {
+        let landscape = traitCollection.verticalSizeClass == .compact
+        let next = landscape ? KeyboardChromeTokens.landscapeHeight : KeyboardChromeTokens.portraitHeight
+        guard heightConstraint?.constant != next else { return }
+        heightConstraint?.constant = next
     }
 
     private func applyDocumentState() {
@@ -123,9 +152,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             shouldCapitalize = context.isEmpty || context.last?.isWhitespace == true
             allCharacters = false
         case .sentences:
-            let trimmed = context.trimmingCharacters(in: .whitespacesAndNewlines)
-            let afterSentence = trimmed.last.map { ".!?".contains($0) } ?? true
-            shouldCapitalize = context.isEmpty || context.last == "\n" || afterSentence
+            let afterSentence = AutocorrectEngine.shouldCapitalizeSentence(beforeInput: context)
+            shouldCapitalize = afterSentence
             allCharacters = false
         case .none:
             shouldCapitalize = false
@@ -142,6 +170,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             UIDevice.current.playInputClick()
             return
         }
+        let context = textDocumentProxy.documentContextBeforeInput ?? ""
+        if AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: text),
+           swipeCommittedWord != nil,
+           context.last == " " {
+            textDocumentProxy.deleteBackward()
+        }
+        swipeCommittedWord = nil
         UIDevice.current.playInputClick()
         if text == " ", shouldReplaceSecondSpaceWithPeriod() {
             textDocumentProxy.deleteBackward()
@@ -151,7 +186,14 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             refreshSuggestions()
             return
         }
+        autocorrect.noteIncomingText(text)
         applyAutocorrectIfNeeded(beforeInserting: text)
+        if AutocorrectEngine.isCommitText(text) {
+            let span = AutocorrectEngine.wordSpan(beforeInput: context)
+            if autocorrect.undoOriginal?.lowercased() != span.lowercased() {
+                teachKeyboardWord(span)
+            }
+        }
         textDocumentProxy.insertText(text)
         lastSpaceTap = text == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
         if autocorrect.suppressUntilWhitespace, AutocorrectEngine.isCommitText(text) {
@@ -166,6 +208,23 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             UIDevice.current.playInputClick()
             return
         }
+        if let word = swipeCommittedWord, !word.isEmpty {
+            let context = textDocumentProxy.documentContextBeforeInput ?? ""
+            if context.hasSuffix(word) {
+                UIDevice.current.playInputClick()
+                for _ in 0..<word.count {
+                    textDocumentProxy.deleteBackward()
+                }
+                swipeCommittedWord = nil
+                lastSpaceTap = nil
+                autocorrect.clearUndo()
+                autocorrect.suppressUntilWhitespace = false
+                updateCapitalization()
+                refreshSuggestions()
+                return
+            }
+            swipeCommittedWord = nil
+        }
         UIDevice.current.playInputClick()
         lastSpaceTap = nil
         textDocumentProxy.deleteBackward()
@@ -174,9 +233,41 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         refreshSuggestions()
     }
 
+    private func insertSwipe(_ candidates: [String]) {
+        guard phase != .waiting else { return }
+        guard let first = candidates.first, !first.isEmpty else { return }
+        if root.handleGifTyping(first) {
+            UIDevice.current.playInputClick()
+            return
+        }
+        UIDevice.current.playInputClick()
+        let context = textDocumentProxy.documentContextBeforeInput ?? ""
+        let span = AutocorrectEngine.wordSpan(beforeInput: context)
+        for _ in 0..<span.count {
+            textDocumentProxy.deleteBackward()
+        }
+        let afterSpan = textDocumentProxy.documentContextBeforeInput ?? ""
+        if AutocorrectEngine.needsLeadingSpace(beforeInput: afterSpan) {
+            textDocumentProxy.insertText(" ")
+        }
+        let trailing = phase == .secure ? "" : " "
+        textDocumentProxy.insertText(first + trailing)
+        swipeCommittedWord = first + trailing
+        lastSpaceTap = trailing == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
+        autocorrect.suppressUntilWhitespace = true
+        if phase != .secure {
+            autocorrect.noteSwipe(committed: first, alternatives: candidates)
+            showCandidates()
+        }
+        updateCapitalization()
+    }
+
     private func applyAutocorrectIfNeeded(beforeInserting text: String) {
         guard phase != .secure, phase != .waiting else { return }
         guard AutocorrectEngine.isCommitText(text) else { return }
+        // Suppress is for the swipe/dictation token on its own trailing space,
+        // not the next typed word. `noteIncomingText` already cleared it if
+        // this commit follows a new letter span (`i` + space after a swipe).
         guard !autocorrect.suppressUntilWhitespace else { return }
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         let span = AutocorrectEngine.wordSpan(beforeInput: context)
@@ -195,6 +286,20 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         guard index >= 0, index < choices.count else { return }
         let chosen = choices[index]
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
+        if AutocorrectEngine.isPunctuationSuggestion(chosen) {
+            let committed = AutocorrectEngine.committedSpan(beforeInput: context)
+            for _ in 0..<committed.trailing.count {
+                textDocumentProxy.deleteBackward()
+            }
+            textDocumentProxy.insertText(chosen + " ")
+            swipeCommittedWord = nil
+            lastSpaceTap = supportsDoubleSpacePeriod ? ContinuousClock().now : nil
+            autocorrect.clearUndo()
+            autocorrect.suppressUntilWhitespace = false
+            updateCapitalization()
+            refreshSuggestions()
+            return
+        }
         let active = AutocorrectEngine.wordSpan(beforeInput: context)
         let target: String
         let trailing: String
@@ -210,13 +315,53 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         for _ in 0..<(trailing.count + target.count) {
             textDocumentProxy.deleteBackward()
         }
-        textDocumentProxy.insertText(chosen + trailing)
+        let inserted: String
+        if AutocorrectEngine.periodAttachedWord(chosen) != nil {
+            inserted = chosen + (trailing.isEmpty && phase != .secure ? " " : trailing)
+        } else if swipeCommittedWord != nil, trailing.isEmpty, phase != .secure {
+            inserted = chosen + " "
+        } else {
+            inserted = chosen + trailing
+        }
+        textDocumentProxy.insertText(inserted)
+        if swipeCommittedWord != nil {
+            swipeCommittedWord = inserted
+            var remaining = choices.filter { $0.lowercased() != chosen.lowercased() }
+            remaining.insert(chosen, at: 0)
+            autocorrect.noteSwipe(committed: AutocorrectEngine.periodAttachedWord(chosen) ?? chosen, alternatives: remaining)
+            lastSpaceTap = inserted.hasSuffix(" ") && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
+            updateCapitalization()
+            showCandidates()
+            teachKeyboardWord(AutocorrectEngine.periodAttachedWord(chosen) ?? chosen)
+            return
+        }
         if let original = autocorrect.undoOriginal, chosen.lowercased() == original.lowercased() {
-            autocorrect.ignore(original)
+            teachKeyboardWord(original)
+        } else if chosen.lowercased() == target.lowercased() {
+            teachKeyboardWord(chosen)
         }
         autocorrect.clearUndo()
         updateCapitalization()
         refreshSuggestions()
+    }
+
+    private func showCandidates() {
+        root.setCandidates(autocorrect.displayed, quoted: autocorrect.quoted)
+    }
+
+    private func teachKeyboardWord(_ raw: String) {
+        let word = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard AutocorrectEngine.shouldTeach(word, known: FrequencyList.words) else { return }
+        autocorrect.ignore(word)
+        LearnedWordStore.learn(word)
+        UITextChecker.learnWord(word)
+        let exists = dictionary.entries.contains {
+            $0.term.lowercased() == word.lowercased()
+        }
+        if !exists {
+            dictionary.add(term: word, variants: [], isAutoLearned: true)
+        }
+        rebuildSwipeLexicon(uiLexicon: nil)
     }
 
     private func refreshSuggestions() {
@@ -225,17 +370,39 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         let span = AutocorrectEngine.wordSpan(beforeInput: context)
         if let corrected = autocorrect.lastCorrected {
             if span == corrected {
-                root.setCandidates(autocorrect.displayed)
+                root.setCandidates(autocorrect.displayed, quoted: autocorrect.quoted)
                 return
             }
             let committed = AutocorrectEngine.committedSpan(beforeInput: context)
             if span.isEmpty, committed.word == corrected {
-                root.setCandidates(autocorrect.displayed)
+                root.setCandidates(autocorrect.displayed, quoted: autocorrect.quoted)
                 return
             }
             autocorrect.clearUndo()
         }
-        root.setCandidates(autocorrect.suggestions(for: span))
+        root.setCandidates(autocorrect.suggestions(for: span, beforeInput: context), quoted: autocorrect.quoted)
+    }
+
+    private func rebuildSwipeLexicon(uiLexicon: UILexicon?) {
+        if let uiLexicon {
+            lexiconDocuments = uiLexicon.entries.map(\.documentText)
+        }
+        let frequency = Set(FrequencyList.words)
+        var priority: [String] = []
+        for entry in dictionary.entries {
+            priority.append(entry.term)
+            priority.append(contentsOf: entry.variants)
+        }
+        priority.append(contentsOf: lexiconDocuments.filter {
+            AutocorrectEngine.allowLexiconInSwipe($0, frequency: frequency)
+        })
+        priority.append(contentsOf: LearnedWordStore.words())
+        root.swipeLexicon = AutocorrectEngine.prioritizedLexicon(
+            priority: priority,
+            frequency: FrequencyList.words
+        )
+        root.swipeCasing = AutocorrectEngine.preferredCasing(priority)
+        autocorrect.setUserWords(priority)
     }
 
     private func shouldReplaceSecondSpaceWithPeriod() -> Bool {
@@ -535,7 +702,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private func startReuseTimeout(for id: String, url: URL) {
         startTimeoutTask?.cancel()
         startTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(1.25))
+            try? await Task.sleep(for: .seconds(2.5))
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self?.waitingID == id,

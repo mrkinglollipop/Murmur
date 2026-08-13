@@ -20,6 +20,10 @@ enum HostAppProbe {
             HandoffDiagnostics.record("keyboard.host.probe", detail: "ivar=\(id) \(fingerprint)")
             return id
         }
+        if let id = scan.connections.compactMap({ signingIdentifier(from: $0) }).compactMap(sanitize).first {
+            HandoffDiagnostics.record("keyboard.host.probe", detail: "xpc-sign=\(id) \(fingerprint)")
+            return id
+        }
         for pid in scan.pids {
             if let id = bundleID(forPID: pid) {
                 HandoffDiagnostics.record(
@@ -86,6 +90,23 @@ enum HostAppProbe {
             return id
         }
         parts.append("match=nil")
+        if let id = codeSigningBundleID(forPID: pid) {
+            parts.append("cs=\(id)")
+            HandoffDiagnostics.record("host.pidLookup", detail: parts.joined(separator: " ") + " via=csops")
+            return id
+        }
+        parts.append("cs=nil")
+        let table = kernelCommTable()
+        parts.append("kall=\(table.count)")
+        if let comm = kernelComm(pid: pid) ?? table[pid] {
+            parts.append("comm=\(comm)")
+            if let id = sanitize(HostFingerprint.bundleID(fromProcessPath: comm)) {
+                HandoffDiagnostics.record("host.pidLookup", detail: parts.joined(separator: " ") + " via=kinfo")
+                return id
+            }
+        } else {
+            parts.append("comm=nil")
+        }
         if let raw = sbsBundleID(forPID: pid) {
             parts.append("sbsRaw=\(raw)")
             if let id = sanitize(raw) ?? sanitize(HostFingerprint.bundleID(fromProcessPath: raw)) {
@@ -138,8 +159,60 @@ enum HostAppProbe {
         AppGroupStore.lastHostBundleID = bundleID
     }
 
+    static func remember(pid: pid_t, bundleID: String) {
+        guard pid > 1, let id = sanitize(bundleID) else { return }
+        var map = pidMap
+        map[String(pid)] = id
+        if map.count > 24, let first = map.keys.first {
+            map.removeValue(forKey: first)
+        }
+        pidMap = map
+    }
+
+    static func rememberedBundleID(forPID pid: pid_t) -> String? {
+        guard pid > 1, let id = pidMap[String(pid)] else { return nil }
+        return sanitize(id)
+    }
+
+    struct FrontmostProbe {
+        var sbs: String?
+        var workspace: String?
+        var sanitized: String?
+    }
+
+    static func frontmostBundleID() -> String? {
+        frontmostProbe().sanitized
+    }
+
+    /// Raw SpringBoard / workspace strings before Murmur/SpringBoard are stripped.
+    /// Callers must log `sbs`/`workspace` — sanitize turns self into “empty.”
+    static func frontmostProbe() -> FrontmostProbe {
+        let sbs = sbsFrontmostBundleID()
+        let workspace = workspaceFrontmostRaw()
+        return FrontmostProbe(
+            sbs: sbs,
+            workspace: workspace,
+            sanitized: sanitize(sbs) ?? sanitize(workspace)
+        )
+    }
+
+    static func sanitizeForHost(_ value: String?) -> String? {
+        sanitize(value)
+    }
+
     static func forget() {
         AppGroupStore.lastHostBundleID = ""
+    }
+
+    private static var pidMap: [String: String] {
+        get {
+            UserDefaults(suiteName: AppGroupStore.suiteName)?
+                .dictionary(forKey: "hostPIDBundleMap") as? [String: String] ?? [:]
+        }
+        set {
+            UserDefaults(suiteName: AppGroupStore.suiteName)?
+                .set(newValue, forKey: "hostPIDBundleMap")
+        }
     }
 
     private static func sanitize(_ value: String?) -> String? {
@@ -191,11 +264,15 @@ enum HostAppProbe {
             return "\(pid):\(path)"
         }.joined(separator: ",")
         var detail = "empty \(fingerprint) pids=\(pids.isEmpty ? "none" : pids)"
+        if !scan.xpcDescriptions.isEmpty {
+            let xpc = scan.xpcDescriptions.prefix(2).joined(separator: "|")
+            detail += " xpc=\(xpc)"
+        }
         if !scan.inventory.isEmpty {
             let inventory = scan.inventory.prefix(24).joined(separator: ";")
             detail += " ivars=\(inventory)"
         }
-        if detail.count > 500 { detail = String(detail.prefix(500)) }
+        if detail.count > 700 { detail = String(detail.prefix(700)) }
         HandoffDiagnostics.record("keyboard.host.probe", detail: detail)
     }
 
@@ -352,6 +429,21 @@ enum HostAppProbe {
         guard handleClass.responds(to: handleSelector),
               let handle = handleClass.perform(handleSelector, with: identifier, with: nil)?
                 .takeUnretainedValue() as? NSObject else { return nil }
+        let description = handle.debugDescription
+        HandoffDiagnostics.record("host.rbs", detail: "pid=\(pid) \(description.prefix(160))")
+        if let id = HostFingerprint.bundleID(fromProcessPath: description) { return id }
+        if handle.responds(to: NSSelectorFromString("identity")),
+           let identity = handle.perform(NSSelectorFromString("identity"))?.takeUnretainedValue() as? NSObject {
+            let identityDescription = identity.debugDescription
+            if let id = HostFingerprint.bundleID(fromProcessPath: identityDescription) { return id }
+            for key in ["embeddedApplicationIdentifier", "applicationBundleIdentifier", "executablePath"] {
+                let idSelector = NSSelectorFromString(key)
+                guard identity.responds(to: idSelector),
+                      let value = identity.perform(idSelector)?.takeUnretainedValue() as? String,
+                      let id = sanitize(value) ?? sanitize(HostFingerprint.bundleID(fromProcessPath: value)) else { continue }
+                return id
+            }
+        }
         for key in ["bundleIdentifier", "executablePath", "executable"] {
             let idSelector = NSSelectorFromString(key)
             guard handle.responds(to: idSelector),
@@ -366,6 +458,108 @@ enum HostAppProbe {
             }
         }
         return nil
+    }
+
+    private static func codeSigningBundleID(forPID pid: pid_t) -> String? {
+        if let identity = csopsString(pid: pid, ops: 12) {
+            if let id = sanitize(identity) { return id }
+            if let id = sanitize(HostFingerprint.bundleID(fromProcessPath: identity)) { return id }
+        }
+        if let path = csopsString(pid: pid, ops: 4) {
+            if let id = sanitize(HostFingerprint.bundleID(fromProcessPath: path)) { return id }
+        }
+        return nil
+    }
+
+    private static func csopsString(pid: pid_t, ops: UInt32) -> String? {
+        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "csops") else { return nil }
+        typealias CSOps = @convention(c) (pid_t, UInt32, UnsafeMutableRawPointer?, Int) -> Int32
+        let fn = unsafeBitCast(symbol, to: CSOps.self)
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        let status = buffer.withUnsafeMutableBytes { raw in
+            fn(pid, ops, raw.baseAddress, raw.count)
+        }
+        guard status == 0 else { return nil }
+        if let direct = String(bytes: buffer.prefix(while: { $0 != 0 }), encoding: .utf8),
+           !direct.isEmpty {
+            return direct
+        }
+        guard buffer.count > 4 else { return nil }
+        let length = Int(buffer.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) })
+        guard length > 0, length < 1000 else { return nil }
+        let slice = buffer.dropFirst(4).prefix(length)
+        return String(bytes: slice.prefix(while: { $0 != 0 }), encoding: .utf8)
+    }
+
+    private static func kernelComm(pid: pid_t) -> String? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return withUnsafeBytes(of: info.kp_proc.p_comm) { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return nil }
+            let name = String(cString: base)
+            return name.isEmpty ? nil : name
+        }
+    }
+
+    private static func kernelCommTable() -> [pid_t: String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size >= MemoryLayout<kinfo_proc>.stride else {
+            return [:]
+        }
+        let count = size / MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count + 8)
+        var bufferSize = procs.count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 3, &procs, &bufferSize, nil, 0) == 0 else { return [:] }
+        let actual = bufferSize / MemoryLayout<kinfo_proc>.stride
+        var result: [pid_t: String] = [:]
+        for index in 0..<actual {
+            let pid = procs[index].kp_proc.p_pid
+            guard pid > 1 else { continue }
+            let name = withUnsafeBytes(of: procs[index].kp_proc.p_comm) { raw -> String? in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return nil }
+                let value = String(cString: base)
+                return value.isEmpty ? nil : value
+            }
+            if let name { result[pid] = name }
+        }
+        return result
+    }
+
+    private static func signingIdentifier(from connection: NSXPCConnection) -> String? {
+        guard let token = auditToken(from: connection) else { return nil }
+        return signingIdentifier(fromAuditToken: token)
+    }
+
+    private static func auditToken(from connection: NSXPCConnection) -> audit_token_t? {
+        let selector = NSSelectorFromString("auditToken")
+        guard connection.responds(to: selector),
+              let method = connection.method(for: selector) else { return nil }
+        typealias Fn = @convention(c) (AnyObject, Selector) -> audit_token_t
+        let fn = unsafeBitCast(method, to: Fn.self)
+        return fn(connection, selector)
+    }
+
+    private static func signingIdentifier(fromAuditToken token: audit_token_t) -> String? {
+        guard let handle = dlopen(
+            "/System/Library/Frameworks/Security.framework/Security",
+            RTLD_NOW
+        ) else { return nil }
+        guard let createSym = dlsym(handle, "SecTaskCreateWithAuditToken"),
+              let copySym = dlsym(handle, "SecTaskCopySigningIdentifier") else { return nil }
+        typealias Create = @convention(c) (CFAllocator?, audit_token_t) -> Unmanaged<AnyObject>?
+        typealias CopyID = @convention(c) (
+            AnyObject, UnsafeMutablePointer<Unmanaged<CFError>?>?
+        ) -> Unmanaged<CFString>?
+        let create = unsafeBitCast(createSym, to: Create.self)
+        let copyID = unsafeBitCast(copySym, to: CopyID.self)
+        guard let task = create(nil, token)?.takeRetainedValue() else { return nil }
+        var error: Unmanaged<CFError>?
+        guard let identifier = copyID(task, &error)?.takeRetainedValue() as String?,
+              !identifier.isEmpty else { return nil }
+        return identifier
     }
 
     private static func sbsBundleID(forPID pid: pid_t) -> String? {
@@ -410,6 +604,10 @@ enum HostAppProbe {
     }
 
     private static func workspaceFrontmostBundleID() -> String? {
+        sanitize(workspaceFrontmostRaw())
+    }
+
+    private static func workspaceFrontmostRaw() -> String? {
         let defaultSelector = NSSelectorFromString("defaultWorkspace")
         guard let workspaceClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
               workspaceClass.responds(to: defaultSelector),
@@ -425,9 +623,10 @@ enum HostAppProbe {
             for key in idKeys {
                 let idSelector = NSSelectorFromString(key)
                 guard app.responds(to: idSelector),
-                      let value = app.perform(idSelector)?.takeUnretainedValue() as? String
+                      let value = app.perform(idSelector)?.takeUnretainedValue() as? String,
+                      !value.isEmpty
                 else { continue }
-                if let id = sanitize(value) { return id }
+                return value
             }
         }
         return nil

@@ -59,6 +59,20 @@ struct SessionView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 28)
 
+                Button {
+                    session.returnToMessages()
+                } label: {
+                    Text("Continue in Messages")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(coral))
+                }
+                .padding(.horizontal, 40)
+                .padding(.top, 28)
+                .accessibilityHint("Returns to Messages and remembers this app for the next dictation.")
+
                 Spacer(minLength: 48)
 
                 Button("Discard") {
@@ -73,7 +87,7 @@ struct SessionView: View {
         }
         .ignoresSafeArea(edges: .bottom)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Murmur is on. Swipe right across the bottom edge to return to your app, then speak.")
+        .accessibilityLabel("Murmur is on. Swipe right across the bottom edge to return to your app, or continue in Messages, then speak.")
     }
 
     private var activeSession: some View {

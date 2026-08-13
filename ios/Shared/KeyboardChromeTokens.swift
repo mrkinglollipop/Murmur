@@ -3,6 +3,10 @@ import UIKit
 /// Keyboard-only tokens. Do not import Mac `Theme.swift`.
 enum KeyboardChromeTokens {
     static let accessoryHeight: CGFloat = 48
+    static let portraitHeight: CGFloat = 296
+    static let landscapeHeight: CGFloat = 188
+    static let chromeCornerRadius: CGFloat = 24
+    static let bottomInset: CGFloat = 14
     static let keyCornerRadius: CGFloat = 9
     static let chipCornerRadius: CGFloat = 10
     static let rowGap: CGFloat = 7

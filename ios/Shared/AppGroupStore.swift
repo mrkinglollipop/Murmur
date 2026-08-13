@@ -8,6 +8,7 @@ enum AppGroupStore {
     static let lastHostKey = "lastHostBundleID"
     static let microphoneLevelKey = "microphoneLevel"
     static let listenGateRequestIDKey = "listenGateRequestID"
+    static let swipeTypingEnabledKey = "swipeTypingEnabled"
 
     private static var suite: UserDefaults? {
         UserDefaults(suiteName: suiteName)
@@ -43,12 +44,10 @@ enum AppGroupStore {
         }
     }
 
+    /// Keyboard and Scribe are English-only. Stored values other than `en` are ignored.
     static var languageCode: String {
-        get {
-            let value = suite?.string(forKey: languageKey) ?? ""
-            return value.isEmpty ? "en" : value
-        }
-        set { suite?.set(newValue, forKey: languageKey) }
+        get { "en" }
+        set { suite?.set("en", forKey: languageKey) }
     }
 
     static var lastHostBundleID: String {
@@ -66,5 +65,46 @@ enum AppGroupStore {
     static var listenGateRequestID: String {
         get { suite?.string(forKey: listenGateRequestIDKey) ?? "" }
         set { suite?.set(newValue, forKey: listenGateRequestIDKey) }
+    }
+
+    /// Sideload bake-off. Missing key means on. Flip off in Settings to kill swipe.
+    static var swipeTypingEnabled: Bool {
+        get {
+            guard let suite, suite.object(forKey: swipeTypingEnabledKey) != nil else { return true }
+            return suite.bool(forKey: swipeTypingEnabledKey)
+        }
+        set { suite?.set(newValue, forKey: swipeTypingEnabledKey) }
+    }
+
+    static let selectedStyleKey = "selectedStyle"
+    static let dictionaryIntroKey = "dictionaryIntroDismissed"
+    static let snippetsIntroKey = "snippetsIntroDismissed"
+
+    static var selectedStyleRaw: String {
+        get { suite?.string(forKey: selectedStyleKey) ?? "casual" }
+        set { suite?.set(newValue, forKey: selectedStyleKey) }
+    }
+
+    static func introDismissed(_ key: String) -> Bool {
+        suite?.bool(forKey: key) ?? false
+    }
+
+    static func dismissIntro(_ key: String) {
+        suite?.set(true, forKey: key)
+    }
+
+    /// App Group file, or a temp directory when the suite is unavailable (unit tests).
+    static func sharedFile(_ name: String) -> URL {
+        if let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: suiteName
+        ) {
+            return container.appendingPathComponent(name)
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "murmur-ios-stores",
+            isDirectory: true
+        )
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(name)
     }
 }

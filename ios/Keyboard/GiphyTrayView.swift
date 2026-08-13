@@ -1,6 +1,6 @@
 import UIKit
 
-/// GIF tray: search + two-column stills + Giphy attribution. Keys type into search.
+/// GIF tray: search + 3-column stills + Giphy attribution. Keys type into search.
 final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
     var onSelect: ((GiphyClient.GIF) -> Void)?
     var onModeChange: (() -> Void)?
@@ -90,8 +90,6 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
 
     func submitSearch() {
         debounceTask?.cancel()
-        isSearchMode = false
-        onModeChange?()
         load(query: searchText)
     }
 
@@ -109,7 +107,7 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
             height: attributionHeight
         )
         attribution.isHidden = isSearchMode
-        collection.isHidden = isSearchMode
+        collection.isHidden = false
         let collectionTop = searchContainer.frame.maxY + 6
         collection.frame = CGRect(
             x: 0,
@@ -117,6 +115,7 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
             width: bounds.width,
             height: max(0, attribution.frame.minY - 4 - collectionTop)
         )
+        collection.collectionViewLayout.invalidateLayout()
         statusLabel.frame = collection.frame.insetBy(dx: 12, dy: 24)
         retryButton.frame = CGRect(
             x: (bounds.width - 88) / 2,
@@ -124,9 +123,9 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
             width: 88,
             height: 32
         )
-        let showStatus = !isSearchMode && (isLoading || lastError != nil || items.isEmpty)
+        let showStatus = isLoading || lastError != nil || items.isEmpty
         statusLabel.isHidden = !showStatus
-        retryButton.isHidden = isSearchMode || lastError == nil
+        retryButton.isHidden = lastError == nil
     }
 
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
@@ -179,8 +178,9 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
         sizeForItemAt indexPath: IndexPath
     ) -> CGSize {
         let spacing: CGFloat = 6
-        let width = floor((collectionView.bounds.width - spacing) / 2)
-        return CGSize(width: max(44, width), height: max(44, width * 0.72))
+        let columns: CGFloat = 3
+        let width = floor((collectionView.bounds.width - spacing * (columns - 1)) / columns)
+        return CGSize(width: max(44, width), height: max(52, width * 0.82))
     }
 
     private func configure() {
@@ -205,6 +205,11 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
         collection.backgroundColor = .clear
         collection.dataSource = self
         collection.delegate = self
+        collection.alwaysBounceVertical = true
+        collection.bounces = true
+        collection.isScrollEnabled = true
+        collection.delaysContentTouches = true
+        collection.canCancelContentTouches = true
         collection.register(GiphyCell.self, forCellWithReuseIdentifier: GiphyCell.reuseID)
         collection.accessibilityIdentifier = "murmur.keyboard.giphy.grid"
         addSubview(collection)

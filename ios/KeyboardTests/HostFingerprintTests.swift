@@ -34,6 +34,24 @@ final class HostFingerprintTests: XCTestCase {
             HostFingerprint.bundleID(fromProcessPath: "MobileSMS"),
             HostFingerprint.messagesBundle
         )
+        XCTAssertEqual(
+            HostFingerprint.bundleID(fromProcessPath: "Notes"),
+            HostFingerprint.notesBundle
+        )
+        XCTAssertEqual(
+            HostFingerprint.bundleID(fromProcessPath: "MobileNotes"),
+            HostFingerprint.notesBundle
+        )
+        XCTAssertEqual(
+            HostFingerprint.bundleID(
+                fromProcessPath: "<NSXPCConnection: 0x1> connection from pid 11908 named MobileSMS"
+            ),
+            HostFingerprint.messagesBundle
+        )
+        XCTAssertEqual(
+            HostFingerprint.bundleID(fromProcessPath: "com.apple.MobileNotes.viewservice"),
+            HostFingerprint.notesBundle
+        )
         XCTAssertTrue(
             HostFingerprint.dictationHostBundleIDs.contains(HostFingerprint.messagesBundle)
         )

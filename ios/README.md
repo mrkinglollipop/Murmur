@@ -41,9 +41,16 @@ becomes `the`; the original stays in the candidate bar as undo. Autocorrect
 runs with Full Access off. It does not run in secure fields, and the first
 space after a dictation insert does not respell the transcript.
 
-GIF tray (Full Access + Giphy key in Murmur onboarding): trending/search via
+GIF tray (Full Access + Giphy key in Murmur Settings): trending/search via
 Giphy REST, not the iOS SDK. Tap inserts the GIF URL (`insertText`). A
 pasteboard GIF copy is attempted for Messages; that bubble path is a spike.
+
+The containing app is a Wispr-style shell (Home, Dictionary, Snippets, Style,
+Scratchpad, Settings). Dictionary terms go to Scribe as `keyterms` and are
+applied again after STT. Snippets expand after Style. Style is local caps /
+punctuation (not an LLM). `no_verbatim` strips fillers. Action Button is the
+App Shortcut “Start Dictation” (clipboard on stop). Host-return interstitial
+still covers the app during a gated keyboard take.
 
 > Distribution note: the keyboard launch/return handoff currently relies on responder-chain and private system APIs. This build is for private sideload testing and is not App Store-ready.
 
@@ -64,4 +71,6 @@ Swift toolchain or fake a build; use a Mac with Xcode.
 This README is the in-repo worksheet. Next slice is whatever the continuing
 thread asks for. Out of scope until explicitly pulled in: Pro/subscription,
 Murmur-server, IAP, local Whisper on iOS, Mac target changes, App
-Store submit. Swipe-to-type is ship-gated after a device bake-off.
+Store submit. Swipe-to-type is in this build (`SwipeTypingEngine`, Settings
+toggle, default on). It is still ship-gated pending a device bake-off — not
+absent from the keyboard.

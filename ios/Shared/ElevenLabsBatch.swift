@@ -3,14 +3,24 @@ import Foundation
 enum ElevenLabsBatch {
     private struct Response: Decodable { let text: String }
 
-    static func transcribe(audioURL: URL, apiKey: String, language: String) async throws -> String {
+    static func transcribe(
+        audioURL: URL,
+        apiKey: String,
+        language: String,
+        noVerbatim: Bool = true,
+        keyterms: [String] = []
+    ) async throws -> String {
         let payload = try WAVTranscoder.wavUploadPayload(from: audioURL)
         let boundary = "Boundary-\(UUID().uuidString)"
         var body = Data()
         func append(_ string: String) {
             body.append(Data(string.utf8))
         }
-        for (key, value) in ["model_id": "scribe_v2", "language_code": language] {
+        for (key, value) in formFields(
+            language: language,
+            noVerbatim: noVerbatim,
+            keyterms: keyterms
+        ) {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
             append("\(value)\r\n")
@@ -39,6 +49,21 @@ enum ElevenLabsBatch {
             throw ElevenLabsError.noTranscript
         }
         return decoded.text
+    }
+
+    /// `keyterms` are repeated form fields, same encoding as Scribe realtime.
+    static func formFields(
+        language: String,
+        noVerbatim: Bool,
+        keyterms: [String]
+    ) -> [(String, String)] {
+        var fields = [
+            ("model_id", "scribe_v2"),
+            ("language_code", language),
+            ("no_verbatim", noVerbatim ? "true" : "false")
+        ]
+        fields.append(contentsOf: keyterms.map { ("keyterms", $0) })
+        return fields
     }
 }
 

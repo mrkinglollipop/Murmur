@@ -35,6 +35,8 @@ targets:
     sources:
       - path: MurmurIOS
       - path: Shared
+      - path: ../Sources/Voice/SpokenCapitalization.swift
+      - path: ../Sources/Voice/DotCompoundNumberNormalizer.swift
     info:
       path: MurmurIOS/Info.plist
       properties:
@@ -97,6 +99,14 @@ targets:
           - MicRecorder.swift
           - ElevenLabsBatch.swift
           - WAVTranscoder.swift
+          - SnippetsStore.swift
+          - ScratchpadStore.swift
+          - StyleStore.swift
+          - StyleProfile.swift
+          - StyleFormatter.swift
+          - HistoryStore.swift
+          - MurmurStores.swift
+          - TranscriptPostProcessor.swift
       - path: Resources
         buildPhase: resources
     info:
@@ -139,6 +149,9 @@ targets:
     sources:
       - path: Activity
       - path: Shared/DictationAttributes.swift
+      - path: Shared/DictationIntents.swift
+      - path: Shared/DictationBridge.swift
+      - path: Shared/AppGroupStore.swift
     info:
       path: Activity/Info.plist
       properties:
@@ -169,9 +182,22 @@ targets:
     sources:
       - path: KeyboardTests
       - path: Keyboard/AutocorrectEngine.swift
+      - path: Keyboard/AutocorrectController.swift
+      - path: Keyboard/SwipeTypingEngine.swift
+      - path: Resources
+        buildPhase: resources
       - path: Shared/HostFingerprint.swift
       - path: Shared/GiphyClient.swift
       - path: Shared/AppGroupStore.swift
+      - path: Shared/PhraseBoundaryPattern.swift
+      - path: Shared/DictionaryStore.swift
+      - path: Shared/SnippetsStore.swift
+      - path: Shared/StyleProfile.swift
+      - path: Shared/StyleFormatter.swift
+      - path: ../Sources/Voice/SpokenCapitalization.swift
+      - path: ../Sources/Voice/DotCompoundNumberNormalizer.swift
+      - path: Shared/TranscriptPostProcessor.swift
+      - path: Shared/LearnedWordStore.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboardtests

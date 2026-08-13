@@ -1,4 +1,5 @@
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 /// Wispr-shaped QWERTY chrome. Murmur dictation replaces the keys while a take is active.
 final class KeyboardChromeView: UIView {
@@ -11,6 +12,10 @@ final class KeyboardChromeView: UIView {
     var onCandidate: ((Int) -> Void)?
     var onGif: (() -> Void)?
     var onGifSelect: ((GiphyClient.GIF) -> Void)?
+    var onSwipe: (([String]) -> Void)?
+    var swipeLexicon: [String] = FrequencyList.words
+    var swipeCasing: [String: String] = [:]
+    var swipeTypingEnabled = true
 
     private enum Page { case letters, numbers, symbols }
 
@@ -36,6 +41,7 @@ final class KeyboardChromeView: UIView {
     private enum ShiftState { case off, once, locked }
     private var shiftState: ShiftState = .once
     private var lastShiftTap: ContinuousClock.Instant?
+    private var longPressConsumed = false
     private var dark = true
     private var micEnabled = true
     private var micHidden = false
@@ -50,6 +56,11 @@ final class KeyboardChromeView: UIView {
     private var gifTrayVisible = false
     private var gifAvailable = false
     private var gifReason = "GIFs need Full Access and a Giphy key"
+    private var letterGeometry: [SwipeTypingEngine.KeyCenter] = []
+    private var letterKeyWidth: CGFloat = 30
+    private let letterSwipe = LetterSwipeRecognizer()
+    private let swipeTrail = SwipeTrailView()
+    private var lastPreviewCount = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -59,6 +70,18 @@ final class KeyboardChromeView: UIView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === letterSwipe else {
+            return super.gestureRecognizerShouldBegin(gestureRecognizer)
+        }
+        return swipeTypingEnabled
+            && page == .letters
+            && !sessionActive
+            && !grid.isHidden
+            && !gifTrayVisible
+            && !letterGeometry.isEmpty
+    }
 
     deinit {
         deleteRepeatTask?.cancel()
@@ -126,8 +149,8 @@ final class KeyboardChromeView: UIView {
         setNeedsLayout()
     }
 
-    func setCandidates(_ words: [String]) {
-        topBar.setCandidates(words)
+    func setCandidates(_ words: [String], quoted: Set<String> = []) {
+        topBar.setCandidates(words, quoted: quoted)
     }
 
     func setFullAccess(_ ok: Bool) {
@@ -221,35 +244,53 @@ final class KeyboardChromeView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         let side: CGFloat = 8
-        let topHeight: CGFloat = 48
+        let topHeight: CGFloat = KeyboardChromeTokens.accessoryHeight
         let globeHeight: CGFloat = showsGlobe ? 28 : 0
+        let bottomInset = KeyboardChromeTokens.bottomInset
 
-        topBar.frame = CGRect(x: side, y: 3, width: bounds.width - side * 2, height: topHeight)
+        topBar.frame = CGRect(x: side, y: 8, width: bounds.width - side * 2, height: topHeight)
         glassBackdrop.frame = bounds
 
-        globeButton.frame = CGRect(x: side + 2, y: bounds.height - globeHeight, width: 42, height: globeHeight)
+        globeButton.frame = CGRect(
+            x: side + 2,
+            y: bounds.height - globeHeight - max(0, bottomInset - 8),
+            width: 42,
+            height: globeHeight
+        )
+        let gridBottom = showsGlobe && !gifTrayVisible
+            ? globeButton.frame.minY
+            : bounds.height - bottomInset
         let gridFrame = CGRect(
             x: side,
-            y: topBar.frame.maxY,
+            y: topBar.frame.maxY + 2,
             width: bounds.width - side * 2,
-            height: max(0, (showsGlobe && !gifTrayVisible ? globeButton.frame.minY : bounds.height - 3) - topBar.frame.maxY)
+            height: max(0, gridBottom - (topBar.frame.maxY + 2))
         )
         if gifTrayVisible {
-            let searchStrip: CGFloat = gifTray.isSearchMode ? 40 : gridFrame.height
-            gifTray.frame = CGRect(
-                x: gridFrame.minX,
-                y: gridFrame.minY,
-                width: gridFrame.width,
-                height: searchStrip
-            )
             if gifTray.isSearchMode {
+                let searchMinKey: CGFloat = 24
+                let rowCount: CGFloat = 4
+                let rowGap = KeyboardChromeTokens.rowGap
+                let trayGridGap: CGFloat = 4
+                let keyStrip = rowCount * searchMinKey + rowGap * (rowCount - 1)
+                let desiredKeyFloor = keyStrip + trayGridGap
+                let minTray = min(gridFrame.height, 80)
+                let keyFloor = min(desiredKeyFloor, max(0, gridFrame.height - minTray))
+                let trayHeight = max(0, gridFrame.height - keyFloor)
+                gifTray.frame = CGRect(
+                    x: gridFrame.minX,
+                    y: gridFrame.minY,
+                    width: gridFrame.width,
+                    height: trayHeight
+                )
                 grid.frame = CGRect(
                     x: gridFrame.minX,
-                    y: gifTray.frame.maxY,
+                    y: gifTray.frame.maxY + trayGridGap,
                     width: gridFrame.width,
-                    height: max(0, gridFrame.maxY - gifTray.frame.maxY)
+                    height: max(0, gridFrame.maxY - gifTray.frame.maxY - trayGridGap)
                 )
             } else {
+                gifTray.frame = gridFrame
                 grid.frame = gridFrame
             }
         } else {
@@ -294,11 +335,36 @@ final class KeyboardChromeView: UIView {
     private func configureChrome() {
         insertSubview(glassBackdrop, at: 0)
         glassBackdrop.isUserInteractionEnabled = false
+        applyChromeShape()
         addSubview(topBar)
         topBar.onMic = { [weak self] in self?.onMic?() }
         topBar.onCandidate = { [weak self] index in self?.onCandidate?(index) }
         topBar.onGif = { [weak self] in self?.onGif?() }
         addSubview(grid)
+        swipeTrail.isUserInteractionEnabled = false
+        swipeTrail.isOpaque = false
+        swipeTrail.backgroundColor = .clear
+        swipeTrail.contentMode = .redraw
+        grid.addSubview(swipeTrail)
+        letterSwipe.addTarget(self, action: #selector(handleLetterSwipe(_:)))
+        letterSwipe.letterAt = { [weak self] point in self?.letterAt(point) }
+        letterSwipe.onPathChanged = { [weak self] points, recognized in
+            guard recognized else { return }
+            self?.swipeTrail.points = points
+            self?.previewSwipe(path: points)
+        }
+        letterSwipe.isSwipeEnabled = { [weak self] in
+            guard let self else { return false }
+            return self.swipeTypingEnabled
+                && self.page == .letters
+                && !self.sessionActive
+                && !self.grid.isHidden
+                && !self.gifTrayVisible
+                && !self.letterGeometry.isEmpty
+        }
+        letterSwipe.delegate = self
+        letterSwipe.cancelsTouchesInView = true
+        grid.addGestureRecognizer(letterSwipe)
         addSubview(gifTray)
         gifTray.isHidden = true
         gifTray.onSelect = { [weak self] gif in self?.onGifSelect?(gif) }
@@ -404,6 +470,19 @@ final class KeyboardChromeView: UIView {
         topBar.setGifTrayOpen(gifTrayVisible && enabled)
     }
 
+    private func applyChromeShape() {
+        let radius = KeyboardChromeTokens.chromeCornerRadius
+        let topCorners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        layer.cornerRadius = radius
+        layer.maskedCorners = topCorners
+        layer.cornerCurve = .continuous
+        clipsToBounds = true
+        glassBackdrop.layer.cornerRadius = radius
+        glassBackdrop.layer.maskedCorners = topCorners
+        glassBackdrop.layer.cornerCurve = .continuous
+        glassBackdrop.clipsToBounds = true
+    }
+
     private func applyColors() {
         backgroundColor = KeyboardChromeTokens.keyboardBackdrop(dark: dark)
         topBar.setAppearance(dark: dark)
@@ -450,9 +529,15 @@ final class KeyboardChromeView: UIView {
                 pan.cancelsTouchesInView = false
                 key.addGestureRecognizer(pan)
             }
+            if spec.longPressInsert != nil {
+                let hold = UILongPressGestureRecognizer(target: self, action: #selector(longPressKey(_:)))
+                hold.minimumPressDuration = 0.35
+                key.addGestureRecognizer(hold)
+            }
             grid.addSubview(key)
             return key
         }
+        grid.bringSubviewToFront(swipeTrail)
         applyColors()
         updateVisibility()
         layoutKeys()
@@ -463,7 +548,9 @@ final class KeyboardChromeView: UIView {
         let gap: CGFloat = KeyboardChromeTokens.keyGap
         let rowGap: CGFloat = KeyboardChromeTokens.rowGap
         let rowCount: CGFloat = 4
-        let height = max(36, (grid.bounds.height - rowGap * (rowCount - 1)) / rowCount)
+        let fitted = (grid.bounds.height - rowGap * (rowCount - 1)) / rowCount
+        let compactSearch = gifTrayVisible && gifTray.isSearchMode
+        let height = compactSearch ? max(1, fitted) : max(36, fitted)
         for row in 0..<Int(rowCount) {
             guard let keys = rows[row] else { continue }
             let y = CGFloat(row) * (height + rowGap)
@@ -476,6 +563,8 @@ final class KeyboardChromeView: UIView {
                 x += width + gap
             }
         }
+        swipeTrail.frame = grid.bounds
+        refreshLetterGeometry()
     }
 
     private func specs() -> [KeySpec] {
@@ -535,9 +624,11 @@ final class KeyboardChromeView: UIView {
 
     private func bottom(modeTitle: String) -> [KeySpec] {
         [
-            KeySpec(row: 3, units: 1.35, title: modeTitle, action: .mode),
-            KeySpec(row: 3, units: 4.15, title: "Murmur", action: .insert(" ")),
-            KeySpec(row: 3, units: 1.65, title: returnTitle, action: .insert("\n"))
+            KeySpec(row: 3, units: 1.2, title: modeTitle, action: .mode),
+            KeySpec(row: 3, units: 1.0, title: ",", action: .insert(","), longPressInsert: "'"),
+            KeySpec(row: 3, units: 3.15, title: "Murmur", action: .insert(" ")),
+            KeySpec(row: 3, units: 1.0, title: ".", action: .insert("."), longPressInsert: "'"),
+            KeySpec(row: 3, units: 1.5, title: returnTitle, action: .insert("\n"))
         ]
     }
 
@@ -588,7 +679,113 @@ final class KeyboardChromeView: UIView {
         deleteRepeatTask = nil
     }
 
+    @objc private func handleLetterSwipe(_ gesture: LetterSwipeRecognizer) {
+        switch gesture.state {
+        case .began:
+            hapticDown()
+            swipeTrail.points = gesture.points
+            highlightSwipe(gesture.sampledLetters)
+            previewSwipe(path: gesture.points)
+        case .changed:
+            swipeTrail.points = gesture.points
+            highlightSwipe(gesture.sampledLetters)
+            previewSwipe(path: gesture.points)
+        case .ended:
+            highlightSwipe([])
+            lastPreviewCount = 0
+            commitSwipe(path: gesture.points)
+            swipeTrail.fadeOut()
+        default:
+            highlightSwipe([])
+            lastPreviewCount = 0
+            swipeTrail.clear()
+        }
+    }
+
+    private func previewSwipe(path: [CGPoint]) {
+        guard path.count - lastPreviewCount >= 2 || lastPreviewCount == 0 else { return }
+        lastPreviewCount = path.count
+        let words = rankedSwipe(path: path)
+        topBar.setCandidates(words.map { applySwipeCase($0) })
+    }
+
+    private func commitSwipe(path: [CGPoint]) {
+        let words = rankedSwipe(path: path)
+        guard !words.isEmpty else { return }
+        onSwipe?(words.map { applySwipeCase($0) })
+        if shiftState == .once {
+            shiftState = .off
+            rebuild()
+        }
+    }
+
+    private func rankedSwipe(path: [CGPoint]) -> [String] {
+        let lexicon = swipeLexicon.isEmpty ? FrequencyList.words : swipeLexicon
+        return SwipeTypingEngine.candidates(
+            path: path,
+            keys: letterGeometry,
+            words: lexicon,
+            keyWidth: letterKeyWidth,
+            limit: 3
+        )
+    }
+
+    private func applySwipeCase(_ word: String) -> String {
+        let cased: String
+        if shiftState == .locked {
+            cased = word.uppercased()
+        } else if let preferred = swipeCasing[word.lowercased()] {
+            cased = preferred
+        } else if FrequencyList.nameSet.contains(word.lowercased()), let first = word.first {
+            cased = String(first).uppercased() + word.dropFirst()
+        } else if shiftState == .once, let first = word.first {
+            cased = String(first).uppercased() + word.dropFirst()
+        } else {
+            cased = word
+        }
+        return AutocorrectEngine.capitalizedIContraction(cased)
+    }
+
+    private func letterAt(_ point: CGPoint) -> Character? {
+        SwipeTypingEngine.nearestLetter(
+            at: point,
+            keys: letterGeometry,
+            maxDistance: letterKeyWidth * 2.2
+        )
+    }
+
+    private func refreshLetterGeometry() {
+        var width: CGFloat = 30
+        letterGeometry = keyViews.compactMap { key in
+            guard case .insert(let text) = key.spec.action,
+                  text.count == 1,
+                  let character = text.lowercased().first,
+                  character.isLetter else { return nil }
+            width = key.frame.width
+            return SwipeTypingEngine.KeyCenter(
+                letter: character,
+                point: CGPoint(x: key.frame.midX, y: key.frame.midY),
+                frame: key.frame
+            )
+        }
+        letterKeyWidth = max(width, 8)
+    }
+
+    private func highlightSwipe(_ letters: [Character]) {
+        let set = Set(letters)
+        for key in keyViews {
+            guard case .insert(let text) = key.spec.action,
+                  let character = text.lowercased().first,
+                  character.isLetter else { continue }
+            key.isHighlighted = set.contains(character)
+        }
+    }
+
     @objc private func tapKey(_ sender: KeyView) {
+        if longPressConsumed {
+            longPressConsumed = false
+            return
+        }
         switch sender.spec.action {
         case .spacer:
             return
@@ -599,7 +796,8 @@ final class KeyboardChromeView: UIView {
             }
             lastShiftTap = nil
             onInsert?(text)
-            if page == .letters, text.count == 1, text != " ", text != "\n", shiftState == .once {
+            if page == .letters, text.count == 1, text != " ", text != "\n",
+               !".,'!?".contains(text), shiftState == .once {
                 shiftState = .off
                 rebuild()
             }
@@ -628,6 +826,16 @@ final class KeyboardChromeView: UIView {
             rebuild()
         }
     }
+
+    @objc private func longPressKey(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began,
+              let key = gesture.view as? KeyView,
+              let alt = key.spec.longPressInsert else { return }
+        longPressConsumed = true
+        hapticDown()
+        key.isHighlighted = false
+        onInsert?(alt)
+    }
 }
 
 private struct KeySpec {
@@ -645,6 +853,7 @@ private struct KeySpec {
     let action: Action
     var symbol: String? = nil
     var isSelected = false
+    var longPressInsert: String? = nil
 
     var isSpacer: Bool {
         if case .spacer = action { return true }
@@ -720,6 +929,149 @@ private extension KeySpec.Action {
         case .insert(let text): return text == " " || text == "\n"
         case .delete, .shift, .mode, .spacer: return true
         }
+    }
+}
+
+extension KeyboardChromeView: UIGestureRecognizerDelegate {
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldReceive touch: UITouch
+    ) -> Bool {
+        guard gestureRecognizer === letterSwipe else { return true }
+        var view: UIView? = touch.view
+        while let current = view, current !== grid {
+            if let key = current as? KeyView {
+                switch key.spec.action {
+                case .insert(let text) where text == " " || text == "\n":
+                    return false
+                case .shift, .delete, .mode, .spacer:
+                    return false
+                default:
+                    return true
+                }
+            }
+            view = current.superview
+        }
+        return true
+    }
+}
+
+/// Coral finger trail. Fades toward the fingertip; older ink stays dimmer.
+private final class SwipeTrailView: UIView {
+    var points: [CGPoint] = [] {
+        didSet { setNeedsDisplay() }
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard points.count >= 2 else { return }
+        let lastIndex = points.count - 1
+        for index in 1...lastIndex {
+            let path = UIBezierPath()
+            path.move(to: points[index - 1])
+            path.addLine(to: points[index])
+            path.lineWidth = 6.5
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            let t = CGFloat(index) / CGFloat(lastIndex)
+            KeyboardChromeTokens.coral.withAlphaComponent(0.18 + 0.72 * t).setStroke()
+            path.stroke()
+        }
+        if let last = points.last {
+            let blob = UIBezierPath(ovalIn: CGRect(x: last.x - 4, y: last.y - 4, width: 8, height: 8))
+            KeyboardChromeTokens.coralLight.withAlphaComponent(0.85).setFill()
+            blob.fill()
+        }
+    }
+
+    func clear() {
+        layer.removeAllAnimations()
+        alpha = 1
+        points = []
+    }
+
+    func fadeOut() {
+        points = []
+        setNeedsDisplay()
+        alpha = 1
+    }
+}
+
+/// Stays `.possible` until the finger crosses two letter keys and ~16pt, so taps still fire.
+private final class LetterSwipeRecognizer: UIGestureRecognizer {
+    var letterAt: ((CGPoint) -> Character?)?
+    var isSwipeEnabled: () -> Bool = { true }
+    var onPathChanged: (([CGPoint], Bool) -> Void)?
+    private(set) var points: [CGPoint] = []
+    private(set) var sampledLetters: [Character] = []
+    private var start = CGPoint.zero
+
+    override func reset() {
+        super.reset()
+        points = []
+        sampledLetters = []
+        start = .zero
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard isSwipeEnabled() else {
+            state = .failed
+            return
+        }
+        guard let touch = touches.first, let view else {
+            state = .failed
+            return
+        }
+        start = touch.location(in: view)
+        points = [start]
+        if let letter = letterAt?(start) {
+            sampledLetters = [letter]
+            state = .possible
+        } else {
+            state = .failed
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = touches.first, let view else { return }
+        let point = touch.location(in: view)
+        append(point)
+        let dx = point.x - start.x
+        let dy = point.y - start.y
+        let distance = (dx * dx + dy * dy).squareRoot()
+        if state == .possible {
+            if distance >= 16, sampledLetters.count >= 2 {
+                state = .began
+            }
+        } else if state == .began || state == .changed {
+            state = .changed
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let touch = touches.first, let view {
+            append(touch.location(in: view))
+        }
+        if state == .began || state == .changed {
+            state = .ended
+        } else {
+            state = .failed
+        }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        state = .cancelled
+    }
+
+    private func append(_ point: CGPoint) {
+        points.append(point)
+        if points.count > 256 {
+            points = stride(from: 0, to: points.count, by: 2).map { points[$0] }
+        }
+        if let letter = letterAt?(point), sampledLetters.last != letter {
+            sampledLetters.append(letter)
+        }
+        let recognized = state == .began || state == .changed
+        onPathChanged?(points, recognized)
     }
 }
 

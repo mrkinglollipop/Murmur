@@ -97,7 +97,7 @@ final class AccessoryBarView: UIView {
         setNeedsLayout()
     }
 
-    func setCandidates(_ words: [String]) {
+    func setCandidates(_ words: [String], quoted: Set<String> = []) {
         let hasWords = words.contains { !$0.isEmpty }
         if hasWords {
             caption = ""
@@ -107,7 +107,15 @@ final class AccessoryBarView: UIView {
         }
         for (index, button) in candidateButtons.enumerated() {
             let word = index < words.count ? words[index] : ""
-            button.setTitle(word, for: .normal)
+            let title: String
+            if word.isEmpty {
+                title = ""
+            } else if quoted.contains(word.lowercased()) {
+                title = "“\(word)”"
+            } else {
+                title = word
+            }
+            button.setTitle(title, for: .normal)
             button.isEnabled = !word.isEmpty
             button.accessibilityLabel = word.isEmpty ? "Suggestion slot \(index + 1)" : word
         }

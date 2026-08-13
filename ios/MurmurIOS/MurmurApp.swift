@@ -1,7 +1,43 @@
 import SwiftUI
+import UIKit
+
+final class MurmurAppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ app: UIApplication,
+        open url: URL,
+        options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+    ) -> Bool {
+        let source = options[.sourceApplication] as? String ?? ""
+        MurmurOpenURL.sourceApplication = source
+        HandoffDiagnostics.record(
+            "app.deeplink.uiapp",
+            detail: "source=\(source.isEmpty ? "nil" : source)"
+        )
+        MurmurOpenURL.handle(url, sourceApplication: source)
+        return true
+    }
+}
+
+enum MurmurOpenURL {
+    static var sourceApplication = ""
+
+    @MainActor
+    static func handle(_ url: URL, sourceApplication: String) {
+        guard let request = DictationHandoff.request(from: url) else { return }
+        HandoffDiagnostics.record("app.deeplink.received", detail: request.id)
+        DictationController.shared.arm(
+            id: request.id,
+            hostBundleID: request.hostBundleID,
+            hostPID: request.hostPID,
+            keyboardStack: request.keyboardStack,
+            sourceApplication: sourceApplication
+        )
+    }
+}
 
 @main
 struct MurmurApp: App {
+    @UIApplicationDelegateAdaptor(MurmurAppDelegate.self) private var appDelegate
     @ObservedObject private var session = DictationController.shared
     @Environment(\.scenePhase) private var scenePhase
 
@@ -12,28 +48,25 @@ struct MurmurApp: App {
 
     var body: some Scene {
         WindowGroup {
-            Group {
-                if session.isArmed {
+            ZStack {
+                AppShellView()
+                if session.isAwaitingHostReturn || session.isRecording || session.isBusy || session.isPaused {
                     SessionView()
-                } else {
-                    OnboardingView()
                 }
             }
             .onAppear { session.restoreIfNeeded() }
             .onOpenURL { url in
-                if let request = DictationHandoff.request(from: url) {
-                    HandoffDiagnostics.record("app.deeplink.received", detail: request.id)
-                    session.arm(
-                        id: request.id,
-                        hostBundleID: request.hostBundleID,
-                        hostPID: request.hostPID,
-                        keyboardStack: request.keyboardStack
-                    )
-                }
+                MurmurOpenURL.handle(url, sourceApplication: MurmurOpenURL.sourceApplication)
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active {
+                switch phase {
+                case .active:
+                    session.setForeground(true)
                     session.becomeActive()
+                case .background:
+                    session.setForeground(false)
+                default:
+                    break
                 }
             }
         }
