@@ -41,9 +41,15 @@ becomes `the`; the original stays in the candidate bar as undo. Autocorrect
 runs with Full Access off. It does not run in secure fields, and the first
 space after a dictation insert does not respell the transcript.
 
+Chrome is Apple-like QWERTY (QuickType bar, coral mic instead of a Start
+pill, width-bucket heights for compact / regular / Max iPhones). Floor is
+iOS 27.0; iPhone only. Visual vs stock Apple is device-screenshot gated.
+
 GIF tray (Full Access + Giphy key in Murmur Settings): trending/search via
-Giphy REST, not the iOS SDK. Tap inserts the GIF URL (`insertText`). A
-pasteboard GIF copy is attempted for Messages; that bubble path is a spike.
+Giphy REST, not the iOS SDK. Search grows the input view so results sit
+above full-size keys (not a compressed key strip). Tap inserts the GIF URL
+(`insertText`). A pasteboard GIF copy is attempted for Messages; that
+bubble path is a spike.
 
 The containing app is a Wispr-style shell (Home, Dictionary, Snippets, Style,
 Scratchpad, Settings). Dictionary terms go to Scribe as `keyterms` and are
@@ -72,5 +78,5 @@ This README is the in-repo worksheet. Next slice is whatever the continuing
 thread asks for. Out of scope until explicitly pulled in: Pro/subscription,
 Murmur-server, IAP, local Whisper on iOS, Mac target changes, App
 Store submit. Swipe-to-type is in this build (`SwipeTypingEngine`, Settings
-toggle, default on). It is still ship-gated pending a device bake-off — not
+toggle, default off). It is still ship-gated pending a device bake-off — not
 absent from the keyboard.

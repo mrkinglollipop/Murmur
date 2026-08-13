@@ -1,28 +1,26 @@
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
 
-/// Wispr-shaped QWERTY chrome. Murmur dictation replaces the keys while a take is active.
+/// Apple-shaped QWERTY chrome. Murmur dictation replaces the keys while a take is active.
 final class KeyboardChromeView: UIView {
     var onMic: (() -> Void)?
     var onCancel: (() -> Void)?
     var onDelete: (() -> Void)?
-    var onGlobe: (() -> Void)?
     var onInsert: ((String) -> Void)?
-    var onSpaceDrag: ((Int) -> Void)?
     var onCandidate: ((Int) -> Void)?
     var onGif: (() -> Void)?
     var onGifSelect: ((GiphyClient.GIF) -> Void)?
     var onSwipe: (([String]) -> Void)?
+    var onNeedsHeightChange: (() -> Void)?
     var swipeLexicon: [String] = FrequencyList.words
     var swipeCasing: [String: String] = [:]
-    var swipeTypingEnabled = true
+    var swipeTypingEnabled = false
 
-    private enum Page { case letters, numbers, symbols }
+    private enum Page { case letters, numbers, symbols, emoji }
 
     private let glassBackdrop = UIVisualEffectView(effect: UIGlassContainerEffect())
     private let topBar = AccessoryBarView()
     private let grid = UIView()
-    private let globeButton = UIButton(type: .system)
 
     private let listeningPanel = UIView()
     private let cancelButton = UIButton(type: .system)
@@ -36,6 +34,7 @@ final class KeyboardChromeView: UIView {
     private let errorLabel = UILabel()
     private let errorDismissButton = UIButton(type: .system)
     private let gifTray = GiphyTrayView()
+    private let emojiPicker = EmojiPickerView()
 
     private var page: Page = .letters
     private enum ShiftState { case off, once, locked }
@@ -47,12 +46,9 @@ final class KeyboardChromeView: UIView {
     private var micHidden = false
     private var sessionActive = false
     private var returnTitle = "return"
-    private var showsGlobe = false
     private var keyViews: [KeyView] = []
     private var deleteRepeatTask: Task<Void, Never>?
     private let keyHaptic = UIImpactFeedbackGenerator(style: .light)
-    private var spaceTrackpadUsed = false
-    private var lastSpaceOffset = 0
     private var gifTrayVisible = false
     private var gifAvailable = false
     private var gifReason = "GIFs need Full Access and a Giphy key"
@@ -60,6 +56,11 @@ final class KeyboardChromeView: UIView {
     private var letterKeyWidth: CGFloat = 30
     private let letterSwipe = LetterSwipeRecognizer()
     private let swipeTrail = SwipeTrailView()
+    private let keyPreview = KeyPreviewView()
+    private let modeSlide = ModeSlideRecognizer()
+    private var metrics = KeyboardChromeMetrics.metrics(width: 430, isLandscape: false)
+    private var slideToTypeActive = false
+    private var diacriticActive = false
     private var lastPreviewCount = 0
 
     override init(frame: CGRect) {
@@ -72,15 +73,21 @@ final class KeyboardChromeView: UIView {
     required init?(coder: NSCoder) { nil }
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard gestureRecognizer === letterSwipe else {
-            return super.gestureRecognizerShouldBegin(gestureRecognizer)
+        if gestureRecognizer === letterSwipe {
+            return swipeTypingEnabled
+                && page == .letters
+                && !sessionActive
+                && !grid.isHidden
+                && !gifTrayVisible
+                && !slideToTypeActive
+                && !diacriticActive
+                && !letterGeometry.isEmpty
         }
-        return swipeTypingEnabled
-            && page == .letters
-            && !sessionActive
-            && !grid.isHidden
-            && !gifTrayVisible
-            && !letterGeometry.isEmpty
+        if gestureRecognizer is UILongPressGestureRecognizer {
+            if letterSwipe.state == .began || letterSwipe.state == .changed { return false }
+            if slideToTypeActive { return false }
+        }
+        return super.gestureRecognizerShouldBegin(gestureRecognizer)
     }
 
     deinit {
@@ -122,6 +129,10 @@ final class KeyboardChromeView: UIView {
         if on {
             gifTrayVisible = false
             gifTray.resetMode()
+            if page == .emoji {
+                page = .letters
+                emojiPicker.resetMode()
+            }
         }
         updateVisibility()
     }
@@ -141,12 +152,6 @@ final class KeyboardChromeView: UIView {
         guard shiftState != next else { return }
         shiftState = next
         rebuild()
-    }
-
-    func setShowsGlobe(_ show: Bool) {
-        showsGlobe = show
-        globeButton.isHidden = !show
-        setNeedsLayout()
     }
 
     func setCandidates(_ words: [String], quoted: Set<String> = []) {
@@ -174,6 +179,10 @@ final class KeyboardChromeView: UIView {
     }
 
     func setGifTrayVisible(_ visible: Bool) {
+        if visible, page == .emoji {
+            page = .letters
+            emojiPicker.resetMode()
+        }
         gifTrayVisible = visible && gifAvailable && !sessionActive && !micHidden
         if gifTrayVisible {
             gifTray.appear()
@@ -181,9 +190,16 @@ final class KeyboardChromeView: UIView {
             gifTray.resetMode()
         }
         updateVisibility()
+        onNeedsHeightChange?()
     }
 
     var isGifTrayVisible: Bool { gifTrayVisible }
+
+    /// Extra input-view height while GIF search sits above full-size keys.
+    var gifSearchExtraHeight: CGFloat {
+        guard gifTrayVisible, gifTray.isSearchMode else { return 0 }
+        return metrics.gifSearchPanelHeight + 4
+    }
 
     func handleGifTyping(_ text: String) -> Bool {
         guard gifTrayVisible else { return false }
@@ -198,6 +214,27 @@ final class KeyboardChromeView: UIView {
         if gifTray.isSearchMode || !gifTray.searchText.isEmpty {
             gifTray.deleteSearchText()
             updateVisibility()
+            setNeedsLayout()
+            return true
+        }
+        return false
+    }
+
+    func handleEmojiTyping(_ text: String) -> Bool {
+        guard page == .emoji, emojiPicker.isSearchMode else { return false }
+        guard text.unicodeScalars.allSatisfy(\.isASCII) else { return false }
+        emojiPicker.insertSearchText(text)
+        setNeedsLayout()
+        return true
+    }
+
+    func handleEmojiDelete() -> Bool {
+        guard page == .emoji else { return false }
+        if EmojiSearchRouting.consumeDelete(
+            isSearchMode: emojiPicker.isSearchMode,
+            searchIsEmpty: emojiPicker.searchText.isEmpty
+        ) {
+            _ = emojiPicker.deleteSearchText()
             setNeedsLayout()
             return true
         }
@@ -243,59 +280,71 @@ final class KeyboardChromeView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let side: CGFloat = 8
-        let topHeight: CGFloat = KeyboardChromeTokens.accessoryHeight
-        let globeHeight: CGFloat = showsGlobe ? 28 : 0
-        let bottomInset = KeyboardChromeTokens.bottomInset
+        let side = metrics.sideInset
+        let topHeight = metrics.accessoryHeight
+        let bottomInset = metrics.bottomInset
 
-        topBar.frame = CGRect(x: side, y: 8, width: bounds.width - side * 2, height: topHeight)
+        topBar.frame = CGRect(x: 0, y: 0, width: bounds.width, height: topHeight)
         glassBackdrop.frame = bounds
 
-        globeButton.frame = CGRect(
-            x: side + 2,
-            y: bounds.height - globeHeight - max(0, bottomInset - 8),
-            width: 42,
-            height: globeHeight
-        )
-        let gridBottom = showsGlobe && !gifTrayVisible
-            ? globeButton.frame.minY
-            : bounds.height - bottomInset
-        let gridFrame = CGRect(
-            x: side,
-            y: topBar.frame.maxY + 2,
-            width: bounds.width - side * 2,
-            height: max(0, gridBottom - (topBar.frame.maxY + 2))
-        )
-        if gifTrayVisible {
-            if gifTray.isSearchMode {
-                let searchMinKey: CGFloat = 24
-                let rowCount: CGFloat = 4
-                let rowGap = KeyboardChromeTokens.rowGap
-                let trayGridGap: CGFloat = 4
-                let keyStrip = rowCount * searchMinKey + rowGap * (rowCount - 1)
-                let desiredKeyFloor = keyStrip + trayGridGap
-                let minTray = min(gridFrame.height, 80)
-                let keyFloor = min(desiredKeyFloor, max(0, gridFrame.height - minTray))
-                let trayHeight = max(0, gridFrame.height - keyFloor)
-                gifTray.frame = CGRect(
-                    x: gridFrame.minX,
-                    y: gridFrame.minY,
-                    width: gridFrame.width,
-                    height: trayHeight
-                )
+        let showEmoji = page == .emoji && !sessionActive
+        if showEmoji {
+            if emojiPicker.isSearchMode {
+                let needed = emojiPicker.searchPanelHeight(forWidth: bounds.width)
+                let keyRow = min(36, metrics.letterKeyHeight)
+                let reservedKeys = 3 * keyRow + 2 * metrics.rowGap
+                let maxPanel = max(0, bounds.height - bottomInset - reservedKeys)
+                let panel = min(needed, maxPanel)
+                emojiPicker.frame = CGRect(x: 0, y: 0, width: bounds.width, height: panel)
                 grid.frame = CGRect(
-                    x: gridFrame.minX,
-                    y: gifTray.frame.maxY + trayGridGap,
-                    width: gridFrame.width,
-                    height: max(0, gridFrame.maxY - gifTray.frame.maxY - trayGridGap)
+                    x: side,
+                    y: panel,
+                    width: bounds.width - side * 2,
+                    height: max(0, bounds.height - bottomInset - panel)
                 )
             } else {
-                gifTray.frame = gridFrame
+                emojiPicker.frame = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: bounds.width,
+                    height: max(0, bounds.height - bottomInset)
+                )
+                grid.frame = .zero
+            }
+            gifTray.frame = .zero
+        } else {
+            emojiPicker.frame = .zero
+            let gridBottom = bounds.height - bottomInset
+            let gridFrame = CGRect(
+                x: side,
+                y: topBar.frame.maxY,
+                width: bounds.width - side * 2,
+                height: max(0, gridBottom - topBar.frame.maxY)
+            )
+            if gifTrayVisible {
+                if gifTray.isSearchMode {
+                    let trayGridGap: CGFloat = 4
+                    let panel = metrics.gifSearchPanelHeight
+                    gifTray.frame = CGRect(
+                        x: gridFrame.minX,
+                        y: topBar.frame.maxY,
+                        width: gridFrame.width,
+                        height: panel
+                    )
+                    grid.frame = CGRect(
+                        x: gridFrame.minX,
+                        y: gifTray.frame.maxY + trayGridGap,
+                        width: gridFrame.width,
+                        height: max(0, bounds.height - bottomInset - gifTray.frame.maxY - trayGridGap)
+                    )
+                } else {
+                    gifTray.frame = gridFrame
+                    grid.frame = gridFrame
+                }
+            } else {
+                gifTray.frame = .zero
                 grid.frame = gridFrame
             }
-        } else {
-            gifTray.frame = .zero
-            grid.frame = gridFrame
         }
         listeningPanel.frame = bounds
         cancelButton.frame = CGRect(x: 10, y: 12, width: 44, height: 44)
@@ -328,8 +377,19 @@ final class KeyboardChromeView: UIView {
             bringSubviewToFront(errorBanner)
         }
 
-        bringSubviewToFront(globeButton)
         layoutKeys()
+        bringSubviewToFront(gifTray)
+        bringSubviewToFront(emojiPicker)
+        bringSubviewToFront(keyPreview)
+        if !errorBanner.isHidden {
+            bringSubviewToFront(errorBanner)
+        }
+    }
+
+    func applyMetrics(_ metrics: KeyboardChromeMetrics) {
+        guard self.metrics != metrics else { return }
+        self.metrics = metrics
+        rebuild()
     }
 
     private func configureChrome() {
@@ -360,19 +420,55 @@ final class KeyboardChromeView: UIView {
                 && !self.sessionActive
                 && !self.grid.isHidden
                 && !self.gifTrayVisible
+                && !self.slideToTypeActive
+                && !self.diacriticActive
                 && !self.letterGeometry.isEmpty
         }
         letterSwipe.delegate = self
         letterSwipe.cancelsTouchesInView = true
         grid.addGestureRecognizer(letterSwipe)
+        modeSlide.canBegin = { [weak self] point in
+            self?.canBeginModeSlide(at: point) ?? false
+        }
+        modeSlide.homeFrameAt = { [weak self] point in
+            self?.modeKeyFrame(at: point) ?? .zero
+        }
+        modeSlide.onSlidOff = { [weak self] in
+            self?.beginSlideToType()
+        }
+        modeSlide.onMoved = { [weak self] point in
+            self?.updateSlideHighlight(at: point)
+        }
+        modeSlide.onFinished = { [weak self] didLeave, point, cancelled in
+            self?.endSlideToType(didLeave: didLeave, at: point, cancelled: cancelled)
+        }
+        modeSlide.cancelsTouchesInView = true
+        addGestureRecognizer(modeSlide)
+        keyPreview.isUserInteractionEnabled = false
+        addSubview(keyPreview)
         addSubview(gifTray)
         gifTray.isHidden = true
         gifTray.onSelect = { [weak self] gif in self?.onGifSelect?(gif) }
         gifTray.onModeChange = { [weak self] in
             self?.updateVisibility()
+            self?.onNeedsHeightChange?()
             self?.setNeedsLayout()
         }
-        addSubview(globeButton)
+        addSubview(emojiPicker)
+        emojiPicker.isHidden = true
+        emojiPicker.onSelect = { [weak self] glyph in self?.onInsert?(glyph) }
+        emojiPicker.onABC = { [weak self] in
+            guard let self else { return }
+            self.page = .letters
+            self.emojiPicker.resetMode()
+            self.rebuild()
+        }
+        emojiPicker.onDelete = { [weak self] in self?.onDelete?() }
+        emojiPicker.onSearchModeChange = { [weak self] in
+            self?.rebuild()
+            self?.updateVisibility()
+            self?.setNeedsLayout()
+        }
         addSubview(listeningPanel)
         listeningPanel.addSubview(cancelButton)
         listeningPanel.addSubview(formatButton)
@@ -427,10 +523,6 @@ final class KeyboardChromeView: UIView {
         microphoneLabel.text = "iPhone Microphone"
         microphoneLabel.accessibilityIdentifier = "murmur.keyboard.microphone"
 
-        globeButton.setImage(UIImage(systemName: "globe"), for: .normal)
-        globeButton.addTarget(self, action: #selector(tapGlobe), for: .touchUpInside)
-        globeButton.accessibilityLabel = "Next keyboard"
-        globeButton.accessibilityIdentifier = "murmur.keyboard.next"
         updateVisibility()
     }
 
@@ -454,11 +546,12 @@ final class KeyboardChromeView: UIView {
         let showPanel = sessionActive && !micHidden
         let showTray = gifTrayVisible && !showPanel && !micHidden
         let searchTyping = showTray && gifTray.isSearchMode
+        let showEmoji = page == .emoji && !showPanel
         listeningPanel.isHidden = !showPanel
-        topBar.isHidden = showPanel
-        grid.isHidden = showPanel || (showTray && !searchTyping)
+        topBar.isHidden = showPanel || showEmoji
+        grid.isHidden = showPanel || (showTray && !searchTyping) || (showEmoji && !emojiPicker.isSearchMode)
         gifTray.isHidden = !showTray
-        globeButton.isHidden = !showsGlobe || showTray
+        emojiPicker.isHidden = !showEmoji
         topBar.setMicHidden(micHidden)
         refreshGifControl()
         setNeedsLayout()
@@ -472,22 +565,20 @@ final class KeyboardChromeView: UIView {
 
     private func applyChromeShape() {
         let radius = KeyboardChromeTokens.chromeCornerRadius
-        let topCorners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         layer.cornerRadius = radius
-        layer.maskedCorners = topCorners
+        layer.maskedCorners = KeyboardChromeTokens.chromeTopCorners
         layer.cornerCurve = .continuous
         clipsToBounds = true
-        glassBackdrop.layer.cornerRadius = radius
-        glassBackdrop.layer.maskedCorners = topCorners
-        glassBackdrop.layer.cornerCurve = .continuous
-        glassBackdrop.clipsToBounds = true
+        glassBackdrop.isHidden = true
+        glassBackdrop.layer.cornerRadius = 0
+        glassBackdrop.layer.maskedCorners = []
     }
 
     private func applyColors() {
         backgroundColor = KeyboardChromeTokens.keyboardBackdrop(dark: dark)
         topBar.setAppearance(dark: dark)
         gifTray.setAppearance(dark: dark)
-        globeButton.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
+        emojiPicker.setAppearance(dark: dark)
 
         listeningPanel.backgroundColor = KeyboardChromeTokens.listeningFill(dark: dark)
         cancelButton.backgroundColor = dark ? UIColor(white: 0.22, alpha: 1) : .white
@@ -505,14 +596,18 @@ final class KeyboardChromeView: UIView {
         errorDismissButton.setTitleColor(.systemBlue, for: .normal)
         listeningStatusLabel.textColor = KeyboardChromeTokens.glyphColor(dark: dark)
         microphoneLabel.textColor = KeyboardChromeTokens.glyphColor(dark: dark).withAlphaComponent(0.65)
+        keyPreview.applyAppearance(dark: dark)
     }
 
     private func rebuild() {
         deleteRepeatTask?.cancel()
         deleteRepeatTask = nil
+        if !diacriticActive && !slideToTypeActive {
+            keyPreview.dismiss()
+        }
         keyViews.forEach { $0.removeFromSuperview() }
         keyViews = specs().map { spec in
-            let key = KeyView(spec: spec, dark: dark)
+            let key = KeyView(spec: spec, dark: dark, metrics: metrics)
             if case .delete = spec.action {
                 key.addTarget(self, action: #selector(beginDelete(_:)), for: .touchDown)
                 key.addTarget(
@@ -520,18 +615,26 @@ final class KeyboardChromeView: UIView {
                     action: #selector(endDelete(_:)),
                     for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit]
                 )
+            } else if case .mode = spec.action, page == .letters, spec.title == "123" {
+                key.addTarget(self, action: #selector(hapticDown), for: .touchDown)
             } else {
                 key.addTarget(self, action: #selector(hapticDown), for: .touchDown)
                 key.addTarget(self, action: #selector(tapKey(_:)), for: .touchUpInside)
-            }
-            if spec.title == "Murmur" {
-                let pan = UIPanGestureRecognizer(target: self, action: #selector(spacePan(_:)))
-                pan.cancelsTouchesInView = false
-                key.addGestureRecognizer(pan)
+                key.addTarget(self, action: #selector(keyPreviewDown(_:)), for: .touchDown)
+                key.addTarget(
+                    self,
+                    action: #selector(keyPreviewEnd(_:)),
+                    for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit]
+                )
             }
             if spec.longPressInsert != nil {
                 let hold = UILongPressGestureRecognizer(target: self, action: #selector(longPressKey(_:)))
                 hold.minimumPressDuration = 0.35
+                key.addGestureRecognizer(hold)
+            } else if case .insert(let text) = spec.action, !KeyDiacriticMap.alternatives(for: text).isEmpty {
+                let hold = UILongPressGestureRecognizer(target: self, action: #selector(diacriticPress(_:)))
+                hold.minimumPressDuration = 0.4
+                hold.delegate = self
                 key.addGestureRecognizer(hold)
             }
             grid.addSubview(key)
@@ -541,16 +644,17 @@ final class KeyboardChromeView: UIView {
         applyColors()
         updateVisibility()
         layoutKeys()
+        bringSubviewToFront(keyPreview)
     }
 
     private func layoutKeys() {
         let rows = Dictionary(grouping: keyViews) { $0.spec.row }
-        let gap: CGFloat = KeyboardChromeTokens.keyGap
-        let rowGap: CGFloat = KeyboardChromeTokens.rowGap
-        let rowCount: CGFloat = 4
+        let gap = metrics.keyGap
+        let rowGap = metrics.rowGap
+        let maxRow = keyViews.map(\.spec.row).max() ?? 3
+        let rowCount = CGFloat(maxRow + 1)
         let fitted = (grid.bounds.height - rowGap * (rowCount - 1)) / rowCount
-        let compactSearch = gifTrayVisible && gifTray.isSearchMode
-        let height = compactSearch ? max(1, fitted) : max(36, fitted)
+        let height = min(metrics.letterKeyHeight, max(32, fitted))
         for row in 0..<Int(rowCount) {
             guard let keys = rows[row] else { continue }
             let y = CGFloat(row) * (height + rowGap)
@@ -581,6 +685,8 @@ final class KeyboardChromeView: UIView {
                 + row(["_", "\\", "|", "~", "<", ">", "€", "£", "¥", "•"], 1)
                 + symbolsThird(shiftTitle: "123", values: [".", ",", "?", "!", "'"])
                 + bottom(modeTitle: "ABC")
+        case .emoji:
+            return emojiPicker.isSearchMode ? searchLetterSpecs() : []
         }
     }
 
@@ -588,12 +694,14 @@ final class KeyboardChromeView: UIView {
         let letters = [Array("qwertyuiop"), Array("asdfghjkl"), Array("zxcvbnm")]
         var result: [KeySpec] = []
         for (row, chars) in letters.enumerated() {
-            if row == 1 { result.append(KeySpec(row: 1, units: 0.4, title: "", action: .spacer)) }
+            if row == 1 {
+                result.append(KeySpec(row: 1, units: metrics.asdfSpacerUnits, title: "", action: .spacer))
+            }
             if row == 2 {
                 let symbol = shiftState == .locked ? "capslock.fill" : (shiftState == .off ? "shift" : "shift.fill")
                 result.append(KeySpec(
                     row: 2,
-                    units: 1.4,
+                    units: metrics.shiftUnits,
                     title: shiftState == .locked ? "caps lock" : "shift",
                     action: .shift,
                     symbol: symbol,
@@ -605,10 +713,54 @@ final class KeyboardChromeView: UIView {
                 let glyph = shiftState == .off ? base : base.uppercased()
                 result.append(KeySpec(row: row, units: 1, title: glyph, action: .insert(glyph)))
             }
-            if row == 1 { result.append(KeySpec(row: 1, units: 0.4, title: "", action: .spacer)) }
-            if row == 2 { result.append(KeySpec(row: 2, units: 1.4, title: "delete", action: .delete, symbol: "delete.backward")) }
+            if row == 1 {
+                result.append(KeySpec(row: 1, units: metrics.asdfSpacerUnits, title: "", action: .spacer))
+            }
+            if row == 2 {
+                result.append(KeySpec(
+                    row: 2,
+                    units: metrics.shiftUnits,
+                    title: "delete",
+                    action: .delete,
+                    symbol: "delete.backward"
+                ))
+            }
         }
         return result + bottom(modeTitle: "123")
+    }
+
+    private func searchLetterSpecs() -> [KeySpec] {
+        let letters = [Array("qwertyuiop"), Array("asdfghjkl"), Array("zxcvbnm")]
+        var result: [KeySpec] = []
+        for (row, chars) in letters.enumerated() {
+            if row == 1 {
+                result.append(KeySpec(row: 1, units: metrics.asdfSpacerUnits, title: "", action: .spacer))
+            }
+            if row == 2 {
+                result.append(KeySpec(
+                    row: 2,
+                    units: metrics.shiftUnits,
+                    title: "space",
+                    action: .insert(" ")
+                ))
+            }
+            for ch in chars {
+                result.append(KeySpec(row: row, units: 1, title: String(ch), action: .insert(String(ch))))
+            }
+            if row == 1 {
+                result.append(KeySpec(row: 1, units: metrics.asdfSpacerUnits, title: "", action: .spacer))
+            }
+            if row == 2 {
+                result.append(KeySpec(
+                    row: 2,
+                    units: metrics.shiftUnits,
+                    title: "delete",
+                    action: .delete,
+                    symbol: "delete.backward"
+                ))
+            }
+        }
+        return result
     }
 
     private func row(_ values: [String], _ row: Int) -> [KeySpec] {
@@ -622,14 +774,40 @@ final class KeyboardChromeView: UIView {
         return result
     }
 
-    private func bottom(modeTitle: String) -> [KeySpec] {
-        [
-            KeySpec(row: 3, units: 1.2, title: modeTitle, action: .mode),
-            KeySpec(row: 3, units: 1.0, title: ",", action: .insert(","), longPressInsert: "'"),
-            KeySpec(row: 3, units: 3.15, title: "Murmur", action: .insert(" ")),
-            KeySpec(row: 3, units: 1.0, title: ".", action: .insert("."), longPressInsert: "'"),
-            KeySpec(row: 3, units: 1.5, title: returnTitle, action: .insert("\n"))
+    private func bottom(modeTitle: String, includeEmojiKey: Bool = true) -> [KeySpec] {
+        var keys: [KeySpec] = [
+            KeySpec(row: 3, units: metrics.modeUnits, title: modeTitle, action: .mode)
         ]
+        if includeEmojiKey {
+            keys.append(
+                KeySpec(
+                    row: 3,
+                    units: metrics.emojiUnits,
+                    title: "emoji",
+                    action: .emoji
+                )
+            )
+        }
+        keys.append(
+            KeySpec(
+                row: 3,
+                units: includeEmojiKey ? metrics.spaceUnits : metrics.spaceUnitsWithoutEmoji,
+                title: "space",
+                action: .insert(" ")
+            )
+        )
+        let returnIsDefault = returnTitle == "return"
+        keys.append(
+            KeySpec(
+                row: 3,
+                units: metrics.returnUnits,
+                title: returnTitle,
+                action: .insert("\n"),
+                symbol: returnIsDefault ? "return.left" : nil,
+                isProminent: !returnIsDefault
+            )
+        )
+        return keys
     }
 
     @objc private func hapticDown() {
@@ -637,29 +815,9 @@ final class KeyboardChromeView: UIView {
         keyHaptic.impactOccurred(intensity: 0.55)
     }
 
-    @objc private func spacePan(_ gesture: UIPanGestureRecognizer) {
-        let translation = gesture.translation(in: self).x
-        switch gesture.state {
-        case .began:
-            spaceTrackpadUsed = false
-            lastSpaceOffset = 0
-        case .changed:
-            let offset = Int((translation / 8).rounded())
-            if abs(translation) > 8 { spaceTrackpadUsed = true }
-            let delta = offset - lastSpaceOffset
-            if delta != 0 {
-                lastSpaceOffset = offset
-                onSpaceDrag?(delta)
-            }
-        default:
-            break
-        }
-    }
-
     @objc private func tapMic() { onMic?() }
     @objc private func tapCancel() { onCancel?() }
     @objc private func tapDismissError() { dismissError() }
-    @objc private func tapGlobe() { onGlobe?() }
 
     @objc private func beginDelete(_: KeyView) {
         hapticDown()
@@ -710,6 +868,17 @@ final class KeyboardChromeView: UIView {
     }
 
     private func commitSwipe(path: [CGPoint]) {
+        let travel = SwipeTypingEngine.pathLength(path)
+        let letters = SwipeTypingEngine.keySequence(
+            path: path,
+            keys: letterGeometry,
+            keyWidth: letterKeyWidth
+        )
+        guard SwipeTypingEngine.isDeliberateSwipe(
+            travel: travel,
+            uniqueLetters: letters.count,
+            keyWidth: letterKeyWidth
+        ) else { return }
         let words = rankedSwipe(path: path)
         guard !words.isEmpty else { return }
         onSwipe?(words.map { applySwipeCase($0) })
@@ -769,6 +938,7 @@ final class KeyboardChromeView: UIView {
             )
         }
         letterKeyWidth = max(width, 8)
+        letterSwipe.keyWidth = letterKeyWidth
     }
 
     private func highlightSwipe(_ letters: [Character]) {
@@ -790,10 +960,6 @@ final class KeyboardChromeView: UIView {
         case .spacer:
             return
         case .insert(let text):
-            if text == " ", spaceTrackpadUsed {
-                spaceTrackpadUsed = false
-                return
-            }
             lastShiftTap = nil
             onInsert?(text)
             if page == .letters, text.count == 1, text != " ", text != "\n",
@@ -822,9 +988,163 @@ final class KeyboardChromeView: UIView {
             case .letters: page = .numbers
             case .numbers: page = sender.spec.title == "#+=" ? .symbols : .letters
             case .symbols: page = sender.spec.title == "123" ? .numbers : .letters
+            case .emoji: page = .letters
             }
             rebuild()
+        case .emoji:
+            UIDevice.current.playInputClick()
+            lastShiftTap = nil
+            gifTrayVisible = false
+            gifTray.resetMode()
+            page = .emoji
+            emojiPicker.resetMode()
+            rebuild()
+            onNeedsHeightChange?()
         }
+    }
+
+    @objc private func keyPreviewDown(_ sender: KeyView) {
+        guard shouldShowPreview(for: sender.spec) else { return }
+        let frame = sender.convert(sender.bounds, to: self)
+        keyPreview.showPopup(glyph: sender.spec.title, keyFrame: frame, chromeBounds: bounds, dark: dark)
+        bringSubviewToFront(keyPreview)
+    }
+
+    @objc private func keyPreviewEnd(_: KeyView) {
+        if !diacriticActive {
+            keyPreview.dismiss()
+        }
+    }
+
+    private func shouldShowPreview(for spec: KeySpec) -> Bool {
+        if UIAccessibility.isReduceMotionEnabled { return false }
+        if slideToTypeActive || diacriticActive { return false }
+        guard case .insert(let text) = spec.action, text.count == 1 else { return false }
+        if page == .numbers, spec.row == 0, text.first?.isNumber == true { return true }
+        if page == .letters, (spec.row == 1 || spec.row == 2), text.first?.isLetter == true { return true }
+        return false
+    }
+
+    private func canBeginModeSlide(at point: CGPoint) -> Bool {
+        guard page == .letters, !sessionActive, !grid.isHidden, !gifTrayVisible, !diacriticActive else {
+            return false
+        }
+        guard let key = keyAtChromePoint(point) else { return false }
+        if case .mode = key.spec.action { return key.spec.title == "123" }
+        return false
+    }
+
+    private func modeKeyFrame(at point: CGPoint) -> CGRect {
+        guard let key = keyAtChromePoint(point) else { return .zero }
+        return key.convert(key.bounds, to: self)
+    }
+
+    private func beginSlideToType() {
+        slideToTypeActive = true
+        letterSwipe.isEnabled = false
+        page = .numbers
+        rebuild()
+    }
+
+    private func updateSlideHighlight(at point: CGPoint) {
+        let hit = slideInsertKey(at: point)
+        for key in keyViews {
+            guard case .insert(let text) = key.spec.action, text != " ", text != "\n" else {
+                key.isHighlighted = false
+                continue
+            }
+            key.isHighlighted = hit === key
+        }
+    }
+
+    private func endSlideToType(didLeave: Bool, at point: CGPoint, cancelled: Bool) {
+        letterSwipe.isEnabled = true
+        slideToTypeActive = false
+        if cancelled {
+            page = .letters
+            rebuild()
+            return
+        }
+        if didLeave {
+            if let key = slideInsertKey(at: point), case .insert(let text) = key.spec.action {
+                onInsert?(text)
+            }
+            page = .letters
+            rebuild()
+        } else {
+            page = .numbers
+            rebuild()
+        }
+    }
+
+    private func slideInsertKey(at point: CGPoint) -> KeyView? {
+        guard let key = keyAtChromePoint(point) else { return nil }
+        guard case .insert(let text) = key.spec.action, text != " ", text != "\n" else { return nil }
+        return key
+    }
+
+    private func keyAtChromePoint(_ point: CGPoint) -> KeyView? {
+        let gridPoint = grid.convert(point, from: self)
+        return keyViews.first { key in
+            !key.spec.isSpacer && key.frame.contains(gridPoint)
+        }
+    }
+
+    @objc private func diacriticPress(_ gesture: UILongPressGestureRecognizer) {
+        guard let key = gesture.view as? KeyView,
+              case .insert(let text) = key.spec.action else { return }
+        let alts = KeyDiacriticMap.alternatives(for: text)
+        guard !alts.isEmpty else { return }
+        let point = gesture.location(in: self)
+        switch gesture.state {
+        case .began:
+            if letterSwipe.state == .began || letterSwipe.state == .changed { return }
+            diacriticActive = true
+            letterSwipe.isEnabled = false
+            longPressConsumed = true
+            hapticDown()
+            key.isHighlighted = true
+            let frame = key.convert(key.bounds, to: self)
+            let preferBelow = key.spec.row == 0
+            keyPreview.showStrip(
+                items: alts,
+                keyFrame: frame,
+                preferBelow: preferBelow,
+                chromeBounds: bounds,
+                dark: dark
+            )
+            bringSubviewToFront(keyPreview)
+        case .changed:
+            guard diacriticActive else { return }
+            keyPreview.select(at: point)
+        case .ended:
+            guard diacriticActive else { return }
+            let glyph = keyPreview.selectedGlyph
+            let shouldUnshift = page == .letters && shiftState == .once && glyph != nil
+            finishDiacritic(key)
+            if let glyph {
+                onInsert?(glyph)
+                if shouldUnshift {
+                    shiftState = .off
+                    rebuild()
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.longPressConsumed = false
+            }
+        default:
+            if diacriticActive {
+                longPressConsumed = false
+                finishDiacritic(key)
+            }
+        }
+    }
+
+    private func finishDiacritic(_ key: KeyView) {
+        diacriticActive = false
+        letterSwipe.isEnabled = true
+        key.isHighlighted = false
+        keyPreview.dismiss()
     }
 
     @objc private func longPressKey(_ gesture: UILongPressGestureRecognizer) {
@@ -844,6 +1164,7 @@ private struct KeySpec {
         case delete
         case shift
         case mode
+        case emoji
         case spacer
     }
 
@@ -853,6 +1174,7 @@ private struct KeySpec {
     let action: Action
     var symbol: String? = nil
     var isSelected = false
+    var isProminent = false
     var longPressInsert: String? = nil
 
     var isSpacer: Bool {
@@ -863,52 +1185,108 @@ private struct KeySpec {
 
 private final class KeyView: UIButton {
     let spec: KeySpec
+    private let face = UIView()
     private let normalFill: UIColor
     private let pressedFill: UIColor
+    private let lipColor: UIColor
 
     override var isHighlighted: Bool {
         didSet {
             guard !spec.isSpacer else { return }
-            backgroundColor = isHighlighted ? pressedFill : normalFill
-            transform = isHighlighted ? CGAffineTransform(scaleX: 0.96, y: 0.96) : .identity
+            face.backgroundColor = isHighlighted ? pressedFill : normalFill
         }
     }
 
-    init(spec: KeySpec, dark: Bool) {
+    init(spec: KeySpec, dark: Bool, metrics: KeyboardChromeMetrics) {
         self.spec = spec
         normalFill = Self.fill(spec: spec, dark: dark)
-        pressedFill = KeyboardChromeTokens.pressedKeyFill(dark: dark)
+        pressedFill = spec.isProminent
+            ? UIColor.systemBlue.withAlphaComponent(0.78)
+            : KeyboardChromeTokens.pressedKeyFill(dark: dark)
+        lipColor = Self.lip(spec: spec, dark: dark)
         super.init(frame: .zero)
         isUserInteractionEnabled = !spec.isSpacer
         isAccessibilityElement = !spec.isSpacer
         accessibilityLabel = spec.title
-        accessibilityIdentifier = spec.title == "Murmur" ? "murmur.keyboard.space" : nil
+        if case .insert(" ") = spec.action {
+            accessibilityIdentifier = "murmur.keyboard.space"
+        } else if case .emoji = spec.action {
+            accessibilityIdentifier = "murmur.keyboard.emoji"
+        }
         layer.cornerRadius = KeyboardChromeTokens.keyCornerRadius
+        layer.cornerCurve = .continuous
+        clipsToBounds = true
+        face.isUserInteractionEnabled = false
+        face.layer.cornerRadius = KeyboardChromeTokens.keyCornerRadius
+        face.layer.cornerCurve = .continuous
+        face.clipsToBounds = true
+        insertSubview(face, at: 0)
+        face.layer.zPosition = -1
         titleLabel?.font = .systemFont(
-            ofSize: spec.action.isSpecial ? KeyboardChromeTokens.specialFontSize : KeyboardChromeTokens.letterFontSize,
-            weight: .regular
+            ofSize: spec.action.isSpecial ? metrics.specialFont : metrics.letterFont,
+            weight: spec.action.isSpecial ? .medium : .regular
         )
         titleLabel?.adjustsFontSizeToFitWidth = true
-        setTitleColor(dark ? .white : .black, for: .normal)
-        tintColor = dark ? .white : .black
+        let glyph = spec.isProminent ? UIColor.white : KeyboardChromeTokens.glyphColor(dark: dark)
         if spec.isSelected {
             setTitleColor(dark ? .black : .white, for: .normal)
             tintColor = dark ? .black : .white
+        } else {
+            setTitleColor(glyph, for: .normal)
+            tintColor = glyph
         }
         if let symbol = spec.symbol {
-            setImage(UIImage(systemName: symbol), for: .normal)
+            let config = UIImage.SymbolConfiguration(pointSize: metrics.specialFont, weight: .medium)
+            let names = [symbol, "globe"]
+            let image = names.compactMap {
+                UIImage(systemName: $0, withConfiguration: config)?.withRenderingMode(.alwaysTemplate)
+            }.first
+            if let image {
+                setImage(image, for: .normal)
+                setTitle(nil, for: .normal)
+            } else {
+                setTitle(spec.title, for: .normal)
+            }
+        } else if case .emoji = spec.action {
+            setImage(nil, for: .normal)
+            setTitle("😊", for: .normal)
+            titleLabel?.font = .systemFont(ofSize: metrics.letterFont, weight: .regular)
+        } else if case .insert(" ") = spec.action {
+            setTitle(nil, for: .normal)
         } else if !spec.isSpacer {
             setTitle(spec.title, for: .normal)
         }
-        backgroundColor = normalFill
+        backgroundColor = spec.isSpacer ? .clear : lipColor
+        face.backgroundColor = spec.isSpacer ? .clear : normalFill
         if spec.isSpacer { backgroundColor = .clear }
     }
 
     required init?(coder: NSCoder) { nil }
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard !spec.isSpacer else {
+            face.frame = .zero
+            return
+        }
+        face.frame = CGRect(x: 0, y: 0, width: bounds.width, height: max(0, bounds.height - 1))
+        sendSubviewToBack(face)
+        if let imageView {
+            bringSubviewToFront(imageView)
+        }
+        if let titleLabel {
+            bringSubviewToFront(titleLabel)
+        }
+    }
+
     private static func fill(spec: KeySpec, dark: Bool) -> UIColor {
+        if spec.isProminent {
+            return .systemBlue
+        }
         switch spec.action {
-        case .insert(" "), .insert("\n"):
+        case .insert(" "):
+            return KeyboardChromeTokens.letterKeyFill(dark: dark)
+        case .insert("\n"):
             return KeyboardChromeTokens.specialKeyFill(dark: dark)
         case .insert:
             return KeyboardChromeTokens.letterKeyFill(dark: dark)
@@ -921,13 +1299,23 @@ private final class KeyView: UIButton {
             return KeyboardChromeTokens.specialKeyFill(dark: dark)
         }
     }
+
+    private static func lip(spec: KeySpec, dark: Bool) -> UIColor {
+        if spec.isProminent {
+            return UIColor.systemBlue.withAlphaComponent(0.72)
+        }
+        if spec.isSelected {
+            return dark ? UIColor(white: 0.72, alpha: 1) : UIColor(white: 0.05, alpha: 1)
+        }
+        return KeyboardChromeTokens.keyLip(dark: dark, special: spec.action.isSpecial)
+    }
 }
 
 private extension KeySpec.Action {
     var isSpecial: Bool {
         switch self {
-        case .insert(let text): return text == " " || text == "\n"
-        case .delete, .shift, .mode, .spacer: return true
+        case .insert(let text): return text == "\n"
+        case .delete, .shift, .mode, .emoji, .spacer: return true
         }
     }
 }
@@ -944,7 +1332,7 @@ extension KeyboardChromeView: UIGestureRecognizerDelegate {
                 switch key.spec.action {
                 case .insert(let text) where text == " " || text == "\n":
                     return false
-                case .shift, .delete, .mode, .spacer:
+                case .shift, .delete, .mode, .emoji, .spacer:
                     return false
                 default:
                     return true
@@ -953,6 +1341,76 @@ extension KeyboardChromeView: UIGestureRecognizerDelegate {
             view = current.superview
         }
         return true
+    }
+}
+
+/// Press 123, drag onto a numbers-page key, release inserts and returns to letters.
+/// No swipe trail. If the finger never leaves 123, this is a normal page switch.
+private final class ModeSlideRecognizer: UIGestureRecognizer {
+    var canBegin: ((CGPoint) -> Bool)?
+    var homeFrameAt: ((CGPoint) -> CGRect)?
+    var onSlidOff: (() -> Void)?
+    var onMoved: ((CGPoint) -> Void)?
+    var onFinished: ((Bool, CGPoint, Bool) -> Void)?
+
+    private var home = CGRect.zero
+    private var left = false
+    private var lastPoint = CGPoint.zero
+
+    override func reset() {
+        super.reset()
+        home = .zero
+        left = false
+        lastPoint = .zero
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = touches.first, let view else {
+            state = .failed
+            return
+        }
+        let point = touch.location(in: view)
+        guard canBegin?(point) == true else {
+            state = .failed
+            return
+        }
+        lastPoint = point
+        home = homeFrameAt?(point) ?? .zero
+        left = false
+        state = .possible
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = touches.first, let view else { return }
+        let point = touch.location(in: view)
+        lastPoint = point
+        if !left && !home.insetBy(dx: -8, dy: -8).contains(point) {
+            left = true
+            state = .began
+            onSlidOff?()
+            onMoved?(point)
+        } else if left, state == .began || state == .changed {
+            state = .changed
+            onMoved?(point)
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let touch = touches.first, let view {
+            lastPoint = touch.location(in: view)
+        }
+        if left {
+            onMoved?(lastPoint)
+        }
+        onFinished?(left, lastPoint, false)
+        state = left ? .ended : .failed
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        if state == .possible || state == .began || state == .changed {
+            onFinished?(left, lastPoint, true)
+        }
+        state = .cancelled
     }
 }
 
@@ -1001,6 +1459,7 @@ private final class LetterSwipeRecognizer: UIGestureRecognizer {
     var letterAt: ((CGPoint) -> Character?)?
     var isSwipeEnabled: () -> Bool = { true }
     var onPathChanged: (([CGPoint], Bool) -> Void)?
+    var keyWidth: CGFloat = 30
     private(set) var points: [CGPoint] = []
     private(set) var sampledLetters: [Character] = []
     private var start = CGPoint.zero
@@ -1039,7 +1498,12 @@ private final class LetterSwipeRecognizer: UIGestureRecognizer {
         let dy = point.y - start.y
         let distance = (dx * dx + dy * dy).squareRoot()
         if state == .possible {
-            if distance >= 16, sampledLetters.count >= 2 {
+            let travel = SwipeTypingEngine.pathLength(points)
+            if SwipeTypingEngine.isDeliberateSwipe(
+                travel: max(distance, travel),
+                uniqueLetters: sampledLetters.count,
+                keyWidth: keyWidth
+            ) {
                 state = .began
             }
         } else if state == .began || state == .changed {

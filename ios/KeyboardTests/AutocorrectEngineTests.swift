@@ -246,6 +246,13 @@ final class AutocorrectEngineTests: XCTestCase {
             AutocorrectEngine.forcedSplit("imgoing", known: known, frequencyOrder: frequency),
             "I'm going"
         )
+        XCTAssertNil(
+            AutocorrectEngine.forcedSplit(
+                "therapist",
+                known: known + ["rapist"],
+                frequencyOrder: frequency + ["rapist"]
+            )
+        )
     }
 
     func testPrioritizedLexiconIncludesMissingContractions() {

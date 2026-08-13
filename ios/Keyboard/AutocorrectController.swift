@@ -2,10 +2,7 @@ import UIKit
 
 /// Loads the bundled frequency list once. Unique, lowercased.
 enum FrequencyList {
-    private static let banned: Set<String> = [
-        "teh", "adn", "taht", "hte", "recieve", "seperate", "occured",
-        "definately", "untill", "wich", "whihc", "thier", "woudl", "jsut", "becuase"
-    ]
+    private static let banned: Set<String> = Set(AutocorrectEngine.commonTypos.keys)
 
     /// Frequency-file order only. Split confidence uses these ranks so a names
     /// prefix on `words` cannot push `he`/`the` past the force threshold.
@@ -177,17 +174,13 @@ final class AutocorrectController {
         if let pronoun = AutocorrectEngine.forcedPronounI(span) {
             return pronoun
         }
-        guard span.count >= 2 else { return nil }
         if let contraction = AutocorrectEngine.forcedContraction(span) {
             return contraction
         }
-        if let split = AutocorrectEngine.forcedSplit(
-            span,
-            known: FrequencyList.words,
-            frequencyOrder: FrequencyList.frequencyOrder
-        ) {
-            return split
+        if let typo = AutocorrectEngine.forcedTypo(span) {
+            return typo
         }
+        guard span.count >= 2 else { return nil }
         let nsWord = span as NSString
         let full = NSRange(location: 0, length: nsWord.length)
         let misspelled = checker.rangeOfMisspelledWord(
@@ -197,13 +190,28 @@ final class AutocorrectController {
             wrap: false,
             language: language
         )
+        // Valid words stay typed. Splits and fuzzy guesses were eating
+        // "therapist" / names / anything UITextChecker merely disliked.
         guard misspelled.location != NSNotFound else { return nil }
+        if let split = AutocorrectEngine.forcedSplit(
+            span,
+            known: FrequencyList.words,
+            frequencyOrder: FrequencyList.frequencyOrder
+        ) {
+            return split
+        }
         let guesses = checker.guesses(
             forWordRange: misspelled,
             in: span,
             language: language
         ) ?? []
-        guard let first = guesses.first, first.lowercased() != span.lowercased() else { return nil }
+        guard let first = guesses.first else { return nil }
+        guard AutocorrectEngine.shouldForceSpelling(
+            span: span,
+            guess: first,
+            frequencyOrder: FrequencyList.frequencyOrder,
+            names: FrequencyList.nameSet
+        ) else { return nil }
         return AutocorrectEngine.applyCase(template: span, correction: first)
     }
 

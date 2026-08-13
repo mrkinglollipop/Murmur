@@ -37,7 +37,8 @@ current setup and contribution guidance.
 | 023 | Open-source readiness | SHIPPED (Phases 1–5) |
 | 024 | Repo audit findings | archival (fix pass 1 landed) |
 | 025 | Murmur Pro scope | approved direction; not started |
-| 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe bake-off gated) | PARTIAL — P0–P2 in tree; swipe is in the build (Settings toggle, default on), still bake-off gated; P2b Messages bubble is a device spike |
+| 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe bake-off gated) | PARTIAL — P0–P2 in tree; swipe is in the build (Settings toggle, default off), still bake-off gated; P2b Messages bubble is a device spike; **027 wins for look** (mic not Start/waveform; brighter caps + 1pt lip, not leftover UIGlassEffect-on-keys); **P0 space-bar trackpad cancelled by 027** |
+| 027 | iOS keyboard: Apple chrome polish + multi-iPhone sizing | SHIPPED (2026-08-13) — visual vs Apple unverified until Messages screenshot; **wins for look** vs 026 (mic not Start/waveform; brighter caps + 1pt lip); **cancels 026 P0 space-bar trackpad**; 026 still owns P0-host / GIF / swipe / dictation bounce |
 
 ## Notes for maintainers
 
@@ -55,11 +56,15 @@ current setup and contribution guidance.
 **Canonical home:** this section in `plans/README.md` until split to `plans/026-ios-keyboard-upgrade.md`.
 **Does not authorize App Store submit, Mac target changes, Pro/IAP, or Murmur-server.**
 
+**027 wins for look (and cancels trackpad):** Plan [027](027-ios-keyboard-apple-polish.md) **replaces** this plan’s accessory CTA and key chrome. Implement **027**: mic on the QuickType bar (**not** the 106pt Start/waveform pill); brighter caps + **1pt lip** (**not** leftover `UIGlassEffect`-on-keys as remaining P0-chrome work). 027 also **cancels 026 P0 space-bar trackpad** and the **P0 acceptance “space-drag moves caret.”** Do not implement or revive that pan.
+
+**026 still owns:** P0-host, GIF, swipe (default **off**), dictation bounce, P1 autocorrect, P3 ship-gate. Those stay as written here.
+
 This plan **explicitly pulls in** `ios/README.md` “Continued work” items that were out of scope until asked: **full QWERTY as a real typing keyboard** (keys already insert; this upgrade makes them competitive), plus swipe, autocorrect, and GIPHY. Dictation bounce architecture stays, but **must return to the originating host app** (Matt, 2026-08-12: today it always dumps you in Messages). **Floor is iOS 27** — Liquid Glass with no iOS 26 compatibility path.
 
 ## 1. Goal
 
-Ship a **dictation-first iOS keyboard that is also a beautiful daily driver**: Wispr Flow parity on the chrome **we will match** (§3; not magnify callouts, not a hamburger drawer), then **three features Wispr’s keyboard docs do not ship** — swipe-to-type, autocorrect with a candidate bar, and a GIPHY tray launched from a dedicated button on the **existing top accessory row** (left of the mic / Start control).
+Ship a **dictation-first iOS keyboard that is also a beautiful daily driver**: Wispr Flow parity on the chrome **we will match** (§3; not magnify callouts, not a hamburger drawer), then **three features Wispr’s keyboard docs do not ship** — swipe-to-type, autocorrect with a candidate bar, and a GIPHY tray launched from a dedicated button on the **existing top accessory row** (left of the **027 mic**; not leftover Start/waveform).
 
 Primary workflow that proves the product: in **Notes** (not Messages), switch to Murmur, type, tap Start, and **not get kidnapped into Messages**. Best case: bounce back to Notes. Honest degrade: stay in Murmur and swipe back; transcript still inserts in Notes. Then GIF + swipe as the rest of the upgrade.
 
@@ -74,9 +79,9 @@ Verified by reading `ios/Keyboard/` this session. Do **not** trust the memory to
 | Top bar | 48pt: `statusLabel` + **Start** (waveform) on the right. `menuButton` exists but is **hidden, disabled, `frame = .zero`** |
 | Keys | Real `textDocumentProxy.insertText` / `deleteBackward`. Letters / 123 / #+= . Shift once/locked. Space labeled **“Murmur”**. Return title from `returnKeyType` |
 | Already shipped typing niceties | Sentence/word/all-caps from `autocapitalizationType`; double-space → `. `; input clicks; candidate bar; `UITextChecker` |
-| Swipe | In the build (`SwipeTypingEngine`, Settings toggle, default on). Still bake-off gated — not missing. |
+| Swipe | In the build (`SwipeTypingEngine`, Settings toggle, **default off**). Still bake-off gated — not missing. |
 | GIF | Giphy REST tray from the accessory row (3-column thumbs). Messages pasteboard bubble is a device spike. |
-| Missing | Space-bar cursor, key callouts; haptics beyond clicks |
+| Missing | Key callouts; haptics beyond clicks. **Space-bar cursor / trackpad cancelled by 027** — not remaining work. |
 | Dictation | Mic does **not** record in the appex. `murmur://dictate` via `extensionContext.open`, fallback responder-chain `UIApplication.open` (sideload). Host records + ElevenLabs `scribe_v2`. Poll `handoff.json` 80ms → `insertText` |
 | Listening overlay | Replaces grid; **Format** disabled; palette is **light gray even in dark mode** |
 | Full Access | `RequestsOpenAccess: true`. No Full Access / no API key → `.setup`, mic dead, **keys still type** |
@@ -88,11 +93,11 @@ Verified by reading `ios/Keyboard/` this session. Do **not** trust the memory to
 
 Research gather 2026-08-12 (official help + App Store + Wispr changelog). Wispr keyboard: [Set up the Flow keyboard on iPhone](https://docs.wisprflow.ai/articles/7453988911-set-up-the-flow-keyboard-on-iphone) (updated ~2026-08-07); App Store `id6497229487`; [What’s new](https://wisprflow.ai/whats-new).
 
-**Wispr ships (parity we will match):** full QWERTY (sometimes behind “Show full QWERTY”), autocap, autocorrect, double-space period, space-bar trackpad, haptics, **top bar** (status / style pill / spinner), globe, Full Access required for transcription, mic bounce into the containing app, cloud dictation.
+**Wispr ships (parity we will match):** full QWERTY (sometimes behind “Show full QWERTY”), autocap, autocorrect, double-space period, haptics, **top bar** (status / style pill / spinner), globe, Full Access required for transcription, mic bounce into the containing app, cloud dictation. **Space-bar trackpad:** Wispr has it; **027 cancels matching it** (do not implement).
 
 **Wispr ships (we will not match):**
 - **Magnify / pop-above-keyboard callouts** — Wispr has them; we will not. Apple forbids drawing key previews above the keyboard’s top edge (same constraint as §5.10).
-- **Hamburger drawer** — Wispr has a hamburger; we **replace that slot** with GIF + candidates + Start. This upgrade does not build a drawer. P0 does not keep a dead hamburger.
+- **Hamburger drawer** — Wispr has a hamburger; we **replace that slot** with GIF + candidates + **027 mic** (not leftover Start/waveform). This upgrade does not build a drawer. P0 does not keep a dead hamburger.
 
 **Wispr does not document (our extras, not parity):** swipe/glide/QuickPath, GIF/sticker tray, Apple-style three-slot QuickType bar.
 
@@ -118,10 +123,10 @@ Research gather 2026-08-12 (official help + App Store + Wispr changelog). Wispr 
 | Network | Only with Full Access | GIF **disabled** (stays in layout; a11y explains why), not removed, when `!hasFullAccess` |
 | Height | Auto Layout on the keyboard view. Cannot draw above top edge | Reuse the **existing 48pt top bar**; bump total height only if the GIF tray needs a second sheet |
 | App Store | 2.5.1 public APIs; 4.4.1 must work without Full Access / without network; must not launch apps besides Settings | **Stay sideload.** Existing `LSApplicationWorkspace` + responder-chain open stay. This build may add `suspend` for host return. Still not App Store. |
-| iOS floor | This machine has **iPhoneOS 27.0 SDK** (`iphoneos27.0`, Xcode-beta, 2026-08-12). Project today is `IPHONEOS_DEPLOYMENT_TARGET: "26.0"` | Bump `ios/project.yml` + both `deploymentTarget` keys to **27.0**. No iOS 26 `#available` chrome. |
+| iOS floor | This machine has **iPhoneOS 27.0 SDK** (`iphoneos27.0`, Xcode-beta). Project **is** `IPHONEOS_DEPLOYMENT_TARGET: "27.0"` in `ios/project.yml` (both `deploymentTarget` keys). | Floor stays **27.0**. No iOS 26 `#available` chrome. Do not plan a 26.0 → 27.0 bump — that already landed. |
 | Tenor | API sunset **2026-06-30**; new keys closed 2026-01-13 | **Not a fallback** |
 | KeyboardKit 10 | `master` LICENSE is closed-source / license key; 9.9.0 was MIT. Pro autocomplete is **$50/mo** (1 language) as of research 2026-08-12 ([KeyboardKit Pro](https://keyboardkit.com/pro)) | **Do not take KK 10.** DIY `UITextChecker` + `UILexicon` |
-| Tests | `ios/` has **zero** test targets | Add a small `MurmurKeyboardTests` host for matcher/spell logic; device remains the UI oracle |
+| Tests | `ios/` has **`MurmurKeyboardTests`** (exists; matcher / spell / swipe tests) | Keep using `MurmurKeyboardTests` for matcher/spell logic; device remains the UI oracle. Do not add a second host as if none exists. |
 
 Apple docs (fetched 2026-08-12): [Creating a custom keyboard](https://developer.apple.com/documentation/uikit/creating-a-custom-keyboard), [UITextChecker](https://developer.apple.com/documentation/uikit/uitextchecker), [requestSupplementaryLexicon](https://developer.apple.com/documentation/uikit/uiinputviewcontroller/requestsupplementarylexicon(completion:)), [App Store Review Guidelines 4.4.1](https://developer.apple.com/app-store/review/guidelines/).
 
@@ -165,14 +170,14 @@ Do not promise “always returns to Notes/Safari” until the device spike says 
 
 1. **Sideload / private** distribution. No App Store work in this upgrade.
 2. **English-first.** `PrimaryLanguage` stays `en-US`.
-3. **Top accessory row layout** (Matt’s request): `[ GIF ] [ candidate ×3 ] ………… [ Start / waveform ]`. GIF = top-left. Mic stays top-right. Candidates occupy the middle that is currently a blank `statusLabel`. During dictation, listening overlay still replaces the whole chrome (unchanged bounce UX).
+3. **Top accessory row layout** (Matt’s 026 request; **027 Batch B replaces the CTA**): `[ GIF ] [ candidate ×3 ] ………… [ mic ]`. GIF = top-left. **027:** coral `mic.fill` ~36×36 on the right — **not** leftover Start/waveform-pill AC. Candidates occupy the middle. During dictation, listening overlay still replaces the whole chrome (unchanged bounce UX).
 4. **GIPHY REST** in the appex, not the official SDK, not Tenor, not a host-app bounce for search.
 5. **Autocorrect engine:** `UITextChecker` + `requestSupplementaryLexicon` + a small bundled frequency list. No cloud LM. **No next-word model in P1** (KeyboardKit claims Apple dropped next-word APIs in iOS 16 — single-source; we do not promise QuickType-quality prediction).
 6. **Swipe honesty bar:** beat Apple on **UX** (visible alternatives, whole-word undo, no silent wrong-commit). Do **not** claim neural QuickPath accuracy. P3 is a **spike with ship/no-ship gate**.
-7. **Visual:** freehand degrade. Coral `#D85A30` / `#F0997B`. **Try** `UIGlassEffect` / `UIGlassContainerEffect` on `UIVisualEffectView` with deployment target 27.0 (no iOS 26 `#available`). Glass samples the **keyboard window**, not the host thread — see §4.1. If the spike looks wrong, ship restyle fills (KeyboardKit’s iOS 26 approach). Duplicate tokens into `ios/Shared/KeyboardChromeTokens.swift` — do not import Mac `Theme.swift`.
+7. **Visual:** coral `#D85A30` / `#F0997B`. Duplicate tokens into `ios/Shared/KeyboardChromeTokens.swift` — do not import Mac `Theme.swift`. **027 wins for key look:** brighter caps + **1pt lip**. Do **not** treat leftover 026 `UIGlassEffect` / `UIGlassContainerEffect` on keys as remaining P0-chrome work (historical spike notes stay in §4.1 for archive).
 8. **Do not regress dictation.** Bounce, lease, App Group IPC, ElevenLabs batch, Live Activity stay. Do not silently revert to in-appex mic. **Do not default the host to Messages.** Auto-return to Notes/Safari is a **device spike**, not a guarantee (§4.1). Keyboard-initiated takes **gate “Listening…”** on keyboard `viewWillAppear` (listen-gate spike).
 9. **Sideload private APIs:** keep `LSApplicationWorkspace` (empirically works). `suspend` is a **spike**, not the product. Still not App Store.
-10. **Space-bar trackpad + key haptics** are P0 Wispr-parity chrome (small, public API). Key *pop-above-keyboard* callouts are **out** — Wispr has magnify callouts; we will not match them (Apple forbids drawing above the top edge; top-row QWERTY would look broken). See §3.
+10. **Key haptics** are P0 Wispr-parity chrome (small, public API). **Space-bar trackpad is cancelled by 027** — do not implement the local space pan or the P0 AC “space-drag moves caret.” Key *pop-above-keyboard* callouts are **out** — Wispr has magnify callouts; we will not match them (Apple forbids drawing above the top edge; top-row QWERTY would look broken). See §3.
 
 ## 6. Architecture (where new code lives)
 
@@ -181,28 +186,28 @@ All new typing/GIF/swipe code stays in the **keyboard target** except: Giphy API
 ```
 ios/Keyboard/
   KeyboardViewController.swift      — proxy, height, Full Access gates, lexicon; **stop defaulting host to MobileSMS**
-  KeyboardChromeView.swift          — layout + **UIGlassEffect**
-  AccessoryBarView.swift            — NEW: GIF button + CandidateStrip + Start
-  AutocorrectController.swift       — NEW: UITextChecker + word-span replace
-  SwipeTypingController.swift       — NEW (P3): pan → path → candidates
-  GifTrayController.swift           — NEW: REST search/trending + grid sheet
-  KeyGeometry.swift                 — NEW: key-center map for swipe + hit tests
+  KeyboardChromeView.swift          — layout; **027 key look** (brighter caps + 1pt lip). Not leftover UIGlassEffect-on-keys work
+  AccessoryBarView.swift            — GIF button + CandidateStrip; **027 CTA is mic**, not Start/waveform
+  AutocorrectController.swift       — UITextChecker + word-span replace (in tree)
+  SwipeTypingEngine.swift           — pan → path → candidates (in tree; Settings toggle, default off)
+  GifTrayController.swift           — REST search/trending + grid sheet (in tree)
+  KeyGeometry.swift                 — key-center map for swipe + hit tests
 ios/Shared/
   HostAppProbe.swift                — probe only; never remember a guessed Messages default
-  KeyboardChromeTokens.swift        — NEW: colors, radii, heights (UIKit)
+  KeyboardChromeTokens.swift        — colors, radii, heights (UIKit)
   AppGroupStore.swift               — add giphyAPIKey (and maybe gifCacheEnabled)
-  GiphyClient.swift                 — NEW: URLSession, tiny cache, attribution
+  GiphyClient.swift                 — URLSession, tiny cache, attribution
 ios/MurmurIOS/
   HostReturn.swift                  — never open Messages unless probe said Messages; suspend is a spike; swipe-back degrade
   OnboardingView.swift              — Giphy key step; GIF works only with Full Access
 ios/Resources/                      — NEW: en-US frequency wordlist (license-clean)
-ios/project.yml                     — iOS 27.0 floor, new test target, no Giphy SPM
+ios/project.yml                     — iOS 27.0 floor (landed), `MurmurKeyboardTests` exists, no Giphy SPM
 ```
 
 **Touch handling (P0 vs P3 — load-bearing):** today’s keys are discrete `UIButton` `.touchUpInside` (`private final class KeyView: UIButton` in `KeyboardChromeView.swift`).
 
-- **P0:** keep that existing `KeyView` subclass. Space-bar trackpad is a **local pan on the space key only** — not a grid-wide pan. Do not introduce a grid-wide gesture owner in P0.
-- **P3:** introduce a single `UIGestureRecognizer` owner on `grid` that dispatches tap vs swipe vs space-drag vs delete-hold, and **absorbs** the P0 space-key pan. Letter keys may then become non-`UIButton` layers under that owner so `UIButton` highlights and the pan recognizer do not fight. Translation under about 16pt → tap (preserve current key behavior); translation across **2 or more letter keys** → swipe path; cancel the tap. Swipe **never** starts on delete / shift / 123 / return / space (space is trackpad, not swipe).
+- **P0:** keep that existing `KeyView` subclass. **Space-bar trackpad is cancelled by 027** — no local pan on the space key. Do not introduce a grid-wide gesture owner in P0.
+- **P3:** introduce a single `UIGestureRecognizer` owner on `grid` that dispatches tap vs swipe vs delete-hold. **Do not absorb a P0 space-key pan** (cancelled by 027; never shipped). Letter keys may then become non-`UIButton` layers under that owner so `UIButton` highlights and the pan recognizer do not fight. Translation under about 16pt → tap (preserve current key behavior); translation across **2 or more letter keys** → swipe path; cancel the tap. Swipe **never** starts on delete / shift / 123 / return / space (space types space, not swipe).
 - **Do not add a second type named `KeyView`.** If P3 replaces the UIButton subclass, rename or convert the existing type in place — never two `KeyView`s.
 
 **Height:** idle typing is **296pt** (`KeyboardChromeTokens.portraitHeight`). GIF search tray shares that height with a compressed key row; it is not a taller keyboard.
@@ -256,25 +261,25 @@ Implementation order is **P0-host → P0-chrome → P1 → P2 → P3**. Host-ret
 
 **Work:**
 
-1. Extract `AccessoryBarView`: left GIF control **visible but disabled** (placeholder slot Matt asked for; a11y explains “GIFs need Full Access and a Giphy key”), middle three candidate slots (empty/idle), right Start — same 48pt row. P2 enables the control when Giphy key + Full Access.
-2. `KeyboardChromeTokens` — light/dark fills, coral CTA, key corner radius ~8–10pt (today 5.5), row gap, font sizes. Listening overlay **follows dark/light**. **Glass spike:** `UIVisualEffectView` + `UIGlassEffect` for keys/chips against the **keyboard’s own** backdrop (`UIGlassContainerEffect` if pieces should merge). Deployment target 27.0; no iOS 26 `#available`. If device screenshots look wrong or jetsam, **degrade** to tinted fills (no `UIVisualEffectView`). Tint coral on Start only. Do not claim the keyboard frosts the Messages thread.
+1. Extract `AccessoryBarView`: left GIF control **visible but disabled** (placeholder slot Matt asked for; a11y explains “GIFs need Full Access and a Giphy key”), middle three candidate slots (empty/idle), right CTA. **027 Batch B:** that CTA is **mic**, not Start/waveform — do not implement leftover Start-pill AC.
+2. `KeyboardChromeTokens` — light/dark fills, coral CTA, key corner radius ~8–10pt (today 5.5), row gap, font sizes. Listening overlay **follows dark/light**. **027 Batch A wins for key look** (brighter caps + 1pt lip). Do **not** treat leftover `UIVisualEffectView` + `UIGlassEffect` on keys as remaining P0-chrome work. Historical spike: glass samples the **keyboard’s own** backdrop only; do not claim the keyboard frosts the Messages thread.
 3. Haptics: `UIImpactFeedbackGenerator` on key down (respect Reduce Motion / system keyboard haptic setting if readable; otherwise follow `UIAccessibility.isReduceMotionEnabled`).
-4. Space-bar trackpad: **local** pan on the Murmur space key only → `textDocumentProxy.adjustTextPosition(byCharacterOffset:)`. Not grid-wide; P3’s gesture owner absorbs this later.
+4. **Cancelled by 027 — space-bar trackpad:** do **not** add a local pan on the space key / `adjustTextPosition`. P3 must not absorb a P0 space-key pan that was never shipped.
 5. Keep globe, shift, 123/#+=, delete-repeat, double-space period, capitalization.
-6. Idle status: do not show a blank status forever; empty candidates + Start is the rest state. Setup/secure copy can use a single-line caption under Start or replace candidates temporarily.
-7. **offline degrade** visual pass (no better-design MCP): no purple SaaS gradient, contrast AA on key glyphs, one primary (Start), no glow soup.
+6. Idle status: do not show a blank status forever; empty candidates + **027 mic** is the rest state. Setup/secure copy can use a single-line caption or replace candidates temporarily.
+7. **offline degrade** visual pass (no better-design MCP): no purple SaaS gradient, contrast AA on key glyphs, one primary (**027 mic**, not Start pill), no glow soup.
 8. **Keyboard target jetsam baseline:** exclude `MicRecorder.swift`, `ElevenLabsBatch.swift`, and `WAVTranscoder.swift` from the MurmurKeyboard target (`project.yml` Shared excludes; host-only).
-9. Bump `ios/project.yml` `deploymentTarget.iOS` and `IPHONEOS_DEPLOYMENT_TARGET` to **27.0**.
+9. `ios/project.yml` `deploymentTarget.iOS` and `IPHONEOS_DEPLOYMENT_TARGET` are **already 27.0** — not remaining work.
 
 **Acceptance:**
 
 - Unsigned `xcodebuild` Debug generic iOS **BUILD SUCCEEDED** (command in §9).
-- Device: light + dark in Notes; Start still starts dictation; keys still insert; space-drag moves caret (space key only); GIF control **visible but disabled** top-left; three candidate slots visible.
+- Device: light + dark in Notes; **mic (027)** still starts dictation (same bounce as 026 Start); keys still insert; **space-drag / trackpad AC cancelled by 027** (space key types space only); GIF control **visible but disabled** top-left; three candidate slots visible.
 - No purple SaaS gradient; key glyphs readable in light and dark (offline degrade).
 - Listening overlay readable in dark mode.
 - No hamburger / dead `menuButton` in the accessory row.
 - Dictation bounce + insert still works (**Notes and Messages**, one take each) **and** P0-host AC (Notes/Safari do not dump into Messages).
-- Keys/accessory: glass **or** restyle fills (whichever the §4.1 spike ships); not flat 2014 calculator gray. Screenshot on device.
+- Keys/accessory look: **027 wins** — brighter caps + 1pt lip (Batch A); mic not Start/waveform (Batch B). Do **not** treat leftover 026 `UIGlassEffect`-on-keys as remaining P0-chrome work. Screenshot on device after 027.
 
 ### P1 — Autocorrect + candidate bar
 
@@ -389,7 +394,7 @@ Expect: `** BUILD SUCCEEDED **`. Re-run after this work. Do not treat a from-`io
 | P0-host | Notes take must not open Messages. Return-to-Notes **or** swipe-right degrade. Listening only after keyboard is back (or logged listen-gate degrade). Log probed/empty/suspend/hostReady. Safari or Mail once. |
 | P0–P3 | Unsigned compile (iOS 27 SDK) |
 | P1, P3 | `MurmurKeyboardTests` (new) |
-| P0–P3 UI | Physical iPhone **on iOS 27**: Notes + Messages, light/dark; glass chrome screenshot |
+| P0–P3 UI | Physical iPhone **on iOS 27**: Notes + Messages, light/dark; **027 look** screenshot (mic + lip), not leftover UIGlassEffect-on-keys |
 | P2 | Failed GIF search must surface in-tray |
 | Dictation regression | One Notes take + one Messages take after every phase that touches `KeyboardViewController` or `HostReturn` |
 
@@ -412,7 +417,7 @@ Not blocked: P0-host **Messages default removal** (in-repo), P1 autocorrect, iOS
 | Risk | Mitigation |
 |---|---|
 | Jetsam when decoding GIFs | Rendition + cache caps; SDK forbidden |
-| Pan vs tap fights | P0: local space pan only. P3: single gesture owner; 16pt slop; modifiers excluded |
+| Pan vs tap fights | P0: no space-key pan (trackpad cancelled by 027). P3: single gesture owner; 16pt slop; modifiers excluded |
 | Autocorrect mangles dictation | After `.done`, `suppressAutocorrectUntilNextWhitespace`; skip secure |
 | Messages ignores pasteboard GIF | P2a URL always; P2b optional |
 | Wordlist license | MIT/Apache/public domain only |
@@ -434,7 +439,7 @@ Same PR as the phase that lands (not now):
 | Phase | Shape |
 |---|---|
 | P0-host | Surgical `HostReturn` / probe / kill Messages default; device Notes+Safari+Messages |
-| P0-chrome | `UIGlassEffect` + accessory bar + iOS 27 floor |
+| P0-chrome | Accessory bar + iOS 27 floor (landed). **Look:** 027 (mic + lip), not leftover UIGlassEffect-on-keys |
 | P1 | Spell engine + tests + bar wiring |
 | P2 | REST client + tray + onboarding; P2b is a device afternoon |
 | P3 | Matcher + tests + device gate; largest unknown |

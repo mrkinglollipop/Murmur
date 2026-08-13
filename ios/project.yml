@@ -198,6 +198,11 @@ targets:
       - path: ../Sources/Voice/DotCompoundNumberNormalizer.swift
       - path: Shared/TranscriptPostProcessor.swift
       - path: Shared/LearnedWordStore.swift
+      - path: Shared/EmojiCatalog.swift
+      - path: Shared/EmojiSearchRouting.swift
+      - path: Shared/KeyboardChromeMetrics.swift
+      - path: Shared/KeyDiacriticMap.swift
+      - path: Shared/KeyboardChromeTokens.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboardtests

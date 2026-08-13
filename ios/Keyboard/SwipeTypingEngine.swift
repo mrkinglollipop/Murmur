@@ -23,6 +23,31 @@ enum SwipeTypingEngine {
         var frame: CGRect = .null
     }
 
+    /// Finger travel that is a tap or a sloppy neighbor-hit, not a glide.
+    static func pathLength(_ points: [CGPoint]) -> CGFloat {
+        guard points.count >= 2 else { return 0 }
+        var total: CGFloat = 0
+        for index in 1..<points.count {
+            total += hypot(points[index].x - points[index - 1].x, points[index].y - points[index - 1].y)
+        }
+        return total
+    }
+
+    /// Two-letter neighbor hits at ~16pt were committing whole words and eating
+    /// the in-progress span. Require a real glide before swipe wins over tap.
+    static func isDeliberateSwipe(
+        travel: CGFloat,
+        uniqueLetters: Int,
+        keyWidth: CGFloat
+    ) -> Bool {
+        let width = max(keyWidth, 8)
+        guard uniqueLetters >= 2, travel > 0 else { return false }
+        if uniqueLetters == 2 {
+            return travel >= max(width * 2.5, 72)
+        }
+        return travel >= max(width * 1.55, 48)
+    }
+
     static func consecutiveUniqueLetters(in word: String) -> [Character] {
         var result: [Character] = []
         for character in word.lowercased() where character.isLetter {

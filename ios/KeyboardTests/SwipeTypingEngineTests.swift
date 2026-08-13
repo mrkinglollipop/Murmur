@@ -1,6 +1,30 @@
 import XCTest
 
 final class SwipeTypingEngineTests: XCTestCase {
+    func testSloppyNeighborHitsAreNotDeliberateSwipes() {
+        let width: CGFloat = 30
+        XCTAssertFalse(
+            SwipeTypingEngine.isDeliberateSwipe(travel: 16, uniqueLetters: 2, keyWidth: width)
+        )
+        XCTAssertFalse(
+            SwipeTypingEngine.isDeliberateSwipe(travel: 40, uniqueLetters: 3, keyWidth: width)
+        )
+        XCTAssertTrue(
+            SwipeTypingEngine.isDeliberateSwipe(travel: 50, uniqueLetters: 3, keyWidth: width)
+        )
+        XCTAssertFalse(
+            SwipeTypingEngine.isDeliberateSwipe(travel: 70, uniqueLetters: 2, keyWidth: width)
+        )
+        XCTAssertTrue(
+            SwipeTypingEngine.isDeliberateSwipe(travel: 80, uniqueLetters: 2, keyWidth: width)
+        )
+        XCTAssertEqual(
+            SwipeTypingEngine.pathLength([CGPoint(x: 0, y: 0), CGPoint(x: 30, y: 0), CGPoint(x: 30, y: 40)]),
+            70,
+            accuracy: 0.01
+        )
+    }
+
     func testConsecutiveUniqueCollapsesDoubleLetters() {
         XCTAssertEqual(
             SwipeTypingEngine.consecutiveUniqueLetters(in: "hello"),
