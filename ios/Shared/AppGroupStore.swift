@@ -9,6 +9,7 @@ enum AppGroupStore {
     static let microphoneLevelKey = "microphoneLevel"
     static let listenGateRequestIDKey = "listenGateRequestID"
     static let swipeTypingEnabledKey = "swipeTypingEnabled"
+    static let recentEmojiKey = "recentEmoji"
 
     private static var suite: UserDefaults? {
         UserDefaults(suiteName: suiteName)
@@ -67,10 +68,32 @@ enum AppGroupStore {
         set { suite?.set(newValue, forKey: listenGateRequestIDKey) }
     }
 
-    /// Sideload bake-off. Missing key means on. Flip off in Settings to kill swipe.
+    static var recentEmoji: [String] {
+        get { suite?.stringArray(forKey: recentEmojiKey) ?? [] }
+        set {
+            var seen = Set<String>()
+            var ordered: [String] = []
+            for glyph in newValue where !glyph.isEmpty {
+                guard seen.insert(glyph).inserted else { continue }
+                ordered.append(glyph)
+                if ordered.count == 36 { break }
+            }
+            suite?.set(ordered, forKey: recentEmojiKey)
+        }
+    }
+
+    static func rememberEmoji(_ glyph: String) {
+        let trimmed = glyph.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var next = recentEmoji.filter { $0 != trimmed }
+        next.insert(trimmed, at: 0)
+        recentEmoji = next
+    }
+
+    /// Missing key means off. Typing quality first; turn on in Settings to experiment.
     static var swipeTypingEnabled: Bool {
         get {
-            guard let suite, suite.object(forKey: swipeTypingEnabledKey) != nil else { return true }
+            guard let suite, suite.object(forKey: swipeTypingEnabledKey) != nil else { return false }
             return suite.bool(forKey: swipeTypingEnabledKey)
         }
         set { suite?.set(newValue, forKey: swipeTypingEnabledKey) }

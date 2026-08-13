@@ -180,7 +180,14 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
         let spacing: CGFloat = 6
         let columns: CGFloat = 3
         let width = floor((collectionView.bounds.width - spacing * (columns - 1)) / columns)
-        return CGSize(width: max(44, width), height: max(52, width * 0.82))
+        let natural = max(52, width * 0.82)
+        let height: CGFloat
+        if isSearchMode, collectionView.bounds.height > 1 {
+            height = min(natural, collectionView.bounds.height)
+        } else {
+            height = natural
+        }
+        return CGSize(width: max(44, width), height: height)
     }
 
     private func configure() {
@@ -203,6 +210,8 @@ final class GiphyTrayView: UIView, UICollectionViewDataSource, UICollectionViewD
         searchContainer.addSubview(clearButton)
 
         collection.backgroundColor = .clear
+        collection.clipsToBounds = true
+        clipsToBounds = true
         collection.dataSource = self
         collection.delegate = self
         collection.alwaysBounceVertical = true

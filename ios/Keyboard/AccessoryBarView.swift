@@ -1,6 +1,6 @@
 import UIKit
 
-/// Top accessory row: GIF · three candidate slots · Start.
+/// Top accessory row: GIF · three candidate slots · mic.
 final class AccessoryBarView: UIView {
     var onMic: (() -> Void)?
     var onGif: (() -> Void)?
@@ -8,17 +8,19 @@ final class AccessoryBarView: UIView {
 
     private let gifButton = UIButton(type: .system)
     private let candidateButtons: [UIButton] = (0..<3).map { _ in UIButton(type: .system) }
+    private let separators = [UIView(), UIView()]
     private let captionLabel = UILabel()
-    private let startButton = UIButton(type: .system)
+    private let micButton = UIButton(type: .system)
     private var dark = true
     private var gifEnabled = false
     private var gifTrayOpen = false
     private var caption = ""
+    private var candidateWords: [String] = []
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         gifButton.setTitle("GIF", for: .normal)
-        gifButton.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
+        gifButton.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
         gifButton.addTarget(self, action: #selector(tapGif), for: .touchUpInside)
         gifButton.accessibilityLabel = "GIFs need Full Access and a Giphy key"
         gifButton.accessibilityIdentifier = "murmur.keyboard.gif"
@@ -27,14 +29,19 @@ final class AccessoryBarView: UIView {
         addSubview(gifButton)
 
         for (index, button) in candidateButtons.enumerated() {
-            button.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
+            button.titleLabel?.font = .systemFont(ofSize: 17, weight: .regular)
             button.titleLabel?.adjustsFontSizeToFitWidth = true
             button.titleLabel?.minimumScaleFactor = 0.7
             button.layer.cornerRadius = KeyboardChromeTokens.chipCornerRadius
+            button.layer.cornerCurve = .continuous
             button.tag = index
             button.addTarget(self, action: #selector(tapCandidate(_:)), for: .touchUpInside)
             button.accessibilityIdentifier = "murmur.keyboard.candidate.\(index)"
             addSubview(button)
+        }
+        for separator in separators {
+            separator.isUserInteractionEnabled = false
+            addSubview(separator)
         }
 
         captionLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -44,21 +51,19 @@ final class AccessoryBarView: UIView {
         captionLabel.accessibilityIdentifier = "murmur.keyboard.caption"
         addSubview(captionLabel)
 
-        var startConfiguration = UIButton.Configuration.plain()
-        startConfiguration.title = "Start"
-        startConfiguration.image = UIImage(systemName: "waveform")
-        startConfiguration.imagePlacement = .trailing
-        startConfiguration.imagePadding = 8
-        startConfiguration.baseForegroundColor = .white
-        startButton.configuration = startConfiguration
-        startButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        startButton.layer.cornerRadius = 22
-        startButton.addTarget(self, action: #selector(tapMic), for: .touchUpInside)
-        startButton.accessibilityLabel = "Start dictation"
-        startButton.accessibilityIdentifier = "murmur.keyboard.start"
-        addSubview(startButton)
+        let micConfig = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+        micButton.setImage(UIImage(systemName: "mic.fill", withConfiguration: micConfig), for: .normal)
+        micButton.tintColor = .white
+        micButton.backgroundColor = KeyboardChromeTokens.coral
+        micButton.layer.cornerRadius = 18
+        micButton.clipsToBounds = true
+        micButton.addTarget(self, action: #selector(tapMic), for: .touchUpInside)
+        micButton.accessibilityLabel = "Start dictation"
+        micButton.accessibilityIdentifier = "murmur.keyboard.start"
+        addSubview(micButton)
 
         applyColors()
+        refreshSlotVisibility()
     }
 
     required init?(coder: NSCoder) { nil }
@@ -86,24 +91,23 @@ final class AccessoryBarView: UIView {
             gifButton.accessibilityLabel = open ? "Close GIFs" : "GIFs"
         }
         applyColors()
+        refreshSlotVisibility()
+        setNeedsLayout()
     }
 
     func setCaption(_ text: String) {
         caption = text.trimmingCharacters(in: .whitespacesAndNewlines)
         captionLabel.text = caption
-        let showCaption = !caption.isEmpty
-        captionLabel.isHidden = !showCaption
-        candidateButtons.forEach { $0.isHidden = showCaption }
+        refreshSlotVisibility()
         setNeedsLayout()
     }
 
     func setCandidates(_ words: [String], quoted: Set<String> = []) {
+        candidateWords = words
         let hasWords = words.contains { !$0.isEmpty }
         if hasWords {
             caption = ""
             captionLabel.text = ""
-            captionLabel.isHidden = true
-            candidateButtons.forEach { $0.isHidden = false }
         }
         for (index, button) in candidateButtons.enumerated() {
             let word = index < words.count ? words[index] : ""
@@ -119,57 +123,82 @@ final class AccessoryBarView: UIView {
             button.isEnabled = !word.isEmpty
             button.accessibilityLabel = word.isEmpty ? "Suggestion slot \(index + 1)" : word
         }
+        applyColors()
+        refreshSlotVisibility()
     }
 
     func setMicEnabled(_ enabled: Bool) {
-        startButton.isEnabled = enabled
-        startButton.alpha = enabled ? 1 : 0.4
+        micButton.isEnabled = enabled
+        micButton.alpha = enabled ? 1 : 0.4
     }
 
     func setMicHidden(_ hidden: Bool) {
-        startButton.isHidden = hidden
+        micButton.isHidden = hidden
         setNeedsLayout()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let gifSide: CGFloat = 40
-        let startWidth: CGFloat = startButton.isHidden ? 0 : 106
-        gifButton.frame = CGRect(x: 0, y: 4, width: gifSide, height: 40)
-        if startWidth > 0 {
-            startButton.frame = CGRect(x: bounds.width - startWidth, y: 2, width: startWidth, height: 44)
+        let gifSide: CGFloat = 36
+        let micSide: CGFloat = micButton.isHidden ? 0 : 36
+        gifButton.frame = CGRect(x: 8, y: 2, width: gifSide, height: 40)
+        if micSide > 0 {
+            micButton.frame = CGRect(
+                x: bounds.width - micSide - 8,
+                y: (bounds.height - 36) / 2,
+                width: 36,
+                height: 36
+            )
         }
-        let midMinX = gifButton.frame.maxX + 6
-        let midMaxX = startWidth > 0 ? startButton.frame.minX - 6 : bounds.width
+        let midMinX = gifButton.frame.maxX + 4
+        let midMaxX = micSide > 0 ? micButton.frame.minX - 8 : bounds.width
         let midWidth = max(0, midMaxX - midMinX)
         captionLabel.frame = CGRect(x: midMinX, y: 6, width: midWidth, height: 36)
-        let slotGap: CGFloat = 5
-        let slotWidth = max(24, (midWidth - slotGap * 2) / 3)
+        let slotWidth = max(24, midWidth / 3)
         for (index, button) in candidateButtons.enumerated() {
             button.frame = CGRect(
-                x: midMinX + CGFloat(index) * (slotWidth + slotGap),
+                x: midMinX + CGFloat(index) * slotWidth,
                 y: 6,
                 width: slotWidth,
                 height: 36
             )
+        }
+        let hairline = 1 / max(traitCollection.displayScale, 1)
+        for (index, separator) in separators.enumerated() {
+            let x = midMinX + CGFloat(index + 1) * slotWidth - hairline / 2
+            separator.frame = CGRect(x: x, y: 12, width: hairline, height: 24)
         }
     }
 
     private func applyColors() {
         gifButton.backgroundColor = gifTrayOpen
             ? KeyboardChromeTokens.coral.withAlphaComponent(0.35)
-            : KeyboardChromeTokens.candidateFill(dark: dark)
+            : .clear
         gifButton.tintColor = KeyboardChromeTokens.glyphColor(dark: dark)
         gifButton.setTitleColor(KeyboardChromeTokens.glyphColor(dark: dark), for: .normal)
         captionLabel.textColor = KeyboardChromeTokens.glyphColor(dark: dark).withAlphaComponent(0.7)
-        startButton.backgroundColor = KeyboardChromeTokens.coral
-        startButton.tintColor = .white
-        startButton.setTitleColor(.white, for: .normal)
-        for button in candidateButtons {
-            button.backgroundColor = KeyboardChromeTokens.candidateFill(dark: dark)
+        micButton.backgroundColor = KeyboardChromeTokens.coral
+        micButton.tintColor = .white
+        let separatorColor = KeyboardChromeTokens.quickTypeSeparator(dark: dark)
+        separators.forEach { $0.backgroundColor = separatorColor }
+        let leftWord = candidateWords.first ?? ""
+        for (index, button) in candidateButtons.enumerated() {
+            let word = index < candidateWords.count ? candidateWords[index] : ""
+            let isCorrection = index == 1 && !word.isEmpty && word != leftWord
+            button.backgroundColor = isCorrection
+                ? KeyboardChromeTokens.candidateFill(dark: dark)
+                : .clear
             button.setTitleColor(KeyboardChromeTokens.glyphColor(dark: dark), for: .normal)
         }
         gifButton.alpha = gifEnabled ? 1 : 0.45
+    }
+
+    private func refreshSlotVisibility() {
+        let showCaption = !caption.isEmpty && !gifTrayOpen
+        let showCandidates = !gifTrayOpen && !showCaption && candidateWords.contains { !$0.isEmpty }
+        captionLabel.isHidden = !showCaption
+        candidateButtons.forEach { $0.isHidden = !showCandidates }
+        separators.forEach { $0.isHidden = !showCandidates }
     }
 
     @objc private func tapMic() { onMic?() }

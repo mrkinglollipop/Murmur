@@ -58,6 +58,120 @@ enum AutocorrectEngine {
         Replacement(deleteCount: span.count, insert: applyCase(template: span, correction: correction))
     }
 
+    /// Hosts lie about `documentContextBeforeInput`. Never `deleteBackward` a
+    /// span the caret does not actually end with. Never eat a phrase: the
+    /// non-space core must be a single token.
+    static func canReplaceSpan(_ span: String, inBeforeInput context: String) -> Bool {
+        guard !span.isEmpty, context.hasSuffix(span) else { return false }
+        let word = span.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !word.isEmpty else { return false }
+        return !word.contains(where: \.isWhitespace)
+    }
+
+    /// Some hosts omit spaces, so a sentence looks like one token
+    /// (`hellohowareyou`). Anything longer than a short word in a
+    /// whitespace-free context is treated as that lie — all-or-nothing.
+    static let maxPlausibleWordLength = 12
+    static let maxDeleteLoop = 40
+
+    /// `span.count` if a loop-delete is safe, otherwise `0`. Never a partial
+    /// count: deleting fewer characters then inserting a correction garbles.
+    static func allowedDeleteCount(span: String, inBeforeInput context: String) -> Int {
+        guard canReplaceSpan(span, inBeforeInput: context) else { return 0 }
+        if span.count > maxDeleteLoop { return 0 }
+        let word = span.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextHasWhitespace = context.contains { $0.isWhitespace || $0.isNewline }
+        if !contextHasWhitespace, word.count > maxPlausibleWordLength {
+            return 0
+        }
+        return span.count
+    }
+
+    /// Stop looping if the host ate a chunk (word-delete or a hidden
+    /// selection) or the context did not shrink.
+    static func shouldAbortDeleteLoop(beforeCount: Int, afterCount: Int) -> Bool {
+        if afterCount >= beforeCount { return true }
+        return (beforeCount - afterCount) > 2
+    }
+
+    /// Double-space → period only when the caret follows `letter/digit` + space.
+    static func shouldReplaceDoubleSpaceWithPeriod(beforeInput: String) -> Bool {
+        guard beforeInput.last == " ",
+              let preceding = beforeInput.dropLast().last else { return false }
+        return preceding.isLetter || preceding.isNumber
+    }
+
+    /// High-confidence mistypes only. Fuzzy `UITextChecker` guesses stay in the bar.
+    static let commonTypos: [String: String] = [
+        "teh": "the",
+        "adn": "and",
+        "taht": "that",
+        "hte": "the",
+        "recieve": "receive",
+        "seperate": "separate",
+        "occured": "occurred",
+        "definately": "definitely",
+        "untill": "until",
+        "wich": "which",
+        "whihc": "which",
+        "thier": "their",
+        "woudl": "would",
+        "jsut": "just",
+        "becuase": "because"
+    ]
+
+    static func forcedTypo(_ span: String) -> String? {
+        guard let correction = commonTypos[span.lowercased()] else { return nil }
+        return applyCase(template: span, correction: correction)
+    }
+
+    /// Damerau-Levenshtein (insert/delete/substitute/transpose).
+    static func damerauLevenshtein(_ a: String, _ b: String) -> Int {
+        let source = Array(a)
+        let target = Array(b)
+        if source.isEmpty { return target.count }
+        if target.isEmpty { return source.count }
+        var table = Array(
+            repeating: Array(repeating: 0, count: target.count + 1),
+            count: source.count + 1
+        )
+        for i in 0...source.count { table[i][0] = i }
+        for j in 0...target.count { table[0][j] = j }
+        for i in 1...source.count {
+            for j in 1...target.count {
+                let cost = source[i - 1] == target[j - 1] ? 0 : 1
+                table[i][j] = min(
+                    table[i - 1][j] + 1,
+                    table[i][j - 1] + 1,
+                    table[i - 1][j - 1] + cost
+                )
+                if i > 1, j > 1,
+                   source[i - 1] == target[j - 2],
+                   source[i - 2] == target[j - 1] {
+                    table[i][j] = min(table[i][j], table[i - 2][j - 2] + 1)
+                }
+            }
+        }
+        return table[source.count][target.count]
+    }
+
+    /// Force a spell guess only when it is a one-edit common word, not a name.
+    static func shouldForceSpelling(
+        span: String,
+        guess: String,
+        frequencyOrder: [String],
+        names: Set<String>
+    ) -> Bool {
+        let typed = span.lowercased()
+        let want = guess.lowercased()
+        guard typed.count >= 3, typed != want else { return false }
+        if names.contains(typed) { return false }
+        let frequency = Set(frequencyOrder)
+        if frequency.contains(typed) { return false }
+        guard frequency.contains(want) else { return false }
+        return damerauLevenshtein(typed, want) <= 1
+    }
+
     static func stripApostrophes(_ word: String) -> String {
         word.replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "’", with: "")
     }
@@ -165,7 +279,7 @@ enum AutocorrectEngine {
             rank[key] = 8_000
         }
 
-        var best: (score: Int, left: String, right: String)?
+        var best: (score: Int, left: String, right: String, leftRank: Int, rightRank: Int)?
         for leftLen in 1..<(lower.count - 1) {
             let splitIndex = lower.index(lower.startIndex, offsetBy: leftLen)
             let left = String(lower[..<splitIndex])
@@ -176,12 +290,52 @@ enum AutocorrectEngine {
             guard let rightHit = resolveSplitPart(right, rank: rank) else { continue }
             let score = leftHit.rank + rightHit.rank
             if best == nil || score < best!.score {
-                best = (score, leftHit.display, rightHit.display)
+                best = (score, leftHit.display, rightHit.display, leftHit.rank, rightHit.rank)
             }
         }
         guard let best else { return nil }
         let text = applyCase(template: span, correction: "\(best.left) \(best.right)")
-        return WordSplit(text: text, highConfidence: best.score < 500)
+        return WordSplit(
+            text: text,
+            highConfidence: isForcedSplit(
+                left: best.left,
+                right: best.right,
+                leftRank: best.leftRank,
+                rightRank: best.rightRank,
+                score: best.score
+            )
+        )
+    }
+
+    /// Spacebar split only for missed-space glues (`he the`, `I'm going`), not
+    /// `the rapist` hiding inside a real word UITextChecker missed.
+    private static let splitAnchors: Set<String> = [
+        "a", "i", "to", "in", "on", "at", "of", "if", "or", "be", "he", "we", "me",
+        "my", "do", "no", "so", "up", "an", "as", "it", "is", "am", "the", "and",
+        "for", "not", "but", "you", "she", "his", "her", "was", "are", "had",
+        "has", "have", "this", "that", "with", "from", "they", "them", "then",
+        "there", "here", "what", "when", "your", "will", "just", "going"
+    ]
+
+    private static func isForcedSplit(
+        left: String,
+        right: String,
+        leftRank: Int,
+        rightRank: Int,
+        score: Int
+    ) -> Bool {
+        guard score < 500 else { return false }
+        let leftKey = stripApostrophes(left).lowercased()
+        let rightKey = stripApostrophes(right).lowercased()
+        let leftIsContraction = contractions[leftKey] != nil
+            || left.contains("'")
+            || left.contains("’")
+        let leftOk = splitAnchors.contains(leftKey) || leftIsContraction
+        guard leftOk else { return false }
+        if splitAnchors.contains(rightKey) { return true }
+        if leftIsContraction { return rightRank < 400 }
+        if leftKey == "the" || leftKey == "a" || leftKey == "an" { return false }
+        return rightRank < 80
     }
 
     private static func resolveSplitPart(

@@ -50,7 +50,7 @@ struct SettingsScreen: View {
                     section("Keyboard") {
                         settingsRow(
                             title: "Swipe to type",
-                            subtitle: "Experimental. Off turns swipe off and leaves tap typing. Kill this if it still loses to Apple QuickPath."
+                            subtitle: "Off by default. Turn on to experiment. If typing still deletes whole sentences, leave this off."
                         ) {
                             Toggle("", isOn: $swipeTypingEnabled)
                                 .labelsHidden()
