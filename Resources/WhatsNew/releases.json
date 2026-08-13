@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.35",
+    "build": "36",
+    "title": "What's New in 0.1.35",
+    "items": [
+      "Saying “exclamation point” or “question mark” at the end of a sentence now inserts ! or ? instead of writing the words.",
+      "Talking about a mark — “a question mark”, “an exclamation point” — still stays words."
+    ]
+  },
+  {
     "version": "0.1.34",
     "build": "35",
     "title": "What's New in 0.1.34",

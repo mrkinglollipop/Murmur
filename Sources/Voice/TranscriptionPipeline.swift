@@ -462,13 +462,13 @@ final class TranscriptionPipeline {
         }
     }
 
-    /// Caps always, then SpokenPunctuation (codeAware), then DotCompound.
-    /// Package-visible for pipeline-gate unit tests. Caps is not gated on
-    /// codeAware or cleanup.
+    /// Caps always, then SpokenPunctuation (full table if codeAware; sentence
+    /// commands always), then DotCompound. Package-visible for pipeline-gate
+    /// unit tests. Caps is not gated on codeAware or cleanup.
     static func preprocessBeforeCleanup(_ text: String, codeAware: Bool) -> String {
         let capped = SpokenCapitalization.apply(text)
         return DotCompoundNumberNormalizer.apply(
-            codeAware ? SpokenPunctuation.apply(capped) : capped
+            SpokenPunctuation.apply(capped, codeAware: codeAware)
         )
     }
 
@@ -496,7 +496,7 @@ final class TranscriptionPipeline {
             // `conduct dot mdc`) and cleanupLooksSane accepts that. Re-run the
             // deterministic pass so spoken punctuation wins last.
             // Post-SP only on successful cleanup; Caps does not re-run here.
-            return codeAware ? SpokenPunctuation.apply(trimmed) : trimmed
+            return SpokenPunctuation.apply(trimmed, codeAware: codeAware)
         } catch {
             vlog("cleanup failed: \(error.localizedDescription) — using raw")
             return preprocessed
