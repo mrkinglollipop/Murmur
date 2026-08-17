@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.37",
+    "build": "38",
+    "title": "What's New in 0.1.37",
+    "items": [
+      "Holding the dictation key no longer force-quits Murmur.",
+      "Murmur uses your Mac microphone instead of Continuity Camera or Jump Desktop unless that is what Sound Input is set to.",
+      "If the first microphone bind fails, it retries a working device instead of showing Microphone unavailable."
+    ]
+  },
+  {
     "version": "0.1.36",
     "build": "37",
     "title": "What's New in 0.1.36",

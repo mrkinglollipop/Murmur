@@ -19,6 +19,10 @@
 # sign_update + --verify → prepend-only appcast merge → asserts BEFORE appcast
 # --clobber → also clobber stable appcast/Murmur.dmg (marketing download alias)
 # → curl -sfL (feed + versioned DMG + stable alias).
+#
+# After AudioRecorder / HAL / engine.start / bind changes: VoiceTests is not
+# the product oracle. install-local + fn-hold + bash scripts/oracle-dictation-start.sh
+# (2026-08-17: Sparkle 0.1.36 shipped on green tests; every hold SIGABRT).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
