@@ -1,6 +1,8 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
 import Carbon
+import CoreAudio
 import os.log
 
 /// Captures microphone audio via AVAudioEngine while the push-to-talk key
@@ -32,9 +34,27 @@ final class AudioRecorder {
     /// the silence guard. A fresh AVAudioEngine rebinds the device correctly.
     private var engineNeedsRebuild = false
 
+    /// Last HAL device ID successfully bound onto the input AU. Used to
+    /// exclude a ghost on the one allowed rebuild so we do not re-pick it.
+    private var lastBoundInputDeviceID: AudioDeviceID?
+
+    /// Device to exclude on the *next* `startMicCapture` bind/rebuild.
+    /// Timeout, in-flight abandon, and fail-closed paths record a known ghost
+    /// here because `doStart` calls `startMicCapture()` with `excluding: nil`.
+    /// Cleared after a successful start, or when bind lands on a different ID.
+    private var excludeOnNextStartDeviceID: AudioDeviceID?
+
     /// Instance-scoped observation of `AVAudioEngineConfigurationChange` —
     /// must be re-registered whenever `engine` is replaced.
     private var engineConfigObserver: NSObjectProtocol?
+
+    /// HAL default-input listener. `AVAudioEngineConfigurationChange` is
+    /// engine-scoped and can miss a Bluetooth unplug while idle/App Nap
+    /// (observed 2026-08-16: ghost device 261, `'nope'` /
+    /// `kAudioHardwareBadDeviceError`, fn tap frozen on main inside
+    /// `engine.start()`). This listener is on the system object so the next
+    /// hold rebuilds even when the engine stayed quiet.
+    private var defaultInputListenerBlock: AudioObjectPropertyListenerBlock?
 
     /// Bumped at each capture start so the zero-buffer watchdog can verify the
     /// take it armed for is still the live one before acting.
@@ -47,12 +67,14 @@ final class AudioRecorder {
 
     init() {
         registerEngineConfigObserver()
+        registerDefaultInputDeviceListener()
     }
 
     deinit {
         if let engineConfigObserver {
             NotificationCenter.default.removeObserver(engineConfigObserver)
         }
+        unregisterDefaultInputDeviceListener()
     }
 
     private func registerEngineConfigObserver() {
@@ -78,7 +100,8 @@ final class AudioRecorder {
         guard Self.shouldRestartCaptureOnConfigChange(
             stillWanted: wantsRecording,
             tapInstalled: isSetUp,
-            alreadyRetried: watchdogRetriedThisTake
+            alreadyRetried: watchdogRetriedThisTake,
+            startInFlight: engineStartInFlight
         ) else {
             vlog("audio engine configuration change — flagging engine rebuild")
             engineNeedsRebuild = true
@@ -86,36 +109,378 @@ final class AudioRecorder {
         }
         watchdogRetriedThisTake = true
         vlog("audio engine configuration change MID-HOLD — rebuilding engine, restarting capture")
+        let failedID = lastBoundInputDeviceID
         teardownMicEngine()
-        rebuildEngine()
-        startMicCapture(isWatchdogRetry: true)
+        rebuildEngine(excluding: failedID)
+        startMicCapture(isWatchdogRetry: true, excluding: failedID)
+    }
+
+    private static var defaultInputPropertyAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    private func registerDefaultInputDeviceListener() {
+        guard defaultInputListenerBlock == nil else { return }
+        var address = Self.defaultInputPropertyAddress
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.handleEngineConfigurationChange()
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+        if status == noErr {
+            defaultInputListenerBlock = block
+            return
+        }
+        logger.error(
+            "Failed to listen for default input device changes: \(status) — retrying once"
+        )
+        let retry = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+        if retry == noErr {
+            defaultInputListenerBlock = block
+        } else {
+            logger.error(
+                "Failed to listen for default input device changes after retry: \(retry)"
+            )
+        }
+    }
+
+    private func unregisterDefaultInputDeviceListener() {
+        guard let block = defaultInputListenerBlock else { return }
+        var address = Self.defaultInputPropertyAddress
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+        defaultInputListenerBlock = nil
+    }
+
+    /// Point the input AU at a device HAL still considers alive with a live
+    /// input format. A new `AVAudioEngine()` rebinds to the *current default*,
+    /// which can still be a ghost Bluetooth ID after unplug — that is not enough.
+    private func bindAliveInputDevice(excluding failedDeviceID: AudioDeviceID? = nil) -> AudioDeviceID? {
+        let defaultID = Self.halDefaultInputDeviceID()
+        let defaultAlive = defaultID.map(Self.isAudioDeviceAlive) ?? false
+        let defaultFormatDead = defaultID.map(Self.audioDeviceInputFormatLooksDead) ?? true
+        let picked = Self.pickAliveInputDevice(
+            defaultID: defaultID,
+            defaultIsAlive: defaultAlive,
+            defaultFormatLooksDead: defaultFormatDead,
+            candidates: Self.halInputDeviceCandidates(),
+            excluding: failedDeviceID
+        )
+        guard let picked else {
+            lastBoundInputDeviceID = nil
+            logger.error("No alive input device to bind")
+            vlog("bindAliveInputDevice: none alive")
+            return nil
+        }
+        if defaultID != picked || !defaultAlive || defaultFormatDead {
+            logger.warning(
+                "Rebinding input away from dead/default \(defaultID ?? 0) → \(picked)"
+            )
+            vlog("bindAliveInputDevice: \(defaultID ?? 0) (alive=\(defaultAlive) formatDead=\(defaultFormatDead)) → \(picked)")
+        }
+        guard bindInputNode(to: picked) else {
+            lastBoundInputDeviceID = nil
+            vlog("bindAliveInputDevice: AudioUnitSetProperty failed for \(picked)")
+            return nil
+        }
+        lastBoundInputDeviceID = picked
+        return picked
+    }
+
+    private func bindInputNode(to deviceID: AudioDeviceID) -> Bool {
+        engine.prepare()
+        guard let audioUnit = engine.inputNode.audioUnit else {
+            logger.error("bindInputNode: input AU is nil (device \(deviceID))")
+            return false
+        }
+        var id = deviceID
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &id,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        if status != noErr {
+            logger.error(
+                "AudioUnitSetProperty CurrentDevice failed: OSStatus \(status) (device \(deviceID))"
+            )
+            return false
+        }
+        return true
+    }
+
+    private static func isAudioDeviceAlive(_ deviceID: AudioDeviceID) -> Bool {
+        guard deviceID != kAudioObjectUnknown, deviceID != 0 else { return false }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return false }
+        var alive: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &alive)
+        return status == noErr && alive != 0
+    }
+
+    private static func halDefaultInputDeviceID() -> AudioDeviceID? {
+        var deviceID = AudioDeviceID()
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = defaultInputPropertyAddress
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        guard status == noErr, deviceID != kAudioObjectUnknown, deviceID != 0 else {
+            return nil
+        }
+        return deviceID
+    }
+
+    private static func audioDeviceInputFormatLooksDead(_ deviceID: AudioDeviceID) -> Bool {
+        guard deviceID != kAudioObjectUnknown, deviceID != 0 else { return true }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return true }
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &asbd)
+        guard status == noErr else { return true }
+        return inputFormatLooksDead(
+            sampleRate: asbd.mSampleRate,
+            channelCount: asbd.mChannelsPerFrame
+        )
+    }
+
+    private static func halInputDeviceCandidates() -> [(id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &dataSize) == noErr else {
+            return []
+        }
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        guard count > 0 else { return [] }
+        var devices = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(system, &address, 0, nil, &dataSize, &devices) == noErr else {
+            return []
+        }
+        return devices.compactMap { id -> (id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)? in
+            guard Self.audioDeviceHasInputStreams(id) else { return nil }
+            return (
+                id,
+                Self.isAudioDeviceAlive(id),
+                Self.audioDeviceIsBuiltIn(id),
+                Self.audioDeviceInputFormatLooksDead(id)
+            )
+        }
+    }
+
+    private static func audioDeviceHasInputStreams(_ deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr else {
+            return false
+        }
+        return size > 0
+    }
+
+    private static func audioDeviceIsBuiltIn(_ deviceID: AudioDeviceID) -> Bool {
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
+            return false
+        }
+        return transport == kAudioDeviceTransportTypeBuiltIn
     }
 
     /// Pure decision (unit-tested): restart mid-hold only while the hold is
-    /// live with a tap installed, and only once per hold (shared budget with
-    /// the zero-buffer watchdog so the two recovery paths cannot ping-pong).
+    /// live with a tap installed, engine start has settled (a pending start
+    /// must not be torn down and re-issued), and only once per hold (shared
+    /// budget with the zero-buffer watchdog so the two recovery paths cannot
+    /// ping-pong). `isSetUp` stays true after tap install so teardown can
+    /// still remove the tap; in-flight start is a separate guard.
     static func shouldRestartCaptureOnConfigChange(
         stillWanted: Bool,
         tapInstalled: Bool,
-        alreadyRetried: Bool
+        alreadyRetried: Bool,
+        startInFlight: Bool
     ) -> Bool {
-        stillWanted && tapInstalled && !alreadyRetried
+        stillWanted && tapInstalled && !alreadyRetried && !startInFlight
     }
 
     /// Replaces the engine (input-node device binding included) and
     /// re-registers the instance-scoped observer. Call only between captures
     /// or after `teardownMicEngine()` — never with a live tap installed.
-    private func rebuildEngine() {
+    /// Returns the bound device ID, or nil when bind failed (fail closed).
+    @discardableResult
+    private func rebuildEngine(excluding failedDeviceID: AudioDeviceID? = nil) -> AudioDeviceID? {
         engine.stop()
         engine = AVAudioEngine()
         registerEngineConfigObserver()
         engineNeedsRebuild = false
+        return bindAliveInputDevice(excluding: failedDeviceID)
     }
 
     /// A CoreAudio device in transition can report a zero format; installing a
     /// tap against it "succeeds" and never fires.
     static func inputFormatLooksDead(sampleRate: Double, channelCount: UInt32) -> Bool {
         sampleRate == 0 || channelCount == 0
+    }
+
+    /// FourCC `'nope'` / missing AudioObject — `engine.start()` against this
+    /// on the main run loop (where the fn tap also lives) is the 2026-08-16
+    /// force-quit hang.
+    static func isGhostInputStartStatus(_ status: OSStatus) -> Bool {
+        status == kAudioHardwareBadDeviceError
+            || status == kAudioHardwareBadObjectError
+    }
+
+    /// Walk `NSUnderlyingErrorKey` a bounded depth — AVFoundation often wraps
+    /// the HAL `'nope'` more than one level down.
+    private static let ghostUnderlyingErrorWalkDepth = 8
+
+    static func isGhostInputStartError(_ error: Error) -> Bool {
+        var current: NSError? = error as NSError
+        var depth = 0
+        while let ns = current, depth < ghostUnderlyingErrorWalkDepth {
+            if isGhostInputStartStatus(OSStatus(ns.code)) { return true }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        return false
+    }
+
+    /// Prefer a live HAL default whose input format is usable; if that ID is
+    /// dead, format-dead, or excluded, take a built-in mic, then any other
+    /// live input with a live format. Nil = no usable device.
+    static func pickAliveInputDevice(
+        defaultID: AudioDeviceID?,
+        defaultIsAlive: Bool,
+        defaultFormatLooksDead: Bool = false,
+        candidates: [(id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)],
+        excluding: AudioDeviceID? = nil
+    ) -> AudioDeviceID? {
+        func isPickable(id: AudioDeviceID, isAlive: Bool, formatLooksDead: Bool) -> Bool {
+            isAlive && !formatLooksDead && id != excluding
+        }
+        if let defaultID, isPickable(
+            id: defaultID,
+            isAlive: defaultIsAlive,
+            formatLooksDead: defaultFormatLooksDead
+        ) {
+            return defaultID
+        }
+        if let builtIn = candidates.first(where: {
+            $0.isBuiltIn && isPickable(
+                id: $0.id,
+                isAlive: $0.isAlive,
+                formatLooksDead: $0.formatLooksDead
+            )
+        }) {
+            return builtIn.id
+        }
+        return candidates.first(where: {
+            isPickable(id: $0.id, isAlive: $0.isAlive, formatLooksDead: $0.formatLooksDead)
+        })?.id
+    }
+
+    /// Next bind/rebuild exclude: an explicit watchdog/config/ghost-throw ID
+    /// wins; otherwise the persisted last-failed ID from a prior timeout
+    /// (or abandoned in-flight start) so hold 2 does not re-pick the ghost.
+    static func excludeOnNextMicStart(
+        explicit: AudioDeviceID?,
+        persistedFailedID: AudioDeviceID?
+    ) -> AudioDeviceID? {
+        explicit ?? persistedFailedID
+    }
+
+    /// Drop the persisted exclude once bind landed on a different device.
+    static func persistedExcludeAfterBind(
+        boundID: AudioDeviceID,
+        persistedExclude: AudioDeviceID?
+    ) -> AudioDeviceID? {
+        guard let persistedExclude else { return nil }
+        return boundID == persistedExclude ? persistedExclude : nil
+    }
+
+    /// Fail-closed persist: keep a known ghost ID for the next hold's bind.
+    /// A nil candidate must not wipe an existing persist (timeout / abandon
+    /// may already have recorded one). Format-dead rebuild can nil
+    /// `lastBoundInputDeviceID` before fail — callers pass the captured ID.
+    static func persistedExcludeOnFailClosed(
+        candidate: AudioDeviceID?,
+        existing: AudioDeviceID?
+    ) -> AudioDeviceID? {
+        candidate ?? existing
+    }
+
+    /// Config-change during pending start only flags `engineNeedsRebuild`.
+    /// Success must rebuild once rather than promote caret on the old binding.
+    static func shouldRestartCaptureAfterStartSuccess(
+        engineNeedsRebuild: Bool,
+        alreadyRetried: Bool
+    ) -> Bool {
+        engineNeedsRebuild && !alreadyRetried
+    }
+
+    /// Shared one-retry budget already used — fail closed instead of promoting
+    /// on a binding we know is stale (avoids a config-change restart loop).
+    static func shouldFailClosedAfterStartSuccessWithPendingRebuild(
+        engineNeedsRebuild: Bool,
+        alreadyRetried: Bool
+    ) -> Bool {
+        engineNeedsRebuild && alreadyRetried
+    }
+
+    /// Bind returned nil — do not probe format / install a tap / start.
+    static func shouldFailClosedWithoutBoundInput(_ boundDeviceID: AudioDeviceID?) -> Bool {
+        boundDeviceID == nil
+    }
+
+    /// After excluding the ghost and rebuilding once, a still-dead format
+    /// must fail closed rather than tap-install or loop.
+    static func shouldFailClosedAfterDeadFormatFallback(formatStillDead: Bool) -> Bool {
+        formatStillDead
     }
 
     /// Pure decision for the zero-buffer watchdog (unit-tested): restart only
@@ -218,6 +583,21 @@ final class AudioRecorder {
 
     /// Off-main queue for concatenating buffers, writing CAF, and retention copy.
     private let audioIOQueue = DispatchQueue(label: "com.matt.voice-dictation.audio-io", qos: .userInitiated)
+
+    /// Invalidated when a start attempt settles, times out, or is torn down
+    /// so a late completion cannot promote caret / arm the watchdog.
+    private var engineStartToken: UInt64 = 0
+
+    /// True from issuing off-main `engine.start()` until that attempt
+    /// finishes, times out, or is torn down. Config-change must not treat
+    /// capture as live in this window: the tap is installed (`isSetUp`) but
+    /// start is still pending.
+    private var engineStartInFlight = false
+
+    /// Upper bound for off-main `engine.start()`. A ghost HAL device has
+    /// been observed to block indefinitely (2026-08-16); abandon and fail
+    /// closed rather than wedge the fn tap.
+    private static let engineStartTimeout: TimeInterval = 2.0
 
     /// Speaker-gating stream processor — allocated only when gating is active
     /// (enabled setting + stored profile). Nil otherwise for zero overhead.
@@ -497,13 +877,24 @@ final class AudioRecorder {
     }
 
     /// Testable seam: skip a queued `doStop` when a newer stop superseded it
-    /// or a re-press already re-armed `wantsRecording`.
+    /// or a re-press already re-armed `wantsRecording`. Never skip while
+    /// `engine.start()` is in flight — that teardown invalidates the start
+    /// token so a re-press cannot issue a second `start()` on the same engine.
     internal static func shouldSkipStaleDoStop(
         wantsRecording: Bool,
         capturedGeneration: UInt64,
-        currentGeneration: UInt64
+        currentGeneration: UInt64,
+        startInFlight: Bool = false
     ) -> Bool {
-        wantsRecording || capturedGeneration != currentGeneration
+        if startInFlight { return false }
+        return wantsRecording || capturedGeneration != currentGeneration
+    }
+
+    /// After tearing down an in-flight `engine.start()`, skip the rest of
+    /// `doStop` when a re-press already re-armed the hold (caret/HUD/file
+    /// paths would consume the newer session).
+    static func shouldReturnAfterInFlightDoStopTeardown(wantsRecording: Bool) -> Bool {
+        wantsRecording
     }
 
     /// Testable seam: one-entry cache map for a session token (mirrors the
@@ -769,7 +1160,7 @@ final class AudioRecorder {
     /// — in file mode — copies it into `pcmBuffers` for a post-release .caf
     /// transcribe. One mic engine backs both paths so the live pill animates
     /// identically regardless of which transcription backend is active.
-    private func startMicCapture(isWatchdogRetry: Bool = false) {
+    private func startMicCapture(isWatchdogRetry: Bool = false, excluding failedDeviceID: AudioDeviceID? = nil) {
         // Defense in depth for WhisperKit fallback / late doStart: do not
         // begin a gate session (or start the engine) after the hold ended.
         // Keyed on wantsRecording only — sticky isStopping from a prior
@@ -787,16 +1178,24 @@ final class AudioRecorder {
             return
         }
 
+        if defaultInputListenerBlock == nil {
+            registerDefaultInputDeviceListener()
+        }
+
+        // A second start() on the same engine while HAL is still blocked
+        // races the first attempt's stale finish, which may stop() the
+        // engine the re-press just started. Tear down / invalidate first.
+        if engineStartInFlight {
+            vlog("startMicCapture — abandoning in-flight engine.start before a new start()")
+            excludeOnNextStartDeviceID = lastBoundInputDeviceID
+            teardownMicEngine()
+            engineNeedsRebuild = true
+        }
+
         if !isWatchdogRetry {
             watchdogRetriedThisTake = false
         }
         captureGeneration &+= 1
-
-        if engineNeedsRebuild {
-            vlog("mic engine flagged stale — rebuilding before capture")
-            teardownMicEngine()
-            rebuildEngine()
-        }
 
         vlog("startMicCapture — AVAudioEngine begins capture")
         // A recovery restart continues the SAME hold — the audio captured
@@ -813,16 +1212,67 @@ final class AudioRecorder {
             levelLock.unlock()
         }
 
+        let exclude = Self.excludeOnNextMicStart(
+            explicit: failedDeviceID,
+            persistedFailedID: excludeOnNextStartDeviceID
+        )
+
+        // Heal a stale AU CurrentDevice *before* probing format / start.
+        // Rebuild-alone is not enough when HAL's default is still the ghost ID.
+        let boundID: AudioDeviceID?
+        if engineNeedsRebuild {
+            vlog("mic engine flagged stale — rebuilding before capture")
+            teardownMicEngine()
+            boundID = rebuildEngine(excluding: exclude)
+        } else {
+            boundID = bindAliveInputDevice(excluding: exclude)
+        }
+        if let boundID {
+            excludeOnNextStartDeviceID = Self.persistedExcludeAfterBind(
+                boundID: boundID,
+                persistedExclude: excludeOnNextStartDeviceID
+            )
+        }
+        if Self.shouldFailClosedWithoutBoundInput(boundID) {
+            failMicStart(reason: "no alive input device to bind")
+            return
+        }
+
         // A device mid-transition can report a dead format; a tap installed
-        // against it never fires. Rebuild once before binding the input node.
+        // against it never fires. Rebuild once, excluding the failed ID.
         let probeFormat = engine.inputNode.outputFormat(forBus: 0)
         if Self.inputFormatLooksDead(
             sampleRate: probeFormat.sampleRate,
             channelCount: probeFormat.channelCount
         ) {
-            vlog("input format dead (\(probeFormat.sampleRate) Hz, \(probeFormat.channelCount) ch) — rebuilding engine")
+            let ghostID = boundID
+            vlog("input format dead (\(probeFormat.sampleRate) Hz, \(probeFormat.channelCount) ch) — rebuilding engine, excluding \(ghostID ?? 0)")
             teardownMicEngine()
-            rebuildEngine()
+            let rebound = rebuildEngine(excluding: ghostID)
+            if Self.shouldFailClosedWithoutBoundInput(rebound) {
+                excludeOnNextStartDeviceID = Self.persistedExcludeOnFailClosed(
+                    candidate: ghostID,
+                    existing: excludeOnNextStartDeviceID
+                )
+                failMicStart(reason: "bind failed after excluding format-dead device \(ghostID ?? 0)")
+                return
+            }
+            let retryFormat = engine.inputNode.outputFormat(forBus: 0)
+            if Self.shouldFailClosedAfterDeadFormatFallback(
+                formatStillDead: Self.inputFormatLooksDead(
+                    sampleRate: retryFormat.sampleRate,
+                    channelCount: retryFormat.channelCount
+                )
+            ) {
+                excludeOnNextStartDeviceID = Self.persistedExcludeOnFailClosed(
+                    candidate: ghostID,
+                    existing: excludeOnNextStartDeviceID
+                )
+                failMicStart(
+                    reason: "input format still dead after excluding device \(ghostID ?? 0)"
+                )
+                return
+            }
         }
 
         let inputNode = engine.inputNode
@@ -892,23 +1342,171 @@ final class AudioRecorder {
             isSetUp = true
         }
 
-        do {
-            try engine.start()
+        startEngineOffMain(isWatchdogRetry: isWatchdogRetry)
+    }
+
+    /// Constraint: `AVAudioEngine.start()` can block in HAL on a ghost input
+    /// (2026-08-16). The HID fn tap runs on `CFRunLoopGetMain()`, so start()
+    /// must not run on the main run loop. Tap install, bind, and HUD stay on
+    /// main with other engine use; only this blocking call hops off.
+    /// Completion hops back to main before caret promote / watchdog arm.
+    ///
+    /// Each start() runs on a disposable per-attempt queue. Do not serialize
+    /// all starts on one forever-blockable queue: if HAL never returns, later
+    /// holds would queue behind that work item and fail their 2s timeout
+    /// without ever calling start(). An abandoned blocked start may still
+    /// occupy its attempt queue until HAL returns; that must not starve the
+    /// next hold's new engine.
+    private func startEngineOffMain(isWatchdogRetry: Bool) {
+        engineStartToken &+= 1
+        let token = engineStartToken
+        let generation = captureGeneration
+        let engineToStart = engine
+        engineStartInFlight = true
+        let attemptQueue = DispatchQueue(
+            label: "com.matt.voice-dictation.engine-start.\(token)",
+            qos: .userInitiated
+        )
+        attemptQueue.async { [weak self] in
+            do {
+                try engineToStart.start()
+                DispatchQueue.main.async {
+                    self?.handleEngineStartFinished(
+                        token: token,
+                        generation: generation,
+                        engineToStart: engineToStart,
+                        result: .success(()),
+                        isWatchdogRetry: isWatchdogRetry
+                    )
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.handleEngineStartFinished(
+                        token: token,
+                        generation: generation,
+                        engineToStart: engineToStart,
+                        result: .failure(error),
+                        isWatchdogRetry: isWatchdogRetry
+                    )
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.engineStartTimeout) { [weak self] in
+            self?.handleEngineStartTimeout(
+                token: token,
+                generation: generation,
+                engineToStart: engineToStart
+            )
+        }
+    }
+
+    private func handleEngineStartFinished(
+        token: UInt64,
+        generation: UInt64,
+        engineToStart: AVAudioEngine,
+        result: Result<Void, Error>,
+        isWatchdogRetry: Bool
+    ) {
+        if token != engineStartToken || generation != captureGeneration {
+            if engineToStart.isRunning {
+                engineToStart.stop()
+            }
+            return
+        }
+        engineStartInFlight = false
+        engineStartToken &+= 1
+        switch result {
+        case .success:
+            guard wantsRecording else {
+                teardownMicEngine()
+                endVoiceGateRecordingSession()
+                clearPendingHeldCaretSnapshot()
+                return
+            }
+            if Self.shouldRestartCaptureAfterStartSuccess(
+                engineNeedsRebuild: engineNeedsRebuild,
+                alreadyRetried: watchdogRetriedThisTake
+            ) {
+                vlog("engine.start succeeded but input changed during start — rebuilding, excluding last-bound")
+                watchdogRetriedThisTake = true
+                let failedID = lastBoundInputDeviceID
+                teardownMicEngine()
+                startMicCapture(isWatchdogRetry: true, excluding: failedID)
+                return
+            }
+            if Self.shouldFailClosedAfterStartSuccessWithPendingRebuild(
+                engineNeedsRebuild: engineNeedsRebuild,
+                alreadyRetried: watchdogRetriedThisTake
+            ) {
+                excludeOnNextStartDeviceID = Self.persistedExcludeOnFailClosed(
+                    candidate: lastBoundInputDeviceID,
+                    existing: excludeOnNextStartDeviceID
+                )
+                failMicStart(reason: "input changed during start after retry")
+                return
+            }
+            excludeOnNextStartDeviceID = nil
             logger.info("AVAudioEngine started — recording…")
             promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
             armZeroBufferWatchdog()
-        } catch {
+        case .failure(let error):
             logger.error("AVAudioEngine start failed: \(error.localizedDescription)")
-            invalidateSecureInputPollTimer()
-            // beginRecordingSession already ran above — clear so Settings does
-            // not stick on "listening…" after a failed engine start.
-            endVoiceGateRecordingSession()
-            clearPendingHeldCaretSnapshot()
-            DispatchQueue.main.async { [weak self] in
-                self?.asrSelector.onFailure?(.micStartFailed)
-                self?.hud.hide()
+            if !isWatchdogRetry, Self.isGhostInputStartError(error) {
+                vlog("engine.start ghost device — rebinding alive input and retrying once")
+                watchdogRetriedThisTake = true
+                invalidateSecureInputPollTimer()
+                let failedID = lastBoundInputDeviceID
+                teardownMicEngine()
+                engineNeedsRebuild = true
+                startMicCapture(isWatchdogRetry: true, excluding: failedID)
+                return
             }
+            excludeOnNextStartDeviceID = Self.persistedExcludeOnFailClosed(
+                candidate: lastBoundInputDeviceID,
+                existing: excludeOnNextStartDeviceID
+            )
+            failMicStart(reason: "engine.start error")
+        }
+    }
+
+    private func handleEngineStartTimeout(
+        token: UInt64,
+        generation: UInt64,
+        engineToStart: AVAudioEngine
+    ) {
+        guard token == engineStartToken, generation == captureGeneration else { return }
+        engineStartInFlight = false
+        engineStartToken &+= 1
+        logger.error(
+            "AVAudioEngine start timed out after \(Self.engineStartTimeout)s — failing closed"
+        )
+        vlog("engine.start timed out — abandoning to keep main run loop free")
+        if engineToStart.isRunning || engine === engineToStart {
+            // stop() from main may unblock a HAL-wedged start() on this
+            // attempt's queue; AVAudioEngine is not documented as
+            // cross-thread safe — residual affinity risk. The abandoned
+            // start may still occupy that queue until HAL returns.
+            engineToStart.stop()
+        }
+        // Next hold must not call start() on this same instance while the
+        // abandoned attempt is still inside HAL, and must not re-pick the
+        // ghost HAL still advertises as default (`doStart` passes no exclude).
+        excludeOnNextStartDeviceID = lastBoundInputDeviceID
+        engineNeedsRebuild = true
+        failMicStart(reason: "engine.start timed out")
+    }
+
+    private func failMicStart(reason: String) {
+        logger.error("mic start failed — \(reason)")
+        vlog("failMicStart — \(reason)")
+        invalidateSecureInputPollTimer()
+        teardownMicEngine()
+        endVoiceGateRecordingSession()
+        clearPendingHeldCaretSnapshot()
+        DispatchQueue.main.async { [weak self] in
+            // onFailure flashes the error pill. hide() here would cancel it.
+            self?.asrSelector.onFailure?(.micStartFailed)
         }
     }
 
@@ -942,9 +1540,10 @@ final class AudioRecorder {
 
             self.watchdogRetriedThisTake = true
             vlog("mic watchdog: no buffers \(Int(Self.zeroBufferWatchdogDelay * 1000)) ms after engine start — rebuilding engine, restarting capture")
+            let failedID = self.lastBoundInputDeviceID
             self.teardownMicEngine()
-            self.rebuildEngine()
-            self.startMicCapture(isWatchdogRetry: true)
+            self.rebuildEngine(excluding: failedID)
+            self.startMicCapture(isWatchdogRetry: true, excluding: failedID)
         }
     }
 
@@ -1007,11 +1606,24 @@ final class AudioRecorder {
         if Self.shouldSkipStaleDoStop(
             wantsRecording: wantsRecording,
             capturedGeneration: capturedGeneration,
-            currentGeneration: stopGeneration
+            currentGeneration: stopGeneration,
+            startInFlight: engineStartInFlight
         ) {
             logger.info("doStop skipped — stale generation or recording re-armed")
             vlog("doStop skipped — wantsRecording=\(wantsRecording) gen=\(capturedGeneration)/\(stopGeneration)")
             return
+        }
+        // In-flight start must be token-invalidated before a re-press starts
+        // another `engine.start()`. Do not run the stop pipeline while
+        // re-armed — that would sample/clear the newer hold's caret.
+        if engineStartInFlight {
+            excludeOnNextStartDeviceID = lastBoundInputDeviceID
+            teardownMicEngine()
+            engineNeedsRebuild = true
+            if Self.shouldReturnAfterInFlightDoStopTeardown(wantsRecording: wantsRecording) {
+                vlog("doStop — torn down in-flight start; re-press owns the hold")
+                return
+            }
         }
         if isStopping {
             invalidateSecureInputPollTimer()
@@ -1301,6 +1913,8 @@ final class AudioRecorder {
     /// teardown and the xAI-streaming stop (which needs the tap gone before it
     /// finalizes the socket). Safe to call when no tap is installed.
     private func teardownMicEngine() {
+        engineStartToken &+= 1
+        engineStartInFlight = false
         guard isSetUp else { return }
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)

@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.36",
+    "build": "37",
+    "title": "What's New in 0.1.36",
+    "items": [
+      "If a headset or other microphone unplugs while Murmur is running, it now switches to a working mic instead of freezing until you force-quit.",
+      "A stuck microphone start times out instead of locking the dictation key."
+    ]
+  },
+  {
     "version": "0.1.35",
     "build": "36",
     "title": "What's New in 0.1.35",

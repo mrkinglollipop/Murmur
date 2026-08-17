@@ -1,4 +1,6 @@
 import XCTest
+import AudioToolbox
+import CoreAudio
 @testable import Voice
 
 /// Decision logic for the mic zero-buffer watchdog and dead-format probe —
@@ -112,7 +114,7 @@ final class MicWatchdogTests: XCTestCase {
     func testConfigChangeRestartsMidHold() {
         XCTAssertTrue(
             AudioRecorder.shouldRestartCaptureOnConfigChange(
-                stillWanted: true, tapInstalled: true, alreadyRetried: false
+                stillWanted: true, tapInstalled: true, alreadyRetried: false, startInFlight: false
             )
         )
     }
@@ -120,7 +122,7 @@ final class MicWatchdogTests: XCTestCase {
     func testConfigChangeOnlyFlagsWhenIdle() {
         XCTAssertFalse(
             AudioRecorder.shouldRestartCaptureOnConfigChange(
-                stillWanted: false, tapInstalled: false, alreadyRetried: false
+                stillWanted: false, tapInstalled: false, alreadyRetried: false, startInFlight: false
             )
         )
     }
@@ -128,7 +130,7 @@ final class MicWatchdogTests: XCTestCase {
     func testConfigChangeRespectsSharedRetryBudget() {
         XCTAssertFalse(
             AudioRecorder.shouldRestartCaptureOnConfigChange(
-                stillWanted: true, tapInstalled: true, alreadyRetried: true
+                stillWanted: true, tapInstalled: true, alreadyRetried: true, startInFlight: false
             )
         )
     }
@@ -136,7 +138,17 @@ final class MicWatchdogTests: XCTestCase {
     func testConfigChangeDoesNotRestartAfterTeardown() {
         XCTAssertFalse(
             AudioRecorder.shouldRestartCaptureOnConfigChange(
-                stillWanted: true, tapInstalled: false, alreadyRetried: false
+                stillWanted: true, tapInstalled: false, alreadyRetried: false, startInFlight: false
+            )
+        )
+    }
+
+    /// Tap is installed (`isSetUp`) before off-main `engine.start()` returns.
+    /// Config-change must not teardown+restart while that start is pending.
+    func testConfigChangeDoesNotRestartWhileStartInFlight() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRestartCaptureOnConfigChange(
+                stillWanted: true, tapInstalled: true, alreadyRetried: false, startInFlight: true
             )
         )
     }
@@ -183,5 +195,333 @@ final class MicWatchdogTests: XCTestCase {
         XCTAssertTrue(AudioRecorder.inputFormatLooksDead(sampleRate: 0, channelCount: 0))
         XCTAssertFalse(AudioRecorder.inputFormatLooksDead(sampleRate: 48_000, channelCount: 1))
         XCTAssertFalse(AudioRecorder.inputFormatLooksDead(sampleRate: 16_000, channelCount: 2))
+    }
+
+    func testGhostInputStatusIsNopeAndBadObject() {
+        XCTAssertTrue(AudioRecorder.isGhostInputStartStatus(kAudioHardwareBadDeviceError))
+        XCTAssertTrue(AudioRecorder.isGhostInputStartStatus(kAudioHardwareBadObjectError))
+        XCTAssertFalse(AudioRecorder.isGhostInputStartStatus(noErr))
+        XCTAssertFalse(AudioRecorder.isGhostInputStartStatus(kAudioUnitErr_FormatNotSupported))
+    }
+
+    func testGhostInputErrorReadsOSStatusAndUnderlying() {
+        let nope = NSError(
+            domain: NSOSStatusErrorDomain,
+            code: Int(kAudioHardwareBadDeviceError)
+        )
+        XCTAssertTrue(AudioRecorder.isGhostInputStartError(nope))
+        let wrapped = NSError(
+            domain: "test",
+            code: 1,
+            userInfo: [NSUnderlyingErrorKey: nope]
+        )
+        XCTAssertTrue(AudioRecorder.isGhostInputStartError(wrapped))
+        XCTAssertFalse(
+            AudioRecorder.isGhostInputStartError(
+                NSError(domain: NSOSStatusErrorDomain, code: Int(kAudioUnitErr_FormatNotSupported))
+            )
+        )
+    }
+
+    func testGhostInputErrorWalksNestedUnderlyingChain() {
+        let nope = NSError(
+            domain: NSOSStatusErrorDomain,
+            code: Int(kAudioHardwareBadDeviceError)
+        )
+        var wrapped: NSError = nope
+        for _ in 0..<5 {
+            wrapped = NSError(
+                domain: "test",
+                code: 1,
+                userInfo: [NSUnderlyingErrorKey: wrapped]
+            )
+        }
+        XCTAssertTrue(AudioRecorder.isGhostInputStartError(wrapped))
+    }
+
+    func testPicksLiveDefaultInputWhenAlive() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: false,
+            candidates: [(id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: false)]
+        )
+        XCTAssertEqual(picked, 261)
+    }
+
+    func testPicksBuiltInWhenDefaultIsAliveButFormatDead() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: true,
+            candidates: [
+                (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: true),
+                (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: false),
+            ]
+        )
+        XCTAssertEqual(picked, 86)
+    }
+
+    func testPicksBuiltInWhenExcludingGhostDefault() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: false,
+            candidates: [
+                (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: false),
+            ],
+            excluding: 261
+        )
+        XCTAssertEqual(picked, 86)
+    }
+
+    func testPicksBuiltInWhenDefaultIsGhost() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: false,
+            defaultFormatLooksDead: true,
+            candidates: [
+                (id: 261, isAlive: false, isBuiltIn: false, formatLooksDead: true),
+                (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: false),
+            ]
+        )
+        XCTAssertEqual(picked, 86)
+    }
+
+    func testPicksAnyAliveInputWhenNoBuiltIn() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: nil,
+            defaultIsAlive: false,
+            candidates: [
+                (id: 99, isAlive: false, isBuiltIn: true, formatLooksDead: true),
+                (id: 42, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ]
+        )
+        XCTAssertEqual(picked, 42)
+    }
+
+    func testSkipsFormatDeadWhenPickingAnyAlive() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: nil,
+            defaultIsAlive: false,
+            candidates: [
+                (id: 41, isAlive: true, isBuiltIn: false, formatLooksDead: true),
+                (id: 42, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ]
+        )
+        XCTAssertEqual(picked, 42)
+    }
+
+    func testPicksNilWhenNothingAlive() {
+        XCTAssertNil(
+            AudioRecorder.pickAliveInputDevice(
+                defaultID: 261,
+                defaultIsAlive: false,
+                candidates: [(id: 261, isAlive: false, isBuiltIn: false, formatLooksDead: true)]
+            )
+        )
+    }
+
+    func testPicksNilWhenAliveDevicesAreFormatDead() {
+        XCTAssertNil(
+            AudioRecorder.pickAliveInputDevice(
+                defaultID: 261,
+                defaultIsAlive: true,
+                defaultFormatLooksDead: true,
+                candidates: [
+                    (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: true),
+                    (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: true),
+                ]
+            )
+        )
+    }
+
+    func testFailClosedWhenBindReturnsNil() {
+        XCTAssertTrue(AudioRecorder.shouldFailClosedWithoutBoundInput(nil))
+        XCTAssertFalse(AudioRecorder.shouldFailClosedWithoutBoundInput(86))
+    }
+
+    func testFailClosedAfterDeadFormatFallback() {
+        XCTAssertTrue(AudioRecorder.shouldFailClosedAfterDeadFormatFallback(formatStillDead: true))
+        XCTAssertFalse(AudioRecorder.shouldFailClosedAfterDeadFormatFallback(formatStillDead: false))
+    }
+
+    // MARK: - Next-start exclude (timeout persist)
+
+    /// Hold 2's `doStart` calls `startMicCapture()` with nil exclude; the
+    /// persisted timeout ID must still reach bind/rebuild.
+    func testNextStartExcludeUsesPersistedWhenExplicitNil() {
+        XCTAssertEqual(
+            AudioRecorder.excludeOnNextMicStart(explicit: nil, persistedFailedID: 261),
+            261
+        )
+    }
+
+    func testNextStartExcludeExplicitWinsOverPersisted() {
+        XCTAssertEqual(
+            AudioRecorder.excludeOnNextMicStart(explicit: 86, persistedFailedID: 261),
+            86
+        )
+    }
+
+    func testNextStartExcludeNilWhenNothingPersisted() {
+        XCTAssertNil(AudioRecorder.excludeOnNextMicStart(explicit: nil, persistedFailedID: nil))
+    }
+
+    func testPersistedExcludeClearsWhenBindLandsOnDifferentDevice() {
+        XCTAssertNil(
+            AudioRecorder.persistedExcludeAfterBind(boundID: 86, persistedExclude: 261)
+        )
+    }
+
+    func testPersistedExcludeKeptWhenBindStillMatches() {
+        XCTAssertEqual(
+            AudioRecorder.persistedExcludeAfterBind(boundID: 261, persistedExclude: 261),
+            261
+        )
+    }
+
+    func testPersistedExcludeStaysNilWhenNothingPersisted() {
+        XCTAssertNil(
+            AudioRecorder.persistedExcludeAfterBind(boundID: 86, persistedExclude: nil)
+        )
+    }
+
+    /// Fail-closed persist: a known ghost ID must survive to the next hold.
+    /// Nil candidate must not wipe an existing persist; rebuild can nil
+    /// `lastBoundInputDeviceID` before fail (format-dead path).
+    func testFailClosedPersistKeepsCandidate() {
+        XCTAssertEqual(
+            AudioRecorder.persistedExcludeOnFailClosed(candidate: 261, existing: nil),
+            261
+        )
+    }
+
+    func testFailClosedPersistDoesNotClobberWithNil() {
+        XCTAssertEqual(
+            AudioRecorder.persistedExcludeOnFailClosed(candidate: nil, existing: 261),
+            261
+        )
+    }
+
+    func testFailClosedPersistNilWhenNothingKnown() {
+        XCTAssertNil(
+            AudioRecorder.persistedExcludeOnFailClosed(candidate: nil, existing: nil)
+        )
+    }
+
+    func testFailClosedPersistCandidateWinsOverExisting() {
+        XCTAssertEqual(
+            AudioRecorder.persistedExcludeOnFailClosed(candidate: 86, existing: 261),
+            86
+        )
+    }
+
+    // MARK: - Stale doStop vs in-flight start
+
+    func testDoStopDoesNotSkipWhileStartInFlightEvenIfReArmed() {
+        XCTAssertFalse(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: true,
+                capturedGeneration: 1,
+                currentGeneration: 1,
+                startInFlight: true
+            )
+        )
+    }
+
+    func testDoStopDoesNotSkipStaleGenerationWhileStartInFlight() {
+        XCTAssertFalse(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: false,
+                capturedGeneration: 1,
+                currentGeneration: 2,
+                startInFlight: true
+            )
+        )
+    }
+
+    func testDoStopStillSkipsReArmedHoldWhenStartNotInFlight() {
+        XCTAssertTrue(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: true,
+                capturedGeneration: 1,
+                currentGeneration: 1,
+                startInFlight: false
+            )
+        )
+    }
+
+    func testDoStopProceedsWhenReleasedAndStartNotInFlight() {
+        XCTAssertFalse(
+            AudioRecorder.shouldSkipStaleDoStop(
+                wantsRecording: false,
+                capturedGeneration: 2,
+                currentGeneration: 2,
+                startInFlight: false
+            )
+        )
+    }
+
+    /// Re-press during an in-flight start: teardown the attempt, but do not
+    /// run the stop pipeline (that would clear the newer hold's caret).
+    func testInFlightDoStopReturnsWithoutPipelineWhenReArmed() {
+        XCTAssertTrue(
+            AudioRecorder.shouldReturnAfterInFlightDoStopTeardown(wantsRecording: true)
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldReturnAfterInFlightDoStopTeardown(wantsRecording: false)
+        )
+    }
+
+    // MARK: - Start-success + pending rebuild
+
+    func testStartSuccessRestartsWhenRebuildPendingAndNotRetried() {
+        XCTAssertTrue(
+            AudioRecorder.shouldRestartCaptureAfterStartSuccess(
+                engineNeedsRebuild: true,
+                alreadyRetried: false
+            )
+        )
+    }
+
+    func testStartSuccessDoesNotRestartWhenNoRebuildPending() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRestartCaptureAfterStartSuccess(
+                engineNeedsRebuild: false,
+                alreadyRetried: false
+            )
+        )
+    }
+
+    func testStartSuccessDoesNotRestartWhenRetryBudgetUsed() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRestartCaptureAfterStartSuccess(
+                engineNeedsRebuild: true,
+                alreadyRetried: true
+            )
+        )
+    }
+
+    func testStartSuccessFailsClosedWhenRebuildPendingAfterRetry() {
+        XCTAssertTrue(
+            AudioRecorder.shouldFailClosedAfterStartSuccessWithPendingRebuild(
+                engineNeedsRebuild: true,
+                alreadyRetried: true
+            )
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldFailClosedAfterStartSuccessWithPendingRebuild(
+                engineNeedsRebuild: true,
+                alreadyRetried: false
+            )
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldFailClosedAfterStartSuccessWithPendingRebuild(
+                engineNeedsRebuild: false,
+                alreadyRetried: true
+            )
+        )
     }
 }
