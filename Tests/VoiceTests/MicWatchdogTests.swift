@@ -271,9 +271,104 @@ final class MicWatchdogTests: XCTestCase {
                 (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: false),
                 (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: false),
             ],
-            excluding: 261
+            excluding: [261]
         )
         XCTAssertEqual(picked, 86)
+    }
+
+    func testPicksRemainingWhenMultipleExcluded() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: false,
+            candidates: [
+                (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 99, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: false),
+            ],
+            excluding: [261, 99]
+        )
+        XCTAssertEqual(picked, 86)
+    }
+
+    func testSkipsContinuityFallbackWhenBuiltInExists() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 81,
+            defaultIsAlive: false,
+            defaultFormatLooksDead: true,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 81, isAlive: true, isBuiltIn: true, formatLooksDead: false),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 81)
+    }
+
+    func testHonorsContinuityWhenItIsLiveDefault() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 93,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: false,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 81, isAlive: true, isBuiltIn: true, formatLooksDead: false),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 93)
+    }
+
+    func testLastResortOnlyWhenNothingElseAlive() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: nil,
+            defaultIsAlive: false,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 93)
+    }
+
+    func testContinuityAndVirtualAreLastResortTransports() {
+        XCTAssertTrue(
+            AudioRecorder.isLastResortInputTransport(
+                kAudioDeviceTransportTypeContinuityCaptureWireless
+            )
+        )
+        XCTAssertTrue(
+            AudioRecorder.isLastResortInputTransport(
+                kAudioDeviceTransportTypeContinuityCaptureWired
+            )
+        )
+        XCTAssertTrue(
+            AudioRecorder.isLastResortInputTransport(kAudioDeviceTransportTypeVirtual)
+        )
+        XCTAssertFalse(
+            AudioRecorder.isLastResortInputTransport(kAudioDeviceTransportTypeBuiltIn)
+        )
+        XCTAssertFalse(
+            AudioRecorder.isLastResortInputTransport(kAudioDeviceTransportTypeUSB)
+        )
+    }
+
+    func testReplacesEngineAfterFailedBindNotAfterSuccess() {
+        XCTAssertTrue(AudioRecorder.shouldReplaceEngineAfterFailedBind(false))
+        XCTAssertFalse(AudioRecorder.shouldReplaceEngineAfterFailedBind(true))
+    }
+
+    func testDoesNotFlagRebuildWhileEngineStartInFlight() {
+        XCTAssertFalse(AudioRecorder.shouldFlagRebuildOnConfigChange(startInFlight: true))
+        XCTAssertTrue(AudioRecorder.shouldFlagRebuildOnConfigChange(startInFlight: false))
+    }
+
+    func testObjCExceptionDomainCountsAsGhostStartError() {
+        XCTAssertTrue(
+            AudioRecorder.isGhostInputStartError(
+                NSError(domain: ObjCExceptionCatcher.errorDomain, code: 1)
+            )
+        )
     }
 
     func testPicksBuiltInWhenDefaultIsGhost() {

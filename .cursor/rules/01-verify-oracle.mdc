@@ -1,0 +1,6 @@
+---
+description: Murmur dictation hold-start oracle — VoiceTests is not a product pass
+alwaysApply: true
+---
+
+After AudioRecorder / HAL / `engine.start` / `bindInputNode` changes, VoiceTests + `install-local.sh` is not done. Run `bash scripts/oracle-dictation-start.sh` after a fn-hold (0=started, 1=fail/crash, 2=no hold — not a pass). Do not Sparkle on tests-only. 2026-08-17: suite green twice (SIGABRT, then Continuity HUD). Details: `CLAUDE.md` Verify.

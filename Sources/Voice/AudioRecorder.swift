@@ -90,6 +90,14 @@ final class AudioRecorder {
         }
     }
 
+    /// `engine.start()` itself posts `AVAudioEngineConfigurationChange`.
+    /// Flagging rebuild during an in-flight start makes every successful
+    /// start look stale — one retry, then fail-closed "input changed during
+    /// start after retry" (2026-08-17 10:18:20).
+    static func shouldFlagRebuildOnConfigChange(startInFlight: Bool) -> Bool {
+        !startInFlight
+    }
+
     /// Mid-hold, a configuration change means the tap is now feeding from a
     /// dead or rerouted device — waiting for the next hold loses everything
     /// the user says from here on (observed 2026-08-09: the change fired 2 s
@@ -103,8 +111,12 @@ final class AudioRecorder {
             alreadyRetried: watchdogRetriedThisTake,
             startInFlight: engineStartInFlight
         ) else {
-            vlog("audio engine configuration change — flagging engine rebuild")
-            engineNeedsRebuild = true
+            if Self.shouldFlagRebuildOnConfigChange(startInFlight: engineStartInFlight) {
+                vlog("audio engine configuration change — flagging engine rebuild")
+                engineNeedsRebuild = true
+            } else {
+                vlog("audio engine configuration change during engine.start — ignored")
+            }
             return
         }
         watchdogRetriedThisTake = true
@@ -176,56 +188,108 @@ final class AudioRecorder {
         let defaultID = Self.halDefaultInputDeviceID()
         let defaultAlive = defaultID.map(Self.isAudioDeviceAlive) ?? false
         let defaultFormatDead = defaultID.map(Self.audioDeviceInputFormatLooksDead) ?? true
-        let picked = Self.pickAliveInputDevice(
-            defaultID: defaultID,
-            defaultIsAlive: defaultAlive,
-            defaultFormatLooksDead: defaultFormatDead,
-            candidates: Self.halInputDeviceCandidates(),
-            excluding: failedDeviceID
-        )
-        guard let picked else {
-            lastBoundInputDeviceID = nil
-            logger.error("No alive input device to bind")
-            vlog("bindAliveInputDevice: none alive")
-            return nil
+        let candidates = Self.halInputDeviceCandidates()
+        let lastResortIDs = Set(candidates.filter(\.isLastResort).map(\.id))
+        var excluded = Set<AudioDeviceID>()
+        if let failedDeviceID {
+            excluded.insert(failedDeviceID)
         }
-        if defaultID != picked || !defaultAlive || defaultFormatDead {
-            logger.warning(
-                "Rebinding input away from dead/default \(defaultID ?? 0) → \(picked)"
+        while true {
+            let picked = Self.pickAliveInputDevice(
+                defaultID: defaultID,
+                defaultIsAlive: defaultAlive,
+                defaultFormatLooksDead: defaultFormatDead,
+                candidates: candidates.map {
+                    (id: $0.id, isAlive: $0.isAlive, isBuiltIn: $0.isBuiltIn, formatLooksDead: $0.formatLooksDead)
+                },
+                excluding: excluded,
+                lastResortIDs: lastResortIDs
             )
-            vlog("bindAliveInputDevice: \(defaultID ?? 0) (alive=\(defaultAlive) formatDead=\(defaultFormatDead)) → \(picked)")
+            guard let picked else {
+                lastBoundInputDeviceID = nil
+                logger.error("No alive input device to bind")
+                vlog("bindAliveInputDevice: none alive")
+                return nil
+            }
+            if defaultID != picked {
+                logger.warning(
+                    "Rebinding input away from dead/default \(defaultID ?? 0) → \(picked)"
+                )
+                vlog("bindAliveInputDevice: \(defaultID ?? 0) (alive=\(defaultAlive) formatDead=\(defaultFormatDead)) → \(picked)")
+            }
+            let bound = bindInputNode(to: picked)
+            if bound {
+                lastBoundInputDeviceID = picked
+                return picked
+            }
+            logger.error("bindInputNode failed for \(picked) — excluding and replacing engine")
+            vlog("bindAliveInputDevice: bind failed for \(picked), excluding")
+            excluded.insert(picked)
+            if Self.shouldReplaceEngineAfterFailedBind(bound) {
+                // NSException from prepare() can leave this graph unusable.
+                // Retry the next HAL candidate on a fresh AVAudioEngine —
+                // do not recurse into rebuildEngine / bindAliveInputDevice
+                // (rebuildEngine calls bindAliveInputDevice).
+                engine.stop()
+                engine = AVAudioEngine()
+                registerEngineConfigObserver()
+            }
         }
-        guard bindInputNode(to: picked) else {
-            lastBoundInputDeviceID = nil
-            vlog("bindAliveInputDevice: AudioUnitSetProperty failed for \(picked)")
-            return nil
-        }
-        lastBoundInputDeviceID = picked
-        return picked
     }
 
+    /// After `bindInputNode` fails, the next candidate must not reuse this
+    /// engine: `prepare()` NSException can leave the graph unusable.
+    static func shouldReplaceEngineAfterFailedBind(_ bindSucceeded: Bool) -> Bool {
+        !bindSucceeded
+    }
+
+    /// Bind the input AU to `deviceID`. Must not abort: `-[AVAudioEngine prepare]`
+    /// can raise NSException (`AVAudioEngineGraph::Initialize`) on a ghost/0ch
+    /// HAL default — 0.1.36 SIGABRT on every hold (IPS 2026-08-17 10:07).
     private func bindInputNode(to deviceID: AudioDeviceID) -> Bool {
-        engine.prepare()
-        guard let audioUnit = engine.inputNode.audioUnit else {
-            logger.error("bindInputNode: input AU is nil (device \(deviceID))")
-            return false
-        }
-        var id = deviceID
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &id,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        if status != noErr {
+        var bound = false
+        var auWasNil = false
+        var setStatus: OSStatus = noErr
+        switch ObjCExceptionCatcher.run({
+            // Set CurrentDevice *before* prepare(). 0.1.36 prepared first and
+            // Initialize aborted on the ghost HAL default. Skipping prepare
+            // left inputNode at 0ch, so we excluded the built-in and started
+            // Continuity iPhone instead (2026-08-17 10:17–10:18).
+            guard let audioUnit = self.engine.inputNode.audioUnit else {
+                auWasNil = true
+                return
+            }
+            var id = deviceID
+            setStatus = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &id,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+            guard setStatus == noErr else { return }
+            self.engine.prepare()
+            bound = true
+        }) {
+        case .failure(let error):
             logger.error(
-                "AudioUnitSetProperty CurrentDevice failed: OSStatus \(status) (device \(deviceID))"
+                "bindInputNode: NSException device \(deviceID): \(error.localizedDescription)"
             )
             return false
+        case .success:
+            if auWasNil {
+                logger.error("bindInputNode: input AU is nil (device \(deviceID))")
+                return false
+            }
+            if !bound {
+                logger.error(
+                    "AudioUnitSetProperty CurrentDevice failed: OSStatus \(setStatus) (device \(deviceID))"
+                )
+                return false
+            }
+            return true
         }
-        return true
     }
 
     private static func isAudioDeviceAlive(_ deviceID: AudioDeviceID) -> Bool {
@@ -278,7 +342,13 @@ final class AudioRecorder {
         )
     }
 
-    private static func halInputDeviceCandidates() -> [(id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)] {
+    private static func halInputDeviceCandidates() -> [(
+        id: AudioDeviceID,
+        isAlive: Bool,
+        isBuiltIn: Bool,
+        formatLooksDead: Bool,
+        isLastResort: Bool
+    )] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -295,13 +365,20 @@ final class AudioRecorder {
         guard AudioObjectGetPropertyData(system, &address, 0, nil, &dataSize, &devices) == noErr else {
             return []
         }
-        return devices.compactMap { id -> (id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)? in
+        return devices.compactMap { id -> (
+            id: AudioDeviceID,
+            isAlive: Bool,
+            isBuiltIn: Bool,
+            formatLooksDead: Bool,
+            isLastResort: Bool
+        )? in
             guard Self.audioDeviceHasInputStreams(id) else { return nil }
             return (
                 id,
                 Self.isAudioDeviceAlive(id),
                 Self.audioDeviceIsBuiltIn(id),
-                Self.audioDeviceInputFormatLooksDead(id)
+                Self.audioDeviceInputFormatLooksDead(id),
+                Self.audioDeviceIsLastResortInput(id)
             )
         }
     }
@@ -331,6 +408,30 @@ final class AudioRecorder {
             return false
         }
         return transport == kAudioDeviceTransportTypeBuiltIn
+    }
+
+    /// Continuity Capture (iPhone mic) and virtual devices (Jump Desktop)
+    /// report alive with a live format, then wedge or time out `engine.start()`.
+    /// Honor them when they are the user's Sound Input default; do not pick
+    /// them as fallback when a hardware mic exists.
+    static func isLastResortInputTransport(_ transport: UInt32) -> Bool {
+        transport == kAudioDeviceTransportTypeVirtual
+            || transport == kAudioDeviceTransportTypeContinuityCaptureWired
+            || transport == kAudioDeviceTransportTypeContinuityCaptureWireless
+    }
+
+    private static func audioDeviceIsLastResortInput(_ deviceID: AudioDeviceID) -> Bool {
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
+            return false
+        }
+        return isLastResortInputTransport(transport)
     }
 
     /// Pure decision (unit-tested): restart mid-hold only while the hold is
@@ -383,6 +484,7 @@ final class AudioRecorder {
         var current: NSError? = error as NSError
         var depth = 0
         while let ns = current, depth < ghostUnderlyingErrorWalkDepth {
+            if ns.domain == ObjCExceptionCatcher.errorDomain { return true }
             if isGhostInputStartStatus(OSStatus(ns.code)) { return true }
             current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
             depth += 1
@@ -398,10 +500,11 @@ final class AudioRecorder {
         defaultIsAlive: Bool,
         defaultFormatLooksDead: Bool = false,
         candidates: [(id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)],
-        excluding: AudioDeviceID? = nil
+        excluding: Set<AudioDeviceID> = [],
+        lastResortIDs: Set<AudioDeviceID> = []
     ) -> AudioDeviceID? {
         func isPickable(id: AudioDeviceID, isAlive: Bool, formatLooksDead: Bool) -> Bool {
-            isAlive && !formatLooksDead && id != excluding
+            isAlive && !formatLooksDead && !excluding.contains(id)
         }
         if let defaultID, isPickable(
             id: defaultID,
@@ -418,6 +521,15 @@ final class AudioRecorder {
             )
         }) {
             return builtIn.id
+        }
+        if let preferred = candidates.first(where: {
+            !lastResortIDs.contains($0.id) && isPickable(
+                id: $0.id,
+                isAlive: $0.isAlive,
+                formatLooksDead: $0.formatLooksDead
+            )
+        }) {
+            return preferred.id
         }
         return candidates.first(where: {
             isPickable(id: $0.id, isAlive: $0.isAlive, formatLooksDead: $0.formatLooksDead)
@@ -1351,6 +1463,10 @@ final class AudioRecorder {
     /// main with other engine use; only this blocking call hops off.
     /// Completion hops back to main before caret promote / watchdog arm.
     ///
+    /// `start()` can also raise NSException (same Initialize path as
+    /// `prepare()`). Swift `try` does not catch that — wrap in
+    /// `ObjCExceptionCatcher` or the process aborts.
+    ///
     /// Each start() runs on a disposable per-attempt queue. Do not serialize
     /// all starts on one forever-blockable queue: if HAL never returns, later
     /// holds would queue behind that work item and fail their 2s timeout
@@ -1368,27 +1484,33 @@ final class AudioRecorder {
             qos: .userInitiated
         )
         attemptQueue.async { [weak self] in
-            do {
-                try engineToStart.start()
-                DispatchQueue.main.async {
-                    self?.handleEngineStartFinished(
-                        token: token,
-                        generation: generation,
-                        engineToStart: engineToStart,
-                        result: .success(()),
-                        isWatchdogRetry: isWatchdogRetry
-                    )
+            var swiftError: Error?
+            let catchResult = ObjCExceptionCatcher.run({
+                do {
+                    try engineToStart.start()
+                } catch {
+                    swiftError = error
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    self?.handleEngineStartFinished(
-                        token: token,
-                        generation: generation,
-                        engineToStart: engineToStart,
-                        result: .failure(error),
-                        isWatchdogRetry: isWatchdogRetry
-                    )
+            })
+            let result: Result<Void, Error>
+            switch catchResult {
+            case .failure(let nsError):
+                result = .failure(nsError)
+            case .success:
+                if let swiftError {
+                    result = .failure(swiftError)
+                } else {
+                    result = .success(())
                 }
+            }
+            DispatchQueue.main.async {
+                self?.handleEngineStartFinished(
+                    token: token,
+                    generation: generation,
+                    engineToStart: engineToStart,
+                    result: result,
+                    isWatchdogRetry: isWatchdogRetry
+                )
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.engineStartTimeout) { [weak self] in
@@ -1500,6 +1622,9 @@ final class AudioRecorder {
     private func failMicStart(reason: String) {
         logger.error("mic start failed — \(reason)")
         vlog("failMicStart — \(reason)")
+        // Next hold's startMicCapture only rebuilds when this is set.
+        // Bind/start failures can leave the graph unusable.
+        engineNeedsRebuild = true
         invalidateSecureInputPollTimer()
         teardownMicEngine()
         endVoiceGateRecordingSession()

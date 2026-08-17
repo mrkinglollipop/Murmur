@@ -26,6 +26,8 @@ xcodegen generate
 
 ## Verify
 
+Build + unit suite (necessary; **not** a dictation product pass):
+
 ```bash
 xcodebuild -scheme Voice -configuration Debug build CODE_SIGNING_ALLOWED=NO
 # → ** BUILD SUCCEEDED **
@@ -34,6 +36,25 @@ xcodebuild test -scheme VoiceTests -destination 'platform=macOS' CODE_SIGNING_AL
 # → expect a green suite (method count drifts as tests are added)
 ```
 
+**Product oracle (AudioRecorder / HAL / `engine.start` / `bindInputNode`):**
+VoiceTests went green twice on 2026-08-17 while every dictation hold either
+SIGABRT'd (`prepare()` before CurrentDevice) or HUD-failed (0-ch graph bound
+Continuity iPhone). After those files change: `install-local.sh`, one fn-hold,
+then:
+
+```bash
+bash scripts/oracle-dictation-start.sh
+# 0 = engine started this window
+# 1 = crash or mic start failed
+# 2 = no hold in the window — not a pass; do not Sparkle
+```
+
+Offline encode check (Linux-safe):
+`bash scripts/test-oracle-dictation-start-helpers.sh` → `ORACLE OK`.
+
+Do not cut Sparkle on VoiceTests-only after those changes. Public feed ≠
+`/Applications` after `install-local.sh`.
+
 Run generate + build + test after any change to `project.yml` — it regenerates
 both the Xcode project and `Info.plist`.
 
@@ -41,6 +62,8 @@ both the Xcode project and `Info.plist`.
 
 `bash scripts/install-local.sh` — Release build, signed with the Developer ID
 identity (certificate must be installed), installs to `/Applications/Murmur.app`.
+After AudioRecorder / HAL / engine.start / bind changes, a green install is
+still not a product pass until `oracle-dictation-start.sh` exits 0.
 
 ## Conventions
 
@@ -66,3 +89,11 @@ identity (certificate must be installed), installs to `/Applications/Murmur.app`
 - This repository intentionally has **no CI**. Local verification (above) is
   the gate — do not re-add a GitHub Actions workflow without an explicit
   maintainer decision.
+- `engine.prepare()` before `AudioUnitSetProperty(CurrentDevice)` raises an
+  ObjC `NSException`; Swift `try` does not catch it (Sparkle 0.1.36 SIGABRT on
+  every hold). Set the device first; `prepare()` inside `ObjCExceptionCatcher`.
+- Skipping `prepare()` leaves `inputNode` at 0 ch; the picker falls through to
+  Continuity (`ccwl`) / Jump Desktop (`virt`). Those transports are last-resort
+  only when they are the Sound Input default.
+- `engine.start()` posts `AVAudioEngineConfigurationChange`. Do not fail-closed
+  on that notification while start is in-flight.
