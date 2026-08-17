@@ -52,7 +52,19 @@ struct SidebarNav: View {
             Text("Murmur")
                 .font(Theme.serifTitle(20, weight: .medium))
                 .foregroundColor(Theme.textPrimary)
+            // PRO ONLY — this branch's builds are visibly distinct from the
+            // free app, so a Pro build is never mistaken for a stock one.
+            // Must not merge to `main`.
+            Text("Pro")
+                .font(Theme.body(10, weight: .semibold))
+                .foregroundColor(Theme.lavenderText)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Theme.lavender)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Murmur Pro")
     }
 
     @ViewBuilder
