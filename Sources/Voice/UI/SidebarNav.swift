@@ -28,6 +28,7 @@ struct SidebarNav: View {
                     row(for: .style)
                     row(for: .transforms)
                     row(for: .scratchpad)
+                    row(for: .clipboard)
                 }
             }
             .padding(.horizontal, 10)
@@ -54,16 +55,26 @@ struct SidebarNav: View {
         }
     }
 
+    @ViewBuilder
     private func row(for tab: RootTab) -> some View {
-        NavRow(tab: tab, isSelected: selectedTab == tab) {
+        let navRow = NavRow(tab: tab, isSelected: selectedTab == tab) {
             withAnimation(Theme.easeOutOrNil()) {
                 selectedTab = tab
             }
         }
-        .keyboardShortcut(tabKeyboardShortcut(for: tab), modifiers: .command)
+        if let key = tabKeyboardShortcut(for: tab) {
+            navRow.keyboardShortcut(key, modifiers: .command)
+        } else {
+            navRow
+        }
     }
 
-    private func tabKeyboardShortcut(for tab: RootTab) -> KeyEquivalent {
+    /// `nil` means the tab is click-only.
+    ///
+    /// Clipboard deliberately has no shortcut: ⌘8 already belongs to Settings,
+    /// and the Pro plan reassigns ⌘8 to Transcripts with Settings moving to
+    /// ⌘9 — so both numbers are spoken for and neither may be taken here.
+    private func tabKeyboardShortcut(for tab: RootTab) -> KeyEquivalent? {
         switch tab {
         case .history: return "1"
         case .insights: return "2"
@@ -72,6 +83,7 @@ struct SidebarNav: View {
         case .style: return "5"
         case .transforms: return "6"
         case .scratchpad: return "7"
+        case .clipboard: return nil
         case .settings: return "8"
         }
     }
