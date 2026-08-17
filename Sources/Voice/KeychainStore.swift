@@ -65,8 +65,19 @@ final class KeychainStore {
     /// on `errSecDuplicateItem` falls back to SecItemUpdate so re-saving an
     /// existing provider's key doesn't require a manual delete first.
     /// Returns `true` when the key was stored successfully.
+    ///
+    /// `accessibility` defaults to the `ThisDeviceOnly` class every BYO API key
+    /// has always used — it is what keeps those keys out of iCloud Keychain.
+    /// It is overridable because that tradeoff does not generalize: a secret
+    /// protecting data the user cannot recreate (see `ClipboardKeyStore`) must
+    /// survive a machine migration, or restoring a backup yields ciphertext
+    /// with no key.
     @discardableResult
-    func setKey(_ value: String, for account: String) -> Bool {
+    func setKey(
+        _ value: String,
+        for account: String,
+        accessibility accessibilityClass: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    ) -> Bool {
         guard let data = value.data(using: .utf8) else { return false }
 
         let query = Self.baseQuery(service: service, account: account)
@@ -76,7 +87,7 @@ final class KeychainStore {
         ]
 
         let accessibility: [String: Any] = [
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            kSecAttrAccessible as String: accessibilityClass
         ]
 
         let addQuery = query

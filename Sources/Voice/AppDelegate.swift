@@ -28,6 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let styleStore = StyleStore()
     private let transformsStore = TransformsStore()
     private let scratchpadStore = ScratchpadStore()
+    /// PRO ONLY — clipboard manager. Construction is cheap (metadata only);
+    /// `activate()` does the Keychain and disk work, off the launch path.
+    private let clipboardStore = ClipboardStore()
+    private lazy var clipboardWatcher = ClipboardWatcher(store: clipboardStore)
     private let settingsStore = SettingsStore()
     private let correctionWatcher = CorrectionWatcher()
     private let learnToast = LearnToastHUD()
@@ -55,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         styleStore: styleStore,
         transformsStore: transformsStore,
         scratchpadStore: scratchpadStore,
+        clipboardStore: clipboardStore,
         settingsStore: settingsStore,
         modelManager: modelManager,
         transformCredentialsProvider: { [weak settingsStore] in
@@ -86,6 +91,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ModelManager init runs WhisperKit Documents→App Support migration
         // before the activation tap starts accepting dictation.
         modelManager = ModelManager()
+
+        // PRO ONLY — clipboard manager. `activate()` resolves the blob key off
+        // the main thread; the watcher may start immediately because its tick
+        // no-ops (without consuming the pasteboard's changeCount) until the
+        // store reports it can capture.
+        clipboardStore.activate()
+        clipboardWatcher.start()
 
         activationController = ActivationController()
         activationController?.useToggleLockProvider = { [weak self] in
@@ -308,6 +320,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        clipboardWatcher.stop()
+        clipboardStore.flush()
         historyStore.flush()
         dictionaryStore.flush()
         correctionsLog.flush()
