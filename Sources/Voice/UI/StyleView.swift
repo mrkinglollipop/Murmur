@@ -13,12 +13,10 @@ struct StyleView: View {
     @State private var pendingRemoveBundleID: String?
     @State private var showRemoveConfirmation = false
 
-    private var frontmostBundleID: String? {
-        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-    }
-
-    private var frontmostAppName: String {
-        NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown app"
+    /// Assign target: the last active non-Murmur app, tracked by the store.
+    /// `frontmostApplication` at click time is always Murmur itself.
+    private var targetApp: StyleStore.ExternalApp? {
+        store.lastExternalApp
     }
 
     private var sortedAssignmentBundleIDs: [String] {
@@ -66,20 +64,23 @@ struct StyleView: View {
 
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(frontmostAppName)
+                    Text(targetApp?.name ?? "No app active yet")
                         .font(Theme.body(13, weight: .medium))
                         .foregroundColor(Theme.textPrimary)
-                        .help(frontmostBundleID ?? "")
+                        .help(targetApp?.bundleID ?? "")
+                    Text("Last active app — switch to an app, then come back to assign")
+                        .font(Theme.body(10))
+                        .foregroundColor(Theme.textSecondary)
                 }
                 Spacer()
                 Button("Assign \(store.selected.displayName)") {
-                    guard let bundleID = frontmostBundleID else { return }
-                    store.assignProfile(store.selected, toBundleID: bundleID)
+                    guard let app = targetApp else { return }
+                    store.assignProfile(store.selected, toBundleID: app.bundleID)
                 }
                 .buttonStyle(.glassProminent)
                 .tint(Theme.lavender)
                 .font(Theme.body(11, weight: .semibold))
-                .disabled(frontmostBundleID == nil)
+                .disabled(targetApp == nil)
             }
 
             if !store.appProfileMap.isEmpty {

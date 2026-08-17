@@ -60,7 +60,14 @@ struct TransformsView: View {
     /// available, or a cloud key configured. Mirrors `TransformRunner`'s
     /// backend selection so the Run button is disabled up front rather than
     /// spinning and then failing with `.noBackendAvailable`.
-    private var backendAvailable: Bool {
+    ///
+    /// Cached rather than computed per access: resolving it reads two Keychain
+    /// items, and every card's Run button and context menu asks for it on each
+    /// body evaluation. Refreshed when the tab appears, which covers a key or
+    /// backend changed over in Settings (switching tabs rebuilds this view).
+    @State private var backendAvailable = false
+
+    private func resolveBackendAvailable() -> Bool {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *), case .available = SystemLanguageModel.default.availability {
             return true
@@ -121,6 +128,9 @@ struct TransformsView: View {
         .onChange(of: editingID) { _, newValue in
             focusedEditID = newValue
         }
+        .task {
+            backendAvailable = resolveBackendAvailable()
+        }
     }
 
     // MARK: - Auto-run + hotkey
@@ -144,7 +154,7 @@ struct TransformsView: View {
             .pickerStyle(.menu)
             .labelsHidden()
 
-            Text("Global hotkey: ⌃⌥⌘T runs the first transform on your last dictation and copies the result.")
+            Text("Global hotkey: ⌃⌥⌘T runs your auto-run transform (or the first one, if none is set) on your last dictation and copies the result.")
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
         }
@@ -397,6 +407,10 @@ struct TransformsView: View {
                     .tint(Theme.lavender)
                     .font(.system(size: 12, weight: .semibold))
                     .keyboardShortcut(.return, modifiers: [])
+                    .disabled(
+                        editName.trimmingCharacters(in: .whitespaces).isEmpty ||
+                        editPrompt.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
             }
         }
         .padding(14)
@@ -434,9 +448,12 @@ struct TransformsView: View {
     }
 
     private func saveEdit(for transform: Transform) {
+        let name = editName.trimmingCharacters(in: .whitespaces)
+        let prompt = editPrompt.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !prompt.isEmpty else { return }
         var updated = transform
-        updated.name = editName.trimmingCharacters(in: .whitespaces)
-        updated.prompt = editPrompt.trimmingCharacters(in: .whitespaces)
+        updated.name = name
+        updated.prompt = prompt
         store.update(updated)
         editingID = nil
         focusedEditID = nil

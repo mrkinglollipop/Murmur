@@ -23,6 +23,19 @@ final class StyleStore: ObservableObject {
     /// bundleID → StyleProfile raw value
     @Published private(set) var appProfileMap: [String: StyleProfile] = [:]
 
+    /// The most recently active app that is NOT Murmur itself. The Style tab
+    /// assigns per-app profiles against this: `frontmostApplication` at
+    /// click time is always Murmur (normal Dock app), so assigning to the
+    /// frontmost app would always self-target.
+    struct ExternalApp: Equatable {
+        let bundleID: String
+        let name: String
+    }
+
+    @Published private(set) var lastExternalApp: ExternalApp?
+
+    private var workspaceObserver: NSObjectProtocol?
+
     /// Weak reference to the live selector, wired in by `AppDelegate` — same
     /// wiring shape as `SettingsStore.asrEngineSelector`.
     weak var asrEngineSelector: ASREngineSelector?
@@ -38,6 +51,37 @@ final class StyleStore: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: Keys.appProfileMap),
            let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
             appProfileMap = decoded.compactMapValues { StyleProfile(rawValue: $0) }
+        }
+
+        if let app = NSWorkspace.shared.frontmostApplication {
+            noteActivatedApp(app)
+        }
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            Task { @MainActor in
+                self?.noteActivatedApp(app)
+            }
+        }
+    }
+
+    deinit {
+        if let workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+        }
+    }
+
+    /// Records the activated app as the per-app assign target, skipping
+    /// Murmur itself so opening the Style tab doesn't clobber the target.
+    private func noteActivatedApp(_ app: NSRunningApplication) {
+        guard let bundleID = app.bundleIdentifier,
+              bundleID != Bundle.main.bundleIdentifier else { return }
+        let candidate = ExternalApp(bundleID: bundleID, name: app.localizedName ?? bundleID)
+        if candidate != lastExternalApp {
+            lastExternalApp = candidate
         }
     }
 

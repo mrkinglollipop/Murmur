@@ -184,4 +184,56 @@ final class SpokenPunctuationTests: XCTestCase {
             XCTAssertEqual(SpokenPunctuation.apply(text), text, "prose corrupted: \(text)")
         }
     }
+
+    func testSentenceEndExclamationCommand() {
+        XCTAssertEqual(
+            SpokenPunctuation.apply("I need one of these, exclamation point.", codeAware: false),
+            "I need one of these!"
+        )
+        XCTAssertEqual(
+            SpokenPunctuation.apply("Exclamation point.", codeAware: false),
+            "!"
+        )
+        XCTAssertEqual(
+            SpokenPunctuation.apply("What the hell exclamation point", codeAware: false),
+            "What the hell!"
+        )
+    }
+
+    func testSentenceEndQuestionCommand() {
+        XCTAssertEqual(
+            SpokenPunctuation.apply("How are you question mark", codeAware: false),
+            "How are you?"
+        )
+        XCTAssertEqual(
+            SpokenPunctuation.apply("How are you question mark.", codeAware: false),
+            "How are you?"
+        )
+    }
+
+    func testPunctuationMentionStaysWords() {
+        let mention = "calling something a question mark versus asking for punctuation at the end of a sentence."
+        XCTAssertEqual(SpokenPunctuation.apply(mention, codeAware: false), mention)
+        XCTAssertEqual(SpokenPunctuation.apply(mention, codeAware: true), mention)
+
+        let anExclamation = "look at the transcripts where I wanted to put an exclamation point in"
+        XCTAssertEqual(SpokenPunctuation.apply(anExclamation, codeAware: false), anExclamation)
+
+        let plural = "It's not doing exclamation points and potentially other things, like question marks, correctly."
+        XCTAssertEqual(SpokenPunctuation.apply(plural, codeAware: false), plural)
+    }
+
+    func testProseDoesNotMapMidSentenceQuestionMark() {
+        XCTAssertEqual(
+            SpokenPunctuation.apply("question mark optional", codeAware: false),
+            "question mark optional"
+        )
+    }
+
+    func testExclamationMarkAliasAtSentenceEnd() {
+        XCTAssertEqual(
+            SpokenPunctuation.apply("Ship it exclamation mark.", codeAware: false),
+            "Ship it!"
+        )
+    }
 }

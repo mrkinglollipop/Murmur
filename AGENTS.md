@@ -16,6 +16,10 @@ tooling and frameworks:
 - Parakeet sidecar (`Resources/parakeet_transcribe.py`) via `parakeet-mlx`
   (Apple MLX / Metal)
 
+This clone also contains **`ios/`** (Murmur iOS keyboard). Same rule: do **not**
+attempt `xcodegen` / `xcodebuild` / simulator / device work on Linux. iOS verify
+is Mac + physical device only — [`ios/README.md`](ios/README.md).
+
 On a Linux cloud agent: do **not** attempt to install a Swift toolchain or fake
 a build. Use the commands in [`CLAUDE.md`](CLAUDE.md) on a Mac with Xcode.
 
@@ -24,7 +28,12 @@ a build. Use the commands in [`CLAUDE.md`](CLAUDE.md) on a Mac with Xcode.
 ```bash
 bash scripts/test-publish-sparkle-helpers.sh   # expect: "ORACLE OK", exit 0
 bash scripts/test-app-icon-helpers.sh          # partial (skips provenance / icns)
+bash scripts/test-oracle-dictation-start-helpers.sh  # expect: "ORACLE OK", exit 0
 ```
+
+Live dictation hold-start (`bash scripts/oracle-dictation-start.sh`) is
+**Mac-only after a fn-hold**. VoiceTests green is not that check — see
+[`CLAUDE.md`](CLAUDE.md) Verify. Cloud agents must not claim dictation works.
 
 `test-app-icon-helpers.sh` needs Pillow (`pip install pillow`) for geometry
 checks. Full icon verification requires macOS (`sips` + `iconutil`).

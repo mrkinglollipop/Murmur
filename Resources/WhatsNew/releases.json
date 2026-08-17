@@ -1,5 +1,53 @@
 [
   {
+    "version": "0.1.37",
+    "build": "38",
+    "title": "What's New in 0.1.37",
+    "items": [
+      "Holding the dictation key no longer force-quits Murmur.",
+      "Murmur uses your Mac microphone instead of Continuity Camera or Jump Desktop unless that is what Sound Input is set to.",
+      "If the first microphone bind fails, it retries a working device instead of showing Microphone unavailable."
+    ]
+  },
+  {
+    "version": "0.1.36",
+    "build": "37",
+    "title": "What's New in 0.1.36",
+    "items": [
+      "If a headset or other microphone unplugs while Murmur is running, it now switches to a working mic instead of freezing until you force-quit.",
+      "A stuck microphone start times out instead of locking the dictation key."
+    ]
+  },
+  {
+    "version": "0.1.35",
+    "build": "36",
+    "title": "What's New in 0.1.35",
+    "items": [
+      "Saying “exclamation point” or “question mark” at the end of a sentence now inserts ! or ? instead of writing the words.",
+      "Talking about a mark — “a question mark”, “an exclamation point” — still stays words."
+    ]
+  },
+  {
+    "version": "0.1.34",
+    "build": "35",
+    "title": "What's New in 0.1.34",
+    "items": [
+      "Dictionary terms and snippet triggers that begin or end with punctuation — “.net”, “@work”, “c++” — now actually apply. They could always be saved, but they never matched anything you said.",
+      "Corrections no longer double up punctuation: dictating “we ship on .net” could come back as “we ship on ..NET”."
+    ]
+  },
+  {
+    "version": "0.1.33",
+    "build": "34",
+    "title": "What's New in 0.1.33",
+    "items": [
+      "Editing a dictionary term, snippet, or transform can no longer blank out the field that does the work — a change that would have quietly deleted words from later dictations is now refused.",
+      "Per-app Style assignment now applies to the app you were last working in, instead of always assigning to Murmur itself.",
+      "Opening a Scratchpad note no longer marks it as edited just for looking at it.",
+      "The confirmation pill stays up long enough to read: dictionary fix counts and the “left on clipboard” warning no longer vanish in half a second, and the live preview shows a third line of text."
+    ]
+  },
+  {
     "version": "0.1.32",
     "build": "33",
     "title": "What's New in 0.1.32",

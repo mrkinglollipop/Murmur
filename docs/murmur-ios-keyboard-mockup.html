@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Murmur iOS keyboard — mockup</title>
+  <style>
+    :root {
+      --bg: #101014;
+      --text: #f5f5f7;
+      --muted: #9a9aa2;
+      --coral: #d85a30;
+      --record: #e24b4a;
+      --hair: rgba(255,255,255,0.10);
+      --glass: rgba(255,255,255,0.07);
+      --imessage: #0a84ff;
+      --bubble: #2c2c2e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #0a0a0c;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 48px;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 48px 24px 80px;
+    }
+    h1 { display: none; }
+    .label {
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+    .phone {
+      width: 390px;
+      height: 844px;
+      background: #000;
+      border-radius: 52px;
+      padding: 10px;
+      box-shadow: 0 40px 80px rgba(0,0,0,0.55);
+      border: 1px solid #2a2a2c;
+    }
+    .screen {
+      height: 100%;
+      background: #000;
+      border-radius: 44px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .island {
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+      width: 128px; height: 34px; background: #1c1c1e; border-radius: 17px; z-index: 2;
+    }
+    .status {
+      padding: 56px 28px 0;
+      display: flex; justify-content: space-between;
+      font-size: 15px; font-weight: 600;
+    }
+    .nav { text-align: center; padding: 12px 0 8px; }
+    .nav strong { font-size: 17px; display: block; }
+    .nav span { font-size: 11px; color: #8e8e93; }
+    .thread { flex: 1; padding: 8px 16px 12px; display: flex; flex-direction: column; gap: 8px; }
+    .bubble { max-width: 78%; padding: 10px 14px; border-radius: 18px; font-size: 16px; line-height: 1.25; }
+    .in { align-self: flex-start; background: var(--bubble); }
+    .out { align-self: flex-end; background: var(--imessage); }
+    .compose {
+      margin: 0 12px 10px;
+      height: 40px;
+      border-radius: 20px;
+      background: #1c1c1e;
+      color: #636366;
+      display: flex; align-items: center;
+      padding: 0 16px;
+      font-size: 16px;
+    }
+    .compose.live { color: #8e8e93; font-style: italic; }
+    .kb {
+      background: var(--bg);
+      border-top: 1px solid var(--hair);
+      padding: 10px 12px 28px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .kb-status {
+      font-size: 13px;
+      color: var(--muted);
+      text-align: center;
+      min-height: 18px;
+    }
+    .kb-status.on { color: var(--text); font-weight: 600; }
+    .row { display: flex; gap: 8px; width: 100%; }
+    .key {
+      height: 44px; flex: 1; border-radius: 8px; background: var(--glass);
+      color: var(--text); display: grid; place-items: center;
+      font-size: 15px; font-weight: 600;
+    }
+    .key.mic {
+      background: var(--coral);
+    }
+    .key.mic.rec {
+      background: var(--record);
+    }
+    .key.mic svg { width: 18px; height: 18px; }
+    .home {
+      position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+      width: 110px; height: 5px; border-radius: 3px; background: rgba(245,245,247,0.35);
+    }
+  </style>
+</head>
+<body>
+  <h1>Murmur iOS keyboard mockup</h1>
+
+  <figure>
+    <div class="label">Idle — Messages never leaves</div>
+    <div class="phone"><div class="screen">
+      <div class="island"></div>
+      <div class="status"><span>9:41</span><span>5G</span></div>
+      <div class="nav"><strong>Alex</strong><span>iMessage</span></div>
+      <div class="thread">
+        <div class="bubble in">You on your way?</div>
+        <div class="bubble out">yeah one sec</div>
+      </div>
+      <div class="compose">iMessage</div>
+      <div class="kb">
+        <div class="kb-status">Tap mic to dictate</div>
+        <div class="row">
+          <div class="key">ABC</div>
+          <div class="key mic" aria-label="Microphone">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#f5f5f7" stroke-width="2" stroke-linecap="round">
+              <rect x="9" y="3" width="6" height="11" rx="3" fill="#f5f5f7" stroke="none"/>
+              <path d="M6 11a6 6 0 0 0 12 0"/>
+              <line x1="12" y1="17" x2="12" y2="21"/>
+              <line x1="8" y1="21" x2="16" y2="21"/>
+            </svg>
+          </div>
+          <div class="key" aria-label="Delete">⌫</div>
+          <div class="key" aria-label="Next">🌐</div>
+        </div>
+      </div>
+      <div class="home"></div>
+    </div></div>
+  </figure>
+
+  <figure>
+    <div class="label">Listening — still Messages</div>
+    <div class="phone"><div class="screen">
+      <div class="island"></div>
+      <div class="status"><span>9:41</span><span>5G</span></div>
+      <div class="nav"><strong>Alex</strong><span>iMessage</span></div>
+      <div class="thread">
+        <div class="bubble in">You on your way?</div>
+        <div class="bubble out">yeah one sec</div>
+      </div>
+      <div class="compose live">running a bit late see you at</div>
+      <div class="kb">
+        <div class="kb-status on">Listening…</div>
+        <div class="row">
+          <div class="key">ABC</div>
+          <div class="key mic rec" aria-label="Stop">
+            <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="#f5f5f7"/></svg>
+          </div>
+          <div class="key" aria-label="Delete">⌫</div>
+          <div class="key" aria-label="Next">🌐</div>
+        </div>
+      </div>
+      <div class="home"></div>
+    </div></div>
+  </figure>
+</body>
+</html>

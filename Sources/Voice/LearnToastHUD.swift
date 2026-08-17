@@ -19,6 +19,8 @@ final class LearnToastHUD {
 
     private let toastWidth: CGFloat = 360
     private let estimatedHeight: CGFloat = 72
+    /// Auto-dismiss window — dismiss/timeout keeps the learn either way.
+    private let autoDismissSeconds: TimeInterval = 8.0
 
     /// Recording HUD used for collision layout.
     weak var recordingHUD: RecordingHUD?
@@ -168,7 +170,7 @@ final class LearnToastHUD {
             self?.dismiss(userInitiated: false)
         }
         dismissWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + autoDismissSeconds, execute: work)
     }
 
     private func reject() {

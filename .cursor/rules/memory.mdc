@@ -1,0 +1,46 @@
+---
+description: Memory system — auto-load MEMORY.md at session start, capture cadence, retrieval fallback
+alwaysApply: true
+---
+
+# Memory System
+
+## Capture cadence
+
+Fire `capture_v2.py` on every:
+- Decision landing (even minor — "use X library")
+- Preference stated (explicit or implicit — "I like that approach")
+- Topic shift (conversation moves to a different system/project)
+- Diagnosis or finding (root cause identified, bug explained)
+- Architectural principle or workspace-structure decision stated — ALWAYS capture-worthy, fire immediately, don't wait
+- At minimum every 4-5 turns in any working session
+
+Do NOT batch captures to session end. Many small captures >> one big dump. Mid-session capture survives `/compact`, context exhaustion, and crashes.
+
+**Stop-hook detector (log only):** `capture_nudge.py` (in `stop` chain after `finish_guard`) logs when capture is stale (~90 min or 5+ substantive turns) to `/tmp/.cursor_capture_nudge_log.jsonl` — **no** `followup_message` / popup. Soft cadence above still applies. Cooldown: 6 turns / 15 min. Kill switch: `/tmp/.cursor_capture_nudge_disable`.
+
+**Shell tool (HARD):** always pass `required_permissions: ["full_network"]` — capture uses the model gateway; default sandbox blocks API calls.
+
+**Invocation (HARD):** always **pipe JSON on stdin** (heredoc or `echo '...' |`). Bare `python3 capture_v2.py` with no pipe used to hang when Cursor left stdin open; script now fails fast with usage, but piping is still required for real captures.
+
+```bash
+cat <<'EOF' | PYTHONPATH="/Volumes/Cloud Storage/Claude/.python_libs:/Volumes/Cloud Storage/Claude/scripts/_clients" python3 "/Volumes/Cloud Storage/Memory/conversations/scripts/capture_v2.py"
+{"summary":"...","topics":["slug"],"decisions":[],"preferences":[],"scope":"build","edges":[],"topic_pages":[{"slug":"...","payload":"..."}]}
+EOF
+```
+
+Required field: `summary`. Optional: `topics`, `decisions`, `preferences`, `scope`, `edges`, `topic_pages`. Use ISO-8601 UTC for `ts` (auto-set if omitted). Slug is kebab-case.
+
+## When NOT to capture
+
+- Trivial Q&A (≤1 turn, no substance)
+- Code the user will throw away
+- Anything prefixed `scope: trivial` or `no memory`
+- Biblical Q&A (logs to `/Volumes/Cloud Storage/Memory/bible-expert/episodes.jsonl` — don't double-bookkeep)
+
+## Retrieval fallback (slug-miss)
+
+Before concluding "no memory on X":
+1. `PYTHONPATH=".python_libs" python3 "/Volumes/Cloud Storage/Graph/query_graph.py" search "X"` — free, the graph indexes every `memory_topic` node.
+2. `grep -ril "X" "/Volumes/Cloud Storage/Memory/conversations/topics/"` — substring search across topic pages.
+3. Episodes older than 90 days rotate to `episodes_<YYYY>.jsonl` archives — grep those for older history.

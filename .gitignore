@@ -29,3 +29,6 @@ sparkle_ed25519
 # Public-cut fragment (Phase 5) — merge into .gitignore when cutting the public repo.
 # Voice.xcodeproj is generated from project.yml; contributors run xcodegen generate.
 Voice.xcodeproj
+ios/*.xcodeproj
+ios/build/
+ios/build-*/

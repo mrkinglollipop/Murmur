@@ -99,6 +99,9 @@ final class ScratchpadStore: ObservableObject {
     func update(id: UUID, title: String, body: String) {
         let mutate = {
             guard let idx = self.notes.firstIndex(where: { $0.id == id }) else { return }
+            // No-op edits (e.g. the view re-pushing a note's own values on
+            // selection change) must not bump updatedAt or touch disk.
+            guard self.notes[idx].title != title || self.notes[idx].body != body else { return }
             self.notes[idx].title = title
             self.notes[idx].body = body
             self.notes[idx].updatedAt = Date()
