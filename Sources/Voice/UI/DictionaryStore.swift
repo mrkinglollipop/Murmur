@@ -342,7 +342,7 @@ final class DictionaryStore: ObservableObject {
         guard !cleanTerm.isEmpty else { return nil }
         let cleanVariants = variants
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && !PhoneticMatcher.isProtectedEnglishPhrase($0) }
         let newEntry = DictionaryEntry(term: cleanTerm, variants: cleanVariants, isAutoLearned: isAutoLearned)
         let mutate = {
             self.entries.append(newEntry)
@@ -355,10 +355,16 @@ final class DictionaryStore: ObservableObject {
     func update(_ entry: DictionaryEntry) {
         // Backstop: an empty term turns correct() into a word deleter
         // (variants replaced with ""). The edit UI guards this too.
-        guard !entry.term.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let cleanTerm = entry.term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTerm.isEmpty else { return }
+        var cleaned = entry
+        cleaned.term = cleanTerm
+        cleaned.variants = entry.variants
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !PhoneticMatcher.isProtectedEnglishPhrase($0) }
         let mutate = {
-            guard let idx = self.entries.firstIndex(where: { $0.id == entry.id }) else { return }
-            self.entries[idx] = entry
+            guard let idx = self.entries.firstIndex(where: { $0.id == cleaned.id }) else { return }
+            self.entries[idx] = cleaned
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
@@ -391,6 +397,7 @@ final class DictionaryStore: ObservableObject {
         for entry in entries {
             for variant in entry.variants {
                 guard !variant.isEmpty else { continue }
+                guard !PhoneticMatcher.isProtectedEnglishPhrase(variant) else { continue }
                 guard !isBlocklisted(heard: variant, replaced: entry.term) else { continue }
                 guard let regex = variantRegexCache[variant] else { continue }
                 let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
@@ -475,6 +482,7 @@ final class DictionaryStore: ObservableObject {
 
     private func phoneticReplacement(for token: String) -> PhoneticReplacement? {
         guard !token.isEmpty else { return nil }
+        guard !PhoneticMatcher.isProtectedHeardToken(token) else { return nil }
 
         if entries.contains(where: { $0.term.caseInsensitiveCompare(token) == .orderedSame }) {
             return nil
@@ -774,6 +782,9 @@ final class DictionaryStore: ObservableObject {
         respectBlocklist: Bool = false
     ) -> LearnedCorrection? {
         if respectBlocklist, isBlocklisted(heard: variant, replaced: term) {
+            return nil
+        }
+        if PhoneticMatcher.isProtectedEnglishPhrase(variant) {
             return nil
         }
         if let existing = entries.first(where: { $0.term.caseInsensitiveCompare(term) == .orderedSame }) {

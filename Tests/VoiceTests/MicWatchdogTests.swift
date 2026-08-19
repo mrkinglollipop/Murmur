@@ -346,6 +346,86 @@ final class MicWatchdogTests: XCTestCase {
         XCTAssertEqual(picked, 81)
     }
 
+    func testBuiltInDefaultBeatsOtherLiveWhenOmittedFromCandidates() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 81,
+            defaultIsAlive: false,
+            defaultFormatLooksDead: true,
+            defaultIsBuiltIn: true,
+            candidates: [
+                (id: 145, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ]
+        )
+        XCTAssertEqual(picked, 81)
+    }
+
+    func testOmitsUnlistedNonBuiltInDefaultInFavorOfOtherLive() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: false,
+            defaultFormatLooksDead: true,
+            defaultIsBuiltIn: false,
+            candidates: [
+                (id: 42, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ]
+        )
+        XCTAssertEqual(picked, 42)
+    }
+
+    func testExcludeAfterInputRerouteKeepsCurrentDefault() {
+        XCTAssertNil(
+            AudioRecorder.excludeAfterInputReroute(lastBound: 81, currentDefault: 81)
+        )
+        XCTAssertEqual(
+            AudioRecorder.excludeAfterInputReroute(lastBound: 81, currentDefault: 145),
+            81
+        )
+        XCTAssertNil(
+            AudioRecorder.excludeAfterInputReroute(lastBound: nil, currentDefault: 81)
+        )
+        XCTAssertNil(
+            AudioRecorder.excludeAfterInputReroute(lastBound: 81, currentDefault: nil)
+        )
+    }
+
+    func testSameDefaultConfigChangeDoesNotRebuildCapture() {
+        XCTAssertFalse(
+            AudioRecorder.shouldRebuildCaptureAfterInputReroute(
+                lastBound: 81, currentDefault: 81
+            )
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldRebuildCaptureAfterInputReroute(
+                lastBound: 81, currentDefault: nil
+            )
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldRebuildCaptureAfterInputReroute(
+                lastBound: nil, currentDefault: 81
+            )
+        )
+        XCTAssertTrue(
+            AudioRecorder.shouldRebuildCaptureAfterInputReroute(
+                lastBound: 81, currentDefault: 145
+            )
+        )
+    }
+
+    func testContinuityUnknownTransportUIDIsLastResort() {
+        XCTAssertTrue(AudioRecorder.isLastResortInputUID("com.apple.continuity.capture"))
+        XCTAssertTrue(AudioRecorder.isLastResortInputUID("Matt’s iPhone Microphone"))
+        XCTAssertTrue(AudioRecorder.isLastResortInputUID("Jump Desktop Microphone"))
+        XCTAssertFalse(AudioRecorder.isLastResortInputUID("BuiltInMicrophoneDevice"))
+        XCTAssertFalse(AudioRecorder.isLastResortInputUID("AppleUSBAudioEngine:Blue"))
+    }
+
+    func testEmbeddedIPhoneLettersAreNotLastResort() {
+        XCTAssertFalse(AudioRecorder.isLastResortInputUID("XiphoneUSB"))
+        XCTAssertTrue(AudioRecorder.isLastResortInputUID("Matt’s iPhone Microphone"))
+        XCTAssertTrue(AudioRecorder.isLastResortInputUID("com.apple.continuity.capture"))
+        XCTAssertTrue(AudioRecorder.isLastResortInputUID("Jump Desktop Microphone"))
+    }
+
     func testUnaliveBuiltInBeatsNonBuiltInInLastBuiltInPass() {
         let picked = AudioRecorder.pickAliveInputDevice(
             defaultID: nil,
@@ -367,7 +447,8 @@ final class MicWatchdogTests: XCTestCase {
                 (id: 99, isAlive: false, isBuiltIn: false, formatLooksDead: true),
                 (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
             ],
-            lastResortIDs: [93]
+            lastResortIDs: [93],
+            allowLastResortFallback: true
         )
         XCTAssertEqual(picked, 93)
     }
@@ -392,6 +473,33 @@ final class MicWatchdogTests: XCTestCase {
             defaultIsAlive: false,
             candidates: [
                 (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ],
+            lastResortIDs: [93],
+            allowLastResortFallback: true
+        )
+        XCTAssertEqual(picked, 93)
+    }
+
+    func testSkipsLastResortWhenFallbackDisabled() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: nil,
+            defaultIsAlive: false,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertNil(picked)
+    }
+
+    func testHonorsContinuityWhenItIsLiveDefaultEvenIfFallbackDisabled() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 93,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: false,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 81, isAlive: true, isBuiltIn: true, formatLooksDead: false),
             ],
             lastResortIDs: [93]
         )

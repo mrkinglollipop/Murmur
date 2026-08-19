@@ -98,6 +98,27 @@ enum AutocorrectEngine {
         return (beforeCount - afterCount) > 2
     }
 
+    enum DocumentMutationDecision: Equatable {
+        case allow
+        case deny
+        case collapseOneCharacterSelection
+    }
+
+    /// `insertText` / `deleteBackward` replace the whole selection. A
+    /// selected clause plus a keystroke wipes the sentence. Collapse is
+    /// only a 1-char caret nudge when overwrite is disallowed — never a
+    /// multi-char wipe. Side effect stays in KeyboardViewController.
+    static func documentMutationDecision(
+        selected: String?,
+        allowSingleCharacterSelection: Bool
+    ) -> DocumentMutationDecision {
+        guard let selected, !selected.isEmpty else { return .allow }
+        if selected.count == 1 {
+            return allowSingleCharacterSelection ? .allow : .collapseOneCharacterSelection
+        }
+        return .deny
+    }
+
     /// UIKit: a real highlight sits after `documentContextBeforeInput`, so
     /// `before.hasSuffix(selected)` is false — allow (phrase, long word, or
     /// short word). A host lie leaves the caret at the end with stale

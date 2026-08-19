@@ -39,10 +39,21 @@ enum PhoneticMatcher {
         let candidateTrimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !heardTrimmed.isEmpty, !candidateTrimmed.isEmpty else { return false }
 
+        let heardLen = heardTrimmed.count
+        let candidateLen = candidateTrimmed.count
         let distance = levenshteinDistance(heardTrimmed, candidateTrimmed)
-        if distance <= 2 { return true }
+        // "line" (4) / "land" (4) vs "Linode" (6): distance 2–3 still looks
+        // "close" to a naive ≤2 / 0.4-primary bar. A short token vs a much
+        // longer jargon term is a false positive, not a misspelling.
+        if abs(heardLen - candidateLen) >= 2 && min(heardLen, candidateLen) < 5 {
+            return false
+        }
 
-        let maxLen = max(heardTrimmed.count, candidateTrimmed.count)
+        if distance <= 2, (min(heardLen, candidateLen) >= 5 || abs(heardLen - candidateLen) <= 1) {
+            return true
+        }
+
+        let maxLen = max(heardLen, candidateLen)
         guard maxLen > 0 else { return false }
         let similarity = 1.0 - Double(distance) / Double(maxLen)
         // Candidates reach this guard only via a metaphone-key hit, so the
@@ -53,6 +64,38 @@ enum PhoneticMatcher {
         // similarity 0.5) still correct. Secondary-only overlaps keep 0.6.
         return similarity >= (primaryKeyMatch ? 0.4 : 0.6)
     }
+
+    /// Closed-class / high-frequency English. Protected tokens block phonetic
+    /// steal; DictionaryStore also skips protected English phrases as literal
+    /// variants on add/correct/learn/update.
+    static func isProtectedHeardToken(_ token: String) -> Bool {
+        protectedHeardTokens.contains(token.lowercased())
+    }
+
+    /// Whole-phrase variants made only of protected English ("line out")
+    /// must not rewrite to jargon. Literal jargon misspellings ("linod")
+    /// still match.
+    static func isProtectedEnglishPhrase(_ phrase: String) -> Bool {
+        let tokens = phrase.split { $0.isWhitespace || $0.isNewline }.map(String.init)
+        guard !tokens.isEmpty else { return false }
+        return tokens.allSatisfy { isProtectedHeardToken($0) }
+    }
+
+    private static let protectedHeardTokens: Set<String> = [
+        "a", "an", "the", "in", "on", "at", "to", "for", "of", "and", "or",
+        "but", "if", "as", "is", "it", "be", "by", "we", "you", "he", "she",
+        "they", "my", "me", "no", "not", "so", "too", "from", "with", "this",
+        "that", "then", "than", "when", "what", "who", "how", "why", "can",
+        "will", "would", "could", "should", "do", "did", "does", "have", "has",
+        "had", "was", "were", "are", "am", "one", "two", "three", "out", "up",
+        "down", "off", "over", "into", "just", "like", "also", "only", "even",
+        "still", "back", "well", "way", "now", "here", "there", "more", "most",
+        "some", "any", "all", "each", "own", "same", "line", "land", "field",
+        "clean", "fine", "find", "kind", "mind", "time", "day", "get", "got",
+        "go", "see", "know", "think", "want", "need", "use", "make", "take",
+        "look", "say", "said", "let", "may", "right", "left", "good", "new",
+        "old", "long", "little", "first", "last", "next",
+    ]
 }
 
 // MARK: - Double Metaphone (faithful port of oubiwann/metaphone DoubleMetaphone)
