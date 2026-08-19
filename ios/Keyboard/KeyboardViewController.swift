@@ -518,14 +518,21 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     /// would move or extend the real range, and the next `deleteBackward`
     /// wipes the sentence.
     private func canMutateDocument(allowSingleCharacterSelection: Bool = true) -> Bool {
-        guard let selected = textDocumentProxy.selectedText, !selected.isEmpty else { return true }
-        if selected.count == 1, allowSingleCharacterSelection { return true }
-        guard selected.count == 1 else { return false }
-        textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
-        if let still = textDocumentProxy.selectedText, !still.isEmpty {
+        switch AutocorrectEngine.documentMutationDecision(
+            selected: textDocumentProxy.selectedText,
+            allowSingleCharacterSelection: allowSingleCharacterSelection
+        ) {
+        case .allow:
+            return true
+        case .deny:
             return false
+        case .collapseOneCharacterSelection:
+            textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
+            if let still = textDocumentProxy.selectedText, !still.isEmpty {
+                return false
+            }
+            return true
         }
-        return true
     }
 
     @discardableResult

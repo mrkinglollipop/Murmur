@@ -364,6 +364,51 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertFalse(AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: 5, afterCount: 4))
     }
 
+    func testDocumentMutationDecisionAllowsEmptyAndDeniesClause() {
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: nil,
+                allowSingleCharacterSelection: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "",
+                allowSingleCharacterSelection: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "x",
+                allowSingleCharacterSelection: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "x",
+                allowSingleCharacterSelection: false
+            ),
+            .collapseOneCharacterSelection
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "hello there friend",
+                allowSingleCharacterSelection: true
+            ),
+            .deny
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "hello there friend",
+                allowSingleCharacterSelection: false
+            ),
+            .deny
+        )
+    }
+
     func testPeriodSpaceRemovalMustStayASingleCharacter() {
         XCTAssertTrue(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 6, afterCount: 5))
         XCTAssertTrue(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 6, afterCount: 4))
