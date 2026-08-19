@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.1.38",
+    "build": "39",
+    "title": "What's New in 0.1.38",
+    "items": [
+      "Murmur still tries your Mac microphone when Core Audio briefly reports it as format-dead or not alive, instead of jumping to Continuity Camera or Jump Desktop."
+    ]
+  },
+  {
     "version": "0.1.37",
     "build": "38",
     "title": "What's New in 0.1.37",
