@@ -493,8 +493,9 @@ final class AudioRecorder {
     }
 
     /// Prefer a live HAL default whose input format is usable; if that ID is
-    /// dead, format-dead, or excluded, take a built-in mic, then any other
-    /// live input with a live format. Nil = no usable device.
+    /// dead, format-dead, or excluded, take a built-in mic (format-dead but
+    /// alive, then even `!isAlive` before Continuity), then any other live
+    /// input with a live format. Nil = no usable device.
     static func pickAliveInputDevice(
         defaultID: AudioDeviceID?,
         defaultIsAlive: Bool,
@@ -522,6 +523,14 @@ final class AudioRecorder {
         }) {
             return builtIn.id
         }
+        // HAL can report the built-in as 0ch/"dead" while System Settings
+        // still lists it as the default. Bind will throw if it is truly dead;
+        // skipping it here falls through to Continuity and ruins the take.
+        if let builtIn = candidates.first(where: {
+            $0.isBuiltIn && $0.isAlive && !excluding.contains($0.id)
+        }) {
+            return builtIn.id
+        }
         if let preferred = candidates.first(where: {
             !lastResortIDs.contains($0.id) && isPickable(
                 id: $0.id,
@@ -530,6 +539,15 @@ final class AudioRecorder {
             )
         }) {
             return preferred.id
+        }
+        // DeviceIsAlive false-negative on the built-in (uid 81) must not
+        // lose to Continuity. Prefer format-dead-but-alive above. Bind
+        // still throws if the device is truly dead. Do not pick a dead
+        // USB mic here — this pass is built-in only.
+        if let builtIn = candidates.first(where: {
+            $0.isBuiltIn && !excluding.contains($0.id)
+        }) {
+            return builtIn.id
         }
         return candidates.first(where: {
             isPickable(id: $0.id, isAlive: $0.isAlive, formatLooksDead: $0.formatLooksDead)

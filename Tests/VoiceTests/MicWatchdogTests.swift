@@ -305,6 +305,60 @@ final class MicWatchdogTests: XCTestCase {
         XCTAssertEqual(picked, 81)
     }
 
+    func testPrefersFormatDeadBuiltInOverContinuity() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 81,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: true,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 81, isAlive: true, isBuiltIn: true, formatLooksDead: true),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 81)
+    }
+
+    func testPrefersFormatDeadUnaliveBuiltInOverContinuity() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 81,
+            defaultIsAlive: false,
+            defaultFormatLooksDead: true,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 81, isAlive: false, isBuiltIn: true, formatLooksDead: true),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 81)
+    }
+
+    func testUnaliveBuiltInBeatsNonBuiltInInLastBuiltInPass() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: nil,
+            defaultIsAlive: false,
+            candidates: [
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+                (id: 81, isAlive: false, isBuiltIn: true, formatLooksDead: true),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 81)
+    }
+
+    func testDoesNotPreferDeadNonBuiltInOverContinuity() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: nil,
+            defaultIsAlive: false,
+            candidates: [
+                (id: 99, isAlive: false, isBuiltIn: false, formatLooksDead: true),
+                (id: 93, isAlive: true, isBuiltIn: false, formatLooksDead: false),
+            ],
+            lastResortIDs: [93]
+        )
+        XCTAssertEqual(picked, 93)
+    }
+
     func testHonorsContinuityWhenItIsLiveDefault() {
         let picked = AudioRecorder.pickAliveInputDevice(
             defaultID: 93,
@@ -418,18 +472,17 @@ final class MicWatchdogTests: XCTestCase {
         )
     }
 
-    func testPicksNilWhenAliveDevicesAreFormatDead() {
-        XCTAssertNil(
-            AudioRecorder.pickAliveInputDevice(
-                defaultID: 261,
-                defaultIsAlive: true,
-                defaultFormatLooksDead: true,
-                candidates: [
-                    (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: true),
-                    (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: true),
-                ]
-            )
+    func testPicksFormatDeadBuiltInInsteadOfFailingClosed() {
+        let picked = AudioRecorder.pickAliveInputDevice(
+            defaultID: 261,
+            defaultIsAlive: true,
+            defaultFormatLooksDead: true,
+            candidates: [
+                (id: 261, isAlive: true, isBuiltIn: false, formatLooksDead: true),
+                (id: 86, isAlive: true, isBuiltIn: true, formatLooksDead: true),
+            ]
         )
+        XCTAssertEqual(picked, 86)
     }
 
     func testFailClosedWhenBindReturnsNil() {
