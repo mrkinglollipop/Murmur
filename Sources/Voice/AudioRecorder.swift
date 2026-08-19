@@ -493,9 +493,11 @@ final class AudioRecorder {
     }
 
     /// Prefer a live HAL default whose input format is usable; if that ID is
-    /// dead, format-dead, or excluded, take a built-in mic (format-dead but
-    /// alive, then even `!isAlive` before Continuity), then any other live
-    /// input with a live format. Nil = no usable device.
+    /// dead, format-dead, or excluded, take a built-in mic (healthy, then
+    /// format-dead-but-alive, then the built-in default even if `!isAlive`,
+    /// then any built-in before Continuity). Other live non-last-resort
+    /// devices come after that so a Bluetooth aggregate cannot beat the
+    /// MacBook mic. Nil = no usable device.
     static func pickAliveInputDevice(
         defaultID: AudioDeviceID?,
         defaultIsAlive: Bool,
@@ -531,6 +533,16 @@ final class AudioRecorder {
         }) {
             return builtIn.id
         }
+        // Sound Input is the built-in, but HAL marked it dead/0ch. Try that
+        // ID before any other live device (Bluetooth aggregates, USB). 0.1.38
+        // still rebound 81 → 145 because the next pass picked a live
+        // non-Continuity ID first. Bind still throws if it is truly dead.
+        if let defaultID,
+           !excluding.contains(defaultID),
+           candidates.contains(where: { $0.id == defaultID && $0.isBuiltIn })
+        {
+            return defaultID
+        }
         if let preferred = candidates.first(where: {
             !lastResortIDs.contains($0.id) && isPickable(
                 id: $0.id,
@@ -540,10 +552,8 @@ final class AudioRecorder {
         }) {
             return preferred.id
         }
-        // DeviceIsAlive false-negative on the built-in (uid 81) must not
-        // lose to Continuity. Prefer format-dead-but-alive above. Bind
-        // still throws if the device is truly dead. Do not pick a dead
-        // USB mic here — this pass is built-in only.
+        // DeviceIsAlive false-negative on a built-in that is not the default
+        // must still beat Continuity. Do not pick a dead USB mic here.
         if let builtIn = candidates.first(where: {
             $0.isBuiltIn && !excluding.contains($0.id)
         }) {
@@ -1586,7 +1596,9 @@ final class AudioRecorder {
                 return
             }
             excludeOnNextStartDeviceID = nil
-            logger.info("AVAudioEngine started — recording…")
+            // warning: unified log drops `info`, so the hold-start oracle
+            // never saw this line (0.1.38 hold classified as NO HOLD).
+            logger.warning("AVAudioEngine started — recording")
             promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
             armZeroBufferWatchdog()
