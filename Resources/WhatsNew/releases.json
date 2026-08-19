@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.1.39",
+    "build": "40",
+    "title": "What's New in 0.1.39",
+    "items": [
+      "When the Mac microphone is the Sound Input default, Murmur binds it even if Core Audio has already offered another live device."
+    ]
+  },
+  {
     "version": "0.1.38",
     "build": "39",
     "title": "What's New in 0.1.38",
