@@ -5,7 +5,10 @@
     },
     "notionApi": {
       "command": "npx",
-      "args": ["-y", "@notionhq/notion-mcp-server"],
+      "args": [
+        "-y",
+        "@notionhq/notion-mcp-server"
+      ],
       "env": {
         "NOTION_TOKEN": "${env:NOTION_TOKEN}"
       }
@@ -24,13 +27,25 @@
     },
     "playwright": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"]
+      "args": [
+        "-y",
+        "@playwright/mcp@latest"
+      ]
     },
     "firecrawl": {
       "command": "npx",
-      "args": ["-y", "firecrawl-mcp"],
+      "args": [
+        "-y",
+        "firecrawl-mcp"
+      ],
       "env": {
         "FIRECRAWL_API_KEY": "${env:FIRECRAWL_API_KEY}"
+      }
+    },
+    "khipu-cloud": {
+      "url": "https://khipu.45-79-143-191.sslip.io/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:KHIPU_GATEWAY_TOKEN}"
       }
     }
   }
