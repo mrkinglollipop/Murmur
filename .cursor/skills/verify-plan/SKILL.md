@@ -155,7 +155,7 @@ Run **sequentially** — do not start the next round until the current round's P
 ## 6. After green
 
 - Does **not** authorize `approved — build` — Matt still says that explicitly for implementation
-- Offer `capture_v2.py` when plan verification produced durable decisions
+- Durable plan decisions: Stop hook writes on this Mac. Cloud / no hook: `khipu_capture`. Do not pipe `capture_v2.py`.
 
 ## Triggers
 

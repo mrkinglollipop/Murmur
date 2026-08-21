@@ -42,7 +42,7 @@ Equivalent to: audit your work in this thread → mandatory report → surgical 
 | In scope | Out of scope |
 |----------|--------------|
 | Paths touched in this thread (`Write` / `StrReplace` / `Delete`; orchestrator + subagents) | Pre-session uncommitted WIP (paths not touched in this thread) |
-| Session shell side effects (e.g. `capture_v2.py` outputs) | Unrelated workspace areas |
+| Session shell side effects (e.g. `khipu capture` / stop-hook → `episodes.jsonl`) | Unrelated workspace areas |
 | Load-bearing chat claims **from this thread** (Fable rule 2) | Whole-system explore (unless session touched many areas) |
 | Process rules followed in this thread (dispatch, build gate, read-only) | Drive-by fixes beyond audit findings |
 | Plan / todo / approved-build scope completion (§4 Plan completion) | Items outside this thread's stated scope |
@@ -280,7 +280,7 @@ Omit empty Findings/Themes sections only when truly none. Do **not** omit §4.1�
 
 ## 5. After the audit
 
-- Offer to capture: if findings are durable, fire `capture_v2.py` with `scope: audit` (or ask Matt first for trivial scans)
+- Offer to capture: if findings are durable, the Stop hook writes on this Mac (`khipu capture`). Cloud / no hook: `khipu_capture` with `scope: audit` (or ask Matt first for trivial scans). Do not pipe `capture_v2.py`.
 - Optional: write report to `/Volumes/Cloud Storage/Memory/conversations/topics/<slug>-audit.md` **only if Matt asks to persist**
 
 ## Triggers (non-exhaustive)
