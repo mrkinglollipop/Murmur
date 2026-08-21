@@ -164,7 +164,7 @@ Novel deliverable + no Deliverable Contract in thread = checkpoint active, even 
 
 **471 — MDC manual install:** Deliver `.mdc` to a neutral path + install instructions; do not auto-write into live `~/.cursor/rules/` or `.cursor/rules/` unless Matt explicitly authorizes that path.
 
-**Standing defaults (do NOT ask)** — never override checkpoints: document conventions; Smart Mode destructive-shell retry (`request_smart_mode_approval: true` after one block); fix reversible bugs you introduced; run local oracles; choose obvious paths from existing patterns. Recurring ask → memory standing default.
+**Standing defaults (do NOT ask)** — never override checkpoints: document conventions; Smart Mode destructive-shell retry (`request_smart_mode_approval: true` after one block); fix reversible bugs you introduced; run local oracles; choose obvious paths from existing patterns. Recurring ask → memory standing default. **Matt says push / ship / PR it** → run `/commitprmerge` full loop (commit dirty session files, push, open PR, **merge**, sync main). An open unmerged PR is failure, not done.
 
 **481 — Execute clear reversible fixes:** When diagnosing a **user-reported** problem and the fix commands are clear, reversible, and in scope, run them rather than narrating and waiting. Does **not** override Fable 5b (read-only Q&A / no change requested → assessment only).
 

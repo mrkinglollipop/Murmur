@@ -13,7 +13,7 @@ description: Session audit (this thread) with mandatory report, then loop audit�
 
 - **Default:** session audit — work done **only in this thread** (the chat where `/myauditandfix` was invoked):
   1. **Conversation writes** — paths touched by `Write`, `StrReplace`, or `Delete` in this thread (orchestrator + subagents).
-  2. **Session side effects** — paths changed by shell in this thread (e.g. `capture_v2.py` → `episodes.jsonl` + any topic pages it wrote).
+  2. **Session side effects** — paths changed by shell in this thread (e.g. `khipu capture` / stop-hook → `episodes.jsonl` + any topic pages).
   3. **Load-bearing chat claims**, plan/todos, and rule-compliance (dispatch, build gate, read-only discipline, **Deliverable Contract compliance + intent alignment vs first user build request**) **from this thread**.
 - **Not in scope:** pre-session uncommitted WIP — do **not** treat repo-wide `git diff` as the session audit surface. If a path was not touched in this thread, it is out of scope unless trailing text names it explicitly.
 - **Narrow:** trailing text after `/myauditandfix` narrows or adds a target (path, subsystem, constraint). Still run Phase 2 unless trailing text explicitly says audit-only / no fixes.
