@@ -11,6 +11,11 @@ struct SettingsView: View {
 
     var onReplayOnboarding: () -> Void = {}
 
+    /// PRO ONLY — account + entitlement. Wired from AppDelegate via RootView.
+    @ObservedObject var authFlow: AuthFlowController
+    @ObservedObject var entitlementStore: EntitlementStore
+    @State private var showSignInSheet = false
+
     /// Local editing buffer for the currently-selected cloud model's API
     /// key field. Not written to Keychain until Save is tapped.
     @State private var apiKeyInput: String = ""
@@ -292,6 +297,11 @@ struct SettingsView: View {
                         .font(Theme.body(12))
                         .foregroundColor(Theme.textSecondary)
                     }
+                }
+
+                // PRO ONLY — must not merge to `main`.
+                section(title: "Murmur Pro") {
+                    proSectionContent
                 }
 
                 section(title: "What's New") {
@@ -714,6 +724,60 @@ struct SettingsView: View {
                     .font(Theme.body(10))
                     .foregroundColor(Theme.amberText)
             }
+        }
+    }
+
+    // MARK: - Murmur Pro (PRO ONLY)
+
+    @ViewBuilder
+    private var proSectionContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            switch authFlow.state {
+            case .signedIn(let session):
+                HStack(spacing: 8) {
+                    Image(systemName: entitlementStore.isPro ? "checkmark.seal.fill" : "person.crop.circle")
+                        .foregroundColor(entitlementStore.isPro ? Theme.successGreen : Theme.textSecondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(session.email ?? "Signed in")
+                            .font(Theme.body(13))
+                            .foregroundColor(Theme.textPrimary)
+                        if entitlementStore.isRefreshing {
+                            Text("Checking subscription…")
+                                .font(Theme.body(11.5))
+                                .foregroundColor(Theme.textSecondary)
+                        } else {
+                            Text(entitlementStore.isPro ? "Murmur Pro is active" : "Free plan")
+                                .font(Theme.body(11.5))
+                                .foregroundColor(entitlementStore.isPro ? Theme.successGreen : Theme.textSecondary)
+                        }
+                    }
+                    Spacer()
+                    Button("Sign out") { authFlow.signOut() }
+                        .buttonStyle(.plain)
+                        .font(Theme.body(12))
+                        .foregroundColor(Theme.textSecondary)
+                }
+            default:
+                HStack(spacing: 10) {
+                    Text("Sign in to unlock Pro features like Clipboard history.")
+                        .font(Theme.body(12))
+                        .foregroundColor(Theme.textSecondary)
+                    Spacer()
+                    Button("Sign in") { showSignInSheet = true }
+                        .buttonStyle(.plain)
+                        .font(Theme.body(12, weight: .semibold))
+                        .foregroundColor(Theme.lavenderText)
+                        .padding(.horizontal, 12)
+                        .frame(height: 28)
+                        .murmurGlassCapsule(tint: Theme.selectionTint)
+                }
+            }
+        }
+        .sheet(isPresented: $showSignInSheet) {
+            SignInSheetView(authFlow: authFlow, onDismiss: { showSignInSheet = false })
+        }
+        .onChange(of: authFlow.state) { _, newState in
+            if case .signedIn = newState { showSignInSheet = false }
         }
     }
 

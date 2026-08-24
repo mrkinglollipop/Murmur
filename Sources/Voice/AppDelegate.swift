@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import Sparkle
 
@@ -47,6 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `application(_:open:)`.
     let authFlow = AuthFlowController()
 
+    /// PRO ONLY — server-authoritative "is this user Pro" answer. Auth state
+    /// drives refreshes; `isPro` drives the clipboard watcher and (via
+    /// RootView) the sidebar gate.
+    let entitlementStore = EntitlementStore()
+    private var proCancellables: Set<AnyCancellable> = []
+
     /// Lazily constructed so the window (and its SwiftUI hierarchy) is only
     /// built once, on first need — not at every Dock-icon click. First
     /// accessed from `openMainWindow()`, which runs after `modelManager` is
@@ -62,6 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboardStore: clipboardStore,
         settingsStore: settingsStore,
         modelManager: modelManager,
+        authFlow: authFlow,
+        entitlementStore: entitlementStore,
         transformCredentialsProvider: { [weak settingsStore] in
             settingsStore?.transformCredentials() ?? .unavailable
         },
@@ -92,12 +101,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before the activation tap starts accepting dictation.
         modelManager = ModelManager()
 
-        // PRO ONLY — clipboard manager. `activate()` resolves the blob key off
-        // the main thread; the watcher may start immediately because its tick
-        // no-ops (without consuming the pasteboard's changeCount) until the
-        // store reports it can capture.
-        clipboardStore.activate()
-        clipboardWatcher.start()
+        // PRO ONLY — the entitlement gate. Auth state changes drive an
+        // entitlement refresh; the entitlement drives the clipboard watcher.
+        // Nothing clipboard-related runs for a signed-out or free user.
+        authFlow.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .signedIn(let session):
+                    Task { await self.entitlementStore.refresh(session: session) }
+                case .signedOut:
+                    self.entitlementStore.clear()
+                case .waitingForBrowser, .exchanging, .failed:
+                    break
+                }
+            }
+            .store(in: &proCancellables)
+
+        entitlementStore.$isPro
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isPro in
+                guard let self else { return }
+                if isPro {
+                    // activate() is idempotent; the watcher's tick additionally
+                    // no-ops (without consuming changeCount) until the store
+                    // reports it can capture.
+                    self.clipboardStore.activate()
+                    self.clipboardWatcher.start()
+                } else {
+                    self.clipboardWatcher.stop()
+                }
+            }
+            .store(in: &proCancellables)
+
+        // Sessions persist a refresh token in the Keychain; without this call
+        // it was write-only and every relaunch was signed out.
+        Task { await authFlow.restoreSessionIfAvailable() }
 
         activationController = ActivationController()
         activationController?.useToggleLockProvider = { [weak self] in

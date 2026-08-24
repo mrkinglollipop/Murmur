@@ -60,6 +60,8 @@ struct RootView: View {
     @ObservedObject var scratchpadStore: ScratchpadStore
     @ObservedObject var clipboardStore: ClipboardStore
     @ObservedObject var settingsStore: SettingsStore
+    @ObservedObject var authFlow: AuthFlowController
+    @ObservedObject var entitlementStore: EntitlementStore
     @ObservedObject var modelManager: ModelManager
 
     /// Resolves the BYO cloud (OpenAI) key for Transforms' cloud fallback —
@@ -77,12 +79,17 @@ struct RootView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            SidebarNav(selectedTab: $selectedTab)
+            SidebarNav(selectedTab: $selectedTab, isPro: entitlementStore.isPro)
             Divider().overlay(Theme.hairline)
             content
         }
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+        .onChange(of: entitlementStore.isPro) { _, isPro in
+            if !isPro && selectedTab == .clipboard {
+                withAnimation(Theme.easeOutOrNil()) { selectedTab = .history }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .murmurSelectTab)) { notification in
             guard let raw = notification.userInfo?["tab"] as? String,
                   let tab = RootTab(rawValue: raw) else { return }
@@ -138,12 +145,25 @@ struct RootView: View {
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
                 case .clipboard:
-                    ClipboardView(store: clipboardStore)
+                    // Defense in depth: the sidebar row is already hidden for
+                    // free users, but .murmurSelectTab notifications can still
+                    // land here.
+                    if entitlementStore.isPro {
+                        ClipboardView(store: clipboardStore)
+                    } else {
+                        HistoryView(
+                            store: historyStore,
+                            dictionaryStore: dictionaryStore,
+                            asrEngineSelector: asrEngineSelector
+                        )
+                    }
                 case .settings:
                     SettingsView(
                         settingsStore: settingsStore,
                         modelManager: modelManager,
-                        onReplayOnboarding: onReplayOnboarding
+                        onReplayOnboarding: onReplayOnboarding,
+                        authFlow: authFlow,
+                        entitlementStore: entitlementStore
                     )
                 }
             }

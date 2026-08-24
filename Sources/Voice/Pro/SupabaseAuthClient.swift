@@ -17,7 +17,10 @@ struct SupabaseAuthClient {
     /// Anon key is a public client identifier by design (RLS is the guard);
     /// embedding it in source is normal Supabase practice.
     static let projectURL = URL(string: "https://bodfkiwketsdmkzndjme.supabase.co")!
-    static let anonKey = "sb_publishable_placeholder" // real key wired in phase-3 finish
+    // Publishable key: public by design (ships in every client); all access
+    // control lives in RLS policies server-side. Rotating it in the dashboard
+    // requires updating it here.
+    static let anonKey = "sb_publishable_zkTW2u3iywE1KeVGUZDPng_-z1RpKc_"
     static let redirectURI = "murmur://auth-callback"
 
     enum Provider: String {

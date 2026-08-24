@@ -5,6 +5,7 @@ import SwiftUI
 /// top-right segmented `navToggle` (see RootView).
 struct SidebarNav: View {
     @Binding var selectedTab: RootTab
+    var isPro: Bool
 
     private let width: CGFloat = 200
 
@@ -21,14 +22,9 @@ struct SidebarNav: View {
             // morph would need a shared .glassEffectID across the rows.
             GlassEffectContainer(spacing: 2) {
                 VStack(spacing: 2) {
-                    row(for: .history)
-                    row(for: .insights)
-                    row(for: .dictionary)
-                    row(for: .snippets)
-                    row(for: .style)
-                    row(for: .transforms)
-                    row(for: .scratchpad)
-                    row(for: .clipboard)
+                    ForEach(RootTab.mainTabs(isPro: isPro)) { tab in
+                        row(for: tab)
+                    }
                 }
             }
             .padding(.horizontal, 10)
