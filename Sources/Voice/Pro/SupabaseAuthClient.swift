@@ -64,12 +64,14 @@ struct SupabaseAuthClient {
     }
 
     /// The browser destination. Supabase drives the provider hop and lands
-    /// back on `redirectURI` with a single-use code (5-minute lifetime).
-    static func authorizeURL(provider: Provider, verifier: String) -> URL {
+    /// back on `redirectTo` with a single-use code (5-minute lifetime).
+    /// Default is the custom-scheme deep link; sign-in normally passes a
+    /// loopback URI instead so the browser tab gets a real page to render.
+    static func authorizeURL(provider: Provider, verifier: String, redirectTo: String = redirectURI) -> URL {
         var c = URLComponents(url: projectURL.appendingPathComponent("/auth/v1/authorize"), resolvingAgainstBaseURL: false)!
         c.queryItems = [
             URLQueryItem(name: "provider", value: provider.rawValue),
-            URLQueryItem(name: "redirect_to", value: redirectURI),
+            URLQueryItem(name: "redirect_to", value: redirectTo),
             URLQueryItem(name: "code_challenge", value: codeChallenge(for: verifier)),
             URLQueryItem(name: "code_challenge_method", value: "s256"),
         ]
@@ -85,7 +87,11 @@ struct SupabaseAuthClient {
     /// Extract the auth code from the deep link, or the error Supabase sent.
     static func parseCallback(_ url: URL) -> Result<String, AuthError> {
         guard isAuthCallback(url) else { return .failure(.callbackMissingCode) }
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        return parseCallbackItems(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+    }
+
+    /// Shared by the deep-link and loopback callback paths.
+    static func parseCallbackItems(_ items: [URLQueryItem]) -> Result<String, AuthError> {
         if let err = items.first(where: { $0.name == "error_description" })?.value
             ?? items.first(where: { $0.name == "error" })?.value {
             return .failure(.callbackCarriedError(err))

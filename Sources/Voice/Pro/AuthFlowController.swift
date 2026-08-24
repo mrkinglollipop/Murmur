@@ -28,6 +28,9 @@ final class AuthFlowController: ObservableObject {
     static let keychainAccount = "supabase-refresh-token"
     private let keychain: KeychainStore
     private var pendingVerifier: String?
+    /// Loopback listener for the browser redirect; nil while not signing in
+    /// or when every allow-listed port was taken (deep-link fallback).
+    private var loopbackServer: LoopbackRedirectServer?
 
     static let browserTimeout: TimeInterval = 300
 
@@ -56,20 +59,57 @@ final class AuthFlowController: ObservableObject {
         let verifier = SupabaseAuthClient.makeCodeVerifier()
         pendingVerifier = verifier
         state = .waitingForBrowser(provider: provider, startedAt: Date())
-        let url = SupabaseAuthClient.authorizeURL(provider: provider, verifier: verifier)
-        vlog("auth: opening browser for \(provider.rawValue) sign-in")
+
+        // Prefer a loopback redirect so the browser tab gets a real
+        // "you can close this tab" page instead of spinning on murmur://.
+        stopLoopbackServer()
+        loopbackServer = LoopbackRedirectServer.start { [weak self] result in
+            Task { @MainActor in self?.handleLoopbackResult(result) }
+        }
+        let redirect = loopbackServer?.redirectURI ?? SupabaseAuthClient.redirectURI
+
+        let url = SupabaseAuthClient.authorizeURL(provider: provider, verifier: verifier, redirectTo: redirect)
+        vlog("auth: opening browser for \(provider.rawValue) sign-in (redirect: \(loopbackServer == nil ? "deep link" : "loopback"))")
         NSWorkspace.shared.open(url)
     }
 
     func cancelSignIn() {
+        stopLoopbackServer()
         pendingVerifier = nil
         state = .signedOut
     }
 
     func expireIfTimedOut(now: Date = Date()) {
         if Self.waitingHasExpired(state: state, now: now) {
+            stopLoopbackServer()
             pendingVerifier = nil
             state = .failed("That took too long — try again.")
+        }
+    }
+
+    private func stopLoopbackServer() {
+        loopbackServer?.stop()
+        loopbackServer = nil
+    }
+
+    /// Loopback twin of `handleCallback` — the code arrived over the local
+    /// HTTP listener instead of the deep link.
+    private func handleLoopbackResult(_ result: Result<String, SupabaseAuthClient.AuthError>) {
+        stopLoopbackServer()
+        guard Self.shouldHandleCallback(state: state), let verifier = pendingVerifier else {
+            vlog("auth: dropping stray loopback callback (state not waiting)")
+            return
+        }
+        pendingVerifier = nil
+        switch result {
+        case .failure(let err):
+            vlog("auth: loopback callback carried error")
+            state = .failed(Self.userMessage(for: err))
+        case .success(let code):
+            state = .exchanging
+            Task { [weak self] in
+                await self?.exchange(code: code, verifier: verifier)
+            }
         }
     }
 
@@ -123,6 +163,7 @@ final class AuthFlowController: ObservableObject {
 
     func signOut() {
         keychain.deleteKey(for: Self.keychainAccount)
+        stopLoopbackServer()
         pendingVerifier = nil
         state = .signedOut
     }
