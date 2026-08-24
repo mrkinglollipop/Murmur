@@ -10,6 +10,7 @@ struct SidebarNav: View {
     @ObservedObject var authFlow: AuthFlowController
 
     @State private var showAccountSheet = false
+    @State private var isHoveringAccount = false
 
     private let width: CGFloat = 200
 
@@ -138,8 +139,13 @@ struct SidebarNav: View {
             .padding(.horizontal, 10)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
+            // Same hover treatment as NavRow — without it this is the one
+            // dead-feeling row in the sidebar.
+            .background(isHoveringAccount ? Theme.surface : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadiusCompact))
         }
         .buttonStyle(.plain)
+        .onHover { isHoveringAccount = $0 }
         .accessibilityLabel(accountLabel)
     }
 
