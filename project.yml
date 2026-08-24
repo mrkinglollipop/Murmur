@@ -96,9 +96,15 @@ targets:
         # installs a menu-bar status item and the floating HUD pill.
         NSMicrophoneUsageDescription: "Murmur uses the microphone to capture audio while you hold the push-to-talk key."
         NSAccessibilityUsageDescription: "Murmur uses Accessibility to inject transcribed text at your cursor and suppress the emoji picker while the push-to-talk key is held."
-        # Sparkle auto-update — public feed on Murmur-updates (source stays private)
-        SUFeedURL: "https://github.com/mrkinglollipop/Murmur-updates/releases/download/appcast/appcast.xml"
-        SUEnableAutomaticChecks: true
+        # PRO ONLY — no update feed on this branch, deliberately. The public
+        # appcast serves free builds, and a Pro build pointed at it would be
+        # overwritten by the next stock release with one click. No SUFeedURL
+        # means SparkleSupport classifies as .missingFeed and the updater is
+        # never constructed (auto AND manual checks). Pro builds update by
+        # rebuild until a private Pro appcast exists; restore these two keys
+        # (with the Pro feed URL) when it does. `main` keeps the public feed.
+        # SUFeedURL: (removed on pro — see above)
+        # SUEnableAutomaticChecks: true
         SUPublicEDKey: "avl49QCQMbC5HBkcNxpcRiFLqJrn2aTfCcAuaauEAoQ="
         # Input Monitoring: CGEvent tap apps request this at runtime via TCC; no Info.plist key required,
         # but we surface a helpful message via code when it is missing.
