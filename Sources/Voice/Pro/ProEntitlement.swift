@@ -129,12 +129,15 @@ final class EntitlementStore: ObservableObject {
 }
 
 extension RootTab {
-    /// The sidebar's main section, gated. `.clipboard` exists only for Pro —
-    /// this is THE entitlement gate for the clipboard manager's UI; the
-    /// watcher side is gated in AppDelegate off the same store.
-    static func mainTabs(isPro: Bool) -> [RootTab] {
-        var tabs: [RootTab] = [.history, .insights, .dictionary, .snippets, .style, .transforms, .scratchpad]
-        if isPro { tabs.append(.clipboard) }
-        return tabs
-    }
+    /// Pro-only tabs carry a "Pro" chip in the sidebar and, for free users,
+    /// show a locked teaser instead of the feature (Matt, 2026-08-24: locked
+    /// features stay visible "so people can see what they're missing").
+    /// The hard gates are at the content layer (RootView swaps in the teaser)
+    /// and the capture layer (AppDelegate never starts the watcher un-Pro).
+    var isProFeature: Bool { self == .clipboard }
+
+    /// The sidebar's main section — identical for free and Pro on purpose.
+    static let mainTabs: [RootTab] = [
+        .history, .insights, .dictionary, .snippets, .style, .transforms, .scratchpad, .clipboard
+    ]
 }

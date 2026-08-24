@@ -346,6 +346,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Clicking the Dock icon (app running, no visible windows) reopens the
     /// main window instead of doing nothing.
+    /// PRO ONLY — re-check the entitlement whenever the app comes forward, so
+    /// a grant (or revocation) lands without a relaunch. The first live test
+    /// required bouncing the app because sign-in was the only refresh trigger.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if case .signedIn(let session) = authFlow.state {
+            Task { await entitlementStore.refresh(session: session) }
+        }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             openMainWindow()

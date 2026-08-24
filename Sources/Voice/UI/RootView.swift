@@ -79,17 +79,12 @@ struct RootView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            SidebarNav(selectedTab: $selectedTab, isPro: entitlementStore.isPro)
+            SidebarNav(selectedTab: $selectedTab, isPro: entitlementStore.isPro, authFlow: authFlow)
             Divider().overlay(Theme.hairline)
             content
         }
         .background(Theme.bg)
         .preferredColorScheme(.dark)
-        .onChange(of: entitlementStore.isPro) { _, isPro in
-            if !isPro && selectedTab == .clipboard {
-                withAnimation(Theme.easeOutOrNil()) { selectedTab = .history }
-            }
-        }
         .onReceive(NotificationCenter.default.publisher(for: .murmurSelectTab)) { notification in
             guard let raw = notification.userInfo?["tab"] as? String,
                   let tab = RootTab(rawValue: raw) else { return }
@@ -145,17 +140,13 @@ struct RootView: View {
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
                 case .clipboard:
-                    // Defense in depth: the sidebar row is already hidden for
-                    // free users, but .murmurSelectTab notifications can still
-                    // land here.
+                    // Free users get the teaser, not the feature — and never
+                    // the data: the watcher only runs entitled, so there is
+                    // no history to protect behind this view.
                     if entitlementStore.isPro {
                         ClipboardView(store: clipboardStore)
                     } else {
-                        HistoryView(
-                            store: historyStore,
-                            dictionaryStore: dictionaryStore,
-                            asrEngineSelector: asrEngineSelector
-                        )
+                        ClipboardLockedView(authFlow: authFlow)
                     }
                 case .settings:
                     SettingsView(

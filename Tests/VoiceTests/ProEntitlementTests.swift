@@ -150,25 +150,25 @@ final class ProEntitlementTests: XCTestCase {
         )
     }
 
-    // MARK: - Sidebar gating
+    // MARK: - Sidebar and pro marking
 
-    func testFreeSidebarHasNoClipboard() {
-        let tabs = RootTab.mainTabs(isPro: false)
-        XCTAssertFalse(tabs.contains(.clipboard))
-        XCTAssertEqual(
-            tabs,
-            [.history, .insights, .dictionary, .snippets, .style, .transforms, .scratchpad]
-        )
+    /// The locked tab is deliberately visible to free users — the teaser IS
+    /// the ad. If this regresses to a hidden tab, free users stop seeing what
+    /// Pro offers; if the pro flag regresses, the content gate in RootView
+    /// stops swapping in the teaser.
+    func testClipboardIsAlwaysListedAndMarkedPro() {
+        XCTAssertEqual(RootTab.mainTabs.last, .clipboard)
+        XCTAssertEqual(RootTab.mainTabs.count, 8)
+        XCTAssertTrue(RootTab.clipboard.isProFeature)
     }
 
-    func testProSidebarAppendsClipboard() {
-        XCTAssertEqual(RootTab.mainTabs(isPro: true).last, .clipboard)
-        XCTAssertEqual(RootTab.mainTabs(isPro: true).count, 8)
+    func testOnlyClipboardIsMarkedPro() {
+        let pro = RootTab.allCases.filter(\.isProFeature)
+        XCTAssertEqual(pro, [.clipboard])
     }
 
-    /// Settings lives outside mainTabs (pinned row) — gating must not touch it.
+    /// Settings lives outside mainTabs (pinned row).
     func testSettingsIsNeverInMainTabs() {
-        XCTAssertFalse(RootTab.mainTabs(isPro: true).contains(.settings))
-        XCTAssertFalse(RootTab.mainTabs(isPro: false).contains(.settings))
+        XCTAssertFalse(RootTab.mainTabs.contains(.settings))
     }
 }

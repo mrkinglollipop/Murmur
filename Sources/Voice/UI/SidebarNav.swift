@@ -6,6 +6,10 @@ import SwiftUI
 struct SidebarNav: View {
     @Binding var selectedTab: RootTab
     var isPro: Bool
+    /// PRO ONLY — drives the account row (sign-in / account sheet).
+    @ObservedObject var authFlow: AuthFlowController
+
+    @State private var showAccountSheet = false
 
     private let width: CGFloat = 200
 
@@ -22,7 +26,7 @@ struct SidebarNav: View {
             // morph would need a shared .glassEffectID across the rows.
             GlassEffectContainer(spacing: 2) {
                 VStack(spacing: 2) {
-                    ForEach(RootTab.mainTabs(isPro: isPro)) { tab in
+                    ForEach(RootTab.mainTabs) { tab in
                         row(for: tab)
                     }
                 }
@@ -31,9 +35,25 @@ struct SidebarNav: View {
 
             Spacer()
 
+            accountRow
+                .padding(.horizontal, 10)
+                .padding(.bottom, 2)
+
             row(for: .settings)
                 .padding(.horizontal, 10)
                 .padding(.bottom, 14)
+        }
+        .sheet(isPresented: $showAccountSheet) {
+            if case .signedIn(let session) = authFlow.state {
+                AccountSheetView(
+                    authFlow: authFlow,
+                    email: session.email,
+                    isPro: isPro,
+                    onDismiss: { showAccountSheet = false }
+                )
+            } else {
+                SignInSheetView(authFlow: authFlow, onDismiss: { showAccountSheet = false })
+            }
         }
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity)
@@ -65,7 +85,7 @@ struct SidebarNav: View {
 
     @ViewBuilder
     private func row(for tab: RootTab) -> some View {
-        let navRow = NavRow(tab: tab, isSelected: selectedTab == tab) {
+        let navRow = NavRow(tab: tab, isSelected: selectedTab == tab, isLocked: tab.isProFeature && !isPro) {
             withAnimation(Theme.easeOutOrNil()) {
                 selectedTab = tab
             }
@@ -95,6 +115,59 @@ struct SidebarNav: View {
         case .settings: return "8"
         }
     }
+
+    /// Account entry on the main screen — signed-out shows a sign-in prompt,
+    /// signed-in shows the account email. Settings-only access was the
+    /// minimum door for the first live test, not the design.
+    private var accountRow: some View {
+        Button {
+            showAccountSheet = true
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: accountIcon)
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(width: 16)
+                Text(accountLabel)
+                    .font(Theme.body(13))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                if isPro { ProChip() }
+            }
+            .foregroundColor(Theme.textSecondary)
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accountLabel)
+    }
+
+    private var accountIcon: String {
+        if case .signedIn = authFlow.state { return "person.crop.circle.fill" }
+        return "person.crop.circle"
+    }
+
+    private var accountLabel: String {
+        if case .signedIn(let session) = authFlow.state {
+            return session.email ?? "Account"
+        }
+        return "Sign in"
+    }
+}
+
+/// Small coral "Pro" marker used beside Pro-only rows and features.
+struct ProChip: View {
+    var body: some View {
+        Text("Pro")
+            .font(Theme.body(9, weight: .semibold))
+            .foregroundColor(Theme.lavenderText)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1.5)
+            .background(Theme.lavender)
+            .clipShape(RoundedRectangle(cornerRadius: 3))
+            .accessibilityLabel("Pro feature")
+    }
 }
 
 /// One sidebar nav row: icon + label; coral-tinted Liquid Glass pill when
@@ -102,6 +175,7 @@ struct SidebarNav: View {
 private struct NavRow: View {
     let tab: RootTab
     let isSelected: Bool
+    let isLocked: Bool
     let action: () -> Void
 
     @State private var isHovering = false
@@ -124,6 +198,14 @@ private struct NavRow: View {
             Text(tab.title)
                 .font(Theme.body(14))
             Spacer(minLength: 0)
+            if tab.isProFeature {
+                if isLocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                ProChip()
+            }
         }
         .foregroundColor(isSelected ? Theme.lavenderText : Theme.textSecondary)
         .padding(.horizontal, 10)

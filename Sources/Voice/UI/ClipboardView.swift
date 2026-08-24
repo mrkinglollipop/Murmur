@@ -481,3 +481,59 @@ private struct ClipboardRow: View {
         return ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file)
     }
 }
+
+/// What a free user sees on the Clipboard tab: the pitch, not the feature.
+/// Deliberately visible (Matt, 2026-08-24) — the locked tab IS the ad. No
+/// history exists to protect here; the watcher never runs un-entitled.
+struct ClipboardLockedView: View {
+    @ObservedObject var authFlow: AuthFlowController
+
+    @State private var showSignInSheet = false
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 30))
+                .foregroundColor(Theme.primary.opacity(0.6))
+                .padding(.bottom, 2)
+
+            HStack(spacing: 7) {
+                Text("Clipboard history")
+                    .font(Theme.serifTitle(19, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                ProChip()
+            }
+
+            Text("Everything you copy — text, images, files — saved, searchable, and encrypted on this Mac. Passwords and other concealed items are never recorded.")
+                .font(Theme.body(12.5))
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
+
+            switch authFlow.state {
+            case .signedIn:
+                Text("Murmur Pro isn't active on this account yet.")
+                    .font(Theme.body(12))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.top, 6)
+            default:
+                Button {
+                    showSignInSheet = true
+                } label: {
+                    Text("Sign in to unlock")
+                        .font(Theme.body(13, weight: .semibold))
+                        .foregroundColor(Theme.lavenderText)
+                        .padding(.horizontal, 16)
+                        .frame(height: 32)
+                }
+                .buttonStyle(.plain)
+                .murmurGlassCapsule(tint: Theme.selectionTint)
+                .padding(.top, 6)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(isPresented: $showSignInSheet) {
+            SignInSheetView(authFlow: authFlow, onDismiss: { showSignInSheet = false })
+        }
+    }
+}

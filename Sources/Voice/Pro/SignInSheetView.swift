@@ -121,3 +121,58 @@ private struct ProviderButtonStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.8 : 1)
     }
 }
+
+/// Signed-in account sheet: who you are, what plan you're on, sign out.
+/// Reached from the sidebar account row.
+struct AccountSheetView: View {
+    @ObservedObject var authFlow: AuthFlowController
+    let email: String?
+    let isPro: Bool
+    var onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "person.crop.circle.fill")
+                .font(.system(size: 34))
+                .foregroundColor(Theme.primary)
+
+            VStack(spacing: 3) {
+                Text(email ?? "Signed in")
+                    .font(Theme.body(14, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                HStack(spacing: 5) {
+                    if isPro { ProChip() }
+                    Text(isPro ? "Murmur Pro" : "Free plan")
+                        .font(Theme.body(12))
+                        .foregroundColor(isPro ? Theme.successGreen : Theme.textSecondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("Sign out") {
+                    authFlow.signOut()
+                    onDismiss()
+                }
+                .buttonStyle(.plain)
+                .font(Theme.body(12))
+                .foregroundColor(Theme.textSecondary)
+                .padding(.horizontal, 14)
+                .frame(height: 30)
+                .murmurGlassCapsule()
+
+                Button("Done") { onDismiss() }
+                    .buttonStyle(.plain)
+                    .font(Theme.body(12, weight: .semibold))
+                    .foregroundColor(Theme.lavenderText)
+                    .padding(.horizontal, 14)
+                    .frame(height: 30)
+                    .murmurGlassCapsule(tint: Theme.selectionTint)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .padding(24)
+        .frame(width: 330)
+        .background(Theme.bg)
+    }
+}
