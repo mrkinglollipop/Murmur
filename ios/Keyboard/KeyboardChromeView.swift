@@ -18,7 +18,6 @@ final class KeyboardChromeView: UIView {
 
     private enum Page { case letters, numbers, symbols, emoji }
 
-    private let glassBackdrop = UIVisualEffectView(effect: UIGlassContainerEffect())
     private let topBar = AccessoryBarView()
     private let grid = UIView()
 
@@ -285,7 +284,6 @@ final class KeyboardChromeView: UIView {
         let bottomInset = metrics.bottomInset
 
         topBar.frame = CGRect(x: 0, y: 0, width: bounds.width, height: topHeight)
-        glassBackdrop.frame = bounds
 
         let showEmoji = page == .emoji && !sessionActive
         if showEmoji {
@@ -393,8 +391,6 @@ final class KeyboardChromeView: UIView {
     }
 
     private func configureChrome() {
-        insertSubview(glassBackdrop, at: 0)
-        glassBackdrop.isUserInteractionEnabled = false
         applyChromeShape()
         addSubview(topBar)
         topBar.onMic = { [weak self] in self?.onMic?() }
@@ -569,9 +565,6 @@ final class KeyboardChromeView: UIView {
         layer.maskedCorners = KeyboardChromeTokens.chromeTopCorners
         layer.cornerCurve = .continuous
         clipsToBounds = true
-        glassBackdrop.isHidden = true
-        glassBackdrop.layer.cornerRadius = 0
-        glassBackdrop.layer.maskedCorners = []
     }
 
     private func applyColors() {

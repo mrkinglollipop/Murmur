@@ -65,6 +65,11 @@ final class AudioRecorder {
     /// the silence guard.
     private var watchdogRetriedThisTake = false
 
+    /// Tink + HUD once the tap is actually live. `doStart` used to fire both
+    /// before `engine.start`, so the pill's idle bars looked like "listening"
+    /// while the first ~200ms of speech hit a dying or not-yet-started tap.
+    private var didAnnounceListeningThisTake = false
+
     init() {
         registerEngineConfigObserver()
         registerDefaultInputDeviceListener()
@@ -119,9 +124,23 @@ final class AudioRecorder {
             }
             return
         }
+        let currentDefault = Self.halDefaultInputDeviceID()
+        // Continuity appearing fires this listener ~80ms after a good start.
+        // Same Sound Input → keep the live tap. Tearing down anyway is the
+        // 195ms double-start that clips the front of the take (2026-08-19).
+        guard Self.shouldRebuildCaptureAfterInputReroute(
+            lastBound: lastBoundInputDeviceID,
+            currentDefault: currentDefault
+        ) else {
+            vlog("audio engine configuration change MID-HOLD — default unchanged, keeping live tap")
+            return
+        }
         watchdogRetriedThisTake = true
         vlog("audio engine configuration change MID-HOLD — rebuilding engine, restarting capture")
-        let failedID = lastBoundInputDeviceID
+        let failedID = Self.excludeAfterInputReroute(
+            lastBound: lastBoundInputDeviceID,
+            currentDefault: currentDefault
+        )
         teardownMicEngine()
         rebuildEngine(excluding: failedID)
         startMicCapture(isWatchdogRetry: true, excluding: failedID)
@@ -199,11 +218,13 @@ final class AudioRecorder {
                 defaultID: defaultID,
                 defaultIsAlive: defaultAlive,
                 defaultFormatLooksDead: defaultFormatDead,
+                defaultIsBuiltIn: defaultID.map(Self.audioDeviceIsBuiltIn) ?? false,
                 candidates: candidates.map {
                     (id: $0.id, isAlive: $0.isAlive, isBuiltIn: $0.isBuiltIn, formatLooksDead: $0.formatLooksDead)
                 },
                 excluding: excluded,
-                lastResortIDs: lastResortIDs
+                lastResortIDs: lastResortIDs,
+                allowLastResortFallback: allowLastResortInputFallbackProvider?() ?? false
             )
             guard let picked else {
                 lastBoundInputDeviceID = nil
@@ -428,10 +449,48 @@ final class AudioRecorder {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
-            return false
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr,
+           isLastResortInputTransport(transport)
+        {
+            return true
         }
-        return isLastResortInputTransport(transport)
+        // Continuity iPhone mic can report transport Unknown (system_profiler
+        // 2026-08-19) — the FourCC last-resort list misses it, so 145 won as
+        // a "live non-last-resort" device.
+        return isLastResortInputUID(audioDeviceCFString(deviceID, kAudioDevicePropertyDeviceUID))
+            || isLastResortInputUID(audioDeviceCFString(deviceID, kAudioObjectPropertyName))
+    }
+
+    private static func audioDeviceCFString(
+        _ deviceID: AudioDeviceID,
+        _ selector: AudioObjectPropertySelector
+    ) -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr,
+              size > 0
+        else { return "" }
+        var cfValue: Unmanaged<CFString>?
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &cfValue) == noErr else {
+            return ""
+        }
+        // HAL GetProperty copies a +1 CFString; takeRetainedValue consumes it.
+        guard let unmanaged = cfValue else { return "" }
+        return unmanaged.takeRetainedValue() as String
+    }
+
+    /// UID / name fragments for Continuity and Jump when transport is Unknown.
+    /// `iphone` is a whole letter-token so USB UIDs like XiphoneUSB do not match.
+    static func isLastResortInputUID(_ uid: String) -> Bool {
+        let folded = uid.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        if folded.contains("continuity") || folded.contains("jump desktop") {
+            return true
+        }
+        return folded.split { !$0.isLetter }.contains { $0 == "iphone" }
     }
 
     /// Pure decision (unit-tested): restart mid-hold only while the hold is
@@ -493,15 +552,21 @@ final class AudioRecorder {
     }
 
     /// Prefer a live HAL default whose input format is usable; if that ID is
-    /// dead, format-dead, or excluded, take a built-in mic, then any other
-    /// live input with a live format. Nil = no usable device.
+    /// dead, format-dead, or excluded, take a built-in mic (healthy, then
+    /// format-dead-but-alive, then the built-in default even if `!isAlive`,
+    /// then any built-in before Continuity). Other live non-last-resort
+    /// devices come after that so a Bluetooth aggregate cannot beat the
+    /// MacBook mic. Last-resort Continuity/virtual is opt-in
+    /// (`allowLastResortFallback`); nil = no usable device.
     static func pickAliveInputDevice(
         defaultID: AudioDeviceID?,
         defaultIsAlive: Bool,
         defaultFormatLooksDead: Bool = false,
+        defaultIsBuiltIn: Bool = false,
         candidates: [(id: AudioDeviceID, isAlive: Bool, isBuiltIn: Bool, formatLooksDead: Bool)],
         excluding: Set<AudioDeviceID> = [],
-        lastResortIDs: Set<AudioDeviceID> = []
+        lastResortIDs: Set<AudioDeviceID> = [],
+        allowLastResortFallback: Bool = false
     ) -> AudioDeviceID? {
         func isPickable(id: AudioDeviceID, isAlive: Bool, formatLooksDead: Bool) -> Bool {
             isAlive && !formatLooksDead && !excluding.contains(id)
@@ -522,6 +587,27 @@ final class AudioRecorder {
         }) {
             return builtIn.id
         }
+        // HAL can report the built-in as 0ch/"dead" while System Settings
+        // still lists it as the default. Bind will throw if it is truly dead;
+        // skipping it here falls through to Continuity and ruins the take.
+        if let builtIn = candidates.first(where: {
+            $0.isBuiltIn && $0.isAlive && !excluding.contains($0.id)
+        }) {
+            return builtIn.id
+        }
+        // Sound Input is the built-in, but HAL marked it dead/0ch — or
+        // omitted it from candidates (0 input streams). Try that ID before
+        // any other live device. `defaultIsBuiltIn` is the HAL transport on
+        // the default ID itself; candidate membership is a fallback so
+        // existing tests that only mark `isBuiltIn` on the tuple still pass.
+        // Bind still throws if it is truly dead.
+        if let defaultID,
+           !excluding.contains(defaultID),
+           defaultIsBuiltIn
+            || candidates.contains(where: { $0.id == defaultID && $0.isBuiltIn })
+        {
+            return defaultID
+        }
         if let preferred = candidates.first(where: {
             !lastResortIDs.contains($0.id) && isPickable(
                 id: $0.id,
@@ -531,8 +617,16 @@ final class AudioRecorder {
         }) {
             return preferred.id
         }
+        // DeviceIsAlive false-negative on a built-in that is not the default
+        // must still beat Continuity. Do not pick a dead USB mic here.
+        if let builtIn = candidates.first(where: {
+            $0.isBuiltIn && !excluding.contains($0.id)
+        }) {
+            return builtIn.id
+        }
         return candidates.first(where: {
             isPickable(id: $0.id, isAlive: $0.isAlive, formatLooksDead: $0.formatLooksDead)
+                && (allowLastResortFallback || !lastResortIDs.contains($0.id))
         })?.id
     }
 
@@ -544,6 +638,31 @@ final class AudioRecorder {
         persistedFailedID: AudioDeviceID?
     ) -> AudioDeviceID? {
         explicit ?? persistedFailedID
+    }
+
+    /// Mid-hold HAL/config reroute: exile lastBound only when it is no
+    /// longer Sound Input. Continuity Capture appearing leaves default 81
+    /// in place; treating 81 as failed is what rebound 81 → 145 after a
+    /// successful `engine.start` on 0.1.39.
+    /// `currentDefault == nil` is a transient HAL miss (Continuity
+    /// ~80ms config-change window), not "81 is gone" — do not exile.
+    static func excludeAfterInputReroute(
+        lastBound: AudioDeviceID?,
+        currentDefault: AudioDeviceID?
+    ) -> AudioDeviceID? {
+        guard let lastBound, let currentDefault else { return nil }
+        if lastBound == currentDefault { return nil }
+        return lastBound
+    }
+
+    /// Tear down + restart capture only when lastBound is a *different*
+    /// concrete device than Sound Input. Same-default (Continuity appearing)
+    /// and nil HAL default must not clip a live take.
+    static func shouldRebuildCaptureAfterInputReroute(
+        lastBound: AudioDeviceID?,
+        currentDefault: AudioDeviceID?
+    ) -> Bool {
+        excludeAfterInputReroute(lastBound: lastBound, currentDefault: currentDefault) != nil
     }
 
     /// Drop the persisted exclude once bind landed on a different device.
@@ -651,6 +770,10 @@ final class AudioRecorder {
     /// each call site rather than cached. Wired by `AppDelegate` to
     /// `SettingsStore.playDictationSound`.
     var playDictationSoundProvider: (() -> Bool)?
+
+    /// Continuity / virtual last-resort fallback. Wired by `AppDelegate` to
+    /// `SettingsStore.allowLastResortInputFallback`. Default off.
+    var allowLastResortInputFallbackProvider: (() -> Bool)?
 
     /// Short label for the HUD key chip (e.g. "fn", "⌥"). Wired by
     /// `AppDelegate` to `SettingsStore.activationKeyOption.hudLabel`.
@@ -1228,14 +1351,7 @@ final class AudioRecorder {
         }
         isStopping = false
         streamingCoordinator.resetStreamTextLatch()
-        playFeedbackSound(named: "Tink")
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            if let label = self.activationKeyLabelProvider?() {
-                self.hud.setActivationKeyLabel(label)
-            }
-            self.hud.show()
-        }
+        didAnnounceListeningThisTake = false
         startTime = Date()
 
         if streamingCoordinator.tryStartXAI(asrSelector: asrSelector, startMicCapture: { [weak self] in
@@ -1257,6 +1373,8 @@ final class AudioRecorder {
             fallbackToFileBased: { [weak self] in self?.startMicCapture() }
         ) {
             // WhisperKit owns the mic — still poll secure input mid-hold.
+            // No AVAudioEngine success callback on this path; announce now.
+            announceListeningIfNeeded()
             promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
             return
@@ -1549,26 +1667,48 @@ final class AudioRecorder {
                 engineNeedsRebuild: engineNeedsRebuild,
                 alreadyRetried: watchdogRetriedThisTake
             ) {
-                vlog("engine.start succeeded but input changed during start — rebuilding, excluding last-bound")
-                watchdogRetriedThisTake = true
-                let failedID = lastBoundInputDeviceID
-                teardownMicEngine()
-                startMicCapture(isWatchdogRetry: true, excluding: failedID)
-                return
+                let currentDefault = Self.halDefaultInputDeviceID()
+                if Self.shouldRebuildCaptureAfterInputReroute(
+                    lastBound: lastBoundInputDeviceID,
+                    currentDefault: currentDefault
+                ) {
+                    vlog("engine.start succeeded but input changed during start — rebuilding, excluding last-bound")
+                    watchdogRetriedThisTake = true
+                    let failedID = Self.excludeAfterInputReroute(
+                        lastBound: lastBoundInputDeviceID,
+                        currentDefault: currentDefault
+                    )
+                    teardownMicEngine()
+                    startMicCapture(isWatchdogRetry: true, excluding: failedID)
+                    return
+                }
+                // Continuity / same-default: a stale rebuild flag must not
+                // clip this start. Keep the live tap.
+                engineNeedsRebuild = false
             }
             if Self.shouldFailClosedAfterStartSuccessWithPendingRebuild(
                 engineNeedsRebuild: engineNeedsRebuild,
                 alreadyRetried: watchdogRetriedThisTake
             ) {
-                excludeOnNextStartDeviceID = Self.persistedExcludeOnFailClosed(
-                    candidate: lastBoundInputDeviceID,
-                    existing: excludeOnNextStartDeviceID
-                )
-                failMicStart(reason: "input changed during start after retry")
-                return
+                let currentDefault = Self.halDefaultInputDeviceID()
+                if Self.shouldRebuildCaptureAfterInputReroute(
+                    lastBound: lastBoundInputDeviceID,
+                    currentDefault: currentDefault
+                ) {
+                    excludeOnNextStartDeviceID = Self.persistedExcludeOnFailClosed(
+                        candidate: lastBoundInputDeviceID,
+                        existing: excludeOnNextStartDeviceID
+                    )
+                    failMicStart(reason: "input changed during start after retry")
+                    return
+                }
+                engineNeedsRebuild = false
             }
             excludeOnNextStartDeviceID = nil
-            logger.info("AVAudioEngine started — recording…")
+            // warning: unified log drops `info`, so the hold-start oracle
+            // never saw this line (0.1.38 hold classified as NO HOLD).
+            logger.warning("AVAudioEngine started — recording")
+            announceListeningIfNeeded()
             promotePendingHeldCaretToActive()
             startSecureInputPollTimer()
             armZeroBufferWatchdog()
@@ -2259,6 +2399,22 @@ final class AudioRecorder {
     private func playFeedbackSound(named name: NSSound.Name) {
         guard playDictationSoundProvider?() == true else { return }
         NSSound(named: name)?.play()
+    }
+
+    /// Tink + HUD after the mic is actually capturing. Once per hold so a
+    /// real HAL reroute restart does not chirp twice.
+    private func announceListeningIfNeeded() {
+        guard !didAnnounceListeningThisTake else { return }
+        didAnnounceListeningThisTake = true
+        playFeedbackSound(named: "Tink")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard self.wantsRecording else { return }
+            if let label = self.activationKeyLabelProvider?() {
+                self.hud.setActivationKeyLabel(label)
+            }
+            self.hud.show()
+        }
     }
 
     // MARK: - Permissions

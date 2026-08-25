@@ -56,7 +56,8 @@ Scratchpad, Settings). Dictionary terms go to Scribe as `keyterms` and are
 applied again after STT. Snippets expand after Style. Style is local caps /
 punctuation (not an LLM). `no_verbatim` strips fillers. Action Button is the
 App Shortcut “Start Dictation” (clipboard on stop). Host-return interstitial
-still covers the app during a gated keyboard take.
+still covers the app during a gated keyboard take. Settings → Return apps is
+a 4-column grid: add any installed app, drag to rearrange, minus to remove.
 
 > Distribution note: the keyboard launch/return handoff currently relies on responder-chain and private system APIs. This build is for private sideload testing and is not App Store-ready.
 

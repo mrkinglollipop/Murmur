@@ -32,6 +32,13 @@ final class PhoneticMatcherTests: XCTestCase {
         // match the strict 0.6 bar applies and the pair is rejected.
         XCTAssertTrue(PhoneticMatcher.guardAccepts(heard: "hyzer", candidate: "Heiser", primaryKeyMatch: true))
         XCTAssertFalse(PhoneticMatcher.guardAccepts(heard: "hyzer", candidate: "Heiser", primaryKeyMatch: false))
+        XCTAssertFalse(PhoneticMatcher.guardAccepts(heard: "line", candidate: "Linode"))
+        XCTAssertFalse(PhoneticMatcher.guardAccepts(heard: "land", candidate: "Linode", primaryKeyMatch: true))
+        XCTAssertTrue(PhoneticMatcher.guardAccepts(heard: "Tari", candidate: "Tauri"))
+        XCTAssertTrue(PhoneticMatcher.isProtectedHeardToken("Line"))
+        XCTAssertTrue(PhoneticMatcher.isProtectedEnglishPhrase("line out"))
+        XCTAssertFalse(PhoneticMatcher.isProtectedEnglishPhrase("Get ignore"))
+        XCTAssertFalse(PhoneticMatcher.isProtectedHeardToken("hyzer"))
     }
 
     private func assertEncode(

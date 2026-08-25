@@ -249,6 +249,20 @@ struct SettingsView: View {
 
                         Divider().overlay(Theme.hairline)
 
+                        Toggle(
+                            "Allow iPhone and virtual mics as fallback",
+                            isOn: $settingsStore.allowLastResortInputFallback
+                        )
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("Off (default): stay on the MacBook mic. Continuity / Jump Desktop only if you pick them as Sound Input in System Settings. On: Murmur may fall back to those when the built-in looks dead.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+
+                        Divider().overlay(Theme.hairline)
+
                         Toggle("Smart leading space", isOn: $settingsStore.smartLeadingSpace)
                             .toggleStyle(.switch)
                             .font(Theme.body(12))

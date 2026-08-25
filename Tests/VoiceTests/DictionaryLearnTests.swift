@@ -79,4 +79,36 @@ final class DictionaryLearnTests: XCTestCase {
         )
         XCTAssertTrue(learned.isEmpty)
     }
+
+    /// 2026-08-25 incident: ASR wrote "Type" for "the"; the user's hand-fix
+    /// was offered as a learned rule mapping "Type" -> "the", which would have
+    /// rewritten every legitimate "type" from then on. "type" is protected
+    /// heard-side, so neither direction of that pair can be learned.
+    /// (Typo fixes TO a function word, like "teh" -> "the", stay learnable.)
+    func testLearnRefusesProtectedEnglishTerm() {
+        let store = makeStore()
+        for userInitiated in [true, false] {
+            let learned = store.learn(
+                from: "I like Type keyboard",
+                to: "I like the keyboard",
+                userInitiated: userInitiated
+            )
+            XCTAssertTrue(learned.isEmpty, "userInitiated=\(userInitiated)")
+        }
+        XCTAssertFalse(store.entries.contains { $0.term.caseInsensitiveCompare("the") == .orderedSame })
+    }
+
+    /// "type" is protected on the heard side too: no learned or phonetic rule
+    /// may steal it as a variant of some jargon term.
+    func testTypeIsProtectedHeardToken() {
+        XCTAssertTrue(PhoneticMatcher.isProtectedHeardToken("type"))
+        XCTAssertTrue(PhoneticMatcher.isProtectedHeardToken("Type"))
+        let store = makeStore()
+        let learned = store.learn(
+            from: "use type here",
+            to: "use Tauri here",
+            userInitiated: true
+        )
+        XCTAssertTrue(learned.isEmpty)
+    }
 }

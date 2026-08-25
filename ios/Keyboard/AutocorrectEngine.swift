@@ -76,13 +76,17 @@ enum AutocorrectEngine {
 
     /// `span.count` if a loop-delete is safe, otherwise `0`. Never a partial
     /// count: deleting fewer characters then inserting a correction garbles.
+    /// Long words are allowed when the context has a real space (`say
+    /// congratulations`). Newlines are not spaces: `Hi\nhellohowareyou` is
+    /// still a glued blob. A whitespace-free context longer than a short
+    /// word is the host stripping spaces — all-or-nothing.
     static func allowedDeleteCount(span: String, inBeforeInput context: String) -> Int {
         guard canReplaceSpan(span, inBeforeInput: context) else { return 0 }
         if span.count > maxDeleteLoop { return 0 }
         let word = span.trimmingCharacters(in: .whitespacesAndNewlines)
-        let contextHasWhitespace = context.contains { $0.isWhitespace || $0.isNewline }
-        if !contextHasWhitespace, word.count > maxPlausibleWordLength {
-            return 0
+        if word.count > maxPlausibleWordLength {
+            let contextHasSpace = context.contains { $0 == " " || $0 == "\t" }
+            if !contextHasSpace { return 0 }
         }
         return span.count
     }
@@ -94,11 +98,72 @@ enum AutocorrectEngine {
         return (beforeCount - afterCount) > 2
     }
 
+    enum DocumentMutationDecision: Equatable {
+        case allow
+        case deny
+        case collapseOneCharacterSelection
+    }
+
+    /// `insertText` / `deleteBackward` replace the whole selection. A
+    /// selected clause plus a keystroke wipes the sentence. Collapse is
+    /// only a 1-char caret nudge when overwrite is disallowed — never a
+    /// multi-char wipe. Side effect stays in KeyboardViewController.
+    static func documentMutationDecision(
+        selected: String?,
+        allowSingleCharacterSelection: Bool
+    ) -> DocumentMutationDecision {
+        guard let selected, !selected.isEmpty else { return .allow }
+        if selected.count == 1 {
+            return allowSingleCharacterSelection ? .allow : .collapseOneCharacterSelection
+        }
+        return .deny
+    }
+
+    /// UIKit: a real highlight sits after `documentContextBeforeInput`, so
+    /// `before.hasSuffix(selected)` is false — allow (phrase, long word, or
+    /// short word). A host lie leaves the caret at the end with stale
+    /// `selectedText` still in `before` (`hasSuffix`). Abort those suffix
+    /// lies when `selected` is a sentence/phrase (whitespace), long glue
+    /// (`count > maxPlausibleWordLength`), or a glued blob that is not the
+    /// last whitespace-delimited token (`hellothereyo`). Allow the last
+    /// token when count ≤ 12 (`world` in `say world`) so Delete can remove
+    /// a host-reported last word.
+    static func shouldAbortMultiCharDelete(selected: String, before: String) -> Bool {
+        guard selected.count > 1 else { return false }
+        guard before.hasSuffix(selected) else { return false }
+        if selected.contains(where: { $0.isWhitespace || $0.isNewline }) {
+            return true
+        }
+        if selected.count > maxPlausibleWordLength {
+            return true
+        }
+        guard before.contains(where: { $0.isWhitespace || $0.isNewline }) else {
+            return true
+        }
+        let lastToken = before.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).last
+            .map(String.init)
+        return lastToken != selected
+    }
+
     /// Double-space → period only when the caret follows `letter/digit` + space.
     static func shouldReplaceDoubleSpaceWithPeriod(beforeInput: String) -> Bool {
         guard beforeInput.last == " ",
               let preceding = beforeInput.dropLast().last else { return false }
         return preceding.isLetter || preceding.isNumber
+    }
+
+    /// After deleting the trailing space for `. `, the host must have removed
+    /// only that space (or a single combining mark). A bigger drop means a
+    /// hidden selection or word-delete already ate the sentence.
+    static func isSafePeriodSpaceRemoval(beforeCount: Int, afterCount: Int) -> Bool {
+        let removed = beforeCount - afterCount
+        return removed >= 1 && removed <= 2
+    }
+
+    /// Remaining context after a safe space-delete must still end on a word.
+    static func shouldInsertPeriodAfterRemovingSpace(beforeInput: String) -> Bool {
+        guard let last = beforeInput.last else { return false }
+        return last.isLetter || last.isNumber
     }
 
     /// High-confidence mistypes only. Fuzzy `UITextChecker` guesses stay in the bar.
@@ -549,6 +614,26 @@ enum AutocorrectEngine {
         guard let last = beforeInput.last else { return false }
         if last.isWhitespace || last.isNewline { return false }
         return !"([{\"'“‘".contains(last)
+    }
+
+    /// Join dictation takes without glue. Leading space when the caret follows
+    /// a word; trailing space so the next take still separates if the host
+    /// reports an empty `documentContextBeforeInput` after bounce-back.
+    static func preparedDictationInsert(
+        transcript: String,
+        beforeInput: String,
+        trailingSpace: Bool
+    ) -> String {
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        var output = text
+        if needsLeadingSpace(beforeInput: beforeInput) {
+            output = " " + output
+        }
+        if trailingSpace, output.last?.isWhitespace != true {
+            output += " "
+        }
+        return output
     }
 
     /// Period, comma, and friends replace the automatic trailing space after a swipe.

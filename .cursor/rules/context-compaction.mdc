@@ -15,23 +15,13 @@ Skip when there is an unanswered question, in-flight work, or an obvious next st
 
 ## Before marking a compact point
 
-If anything substantive happened since the last capture, fire capture before appending the marker (Shell with `required_permissions: ["full_network"]`):
-
-```bash
-cat <<'EOF' | PYTHONPATH="/Volumes/Cloud Storage/Claude/.python_libs:/Volumes/Cloud Storage/Claude/scripts/_clients" python3 "/Volumes/Cloud Storage/Memory/conversations/scripts/capture_v2.py"
-{"summary":"..."}
-EOF
-```.
+If anything substantive happened since the last capture, rely on the PreCompact
+/`khipu-stop-hook` writer (hub mode). Do **not** pipe `capture_v2.py`. Cloud
+agents with no hook: `khipu_capture` before the marker.
 
 ## User-initiated summarize
 
-When Matt mentions summarizing, compressing, or hitting context limits — or asks to capture before summarize — fire a full capture immediately:
-
-```bash
-cat <<'EOF' | PYTHONPATH="/Volumes/Cloud Storage/Claude/.python_libs:/Volumes/Cloud Storage/Claude/scripts/_clients" python3 "/Volumes/Cloud Storage/Memory/conversations/scripts/capture_v2.py"
-{"summary":"..."}
-EOF
-```; do not wait for the next cadence tick.
+When Matt mentions summarizing, compressing, or hitting context limits — or asks to capture before summarize — the PreCompact hook captures on this Mac. Cloud / no hook: `khipu_capture` immediately; do not wait for the next cadence tick. Do **not** pipe `capture_v2.py`.
 
 Manual compaction in Cursor: **`/summarize`** or **`/compress`** (not `/compact`). Requires a **native Cursor model** — OpenRouter models do not support summarize reliably.
 

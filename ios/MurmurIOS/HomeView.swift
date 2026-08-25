@@ -35,9 +35,12 @@ struct HomeView: View {
     private var hero: some View {
         VStack(alignment: .leading, spacing: 8) {
             if history.wordCount == 0 {
+                // "on" = set up and ready (key + mic). `session.isArmed` is a
+                // transient take-in-flight flag — it read "off" whenever the
+                // app was opened between takes, while the keyboard worked fine.
                 (
                     Text("Murmur is ")
-                        + Text(session.isArmed ? "on" : "off")
+                        + Text(setupIncomplete ? "off" : "on")
                         .foregroundColor(AppTheme.coral)
                 )
                 .font(AppTheme.serif(36))

@@ -139,7 +139,7 @@ Skip if encode table empty or `audit-only`.
 4. If `$CURSOR_ROOT/.cursor/**` touched: `bash "$CURSOR_ROOT/.cursor/hooks/smoke_harness_full.sh"` or targeted smoke
 5. If plugin/commands/rules changed: `bash "$CURSOR_ROOT/.cursor/scripts/sync-harness.sh"`
 6. `/commitprmerge` per affected git root
-7. `capture_v2` from `$CURSOR_ROOT`
+7. Local Mac: do not pipe `capture_v2`; `khipu-stop-hook` owns the write. Cloud: `khipu_capture`.
 
 **Removable gap (max once):** if Phase 3 lists in-scope fixable gap (forgot re-run, encode skipped), fix once and re-emit Phase 3.
 

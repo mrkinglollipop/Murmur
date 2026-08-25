@@ -56,7 +56,7 @@ Skip when no `encode` rows or trailing `audit-only`.
 3. Prefer product Auto / Task for large hook edits; orchestrator runs oracle. No LOC force-dispatch.
 4. Re-run changed oracle (3-run cap); smoke if `$CURSOR_ROOT/.cursor/**` touched
 5. `sync-harness.sh` if plugin/commands/rules changed
-6. `/commitprmerge` per affected git root; `capture_v2`
+6. `/commitprmerge` per affected git root (hook owns capture; do not pipe `capture_v2`)
 
 **Write authorization:** harness SSOT only — see SKILL §2. Includes `$REPO_ROOT/.cursor/**` and `~/Projects/*` harness when thread touched repo.
 

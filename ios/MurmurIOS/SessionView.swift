@@ -24,70 +24,72 @@ struct SessionView: View {
 
     /// Match Wispr’s “Flow is on / swipe bottom edge” interstitial — Murmur coral.
     private var swipeInterstitial: some View {
-        ZStack(alignment: .bottom) {
+        let returnIDs = AppGroupStore.interstitialReturnAppIDs
+        return ZStack(alignment: .bottom) {
             Color.white.ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                Spacer(minLength: 36)
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 36)
 
-                VStack(spacing: 12) {
-                    (Text("Murmur is ") + Text("on").foregroundColor(coral))
-                        .font(.system(size: 36, weight: .bold))
-                        .foregroundStyle(ink)
+                    VStack(spacing: 12) {
+                        (Text("Murmur is ") + Text("on").foregroundColor(coral))
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundStyle(ink)
 
-                    Text("Swipe back to your app, then speak")
-                        .font(.system(size: 17, weight: .regular))
-                        .foregroundStyle(muted)
-                        .multilineTextAlignment(.center)
+                        Text("Swipe back to your app, then speak")
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(muted)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 28)
+                    }
+
+                    Spacer(minLength: 20)
+
+                    PhoneSwipeDiagram(coral: coral, reduceMotion: reduceMotion)
+                        .padding(.horizontal, 52)
+
+                    Spacer(minLength: 24)
+
+                    (
+                        Text("Swipe right across the ")
+                            + Text("bottom edge").foregroundColor(coral)
+                            + Text(" to continue")
+                    )
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(ink)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 28)
+
+                    if !returnIDs.isEmpty {
+                        Text("Or jump back to an app")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(muted)
+                            .padding(.top, 22)
+
+                        JumpBackAppGrid(
+                            bundleIDs: returnIDs,
+                            onSelect: { session.returnToApp($0) }
+                        )
                         .padding(.horizontal, 28)
+                        .padding(.top, 12)
+                    }
+
+                    Button("Discard") {
+                        session.discard()
+                    }
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(muted)
+                    .padding(.top, 28)
+                    .padding(.bottom, 108)
                 }
-
-                Spacer(minLength: 20)
-
-                PhoneSwipeDiagram(coral: coral, reduceMotion: reduceMotion)
-                    .padding(.horizontal, 52)
-
-                Spacer(minLength: 24)
-
-                (
-                    Text("Swipe right across the ")
-                        + Text("bottom edge").foregroundColor(coral)
-                        + Text(" to continue")
-                )
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(ink)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 28)
-
-                Button {
-                    session.returnToMessages()
-                } label: {
-                    Text("Continue in Messages")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(coral))
-                }
-                .padding(.horizontal, 40)
-                .padding(.top, 28)
-                .accessibilityHint("Returns to Messages and remembers this app for the next dictation.")
-
-                Spacer(minLength: 48)
-
-                Button("Discard") {
-                    session.discard()
-                }
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(muted)
-                .padding(.bottom, 72)
             }
 
             BottomSwipeCoach(coral: coral, reduceMotion: reduceMotion)
         }
         .ignoresSafeArea(edges: .bottom)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Murmur is on. Swipe right across the bottom edge to return to your app, or continue in Messages, then speak.")
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Murmur is on. Swipe right across the bottom edge to return to your app, or choose an app, then speak.")
     }
 
     private var activeSession: some View {

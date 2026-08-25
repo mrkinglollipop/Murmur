@@ -71,6 +71,14 @@ final class AutocorrectControllerTests: XCTestCase {
             "hosts that strip spaces must not look like one giant word"
         )
         XCTAssertEqual(
+            AutocorrectEngine.allowedDeleteCount(
+                span: "hellohowareyou",
+                inBeforeInput: "Hi\nhellohowareyou"
+            ),
+            0,
+            "a prior newline must not make a glued sentence look like one word"
+        )
+        XCTAssertEqual(
             AutocorrectEngine.wordSpan(beforeInput: "hellohowareyou"),
             "hellohowareyou"
         )
@@ -83,7 +91,16 @@ final class AutocorrectControllerTests: XCTestCase {
         XCTAssertFalse(AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: 5, afterCount: 4))
         XCTAssertEqual(
             AutocorrectEngine.allowedDeleteCount(span: "congratulations", inBeforeInput: "congratulations"),
-            0
+            0,
+            "a long token with no space in context is a glued blob"
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.allowedDeleteCount(
+                span: "congratulations",
+                inBeforeInput: "say congratulations"
+            ),
+            15,
+            "a legitimate long word after a space must still be deletable"
         )
         XCTAssertTrue(AutocorrectEngine.shouldReplaceDoubleSpaceWithPeriod(beforeInput: "you "))
         XCTAssertFalse(AutocorrectEngine.shouldReplaceDoubleSpaceWithPeriod(beforeInput: "you  "))

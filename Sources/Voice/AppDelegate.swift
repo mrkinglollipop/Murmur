@@ -289,6 +289,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activationController?.audioRecorder.playDictationSoundProvider = { [weak self] in
             self?.settingsStore.playDictationSound ?? false
         }
+        activationController?.audioRecorder.allowLastResortInputFallbackProvider = { [weak self] in
+            self?.settingsStore.allowLastResortInputFallback ?? false
+        }
 
         activationController?.audioRecorder.activationKeyLabelProvider = { [weak self] in
             self?.settingsStore.activationKeyOption.hudLabel ?? "fn"

@@ -9,7 +9,12 @@ description: "Ship all session changes in the current repo: branch, commit, push
 
 Equivalent to explicit authorization for commit, push, PR create, and merge in one command.
 
-**Incomplete ship is failure.** Local commit alone is **not** done. Never tell Matt the work is "committed" / "shipped" / "caught up" unless push + PR + merge (or an explicit **INCOMPLETE** stop with the blocker) completed with shell/`gh` evidence.
+**Incomplete ship is failure.** Local commit alone is **not** done. An **open** PR is **not** done. Never tell Matt the work is "committed" / "shipped" / "caught up" unless push + PR + **merge** (or an explicit **INCOMPLETE** stop with the blocker) completed with shell/`gh` evidence.
+
+**Matt said push (HARD).** `push`, `ship`, `PR it`, or `/commitprmerge` authorizes the **full** loop: commit dirty session files → push → open PR → **merge on GitHub** → sync local `main`.
+- Dirty session files + "push" → **commit first**. Never `git push` while in-scope work is still uncommitted.
+- Stopping after `gh pr create` is **INCOMPLETE**, not success. Matt treats unmerged PRs as a mess he already thought landed.
+- If a merge gate blocks, lead with **INCOMPLETE** and the blocker — do not imply GitHub is caught up.
 
 ## Where this command lives
 
@@ -43,13 +48,13 @@ Operate in the git repo containing the cwd (`git rev-parse --show-toplevel`). **
 
 ## Push-audit gate (HARD — read before push)
 
-`beforeShellExecution` → `push_audit_gate.py` **allows `git commit`, denies `git push`** until this conversation has a green `/myauditandfix` marker (or bypass).
+`beforeShellExecution` → `push_audit_gate.py` **allows `git commit`, denies `git push`** until this conversation has a green `/audit` or `/myauditandfix` marker (or bypass).
 
 | Marker | Meaning |
 |--------|---------|
-| `/tmp/.cursor_audit_ok_<conversation_id>` | Stop stamped after `Green: Y` (+ Task pipeline evidence when `/myauditandfix` is pending) |
+| `/tmp/.cursor_audit_ok_<conversation_id>` | Stop stamped after `Green: Y` (+ Task pipeline evidence when `/audit` or `/myauditandfix` is pending) |
 | `/tmp/.cursor_audit_ok_ws_<workspace>` | Workspace-root fallback OK |
-| Bypass phrases | Matt says `push without audit` / `skip audit` / `bypass push audit` as its **own line** (option-list pastes do not stamp) |
+| Bypass phrases | Matt says `push without audit` / `skip audit` / `bypass push audit` **anywhere in the prompt** (inline is enough). Option-list / INCOMPLETE dual-phrase pastes do not stamp |
 | Kill switch | `touch /tmp/.cursor_push_audit_disable` |
 
 **Live transcript fallback:** `beforeShellExecution` often supplies only `command` + `conversation_id` (no `transcript_path`). The gate **best-effort resolves** the transcript from payload path keys (`transcript_path`, `transcriptPath`, `agent_transcript_path`) or by searching `~/.cursor/projects/*/agent-transcripts/` for `{conversation_id}.jsonl`. When a transcript is found and it already has `Green: Y` and (when myaudit) dual-critic→confirm Task evidence, the gate **allows push and backfills** the OK stamp.
@@ -64,11 +69,11 @@ python3 "/Volumes/Cloud Storage/Claude/.cursor/hooks/audit_marker.py" stamp_ok <
 EOF
 ```
 
-Do **not** invent bypass markers. Bypass phrases stamp only when Matt types them as their **own line** (not inside an INCOMPLETE option list).
+Do **not** invent bypass markers. Bypass phrases stamp when they appear in Matt's prompt (inline is enough — not own-line-only). Option-list / INCOMPLETE dual-phrase pastes still do not stamp.
 
 **Preflight (before `git push`):** check for OK/bypass markers, cloud fail-open, or expect transcript fallback; if the previous push was denied, stop with **INCOMPLETE** — do not retry push in a loop, do not claim "committed and done."
 
-Preferred recovery: end a turn with Loop summary `Green: Y` after `/myauditandfix`, run `stamp_ok` when cloud/no-transcript, then re-run `/commitprmerge` (or Matt says a standalone bypass phrase).
+Preferred recovery: end a turn with Loop summary `Green: Y` after `/audit` or `/myauditandfix`, run `stamp_ok` when cloud/no-transcript, then re-run `/commitprmerge` (or Matt says a bypass phrase anywhere in the prompt).
 
 ## What to ship (default scope)
 
@@ -77,7 +82,7 @@ Preferred recovery: end a turn with Loop summary `Green: Y` after `/myauditandfi
 ### Build the session file list (before staging)
 
 1. **Conversation writes** — every path touched by `Write`, `StrReplace`, or `Delete` in **this thread only** (orchestrator + subagents).
-2. **Session side effects** — paths known to have changed from shell in this thread (e.g. `capture_v2.py` → `/Volumes/Cloud Storage/Memory/conversations/episodes.jsonl` and any `topic_pages` it wrote).
+2. **Session side effects** — paths known to have changed from shell in this thread (e.g. `khipu capture` / stop-hook → `/Volumes/Cloud Storage/Memory/conversations/episodes.jsonl` and any `topic_pages`).
 3. **Intersect with git** — `git status --short`; stage only session-list paths that are modified, added, or untracked. Ignore other dirty files even if present.
 4. **Never stage** even if in the session list: `API Keys/`, `**/.env`, `**/*.pem`, `**/*.key`, secrets, `_precompact_safety/`, `*.bak*`, build artifacts ignored by `.gitignore` but accidentally forced.
 5. **`.cursor/mcp.json` carve-out:** may stage when in the session list **only if** `python3 .cursor/scripts/mcp_json_is_shippable.py .cursor/mcp.json` (or the Claude workspace copy of that script) exits 0 — URL / `${env:…}` / `<from …>` stubs only. **Abort** if the checker fails (live tokens). Never stage `~/.cursor/mcp.json`.
@@ -121,8 +126,8 @@ When continuing unpushed commits already on a feature branch, **stay on that bra
 2. **Branch** — fresh branch off updated `main` (step above), unless continuing an existing feature branch with unpushed commits.
 3. **Stage + security gate** — stage in-scope files; `git diff --cached --name-only`; abort on secrets or unintended paths. (Skip if continue-from-push.)
 4. **Commit** — `git commit -m "<type>: <summary>"` where `<type>` is `memory` for claude-os-workspace memory-only, else `feat`, `fix`, or `chore` inferred from the diff. Summary from trailing text or diff. (Skip if continue-from-push.)
-5. **Push** — `git push -u origin HEAD`. On `push_audit_gate` deny → **INCOMPLETE** (commits local only); tell Matt to finish `/myauditandfix` green or bypass; **do not** claim shipped.
-6. **Prepr evidence reuse (code ships)** — when shipping code files (py, ts, swift, etc.): **do not** run `prepr_audit.py`. Read the latest `/myauditandfix` prepr prepare evidence from **this conversation's transcript** (completed `--worktree --prepare` run, fingerprint, bundle attached to critics). This step is a **transcript read, not a mechanical marker check** — the mechanical gate is `push_audit_gate` on `Green: Y` at step 5. If the transcript has no current Green:Y with completed prepr prepare evidence for the code being shipped → **INCOMPLETE**; tell Matt to run `/myauditandfix` (prepr is that command's oracle, not commit/PR). Docs-only / no-code ships: prepr **N/A**.
+5. **Push** — `git push -u origin HEAD`. On `push_audit_gate` deny → **INCOMPLETE** (commits local only); tell Matt to finish `/audit` or `/myauditandfix` green or bypass; **do not** claim shipped.
+6. **Prepr evidence reuse (code ships)** — when shipping code files (py, ts, swift, etc.): **do not** run `prepr_audit.py`. Read the latest `/audit` or `/myauditandfix` prepr prepare evidence from **this conversation's transcript** (completed `--worktree --prepare` run, fingerprint, bundle attached to the solo Task or critics). This step is a **transcript read, not a mechanical marker check** — the mechanical gate is `push_audit_gate` on `Green: Y` at step 5. If the transcript has no current Green:Y with completed prepr prepare evidence for the code being shipped → **INCOMPLETE**; tell Matt to run `/audit` or `/myauditandfix` (prepr is that command's oracle, not commit/PR). Docs-only / no-code ships: prepr **N/A**.
 7. **Open PR** — `gh pr create --base main --title "<type>: <summary>" --body "…"`. Cloud Agent fallback: `ManagePullRequest` `action: create_pr` when `gh pr create` fails with integration permissions.
 8. **Merge gate (repo-specific)**
    - **iOS / native green lane (non-BugBot):** for iOS/macOS app ships, require session-scoped changes, a green local build oracle when the session touched native code, `/myauditandfix` prepr evidence from this transcript for code ships, and a human checkpoint before merge when the repo's ship norms require it. Do **not** open Memory BugBot runbooks from this command — BugBot stays opt-in only.
@@ -152,6 +157,8 @@ Run shell steps with evidence; tag claims **verified** / **unverified** / **fail
 - Expecting the command when it was never installed to `~/.cursor/commands/`
 - Claiming merged without `gh` + `git` output
 - Claiming "committed" / "done" when push or PR/merge did not finish
+- Stopping after `gh pr create` with the PR still **open** — that is INCOMPLETE
+- `git push` while in-scope session files are still uncommitted when Matt said push/ship
 - Stopping at "Nothing to ship" when this conversation already has unpushed commits on the feature branch
 - Force-pushing `main` or merging without Matt naming explicit path overrides for out-of-scope files
 - Re-running `prepr_audit.py` inside `/commitprmerge` (prepr belongs to `/myauditandfix` only)
