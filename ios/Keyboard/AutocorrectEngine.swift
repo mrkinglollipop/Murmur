@@ -98,6 +98,37 @@ enum AutocorrectEngine {
         return (beforeCount - afterCount) > 2
     }
 
+    /// After `insertText(inserted)` the context should read `before + inserted`.
+    /// Hosts can hold a selection they REPORT as empty; `insertText` then
+    /// replaces it invisibly (2026-08-25: a double-space erased a whole
+    /// dictated sentence with no guard firing). When the post-insert context
+    /// ends with the insert but its base is a strict prefix of `before`, the
+    /// gap is exactly what the host swallowed — return it so the caller can
+    /// put it back. The lost span keeps its boundary whitespace: inserting
+    /// `lost + inserted` after removing `inserted` reproduces
+    /// `before + inserted` exactly. Nil means the insert looks clean (or the
+    /// context window slid, which breaks the prefix relation and must not
+    /// trigger a restore).
+    static func lostTextAfterInsert(before: String, after: String, inserted: String) -> String? {
+        guard !inserted.isEmpty, after.hasSuffix(inserted) else { return nil }
+        let afterBase = String(after.dropLast(inserted.count))
+        guard afterBase.count < before.count else { return nil }
+        guard before.hasPrefix(afterBase) else { return nil }
+        let lost = String(before.dropFirst(afterBase.count))
+        return lost.isEmpty ? nil : lost
+    }
+
+    /// After ONE `deleteBackward`, more than the final character (plus
+    /// combining-mark slack) vanished and the remainder is a prefix of
+    /// `before`: the host deleted a hidden tail selection. Everything except
+    /// the one character the user actually asked to remove is restorable.
+    static func lostTailAfterSingleDelete(before: String, after: String) -> String? {
+        guard before.count - after.count > 2 else { return nil }
+        guard before.hasPrefix(after) else { return nil }
+        let lost = String(before.dropFirst(after.count).dropLast(1))
+        return lost.isEmpty ? nil : lost
+    }
+
     enum DocumentMutationDecision: Equatable {
         case allow
         case deny
@@ -640,6 +671,11 @@ enum AutocorrectEngine {
     static func shouldEatTrailingSwipeSpace(beforeInserting text: String) -> Bool {
         if text == "\n" { return true }
         guard text.count == 1, let character = text.first else { return false }
+        // A typed space also swallows the automatic trailing space — otherwise
+        // a swipe/dictation take leaves "word  " and, worse, double-space-
+        // period can never fire after dictation (the second tap sees a space
+        // before the space and bails).
+        if character == " " { return true }
         return ".,!?;:)]}…".contains(character)
     }
 
