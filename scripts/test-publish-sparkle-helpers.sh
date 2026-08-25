@@ -506,6 +506,21 @@ else
   fail "publish-sparkle.sh must mention scripts/oracle-dictation-start.sh"
 fi
 
+echo "==> prior-appcast fetch survives a fresh checkout (build/ missing)"
+if grep -q 'mkdir -p "$(dirname "$PREV_APPCAST")"' "$SCRIPT"; then
+  pass "mkdir -p before prior-appcast curl"
+else
+  fail "fetch_prior_appcast curls into build/ before it exists (curl 56 read as network failure)"
+fi
+
+echo "==> prior-appcast fetch failure surfaces curl exit code"
+if grep -q 'FETCH_PRIOR_CURL_STATUS' "$SCRIPT" \
+  && grep -q 'curl exit \$FETCH_PRIOR_CURL_STATUS' "$SCRIPT"; then
+  pass "curl exit code in the failed-download error"
+else
+  fail "failed-download error hides curl's exit code"
+fi
+
 echo ""
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ORACLE FAILED"
