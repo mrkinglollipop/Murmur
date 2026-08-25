@@ -689,10 +689,30 @@ PY
 # --- 6) Upload DMG release ---
 TAG="v${SHORT}"
 echo "==> GitHub release $TAG on $UPDATES_REPO"
+WHATSNEW_NOTES="$(python3 - "$SHORT" "$BUILD" <<'PY'
+import json, sys
+from pathlib import Path
+short, build = sys.argv[1], sys.argv[2]
+path = Path("Resources/WhatsNew/releases.json")
+data = json.loads(path.read_text(encoding="utf-8"))
+entry = next((e for e in data if str(e.get("build", "")) == build), None)
+if entry is None:
+    entry = next((e for e in data if str(e.get("version")) == short), None)
+if not entry:
+    print(f"Murmur {short} (build {build})")
+else:
+    title = str(entry.get("title") or f"Murmur {short}").strip()
+    print(title)
+    for item in entry.get("items") or []:
+        item = str(item).strip()
+        if item:
+            print(f"- {item}")
+PY
+)"
 if gh_release_exists "$TAG" "DMG upload"; then
   gh release upload "$TAG" "$DMG" --repo "$UPDATES_REPO" --clobber
 else
-  gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "Murmur $SHORT (build $BUILD)"
+  gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "$WHATSNEW_NOTES"
 fi
 
 # --- 7) Appcast release (only after asserts) ---
