@@ -160,9 +160,9 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: ","))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "!"))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "\n"))
-        // A typed space swallows the auto trailing space too (2026-08-25) —
-        // otherwise double-space-period is unreachable after dictation.
-        XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
+        // A typed space must NOT eat the auto space — that deleteBackward
+        // after a bulk insert wiped a dictated sentence (2026-08-25).
+        XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "a"))
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "'"))
     }
@@ -555,9 +555,23 @@ final class AutocorrectEngineTests: XCTestCase {
             before: "abcdefgh", after: "efgh"))
     }
 
-    /// A typed space swallows the automatic trailing space after swipe or
-    /// dictation — otherwise double-space-period can never fire there.
-    func testTypedSpaceEatsAutoTrailingSpace() {
-        XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
+    /// A typed space never eats the auto trailing space: that deleteBackward
+    /// right after a bulk dictation insert is what wiped a sentence on hosts
+    /// that treat the insert as one deletable clump. The doubled space is
+    /// handled by the non-deleting period walk instead.
+    func testTypedSpaceDoesNotEatAutoTrailingSpace() {
+        XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
+    }
+
+    /// Non-deleting double-space-period: trailing-space run to step over.
+    func testDoubleSpacePeriodWalk() {
+        XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word "), 1)
+        XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "sentence  "), 2)
+        XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "ok2 "), 1)
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word   "))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word"))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word. "))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: " "))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: ""))
     }
 }
