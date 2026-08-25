@@ -188,6 +188,7 @@ targets:
       - path: Shared/DictationIntents.swift
       - path: Shared/DictationBridge.swift
       - path: Shared/AppGroupStore.swift
+      - path: Shared/HandoffDiagnostics.swift
       - path: Shared/HostFingerprint.swift
       - path: Shared/ReturnAppCatalog.swift
     info:
@@ -227,6 +228,7 @@ targets:
       - path: Shared/HostFingerprint.swift
       - path: Shared/GiphyClient.swift
       - path: Shared/AppGroupStore.swift
+      - path: Shared/HandoffDiagnostics.swift
       - path: Shared/PhraseBoundaryPattern.swift
       - path: Shared/DictionaryStore.swift
       - path: Shared/SnippetsStore.swift

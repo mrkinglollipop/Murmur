@@ -101,16 +101,32 @@ enum AppGroupStore {
     }
 
     /// Bundle IDs shown as jump-back tiles on the swipe interstitial, in grid order.
+    ///
+    /// Reads fall back to a process-local mirror before factory defaults:
+    /// an App Group read that comes back key-missing after the key was set
+    /// silently replaced the user's chosen grid with the factory apps. The
+    /// diagnostic record is what tells us which failure actually happens.
     static var interstitialReturnAppIDs: [String] {
         get {
+            let suite = self.suite
+            let stored = suite?.stringArray(forKey: interstitialAppsKey)
             let exists = suite?.object(forKey: interstitialAppsKey) != nil
-            return ReturnAppCatalog.resolvedIDs(
-                stored: suite?.stringArray(forKey: interstitialAppsKey),
-                keyExists: exists
-            )
+            if suite == nil || !exists {
+                let mirror = UserDefaults.standard.stringArray(forKey: interstitialAppsKey)
+                HandoffDiagnostics.record(
+                    "app.returnApps.groupReadMissed",
+                    detail: "suiteNil=\(suite == nil) mirror=\(mirror?.count ?? -1)"
+                )
+                if let mirror {
+                    return ReturnAppCatalog.sanitizedIDs(mirror)
+                }
+            }
+            return ReturnAppCatalog.resolvedIDs(stored: stored, keyExists: exists)
         }
         set {
-            suite?.set(ReturnAppCatalog.sanitizedIDs(newValue), forKey: interstitialAppsKey)
+            let ids = ReturnAppCatalog.sanitizedIDs(newValue)
+            suite?.set(ids, forKey: interstitialAppsKey)
+            UserDefaults.standard.set(ids, forKey: interstitialAppsKey)
         }
     }
 
