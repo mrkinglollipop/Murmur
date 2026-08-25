@@ -65,6 +65,42 @@ targets:
           - sms
           - mobilenotes
           - message
+          - x-web-search
+          - x-apple-reminderkit
+          - calshow
+          - shareddocuments
+          - slack
+          - whatsapp
+          - twitter
+          - instagram
+          - threads
+          - fb
+          - fb-messenger
+          - snapchat
+          - snssdk1233
+          - reddit
+          - linkedin
+          - discord
+          - tg
+          - sgnl
+          - msteams
+          - zoomus
+          - googlechrome
+          - googlegmail
+          - googledrive
+          - comgooglemaps
+          - youtube
+          - ms-outlook
+          - spotify
+          - nflx
+          - aiv
+          - uber
+          - lyft
+          - paypal
+          - venmo
+          - cashme
+          - openai
+          - github
     entitlements:
       path: MurmurIOS/MurmurIOS.entitlements
       properties:
@@ -152,6 +188,8 @@ targets:
       - path: Shared/DictationIntents.swift
       - path: Shared/DictationBridge.swift
       - path: Shared/AppGroupStore.swift
+      - path: Shared/HostFingerprint.swift
+      - path: Shared/ReturnAppCatalog.swift
     info:
       path: Activity/Info.plist
       properties:
@@ -203,6 +241,8 @@ targets:
       - path: Shared/KeyboardChromeMetrics.swift
       - path: Shared/KeyDiacriticMap.swift
       - path: Shared/KeyboardChromeTokens.swift
+      - path: Shared/KeyboardAppearanceResolve.swift
+      - path: Shared/ReturnAppCatalog.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matt.murmur.ios.keyboardtests

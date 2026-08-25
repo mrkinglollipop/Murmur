@@ -53,7 +53,7 @@ final class KeyboardChromeMetricsTests: XCTestCase {
         XCTAssertEqual(max.bottomInset, 8)
     }
 
-    func testChromeTopRadiusMatchesIOSKeyboardSheet() {
+    func testChromeTopRadiusIsAppliedOnce() {
         XCTAssertEqual(KeyboardChromeTokens.chromeCornerRadius, 28)
     }
 

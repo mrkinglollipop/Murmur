@@ -10,6 +10,7 @@ enum AppGroupStore {
     static let listenGateRequestIDKey = "listenGateRequestID"
     static let swipeTypingEnabledKey = "swipeTypingEnabled"
     static let recentEmojiKey = "recentEmoji"
+    static let interstitialAppsKey = "interstitialReturnAppIDs"
 
     private static var suite: UserDefaults? {
         UserDefaults(suiteName: suiteName)
@@ -97,6 +98,48 @@ enum AppGroupStore {
             return suite.bool(forKey: swipeTypingEnabledKey)
         }
         set { suite?.set(newValue, forKey: swipeTypingEnabledKey) }
+    }
+
+    /// Bundle IDs shown as jump-back tiles on the swipe interstitial, in grid order.
+    static var interstitialReturnAppIDs: [String] {
+        get {
+            let exists = suite?.object(forKey: interstitialAppsKey) != nil
+            return ReturnAppCatalog.resolvedIDs(
+                stored: suite?.stringArray(forKey: interstitialAppsKey),
+                keyExists: exists
+            )
+        }
+        set {
+            suite?.set(ReturnAppCatalog.sanitizedIDs(newValue), forKey: interstitialAppsKey)
+        }
+    }
+
+    static func addInterstitialReturnApp(_ bundleID: String) {
+        var ids = interstitialReturnAppIDs
+        let id = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ReturnAppCatalog.isAllowed(id), !ids.contains(id) else { return }
+        ids.append(id)
+        interstitialReturnAppIDs = ids
+    }
+
+    static func removeInterstitialReturnApp(_ bundleID: String) {
+        interstitialReturnAppIDs = interstitialReturnAppIDs.filter { $0 != bundleID }
+    }
+
+    static func reorderInterstitialReturnApp(moving: String, onto: String) {
+        interstitialReturnAppIDs = ReturnAppCatalog.reorderedIDs(
+            interstitialReturnAppIDs,
+            moving: moving,
+            onto: onto
+        )
+    }
+
+    static func setInterstitialReturnApp(_ bundleID: String, enabled: Bool) {
+        if enabled {
+            addInterstitialReturnApp(bundleID)
+        } else {
+            removeInterstitialReturnApp(bundleID)
+        }
     }
 
     static let selectedStyleKey = "selectedStyle"

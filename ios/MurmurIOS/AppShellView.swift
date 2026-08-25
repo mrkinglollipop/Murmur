@@ -33,8 +33,13 @@ enum AppTab: String, CaseIterable, Identifiable {
 struct AppShellView: View {
     @ObservedObject private var session = DictationController.shared
     @State private var tab: AppTab = .home
-    @State private var showMenu = false
+    @State private var menuOpen = false
+    @State private var menuDrag: CGFloat = 0
+    @State private var menuDragLocked: Bool?
     @State private var showSettings = false
+
+    private let menuWidth: CGFloat = 280
+    private let menuEdge: CGFloat = 32
 
     var body: some View {
         ZStack {
@@ -53,9 +58,8 @@ struct AppShellView: View {
                     .padding(.bottom, 8)
             }
 
-            if showMenu {
-                menuScrim
-            }
+            menuEdgeGrab
+            menuLayer
         }
         .sheet(isPresented: $showSettings) {
             SettingsScreen()
@@ -63,10 +67,15 @@ struct AppShellView: View {
         .preferredColorScheme(.light)
     }
 
+    private var menuReveal: CGFloat {
+        let base: CGFloat = menuOpen ? menuWidth : 0
+        return min(menuWidth, max(0, base + menuDrag))
+    }
+
     private var header: some View {
         HStack {
             Button {
-                withAnimation(.easeOut(duration: 0.2)) { showMenu = true }
+                setMenuOpen(true)
             } label: {
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 18, weight: .semibold))
@@ -152,36 +161,99 @@ struct AppShellView: View {
         )
     }
 
-    private var menuScrim: some View {
-        ZStack(alignment: .leading) {
-            Color.black.opacity(0.28)
+    /// Leading-edge pull to open. Stops short of the header (hamburger still
+    /// tappable) and the tab bar.
+    private var menuEdgeGrab: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                Color.clear
+                    .frame(height: 52)
+                    .allowsHitTesting(false)
+                Color.clear
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .highPriorityGesture(menuPan)
+                Color.clear
+                    .frame(height: 86)
+                    .allowsHitTesting(false)
+            }
+            .frame(width: menuEdge)
+            Spacer(minLength: 0)
+        }
+        .allowsHitTesting(!menuOpen)
+        .accessibilityHidden(true)
+    }
+
+    private var menuLayer: some View {
+        let progress = menuReveal / menuWidth
+        return ZStack(alignment: .leading) {
+            Color.black.opacity(0.28 * progress)
                 .ignoresSafeArea()
-                .onTapGesture {
-                    withAnimation(.easeOut(duration: 0.2)) { showMenu = false }
-                }
+                .onTapGesture { setMenuOpen(false) }
 
             VStack(alignment: .leading, spacing: 20) {
                 Text("Murmur")
                     .font(AppTheme.serif(28))
                     .foregroundStyle(AppTheme.ink)
 
+                Spacer()
+
                 Button {
-                    showMenu = false
+                    setMenuOpen(false)
                     showSettings = true
                 } label: {
                     Label("Settings", systemImage: "gearshape")
                         .font(AppTheme.sans(17, weight: .medium))
                         .foregroundStyle(AppTheme.ink)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
                 }
                 .accessibilityLabel("Settings")
-
-                Spacer()
             }
-            .padding(24)
-            .frame(width: 280, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+            .padding(.bottom, 8)
+            .safeAreaPadding(.bottom)
+            .frame(width: menuWidth, alignment: .leading)
             .frame(maxHeight: .infinity)
             .background(AppTheme.card.ignoresSafeArea())
+            .offset(x: menuReveal - menuWidth)
+            .accessibilityHidden(progress < 0.5)
+        }
+        .allowsHitTesting(menuOpen)
+        .gesture(menuPan)
+    }
+
+    private var menuPan: some Gesture {
+        DragGesture(minimumDistance: 16, coordinateSpace: .global)
+            .onChanged { value in
+                if menuDragLocked == nil {
+                    let horizontal = abs(value.translation.width) >= abs(value.translation.height)
+                    menuDragLocked = horizontal && (menuOpen || value.startLocation.x <= menuEdge)
+                }
+                guard menuDragLocked == true else { return }
+                if menuOpen {
+                    menuDrag = min(0, value.translation.width)
+                } else {
+                    menuDrag = max(0, value.translation.width)
+                }
+            }
+            .onEnded { value in
+                let tracked = menuDragLocked == true
+                menuDragLocked = nil
+                guard tracked else {
+                    menuDrag = 0
+                    return
+                }
+                let projected = menuReveal + value.velocity.width * 0.18
+                setMenuOpen(projected > menuWidth * 0.45)
+            }
+    }
+
+    private func setMenuOpen(_ open: Bool) {
+        withAnimation(.easeOut(duration: 0.22)) {
+            menuOpen = open
+            menuDrag = 0
         }
     }
 }

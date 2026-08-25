@@ -88,6 +88,73 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertFalse(AutocorrectEngine.needsLeadingSpace(beforeInput: "\n"))
     }
 
+    func testPreparedDictationInsertJoinsTakesWithoutGlue() {
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "hello there",
+                beforeInput: "",
+                trailingSpace: true
+            ),
+            "hello there "
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "more words",
+                beforeInput: "hello there",
+                trailingSpace: true
+            ),
+            " more words "
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "more words",
+                beforeInput: "hello there ",
+                trailingSpace: true
+            ),
+            "more words "
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "  more words  ",
+                beforeInput: "hello.",
+                trailingSpace: true
+            ),
+            " more words "
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "hello",
+                beforeInput: "(",
+                trailingSpace: true
+            ),
+            "hello "
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "hello",
+                beforeInput: "\n",
+                trailingSpace: true
+            ),
+            "hello "
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "   ",
+                beforeInput: "hello",
+                trailingSpace: true
+            ),
+            ""
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.preparedDictationInsert(
+                transcript: "hello",
+                beforeInput: "hi",
+                trailingSpace: false
+            ),
+            " hello"
+        )
+    }
+
     func testPunctuationEatsTrailingSwipeSpace() {
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "."))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: ","))

@@ -33,7 +33,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = KeyboardChromeTokens.keyboardBackdrop(dark: false)
         view.insetsLayoutMarginsFromSafeArea = false
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
@@ -57,6 +56,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.onSwipe = { [weak self] words in self?.insertSwipe(words) }
         root.onNeedsHeightChange = { [weak self] in self?.updateKeyboardHeight() }
         AppGroupStore.consumeGiphySeedIfNeeded()
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (vc: KeyboardViewController, _) in
+            vc.applyDocumentState()
+        }
         applyDocumentState()
     }
 
@@ -103,11 +105,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         applyDocumentState()
     }
 
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
-        updateKeyboardHeight()
-    }
-
     override func viewWillLayoutSubviews() {
         super.viewWillLayoutSubviews()
         updateKeyboardHeight()
@@ -128,31 +125,21 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
     }
 
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        let appearance = textDocumentProxy.keyboardAppearance
-        let dark = appearance == .dark
-            || (appearance == .default && traitCollection.userInterfaceStyle == .dark)
-        applyHostChrome(backdrop: KeyboardChromeTokens.keyboardBackdrop(dark: dark))
+    /// Keep the input view clear so the chrome's top radius is the only fill.
+    /// Do not round or paint system ancestors (that was the lip + flicker).
+    private func applyHostChrome() {
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.layer.cornerRadius = 0
+        view.layer.maskedCorners = []
+        view.clipsToBounds = false
     }
 
-    /// Round the input view to match iOS 26's keyboard sheet. Paint ancestors
-    /// the same fill so clipped corners are not Messages-white, but do not
-    /// round those ancestors (the globe/mic well lives outside this view).
-    private func applyHostChrome(backdrop: UIColor) {
-        let radius = KeyboardChromeTokens.chromeCornerRadius
-        view.backgroundColor = backdrop
-        view.layer.cornerRadius = radius
-        view.layer.maskedCorners = KeyboardChromeTokens.chromeTopCorners
-        view.layer.cornerCurve = .continuous
-        view.clipsToBounds = true
-        var ancestor = view.superview
-        var depth = 0
-        while let host = ancestor, depth < 3, !(host is UIWindow) {
-            host.backgroundColor = backdrop
-            ancestor = host.superview
-            depth += 1
-        }
+    private func isDarkKeyboard() -> Bool {
+        KeyboardAppearanceResolve.isDark(
+            keyboardAppearance: textDocumentProxy.keyboardAppearance ?? .default,
+            userInterfaceStyle: traitCollection.userInterfaceStyle
+        )
     }
 
     private func applyDocumentState() {
@@ -162,12 +149,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             pollTask?.cancel()
             pollTask = nil
         }
-        let appearance = textDocumentProxy.keyboardAppearance
-        let dark = appearance == .dark
-            || (appearance == .default && traitCollection.userInterfaceStyle == .dark)
+        let dark = isDarkKeyboard()
         root.setAppearance(dark: dark)
-        let backdrop = KeyboardChromeTokens.keyboardBackdrop(dark: dark)
-        applyHostChrome(backdrop: backdrop)
+        applyHostChrome()
         root.setReturnTitle(returnTitle)
         updateCapitalization()
         refreshChrome()
@@ -868,9 +852,14 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             HandoffDiagnostics.record("keyboard.result.received", detail: payload.id)
             finishWait()
             if textDocumentProxy.isSecureTextEntry == true { return }
-            let text = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = AutocorrectEngine.preparedDictationInsert(
+                transcript: payload.text,
+                beforeInput: textDocumentProxy.documentContextBeforeInput ?? "",
+                trailingSpace: true
+            )
             if !text.isEmpty {
                 self.insertPlain(text)
+                swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
                 HandoffDiagnostics.record(
