@@ -160,7 +160,9 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: ","))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "!"))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "\n"))
-        XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
+        // A typed space swallows the auto trailing space too (2026-08-25) —
+        // otherwise double-space-period is unreachable after dictation.
+        XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "a"))
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "'"))
     }
@@ -494,5 +496,68 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertTrue(AutocorrectEngine.shouldTeach("Schwartz", known: ["the", "and"]))
         XCTAssertFalse(AutocorrectEngine.shouldTeach("東京", known: []))
         XCTAssertFalse(AutocorrectEngine.shouldTeach("a", known: []))
+    }
+
+    // MARK: - Hidden-selection loss recovery (2026-08-25 sentence wipe)
+
+    /// Clean insert: after == before + inserted → nothing lost.
+    func testLostTextAfterInsertCleanInsertIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "The whole sentence", after: "The whole sentence ", inserted: " "))
+    }
+
+    /// The host replaced a hidden selection with the insert: the swallowed
+    /// span is exactly the gap between the surviving prefix and `before`.
+    func testLostTextAfterInsertReturnsSwallowedSelection() {
+        XCTAssertEqual(
+            AutocorrectEngine.lostTextAfterInsert(
+                before: "Hi. The whole sentence", after: "Hi. ", inserted: " "),
+            " The whole sentence"
+        )
+    }
+
+    /// Context window slid (front chars dropped): prefix relation breaks —
+    /// never "restore" from a slid window.
+    func testLostTextAfterInsertWindowSlideIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abcdef", after: "bcdef ", inserted: " "))
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abc", after: "xyz ", inserted: " "))
+    }
+
+    /// Insert missing from the tail (host did something else entirely): nil.
+    func testLostTextAfterInsertMissingInsertIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abc", after: "ab", inserted: " "))
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abc", after: "abc x", inserted: " "))
+    }
+
+    /// A normal single delete (1 char, or 2 with a combining mark) is clean.
+    func testLostTailAfterSingleDeleteCleanIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTailAfterSingleDelete(before: "word ", after: "word"))
+        XCTAssertNil(AutocorrectEngine.lostTailAfterSingleDelete(before: "word ", after: "wor"))
+    }
+
+    /// deleteBackward took a hidden tail selection: restore everything except
+    /// the one character the user asked to remove.
+    func testLostTailAfterSingleDeleteRestoresAllButIntended() {
+        XCTAssertEqual(
+            AutocorrectEngine.lostTailAfterSingleDelete(
+                before: "Hi. The whole sentence ", after: "Hi. "),
+            "The whole sentence"
+        )
+    }
+
+    /// Loss that is not a tail (remainder is not a prefix): unrecoverable, nil.
+    func testLostTailAfterSingleDeleteNonTailIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTailAfterSingleDelete(
+            before: "abcdefgh", after: "efgh"))
+    }
+
+    /// A typed space swallows the automatic trailing space after swipe or
+    /// dictation — otherwise double-space-period can never fire there.
+    func testTypedSpaceEatsAutoTrailingSpace() {
+        XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
     }
 }

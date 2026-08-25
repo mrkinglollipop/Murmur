@@ -64,6 +64,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        // Build stamp: proves which binary is actually serving keys. An iOS
+        // reinstall does not restart a live keyboard process, and the
+        // 2026-08-25 sentence-wipe hunt burned an hour not knowing.
+        HandoffDiagnostics.record(
+            "keyboard.appeared",
+            detail: "build=\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")"
+        )
         AppGroupStore.consumeGiphySeedIfNeeded()
         root.swipeTypingEnabled = AppGroupStore.swipeTypingEnabled
         dictionary.reload()
@@ -549,7 +556,23 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         // Never overwrite a 1-char selection — collapse it. A phantom host
         // selection plus insertText is a silently eaten character.
         guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
         textDocumentProxy.insertText(text)
+        // Hosts can hold a selection they report as empty; insertText then
+        // replaces it invisibly and no guard above can fire. Detect the loss
+        // from the context arithmetic and put the swallowed text back.
+        // Typing-size inserts only — unwinding a large paste/dictation insert
+        // char-by-char is its own hazard, so those just get logged.
+        let after = textDocumentProxy.documentContextBeforeInput ?? ""
+        if let lost = AutocorrectEngine.lostTextAfterInsert(before: before, after: after, inserted: text) {
+            if text.count <= 4 {
+                for _ in 0..<text.count { textDocumentProxy.deleteBackward() }
+                textDocumentProxy.insertText(lost + text)
+                HandoffDiagnostics.record("keyboard.insert.recovered", detail: "lost=\(lost.count)")
+            } else {
+                HandoffDiagnostics.record("keyboard.insert.lossDetected", detail: "lost=\(lost.count) inserted=\(text.count)")
+            }
+        }
         return true
     }
 
@@ -569,14 +592,26 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             textDocumentProxy.deleteBackward()
             let after = textDocumentProxy.documentContextBeforeInput ?? ""
             if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
-                HandoffDiagnostics.record(
-                    "keyboard.delete.hostDrop",
-                    detail: "before=\(before.count) after=\(after.count)"
-                )
+                restoreHiddenSelectionLoss(before: before, after: after)
                 return false
             }
         }
         return true
+    }
+
+    /// One deleteBackward took a hidden tail selection with it — restore
+    /// everything except the character the user actually asked to remove.
+    /// Falls back to logging the drop when the loss is not tail-shaped.
+    private func restoreHiddenSelectionLoss(before: String, after: String) {
+        if let lost = AutocorrectEngine.lostTailAfterSingleDelete(before: before, after: after) {
+            textDocumentProxy.insertText(lost)
+            HandoffDiagnostics.record("keyboard.delete.recovered", detail: "lost=\(lost.count)")
+        } else {
+            HandoffDiagnostics.record(
+                "keyboard.delete.hostDrop",
+                detail: "before=\(before.count) after=\(after.count)"
+            )
+        }
     }
 
     /// One `deleteBackward` for Delete / nil-selection. Insert still treats
@@ -591,10 +626,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         textDocumentProxy.deleteBackward()
         let after = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
-            HandoffDiagnostics.record(
-                "keyboard.delete.hostDrop",
-                detail: "single before=\(before.count) after=\(after.count)"
-            )
+            restoreHiddenSelectionLoss(before: before, after: after)
         }
     }
 
