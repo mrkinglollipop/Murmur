@@ -10,6 +10,7 @@ enum AppGroupStore {
     static let listenGateRequestIDKey = "listenGateRequestID"
     static let swipeTypingEnabledKey = "swipeTypingEnabled"
     static let recentEmojiKey = "recentEmoji"
+    static let interstitialAppsKey = "interstitialReturnAppIDs"
 
     private static var suite: UserDefaults? {
         UserDefaults(suiteName: suiteName)
@@ -97,6 +98,64 @@ enum AppGroupStore {
             return suite.bool(forKey: swipeTypingEnabledKey)
         }
         set { suite?.set(newValue, forKey: swipeTypingEnabledKey) }
+    }
+
+    /// Bundle IDs shown as jump-back tiles on the swipe interstitial, in grid order.
+    ///
+    /// Reads fall back to a process-local mirror before factory defaults:
+    /// an App Group read that comes back key-missing after the key was set
+    /// silently replaced the user's chosen grid with the factory apps. The
+    /// diagnostic record is what tells us which failure actually happens.
+    static var interstitialReturnAppIDs: [String] {
+        get {
+            let suite = self.suite
+            let stored = suite?.stringArray(forKey: interstitialAppsKey)
+            let exists = suite?.object(forKey: interstitialAppsKey) != nil
+            if suite == nil || !exists {
+                let mirror = UserDefaults.standard.stringArray(forKey: interstitialAppsKey)
+                HandoffDiagnostics.record(
+                    "app.returnApps.groupReadMissed",
+                    detail: "suiteNil=\(suite == nil) mirror=\(mirror?.count ?? -1)"
+                )
+                if let mirror {
+                    return ReturnAppCatalog.sanitizedIDs(mirror)
+                }
+            }
+            return ReturnAppCatalog.resolvedIDs(stored: stored, keyExists: exists)
+        }
+        set {
+            let ids = ReturnAppCatalog.sanitizedIDs(newValue)
+            suite?.set(ids, forKey: interstitialAppsKey)
+            UserDefaults.standard.set(ids, forKey: interstitialAppsKey)
+        }
+    }
+
+    static func addInterstitialReturnApp(_ bundleID: String) {
+        var ids = interstitialReturnAppIDs
+        let id = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ReturnAppCatalog.isAllowed(id), !ids.contains(id) else { return }
+        ids.append(id)
+        interstitialReturnAppIDs = ids
+    }
+
+    static func removeInterstitialReturnApp(_ bundleID: String) {
+        interstitialReturnAppIDs = interstitialReturnAppIDs.filter { $0 != bundleID }
+    }
+
+    static func reorderInterstitialReturnApp(moving: String, onto: String) {
+        interstitialReturnAppIDs = ReturnAppCatalog.reorderedIDs(
+            interstitialReturnAppIDs,
+            moving: moving,
+            onto: onto
+        )
+    }
+
+    static func setInterstitialReturnApp(_ bundleID: String, enabled: Bool) {
+        if enabled {
+            addInterstitialReturnApp(bundleID)
+        } else {
+            removeInterstitialReturnApp(bundleID)
+        }
     }
 
     static let selectedStyleKey = "selectedStyle"

@@ -66,9 +66,9 @@ enum HostReturn {
         function(workspace, openSelector, bundleID as NSString, nil, completion)
     }
 
-    /// Scheme fallback only for the probed host. `sms:` only when that host is Messages.
+    /// Scheme fallback for the chosen host. Catalog owns which URL, if any.
     private static func openScheme(_ bundleID: String, reason: String) {
-        guard let url = schemeURL(for: bundleID) else {
+        guard let url = ReturnAppCatalog.schemeURL(for: bundleID) else {
             HandoffDiagnostics.record("app.return.noFallback", detail: "\(bundleID) reason=\(reason)")
             return
         }
@@ -79,16 +79,5 @@ enum HostReturn {
         UIApplication.shared.open(url, options: [:]) { opened in
             HandoffDiagnostics.record("app.return.scheme.completed", detail: String(opened))
         }
-    }
-
-    private static func schemeURL(for bundleID: String) -> URL? {
-        let schemes = [
-            messagesBundle: "sms:",
-            "com.apple.mobilenotes": "mobilenotes://",
-            "com.apple.mail": "message://",
-            "com.apple.mobilemail": "message://"
-        ]
-        guard let value = schemes[bundleID] else { return nil }
-        return URL(string: value)
     }
 }

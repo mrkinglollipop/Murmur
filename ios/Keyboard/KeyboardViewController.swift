@@ -33,7 +33,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = KeyboardChromeTokens.keyboardBackdrop(dark: false)
         view.insetsLayoutMarginsFromSafeArea = false
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
@@ -57,6 +56,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.onSwipe = { [weak self] words in self?.insertSwipe(words) }
         root.onNeedsHeightChange = { [weak self] in self?.updateKeyboardHeight() }
         AppGroupStore.consumeGiphySeedIfNeeded()
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (vc: KeyboardViewController, _) in
+            vc.applyDocumentState()
+        }
         applyDocumentState()
     }
 
@@ -103,11 +105,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         applyDocumentState()
     }
 
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
-        updateKeyboardHeight()
-    }
-
     override func viewWillLayoutSubviews() {
         super.viewWillLayoutSubviews()
         updateKeyboardHeight()
@@ -128,31 +125,21 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
     }
 
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        let appearance = textDocumentProxy.keyboardAppearance
-        let dark = appearance == .dark
-            || (appearance == .default && traitCollection.userInterfaceStyle == .dark)
-        applyHostChrome(backdrop: KeyboardChromeTokens.keyboardBackdrop(dark: dark))
+    /// Keep the input view clear so the chrome's top radius is the only fill.
+    /// Do not round or paint system ancestors (that was the lip + flicker).
+    private func applyHostChrome() {
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.layer.cornerRadius = 0
+        view.layer.maskedCorners = []
+        view.clipsToBounds = false
     }
 
-    /// Round the input view to match iOS 26's keyboard sheet. Paint ancestors
-    /// the same fill so clipped corners are not Messages-white, but do not
-    /// round those ancestors (the globe/mic well lives outside this view).
-    private func applyHostChrome(backdrop: UIColor) {
-        let radius = KeyboardChromeTokens.chromeCornerRadius
-        view.backgroundColor = backdrop
-        view.layer.cornerRadius = radius
-        view.layer.maskedCorners = KeyboardChromeTokens.chromeTopCorners
-        view.layer.cornerCurve = .continuous
-        view.clipsToBounds = true
-        var ancestor = view.superview
-        var depth = 0
-        while let host = ancestor, depth < 3, !(host is UIWindow) {
-            host.backgroundColor = backdrop
-            ancestor = host.superview
-            depth += 1
-        }
+    private func isDarkKeyboard() -> Bool {
+        KeyboardAppearanceResolve.isDark(
+            keyboardAppearance: textDocumentProxy.keyboardAppearance ?? .default,
+            userInterfaceStyle: traitCollection.userInterfaceStyle
+        )
     }
 
     private func applyDocumentState() {
@@ -162,12 +149,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             pollTask?.cancel()
             pollTask = nil
         }
-        let appearance = textDocumentProxy.keyboardAppearance
-        let dark = appearance == .dark
-            || (appearance == .default && traitCollection.userInterfaceStyle == .dark)
+        let dark = isDarkKeyboard()
         root.setAppearance(dark: dark)
-        let backdrop = KeyboardChromeTokens.keyboardBackdrop(dark: dark)
-        applyHostChrome(backdrop: backdrop)
+        applyHostChrome()
         root.setReturnTitle(returnTitle)
         updateCapitalization()
         refreshChrome()
@@ -207,10 +191,11 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             UIDevice.current.playInputClick()
             return
         }
-        // Space/return must not replace a 1-char selection — that is the
-        // double-tap "ate the last letter" path. Letters may still overwrite.
-        let allowSingleSelection = text != " " && text != "\n"
-        guard canMutateDocument(allowSingleCharacterSelection: allowSingleSelection) else { return }
+        // No insert may replace a 1-char selection. Space/return got this
+        // guard first (double-tap "ate the last letter"); letters were left
+        // able to overwrite, so the same phantom host selection could still
+        // silently eat one character per keystroke. Collapse instead.
+        guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: text),
            swipeCommittedWord != nil,
@@ -238,7 +223,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                     afterCount: remaining.count
                 ), AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: remaining) {
                     insertPlain(". ")
-                } else if remaining.count >= beforeCount {
+                } else {
+                    // Not safe to insert the period — restore the space this
+                    // tap consumed. Deleting without reinserting anything is
+                    // how this path used to eat a character.
                     insertPlain(" ")
                 }
                 lastSpaceTap = nil
@@ -281,10 +269,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             lastSpaceTap = nil
             swipeCommittedWord = nil
             if AutocorrectEngine.shouldAbortMultiCharDelete(selected: selected, before: context) {
+                HandoffDiagnostics.record("keyboard.delete.multiSelectAborted", detail: "len=\(selected.count)")
                 updateCapitalization()
                 refreshSuggestions()
                 return
             }
+            HandoffDiagnostics.record("keyboard.delete.multiSelect", detail: "len=\(selected.count)")
             // UIKit deletes the highlight even when before is empty (caret at
             // document start). Host-drop compare needs a non-empty before;
             // the empty skip stays on the caret path below.
@@ -303,6 +293,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             let allowed = AutocorrectEngine.allowedDeleteCount(span: word, inBeforeInput: context)
             if allowed > 0 {
                 UIDevice.current.playInputClick()
+                HandoffDiagnostics.record("keyboard.delete.swipeWord", detail: "count=\(allowed)")
                 deleteCharacters(allowed)
                 swipeCommittedWord = nil
                 lastSpaceTap = nil
@@ -336,7 +327,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         if !span.isEmpty {
             let allowed = AutocorrectEngine.allowedDeleteCount(span: span, inBeforeInput: context)
             guard allowed > 0, selectedTextIsEmpty else { return }
-            deleteCharacters(allowed)
+            guard deleteCharacters(allowed) else {
+                HandoffDiagnostics.record("keyboard.swipe.abortedSpanEat", detail: "wanted=\(allowed)")
+                return
+            }
         }
         let afterSpan = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.needsLeadingSpace(beforeInput: afterSpan) {
@@ -368,7 +362,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         guard let correction = autocorrect.correction(for: span), correction != span else { return }
         let replacement = AutocorrectEngine.replacement(span: span, correction: correction)
         guard replacement.deleteCount == allowed else { return }
-        deleteCharacters(allowed)
+        guard deleteCharacters(allowed) else {
+            HandoffDiagnostics.record("keyboard.autocorrect.abortedDelete", detail: "wanted=\(allowed)")
+            return
+        }
         insertPlain(replacement.insert)
         autocorrect.noteAutocorrect(original: span, corrected: replacement.insert)
     }
@@ -382,7 +379,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.isPunctuationSuggestion(chosen) {
             let committed = AutocorrectEngine.committedSpan(beforeInput: context)
-            deleteCharacters(committed.trailing.count)
+            guard deleteCharacters(committed.trailing.count) else {
+                HandoffDiagnostics.record("keyboard.candidate.abortedDelete", detail: "trailing=\(committed.trailing.count)")
+                return
+            }
             insertPlain(chosen + " ")
             swipeCommittedWord = nil
             lastSpaceTap = supportsDoubleSpacePeriod ? ContinuousClock().now : nil
@@ -407,7 +407,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         let removable = target + trailing
         let allowed = AutocorrectEngine.allowedDeleteCount(span: removable, inBeforeInput: context)
         guard allowed > 0, selectedTextIsEmpty else { return }
-        deleteCharacters(allowed)
+        guard deleteCharacters(allowed) else {
+            HandoffDiagnostics.record("keyboard.candidate.abortedDelete", detail: "wanted=\(allowed)")
+            return
+        }
         let inserted: String
         if AutocorrectEngine.periodAttachedWord(chosen) != nil {
             inserted = chosen + (trailing.isEmpty && phase != .secure ? " " : trailing)
@@ -525,37 +528,55 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         case .allow:
             return true
         case .deny:
+            HandoffDiagnostics.record(
+                "keyboard.mutate.denied",
+                detail: "selectedLen=\(textDocumentProxy.selectedText?.count ?? 0)"
+            )
             return false
         case .collapseOneCharacterSelection:
             textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
             if let still = textDocumentProxy.selectedText, !still.isEmpty {
+                HandoffDiagnostics.record("keyboard.mutate.collapseFailed", detail: "selectedLen=\(still.count)")
                 return false
             }
+            HandoffDiagnostics.record("keyboard.mutate.collapsed", detail: "")
             return true
         }
     }
 
     @discardableResult
     private func insertPlain(_ text: String) -> Bool {
-        let allowSingle = text != " " && text != "\n" && text != ". "
-        guard canMutateDocument(allowSingleCharacterSelection: allowSingle) else { return false }
+        // Never overwrite a 1-char selection — collapse it. A phantom host
+        // selection plus insertText is a silently eaten character.
+        guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
         textDocumentProxy.insertText(text)
         return true
     }
 
-    private func deleteCharacters(_ requested: Int) {
+    /// True when exactly `requested` characters were removed with no host
+    /// anomaly. False → the document is NOT in the expected state; callers
+    /// must skip any replacement insert (deleting fewer characters and then
+    /// inserting a correction garbles the word).
+    @discardableResult
+    private func deleteCharacters(_ requested: Int) -> Bool {
+        guard requested != 0 else { return true }
         let count = min(max(0, requested), AutocorrectEngine.maxDeleteLoop)
-        guard count > 0 else { return }
-        guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
+        guard count > 0 else { return false }
+        guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
         for _ in 0..<count {
             let before = textDocumentProxy.documentContextBeforeInput ?? ""
-            if before.isEmpty { break }
+            if before.isEmpty { return false }
             textDocumentProxy.deleteBackward()
             let after = textDocumentProxy.documentContextBeforeInput ?? ""
             if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
-                break
+                HandoffDiagnostics.record(
+                    "keyboard.delete.hostDrop",
+                    detail: "before=\(before.count) after=\(after.count)"
+                )
+                return false
             }
         }
+        return true
     }
 
     /// One `deleteBackward` for Delete / nil-selection. Insert still treats
@@ -570,7 +591,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         textDocumentProxy.deleteBackward()
         let after = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
-            return
+            HandoffDiagnostics.record(
+                "keyboard.delete.hostDrop",
+                detail: "single before=\(before.count) after=\(after.count)"
+            )
         }
     }
 
@@ -924,9 +948,14 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             HandoffDiagnostics.record("keyboard.result.received", detail: payload.id)
             finishWait()
             if textDocumentProxy.isSecureTextEntry == true { return }
-            let text = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = AutocorrectEngine.preparedDictationInsert(
+                transcript: payload.text,
+                beforeInput: textDocumentProxy.documentContextBeforeInput ?? "",
+                trailingSpace: true
+            )
             if !text.isEmpty {
                 self.insertPlain(text)
+                swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
                 HandoffDiagnostics.record(

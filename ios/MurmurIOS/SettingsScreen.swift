@@ -7,6 +7,8 @@ struct SettingsScreen: View {
     @State private var apiKey = AppGroupStore.apiKey
     @State private var giphyAPIKey = AppGroupStore.giphyAPIKey
     @State private var swipeTypingEnabled = AppGroupStore.swipeTypingEnabled
+    @State private var interstitialIDs = AppGroupStore.interstitialReturnAppIDs
+    @State private var showingAddApps = false
     @State private var micStatus = "Not requested"
     @State private var rehearsal = ""
 
@@ -74,6 +76,30 @@ struct SettingsScreen: View {
                         )
                     }
 
+                    section("Return apps") {
+                        settingsRow(
+                            title: "Jump-back grid",
+                            subtitle: "Shown on the swipe screen after keyboard dictation. Add any installed app, drag to rearrange, tap minus to remove. Swipe still works if you skip them."
+                        )
+                        JumpBackAppGrid(
+                            bundleIDs: interstitialIDs,
+                            showsAdd: true,
+                            showsRemove: true,
+                            allowsReorder: true,
+                            onAdd: { showingAddApps = true },
+                            onRemove: { id in
+                                AppGroupStore.removeInterstitialReturnApp(id)
+                                interstitialIDs = AppGroupStore.interstitialReturnAppIDs
+                            },
+                            onReorder: { moving, onto in
+                                AppGroupStore.reorderInterstitialReturnApp(moving: moving, onto: onto)
+                                interstitialIDs = AppGroupStore.interstitialReturnAppIDs
+                            }
+                        )
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 14)
+                    }
+
                     section("Keys") {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("ElevenLabs API key")
@@ -135,7 +161,15 @@ struct SettingsScreen: View {
                 AppGroupStore.consumeGiphySeedIfNeeded()
                 giphyAPIKey = AppGroupStore.giphyAPIKey
                 swipeTypingEnabled = AppGroupStore.swipeTypingEnabled
+                interstitialIDs = AppGroupStore.interstitialReturnAppIDs
                 refreshMicStatus()
+            }
+            .sheet(isPresented: $showingAddApps) {
+                AddJumpBackAppSheet(alreadyPicked: Set(interstitialIDs)) { id in
+                    AppGroupStore.addInterstitialReturnApp(id)
+                    interstitialIDs = AppGroupStore.interstitialReturnAppIDs
+                    showingAddApps = false
+                }
             }
         }
         .preferredColorScheme(.light)

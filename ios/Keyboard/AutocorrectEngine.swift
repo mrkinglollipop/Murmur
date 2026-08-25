@@ -616,6 +616,26 @@ enum AutocorrectEngine {
         return !"([{\"'“‘".contains(last)
     }
 
+    /// Join dictation takes without glue. Leading space when the caret follows
+    /// a word; trailing space so the next take still separates if the host
+    /// reports an empty `documentContextBeforeInput` after bounce-back.
+    static func preparedDictationInsert(
+        transcript: String,
+        beforeInput: String,
+        trailingSpace: Bool
+    ) -> String {
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        var output = text
+        if needsLeadingSpace(beforeInput: beforeInput) {
+            output = " " + output
+        }
+        if trailingSpace, output.last?.isWhitespace != true {
+            output += " "
+        }
+        return output
+    }
+
     /// Period, comma, and friends replace the automatic trailing space after a swipe.
     static func shouldEatTrailingSwipeSpace(beforeInserting text: String) -> Bool {
         if text == "\n" { return true }

@@ -40,6 +40,42 @@
 		<string>sms</string>
 		<string>mobilenotes</string>
 		<string>message</string>
+		<string>x-web-search</string>
+		<string>x-apple-reminderkit</string>
+		<string>calshow</string>
+		<string>shareddocuments</string>
+		<string>slack</string>
+		<string>whatsapp</string>
+		<string>twitter</string>
+		<string>instagram</string>
+		<string>threads</string>
+		<string>fb</string>
+		<string>fb-messenger</string>
+		<string>snapchat</string>
+		<string>snssdk1233</string>
+		<string>reddit</string>
+		<string>linkedin</string>
+		<string>discord</string>
+		<string>tg</string>
+		<string>sgnl</string>
+		<string>msteams</string>
+		<string>zoomus</string>
+		<string>googlechrome</string>
+		<string>googlegmail</string>
+		<string>googledrive</string>
+		<string>comgooglemaps</string>
+		<string>youtube</string>
+		<string>ms-outlook</string>
+		<string>spotify</string>
+		<string>nflx</string>
+		<string>aiv</string>
+		<string>uber</string>
+		<string>lyft</string>
+		<string>paypal</string>
+		<string>venmo</string>
+		<string>cashme</string>
+		<string>openai</string>
+		<string>github</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>

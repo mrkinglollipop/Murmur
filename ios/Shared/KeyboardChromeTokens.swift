@@ -11,9 +11,8 @@ enum KeyboardChromeTokens {
     static var landscapeHeight: CGFloat {
         KeyboardChromeMetrics.metrics(width: 430, isLandscape: true).keyboardHeight
     }
-    /// iOS 26+ wraps the input view in a rounded sheet. Radius 0 left a square
-    /// slab inside that sheet (the top indent). Match the sheet; do not also
-    /// apply `UIGlassContainerEffect` (that drew a second card).
+    /// One rounded top on the chrome fill. Do not also round the input view or
+    /// add `UIGlassContainerEffect` — that stacked a second card / lip.
     static let chromeCornerRadius: CGFloat = 28
     static let chromeTopCorners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
     static let bottomInset: CGFloat = 6

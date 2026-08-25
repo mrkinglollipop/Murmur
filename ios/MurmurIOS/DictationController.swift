@@ -508,18 +508,23 @@ final class DictationController: ObservableObject {
         }
     }
 
-    /// Interstitial control: user says this take is Messages. Remembers the PID
-    /// so the next Start with that PID bounces. Does not guess for Notes.
-    func returnToMessages() {
-        let id = HostReturn.messagesBundle
+    /// Interstitial control: user picked a host. Remembers the PID so the next
+    /// Start with that PID bounces. Does not guess for unknown apps.
+    func returnToApp(_ bundleID: String) {
+        let id = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ReturnAppCatalog.isAllowed(id) else { return }
         hostBundleID = id
         if hostPID > 1 {
             HostAppProbe.remember(pid: pid_t(hostPID), bundleID: id)
         }
         HostAppProbe.remember(id)
-        HandoffDiagnostics.record("app.return.messagesButton", detail: "pid=\(hostPID)")
+        HandoffDiagnostics.record("app.return.appButton", detail: "\(id) pid=\(hostPID)")
         hostBounceAttempts = 0
-        tryHostBounce(reason: "messages-button")
+        tryHostBounce(reason: "app-button")
+    }
+
+    func returnToMessages() {
+        returnToApp(HostReturn.messagesBundle)
     }
 
     /// User left Murmur (swipe or bounce). If the keyboard already appeared, start capture.
