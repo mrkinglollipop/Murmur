@@ -59,6 +59,9 @@ targets:
     productName: Murmur
     sources:
       - path: Sources/Voice
+        excludes:
+          # Bridging header is a build setting, not a compiled source.
+          - Murmur-Bridging-Header.h
       - path: Resources
         buildPhase: resources
         excludes:
@@ -75,8 +78,8 @@ targets:
         CFBundleDisplayName: Murmur
         CFBundleIconFile: AppIcon
         CFBundleIdentifier: com.matt.voice-dictation
-        CFBundleVersion: "36"
-        CFBundleShortVersionString: "0.1.35"
+        CFBundleVersion: "41"
+        CFBundleShortVersionString: "0.1.40"
         CFBundleExecutable: "$(EXECUTABLE_NAME)"
         CFBundlePackageType: APPL
         CFBundleSignature: "????"
@@ -115,6 +118,8 @@ targets:
         PRODUCT_MODULE_NAME: Voice
         INFOPLIST_FILE: Sources/Voice/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/Voice/Voice.entitlements
+        # NSException from AVAudioEngine.prepare/start — Swift try does not catch it.
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Voice/Murmur-Bridging-Header.h
 
   VoiceTests:
     type: bundle.unit-test

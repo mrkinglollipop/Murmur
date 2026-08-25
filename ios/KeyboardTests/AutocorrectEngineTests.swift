@@ -361,6 +361,134 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertTrue(AutocorrectEngine.allowLexiconInSwipe("Schwartz", frequency: frequency))
     }
 
+    func testShouldAbortMultiCharDeleteRejectsClauseAndGluedBlob() {
+        XCTAssertTrue(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "hello there friend",
+                before: "hello there friend"
+            ),
+            "stale sentence suffix"
+        )
+        XCTAssertTrue(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "hellothereyo",
+                before: "hellothereyo"
+            ),
+            "glued blob ≤12 that is the whole suffix"
+        )
+        XCTAssertTrue(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "hellohowareyou",
+                before: "hellohowareyou"
+            ),
+            "glued blob >12"
+        )
+        XCTAssertTrue(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "hello",
+                before: "say hellohello"
+            ),
+            "suffix match that is not the last token"
+        )
+        XCTAssertFalse(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "world",
+                before: "say world"
+            ),
+            "last whitespace-delimited token suffix"
+        )
+        XCTAssertFalse(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "hello there",
+                before: "I said "
+            ),
+            "real phrase highlight is not a suffix of before"
+        )
+        XCTAssertFalse(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "congratulations",
+                before: "say "
+            ),
+            "real long-word highlight is not a suffix of before"
+        )
+        XCTAssertFalse(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "hi",
+                before: "say hi"
+            )
+        )
+        XCTAssertFalse(
+            AutocorrectEngine.shouldAbortMultiCharDelete(
+                selected: "word",
+                before: "prefix "
+            ),
+            "a short highlight that is not the caret suffix is still a real selection"
+        )
+        XCTAssertFalse(
+            AutocorrectEngine.shouldAbortMultiCharDelete(selected: "x", before: "ax")
+        )
+        XCTAssertTrue(AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: 17, afterCount: 3))
+        XCTAssertFalse(AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: 5, afterCount: 4))
+    }
+
+    func testDocumentMutationDecisionAllowsEmptyAndDeniesClause() {
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: nil,
+                allowSingleCharacterSelection: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "",
+                allowSingleCharacterSelection: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "x",
+                allowSingleCharacterSelection: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "x",
+                allowSingleCharacterSelection: false
+            ),
+            .collapseOneCharacterSelection
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "hello there friend",
+                allowSingleCharacterSelection: true
+            ),
+            .deny
+        )
+        XCTAssertEqual(
+            AutocorrectEngine.documentMutationDecision(
+                selected: "hello there friend",
+                allowSingleCharacterSelection: false
+            ),
+            .deny
+        )
+    }
+
+    func testPeriodSpaceRemovalMustStayASingleCharacter() {
+        XCTAssertTrue(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 6, afterCount: 5))
+        XCTAssertTrue(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 6, afterCount: 4))
+        XCTAssertFalse(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 6, afterCount: 6))
+        XCTAssertFalse(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 20, afterCount: 0))
+        XCTAssertFalse(AutocorrectEngine.isSafePeriodSpaceRemoval(beforeCount: 6, afterCount: 7))
+        XCTAssertTrue(AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: "hello"))
+        XCTAssertTrue(AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: "ok2"))
+        XCTAssertFalse(AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: "hello "))
+        XCTAssertFalse(AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: "hello."))
+        XCTAssertFalse(AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: ""))
+    }
+
     func testShouldTeachSkipsKnownEnglish() {
         XCTAssertFalse(AutocorrectEngine.shouldTeach("the", known: ["the", "and"]))
         XCTAssertTrue(AutocorrectEngine.shouldTeach("Schwartz", known: ["the", "and"]))

@@ -191,7 +191,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             UIDevice.current.playInputClick()
             return
         }
-        guard canMutateDocument() else { return }
+        // Space/return must not replace a 1-char selection — that is the
+        // double-tap "ate the last letter" path. Letters may still overwrite.
+        let allowSingleSelection = text != " " && text != "\n"
+        guard canMutateDocument(allowSingleCharacterSelection: allowSingleSelection) else { return }
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: text),
            swipeCommittedWord != nil,
@@ -210,10 +213,18 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
         if text == " ", shouldReplaceSecondSpaceWithPeriod() {
             let after = textDocumentProxy.documentContextBeforeInput ?? ""
-            if AutocorrectEngine.shouldReplaceDoubleSpaceWithPeriod(beforeInput: after),
-               selectedTextIsEmpty {
+            if AutocorrectEngine.shouldReplaceDoubleSpaceWithPeriod(beforeInput: after) {
+                let beforeCount = after.count
                 deleteCharacters(1)
-                insertPlain(". ")
+                let remaining = textDocumentProxy.documentContextBeforeInput ?? ""
+                if AutocorrectEngine.isSafePeriodSpaceRemoval(
+                    beforeCount: beforeCount,
+                    afterCount: remaining.count
+                ), AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: remaining) {
+                    insertPlain(". ")
+                } else if remaining.count >= beforeCount {
+                    insertPlain(" ")
+                }
                 lastSpaceTap = nil
                 updateCapitalization()
                 refreshSuggestions()
@@ -228,8 +239,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 teachKeyboardWord(span)
             }
         }
-        insertPlain(text)
-        lastSpaceTap = text == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
+        let didInsert = insertPlain(text)
+        lastSpaceTap = didInsert && text == " " && supportsDoubleSpacePeriod
+            ? ContinuousClock().now
+            : nil
         if autocorrect.suppressUntilWhitespace, AutocorrectEngine.isCommitText(text) {
             autocorrect.suppressUntilWhitespace = false
         }
@@ -247,10 +260,23 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             return
         }
         if let selected = textDocumentProxy.selectedText, selected.count > 1 {
+            let context = textDocumentProxy.documentContextBeforeInput ?? ""
             UIDevice.current.playInputClick()
             lastSpaceTap = nil
-            textDocumentProxy.deleteBackward()
             swipeCommittedWord = nil
+            if AutocorrectEngine.shouldAbortMultiCharDelete(selected: selected, before: context) {
+                updateCapitalization()
+                refreshSuggestions()
+                return
+            }
+            // UIKit deletes the highlight even when before is empty (caret at
+            // document start). Host-drop compare needs a non-empty before;
+            // the empty skip stays on the caret path below.
+            if context.isEmpty {
+                textDocumentProxy.deleteBackward()
+            } else {
+                deleteBackwardCheckingHostDrop()
+            }
             autocorrect.clearUndo()
             updateCapitalization()
             refreshSuggestions()
@@ -274,7 +300,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
         UIDevice.current.playInputClick()
         lastSpaceTap = nil
-        textDocumentProxy.deleteBackward()
+        deleteBackwardCheckingHostDrop()
         autocorrect.clearUndo()
         updateCapitalization()
         refreshSuggestions()
@@ -471,20 +497,34 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         return selected.isEmpty
     }
 
-    /// Collapse a multi-character selection by moving the caret, never by
-    /// `insertText` — a stale `selectedText` would replace the real range.
+    /// Collapse a 1-char selection by moving one unit, never by `insertText`.
+    /// Do not jump by `selected.length` — a stale clause-sized `selectedText`
+    /// would move or extend the real range, and the next `deleteBackward`
+    /// wipes the sentence.
     private func canMutateDocument(allowSingleCharacterSelection: Bool = true) -> Bool {
-        guard let selected = textDocumentProxy.selectedText, !selected.isEmpty else { return true }
-        if selected.count == 1, allowSingleCharacterSelection { return true }
-        let offset = (selected as NSString).length
-        textDocumentProxy.adjustTextPosition(byCharacterOffset: offset)
-        guard let still = textDocumentProxy.selectedText, still.count > 1 else { return true }
-        return false
+        switch AutocorrectEngine.documentMutationDecision(
+            selected: textDocumentProxy.selectedText,
+            allowSingleCharacterSelection: allowSingleCharacterSelection
+        ) {
+        case .allow:
+            return true
+        case .deny:
+            return false
+        case .collapseOneCharacterSelection:
+            textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
+            if let still = textDocumentProxy.selectedText, !still.isEmpty {
+                return false
+            }
+            return true
+        }
     }
 
-    private func insertPlain(_ text: String) {
-        guard canMutateDocument() else { return }
+    @discardableResult
+    private func insertPlain(_ text: String) -> Bool {
+        let allowSingle = text != " " && text != "\n" && text != ". "
+        guard canMutateDocument(allowSingleCharacterSelection: allowSingle) else { return false }
         textDocumentProxy.insertText(text)
+        return true
     }
 
     private func deleteCharacters(_ requested: Int) {
@@ -499,6 +539,22 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
                 break
             }
+        }
+    }
+
+    /// One `deleteBackward` for Delete / nil-selection. Insert still treats
+    /// nil `selectedText` as an empty caret. Empty `before` is a no-op
+    /// (nothing to backspace). Multi-char selection at document start
+    /// deletes once in `deleteFromKeyboard` instead. If the host ate a
+    /// hidden range, stop — we cannot un-delete, but we must not loop.
+    /// The first host word-delete cannot be undone.
+    private func deleteBackwardCheckingHostDrop() {
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        guard !before.isEmpty else { return }
+        textDocumentProxy.deleteBackward()
+        let after = textDocumentProxy.documentContextBeforeInput ?? ""
+        if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
+            return
         }
     }
 

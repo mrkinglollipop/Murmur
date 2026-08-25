@@ -58,6 +58,37 @@ final class DictionaryPhoneticCorrectionTests: XCTestCase {
         XCTAssertTrue(result.records.isEmpty)
     }
 
+    func testPhoneticDoesNotStealLineOrLandForLinode() {
+        let store = makeStore()
+        store.add(term: "Linode", variants: ["line out"])
+        let field = store.correct("Did test, test, test in the field clean?")
+        XCTAssertEqual(field.text, "Did test, test, test in the field clean?")
+        XCTAssertTrue(field.records.isEmpty)
+        let line = store.correct("the line broke")
+        XCTAssertEqual(line.text, "the line broke")
+        let phrase = store.correct("Can you get the line out or does that need to be the line out?")
+        XCTAssertEqual(
+            phrase.text,
+            "Can you get the line out or does that need to be the line out?"
+        )
+        XCTAssertTrue(phrase.records.isEmpty)
+    }
+
+    func testUpdateStripsProtectedEnglishPhraseVariants() {
+        let store = makeStore()
+        store.add(term: "Linode", variants: ["linod"])
+        guard var entry = store.entries.first else {
+            XCTFail("expected Linode entry")
+            return
+        }
+        entry.variants = ["linod", "line out"]
+        store.update(entry)
+        XCTAssertEqual(store.entries.first?.variants, ["linod"])
+        let heard = store.correct("Can you get the line out?")
+        XCTAssertEqual(heard.text, "Can you get the line out?")
+        XCTAssertTrue(heard.records.isEmpty)
+    }
+
     func testPhoneticGuardRejectsCatKite() {
         let store = makeStore()
         store.add(term: "cat", variants: [])

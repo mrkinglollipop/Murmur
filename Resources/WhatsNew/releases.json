@@ -1,5 +1,50 @@
 [
   {
+    "version": "0.1.40",
+    "build": "41",
+    "title": "What's New in 0.1.40",
+    "items": [
+      "Holding to talk no longer drops the start of a sentence when Continuity Camera appears. The listening sound waits until the microphone is actually live.",
+      "iPhone and virtual mics stay off unless you turn on fallback in Settings.",
+      "Everyday phrases like “line out” are no longer rewritten to jargon from your dictionary."
+    ]
+  },
+  {
+    "version": "0.1.39",
+    "build": "40",
+    "title": "What's New in 0.1.39",
+    "items": [
+      "When the Mac microphone is the Sound Input default, Murmur binds it even if Core Audio has already offered another live device."
+    ]
+  },
+  {
+    "version": "0.1.38",
+    "build": "39",
+    "title": "What's New in 0.1.38",
+    "items": [
+      "Murmur still tries your Mac microphone when Core Audio briefly reports it as format-dead or not alive, instead of jumping to Continuity Camera or Jump Desktop."
+    ]
+  },
+  {
+    "version": "0.1.37",
+    "build": "38",
+    "title": "What's New in 0.1.37",
+    "items": [
+      "Holding the dictation key no longer force-quits Murmur.",
+      "Murmur uses your Mac microphone instead of Continuity Camera or Jump Desktop unless that is what Sound Input is set to.",
+      "If the first microphone bind fails, it retries a working device instead of showing Microphone unavailable."
+    ]
+  },
+  {
+    "version": "0.1.36",
+    "build": "37",
+    "title": "What's New in 0.1.36",
+    "items": [
+      "If a headset or other microphone unplugs while Murmur is running, it now switches to a working mic instead of freezing until you force-quit.",
+      "A stuck microphone start times out instead of locking the dictation key."
+    ]
+  },
+  {
     "version": "0.1.35",
     "build": "36",
     "title": "What's New in 0.1.35",

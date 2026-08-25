@@ -499,6 +499,13 @@ print("  PASS: mask + attribute-only prior + prior_sparkle_version bump-gate")
 print("  PASS: whitespace-only + versionless-newest fail-closed")
 PY
 
+echo "==> dictation product oracle reminder (VoiceTests ≠ hold)"
+if grep -q 'oracle-dictation-start.sh' "$SCRIPT"; then
+  pass "publish-sparkle names dictation start oracle"
+else
+  fail "publish-sparkle.sh must mention scripts/oracle-dictation-start.sh"
+fi
+
 echo ""
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ORACLE FAILED"

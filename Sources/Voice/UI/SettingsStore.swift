@@ -62,6 +62,7 @@ final class SettingsStore: ObservableObject {
         static let codeAwareMode = "voice.settings.codeAwareMode"
         static let launchAtLogin = "voice.settings.launchAtLogin"
         static let playDictationSound = "voice.settings.playDictationSound"
+        static let allowLastResortInputFallback = "voice.settings.allowLastResortInputFallback"
         static let useStreaming = "voice.settings.useStreaming"
         static let removeFillerWords = "voice.settings.removeFillerWords"
         static let useToggleLock = "voice.settings.useToggleLock"
@@ -179,6 +180,19 @@ final class SettingsStore: ObservableObject {
     @Published var playDictationSound: Bool {
         didSet {
             UserDefaults.standard.set(playDictationSound, forKey: Keys.playDictationSound)
+        }
+    }
+
+    /// When off (default), Continuity iPhone and virtual mics (Jump Desktop)
+    /// are never a fallback — only an explicit System Settings Sound Input
+    /// default can bind them. Wired into `AudioRecorder` via
+    /// `allowLastResortInputFallbackProvider`.
+    @Published var allowLastResortInputFallback: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                allowLastResortInputFallback,
+                forKey: Keys.allowLastResortInputFallback
+            )
         }
     }
 
@@ -376,6 +390,12 @@ final class SettingsStore: ObservableObject {
             playDictationSound = defaults.bool(forKey: Keys.playDictationSound)
         } else {
             playDictationSound = false
+        }
+
+        if defaults.object(forKey: Keys.allowLastResortInputFallback) != nil {
+            allowLastResortInputFallback = defaults.bool(forKey: Keys.allowLastResortInputFallback)
+        } else {
+            allowLastResortInputFallback = false
         }
 
         if defaults.object(forKey: Keys.useStreaming) != nil {
