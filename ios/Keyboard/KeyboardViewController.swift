@@ -221,21 +221,16 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
         if text == " ", shouldReplaceSecondSpaceWithPeriod() {
             let after = textDocumentProxy.documentContextBeforeInput ?? ""
-            if AutocorrectEngine.shouldReplaceDoubleSpaceWithPeriod(beforeInput: after) {
-                let beforeCount = after.count
-                deleteCharacters(1)
-                let remaining = textDocumentProxy.documentContextBeforeInput ?? ""
-                if AutocorrectEngine.isSafePeriodSpaceRemoval(
-                    beforeCount: beforeCount,
-                    afterCount: remaining.count
-                ), AutocorrectEngine.shouldInsertPeriodAfterRemovingSpace(beforeInput: remaining) {
-                    insertPlain(". ")
-                } else {
-                    // Not safe to insert the period — restore the space this
-                    // tap consumed. Deleting without reinserting anything is
-                    // how this path used to eat a character.
-                    insertPlain(" ")
-                }
+            if let walk = AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: after) {
+                // NEVER delete here. Step the caret back over the trailing
+                // space(s), drop the period in, step forward, and consume the
+                // tap. A deleteBackward on this path erased whole dictated
+                // sentences twice (2026-08-25) — hosts can treat a fresh bulk
+                // insert as one deletable clump and lie about it afterward.
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: -walk)
+                textDocumentProxy.insertText(".")
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: walk)
+                HandoffDiagnostics.record("keyboard.doubleSpace.period", detail: "walk=\(walk)")
                 lastSpaceTap = nil
                 updateCapitalization()
                 refreshSuggestions()
@@ -513,7 +508,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
               let lastSpaceTap,
               ContinuousClock().now - lastSpaceTap < .milliseconds(700) else { return false }
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
-        return AutocorrectEngine.shouldReplaceDoubleSpaceWithPeriod(beforeInput: context)
+        // Walk-based: also matches "sentence  " (dictation's auto trailing
+        // space + the first tap), which the single-space check never could.
+        return AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: context) != nil
     }
 
     /// `deleteBackward` / `insertText` replace the *selection*, not one character.

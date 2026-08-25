@@ -671,12 +671,33 @@ enum AutocorrectEngine {
     static func shouldEatTrailingSwipeSpace(beforeInserting text: String) -> Bool {
         if text == "\n" { return true }
         guard text.count == 1, let character = text.first else { return false }
-        // A typed space also swallows the automatic trailing space — otherwise
-        // a swipe/dictation take leaves "word  " and, worse, double-space-
-        // period can never fire after dictation (the second tap sees a space
-        // before the space and bails).
-        if character == " " { return true }
+        // A typed space must NOT eat the auto trailing space: that fired a
+        // deleteBackward right after a bulk dictation insert, and hosts that
+        // treat the fresh insert as one deletable clump took the whole
+        // sentence with it (2026-08-25, second wipe). Double-space-period
+        // handles the doubled space via doubleSpacePeriodWalk instead.
         return ".,!?;:)]}…".contains(character)
+    }
+
+    /// Non-deleting double-space-period. Returns how many trailing spaces
+    /// (1 or 2) the caret must step back over before inserting "." — nil when
+    /// the context doesn't end in letter/digit + 1–2 spaces. The space paths
+    /// may never call `deleteBackward`: hosts can hold selections they report
+    /// as empty and treat a fresh bulk insert as one deletable clump — both
+    /// 2026-08-25 sentence wipes rode a delete on this path. Walking the
+    /// caret and inserting cannot lose text on any host.
+    static func doubleSpacePeriodWalk(beforeInput: String) -> Int? {
+        var spaces = 0
+        var index = beforeInput.endIndex
+        while index > beforeInput.startIndex, spaces < 3 {
+            let previous = beforeInput.index(before: index)
+            guard beforeInput[previous] == " " else { break }
+            spaces += 1
+            index = previous
+        }
+        guard (1...2).contains(spaces), index > beforeInput.startIndex else { return nil }
+        let anchor = beforeInput[beforeInput.index(before: index)]
+        return (anchor.isLetter || anchor.isNumber) ? spaces : nil
     }
 
     /// Word immediately before trailing whitespace. Empty if the caret follows punctuation.
