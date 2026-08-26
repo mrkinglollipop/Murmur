@@ -563,6 +563,22 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
     }
 
+    /// A reported highlight whose text lives inside the recent dictation
+    /// insert is the host's phantom pending-region selection, never deletable.
+    func testIsLikelyHostHighlight() {
+        let take = "the whole dictated sentence with several words "
+        XCTAssertTrue(AutocorrectEngine.isLikelyHostHighlight(
+            selected: "several words ", recentBulkInsert: take))
+        XCTAssertTrue(AutocorrectEngine.isLikelyHostHighlight(
+            selected: take, recentBulkInsert: take))
+        XCTAssertFalse(AutocorrectEngine.isLikelyHostHighlight(
+            selected: "unrelated text", recentBulkInsert: take))
+        XCTAssertFalse(AutocorrectEngine.isLikelyHostHighlight(
+            selected: "several words", recentBulkInsert: nil))
+        XCTAssertFalse(AutocorrectEngine.isLikelyHostHighlight(
+            selected: " a ", recentBulkInsert: take), "1-char trimmed needle too weak")
+    }
+
     /// Bulk inserts go in as word-boundary chunks that rejoin exactly.
     func testBulkInsertChunksRejoinExactly() {
         let text = String(repeating: "hello world ", count: 12)  // 144 chars
