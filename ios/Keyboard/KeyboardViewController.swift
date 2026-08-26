@@ -20,9 +20,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var lastSpaceTap: ContinuousClock.Instant?
     private let autocorrect = AutocorrectController()
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
-    private var takeGuard: (lastContext: String, armedAt: ContinuousClock.Instant, restores: Int)?
-    private var restorePollTask: Task<Void, Never>?
-    private var lastRiskKeystrokeAt: ContinuousClock.Instant?
     private let dictionary = DictionaryStore()
     private var swipeCommittedWord: String?
     private var lexiconDocuments: [String] = []
@@ -105,8 +102,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         pollTask = nil
         startTimeoutTask?.cancel()
         startTimeoutTask = nil
-        restorePollTask?.cancel()
-        restorePollTask = nil
         if textDocumentProxy.isSecureTextEntry == true {
             waitingID = nil
             session = .idle
@@ -115,78 +110,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
-        checkGroundTruthRestore()
         applyDocumentState()
-    }
-
-    /// The endgame for the 2026-08-25/26 sentence wipes: every reported-state
-    /// defense failed because the host wipes through selections it reports as
-    /// empty. `textDidChange` reflects the document as it actually is — when
-    /// a big span of a just-dictated take silently vanishes between syncs,
-    /// put it back. Up to three restores per take (2026-08-26: Messages wiped
-    /// the SAME take twice; the one-shot rail caught the first and let the
-    /// second through), 90s window, disarmed by return (send) and by
-    /// deliberate multi-char deletes.
-    private static let maxRestoresPerTake = 3
-
-    /// iOS surfaces host-side wipes only at the NEXT user interaction, so the
-    /// textDidChange restore fired a tap late — the wiped text sat gone until
-    /// the user touched the field again (reported as "worse", fairly). While
-    /// a take is armed, actively re-check ground truth shortly after every
-    /// keystroke so a wipe is reversed in sub-second time instead.
-    private func scheduleRestorePoll() {
-        guard takeGuard != nil else { return }
-        restorePollTask?.cancel()
-        restorePollTask = Task { [weak self] in
-            for delay in [200, 700, 1500] {
-                try? await Task.sleep(for: .milliseconds(delay))
-                guard !Task.isCancelled else { return }
-                await MainActor.run { self?.checkGroundTruthRestore() }
-            }
-        }
-    }
-
-    private func checkGroundTruthRestore() {
-        guard let state = takeGuard else { return }
-        let now = ContinuousClock().now
-        guard now - state.armedAt < .seconds(90) else {
-            takeGuard = nil
-            return
-        }
-        let current = textDocumentProxy.documentContextBeforeInput ?? ""
-        // A total wipe empties the field exactly like a send does; only the
-        // trailing space/delete keystroke distinguishes them (2026-08-26
-        // round: the empty-guard refused a whole-field rescue).
-        let riskWindow: Bool
-        if let last = lastRiskKeystrokeAt {
-            riskWindow = now - last < .milliseconds(2500)
-        } else {
-            riskWindow = false
-        }
-        if state.restores < Self.maxRestoresPerTake,
-           let plan = AutocorrectEngine.wipeRestorePlan(
-               previous: state.lastContext,
-               current: current,
-               afterContext: textDocumentProxy.documentContextAfterInput ?? "",
-               allowEmptyCurrent: riskWindow
-           ) {
-            if plan.walkBack > 0 {
-                textDocumentProxy.adjustTextPosition(byCharacterOffset: -plan.walkBack)
-            }
-            for chunk in AutocorrectEngine.bulkInsertChunks(plan.lost) {
-                textDocumentProxy.insertText(chunk)
-            }
-            if plan.walkBack > 0 {
-                textDocumentProxy.adjustTextPosition(byCharacterOffset: plan.walkBack)
-            }
-            HandoffDiagnostics.record(
-                "keyboard.restore.performed",
-                detail: "lost=\(plan.lost.count) walkBack=\(plan.walkBack) n=\(state.restores + 1)"
-            )
-            takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", state.armedAt, state.restores + 1)
-            return
-        }
-        takeGuard = (current, state.armedAt, state.restores)
     }
 
     override func viewWillLayoutSubviews() {
@@ -267,8 +191,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func insertFromKeyboard(_ text: String) {
-        if text == " " { lastRiskKeystrokeAt = ContinuousClock().now }
-        scheduleRestorePoll()
         if root.handleGifTyping(text) {
             UIDevice.current.playInputClick()
             return
@@ -276,10 +198,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         if root.handleEmojiTyping(text) {
             UIDevice.current.playInputClick()
             return
-        }
-        if text == "\n" {
-            // Return can be Send — never resurrect a sent draft.
-            takeGuard = nil
         }
         // No insert may replace a 1-char selection. Space/return got this
         // guard first (double-tap "ate the last letter"); letters were left
@@ -345,8 +263,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func deleteFromKeyboard() {
-        lastRiskKeystrokeAt = ContinuousClock().now
-        scheduleRestorePoll()
         if root.handleGifDelete() {
             UIDevice.current.playInputClick()
             return
@@ -369,7 +285,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 recentBulkInsert: recentBulkInsertText()
             ) {
                 HandoffDiagnostics.record("keyboard.delete.refusedHostHighlight", detail: "len=\(selected.count)")
-                defuseHostSelectionAfterInsert()
                 updateCapitalization()
                 refreshSuggestions()
                 return
@@ -381,8 +296,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 return
             }
             HandoffDiagnostics.record("keyboard.delete.multiSelect", detail: "len=\(selected.count)")
-            // A deliberate highlight delete must not be "restored".
-            takeGuard = nil
             // UIKit deletes the highlight even when before is empty (caret at
             // document start). Host-drop compare needs a non-empty before;
             // the empty skip stays on the caret path below.
@@ -610,6 +523,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func shouldReplaceSecondSpaceWithPeriod() -> Bool {
+        // SIMPLIFIED 2026-08-26: no double-space magic near a dictation take.
+        // Messages discards its provisional region when anything touches it;
+        // near a transcript a space is just a space. Failure mode: no period
+        // appears — never a wipe, never a paste. "Near" = the 180-second
+        // recentBulkInsertText window; generous on purpose, since the cost
+        // of suppression is only a missing period.
+        guard recentBulkInsertText() == nil else { return false }
         guard supportsDoubleSpacePeriod,
               let lastSpaceTap,
               ContinuousClock().now - lastSpaceTap < .milliseconds(700) else { return false }
@@ -642,14 +562,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 "keyboard.mutate.denied",
                 detail: "selectedLen=\(textDocumentProxy.selectedText?.count ?? 0)"
             )
-            // If the blocking "selection" is the host's phantom highlight of
-            // our own recent insert, collapse it so the next keystroke works.
-            if AutocorrectEngine.isLikelyHostHighlight(
-                selected: textDocumentProxy.selectedText ?? "",
-                recentBulkInsert: recentBulkInsertText()
-            ) {
-                defuseHostSelectionAfterInsert()
-            }
             return false
         case .collapseOneCharacterSelection:
             textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
@@ -667,23 +579,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         // Never overwrite a 1-char selection — collapse it. A phantom host
         // selection plus insertText is a silently eaten character.
         guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
-        let before = textDocumentProxy.documentContextBeforeInput ?? ""
         textDocumentProxy.insertText(text)
-        // Hosts can hold a selection they report as empty; insertText then
-        // replaces it invisibly and no guard above can fire. Detect the loss
-        // from the context arithmetic and put the swallowed text back.
-        // Typing-size inserts only — unwinding a large paste/dictation insert
-        // char-by-char is its own hazard, so those just get logged.
-        let after = textDocumentProxy.documentContextBeforeInput ?? ""
-        if let lost = AutocorrectEngine.lostTextAfterInsert(before: before, after: after, inserted: text) {
-            if text.count <= 4 {
-                for _ in 0..<text.count { textDocumentProxy.deleteBackward() }
-                textDocumentProxy.insertText(lost + text)
-                HandoffDiagnostics.record("keyboard.insert.recovered", detail: "lost=\(lost.count)")
-            } else {
-                HandoffDiagnostics.record("keyboard.insert.lossDetected", detail: "lost=\(lost.count) inserted=\(text.count)")
-            }
-        }
         return true
     }
 
@@ -716,33 +612,15 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         return last.text
     }
 
-    /// Walk the caret to the end of any host-reported selection so a later
-    /// keystroke cannot replace or delete it wholesale. Called right after
-    /// our own bulk insert (caret at document tail — an over-walk on a stale
-    /// report clamps harmlessly) and when a phantom highlight blocks input.
-    private func defuseHostSelectionAfterInsert() {
-        guard let selected = textDocumentProxy.selectedText, !selected.isEmpty else { return }
-        textDocumentProxy.adjustTextPosition(byCharacterOffset: selected.count)
-        let still = textDocumentProxy.selectedText ?? ""
-        HandoffDiagnostics.record(
-            "keyboard.selection.defused",
-            detail: "was=\(selected.count) still=\(still.count)"
-        )
-    }
-
-    /// One deleteBackward took a hidden tail selection with it — restore
-    /// everything except the character the user actually asked to remove.
-    /// Falls back to logging the drop when the loss is not tail-shaped.
+    /// A delete removed more than expected (host word-delete or hidden
+    /// selection). SIMPLIFIED 2026-08-26: log only — every automatic
+    /// reinsertion built during the sentence-wipe saga misfired somewhere;
+    /// cleverness here must fail to "nothing happens".
     private func restoreHiddenSelectionLoss(before: String, after: String) {
-        if let lost = AutocorrectEngine.lostTailAfterSingleDelete(before: before, after: after) {
-            textDocumentProxy.insertText(lost)
-            HandoffDiagnostics.record("keyboard.delete.recovered", detail: "lost=\(lost.count)")
-        } else {
-            HandoffDiagnostics.record(
-                "keyboard.delete.hostDrop",
-                detail: "before=\(before.count) after=\(after.count)"
-            )
-        }
+        HandoffDiagnostics.record(
+            "keyboard.delete.hostDrop",
+            detail: "before=\(before.count) after=\(after.count)"
+        )
     }
 
     /// One `deleteBackward` for Delete / nil-selection. Insert still treats
@@ -1132,9 +1010,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                     textDocumentProxy.insertText(chunk)
                 }
                 lastBulkInsert = (text: text, at: ContinuousClock().now)
-                defuseHostSelectionAfterInsert()
-                // Arm the ground-truth restore with the post-insert context.
-                takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", ContinuousClock().now, 0)
                 swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
