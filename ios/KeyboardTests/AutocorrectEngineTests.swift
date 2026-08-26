@@ -569,38 +569,52 @@ final class AutocorrectEngineTests: XCTestCase {
         // Phantom wipe: sentence gone, a typed period survives at the tail.
         let plan = AutocorrectEngine.wipeRestorePlan(
             previous: "Hi. The whole dictated sentence sits here  ",
-            current: "Hi. ."
+            current: "Hi. .",
+            afterContext: ""
         )
         XCTAssertEqual(plan?.lost, "The whole dictated sentence sits here  ")
         XCTAssertEqual(plan?.walkBack, 1)
         // Whole-field wipe leaving only the typed space.
         let whole = AutocorrectEngine.wipeRestorePlan(
             previous: "The whole dictated sentence sits here ",
-            current: " "
+            current: " ",
+            afterContext: ""
         )
         XCTAssertEqual(whole?.lost, "The whole dictated sentence sits here ")
         XCTAssertEqual(whole?.walkBack, 1)
         // Send / cleared field: never restore into empty by default.
         XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
-            previous: "The whole dictated sentence sits here ", current: ""))
+            previous: "The whole dictated sentence sits here ", current: "", afterContext: ""))
         // Total wipe inside the keystroke risk window: restore is allowed.
         let total = AutocorrectEngine.wipeRestorePlan(
             previous: "The whole dictated sentence sits here ",
             current: "",
+            afterContext: "",
             allowEmptyCurrent: true
         )
         XCTAssertEqual(total?.lost, "The whole dictated sentence sits here ")
         XCTAssertEqual(total?.walkBack, 0)
         // Normal typing grows the context.
         XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
-            previous: "hello there my friend okay", current: "hello there my friend okayx"))
+            previous: "hello there my friend okay", current: "hello there my friend okayx", afterContext: ""))
         // Single backspace: loss below threshold.
         XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
-            previous: "hello there my friend okay", current: "hello there my friend oka"))
+            previous: "hello there my friend okay", current: "hello there my friend oka", afterContext: ""))
         // Field switch to a longer different field: extra too large.
         XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
             previous: "the entire dictated sentence lives here",
-            current: "completely different field contents"))
+            current: "completely different field contents", afterContext: ""))
+    }
+
+    /// Tapping earlier in the text shrinks the before-context exactly like a
+    /// wipe — but the "lost" text still sits after the caret. Never restore
+    /// when anything follows the caret (the paste-on-click regression).
+    func testWipeRestorePlanNeverFiresMidText() {
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "Hi. The whole dictated sentence sits here ",
+            current: "Hi. The",
+            afterContext: " whole dictated sentence sits here "
+        ))
     }
 
     /// A reported highlight whose text lives inside the recent dictation

@@ -167,6 +167,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
            let plan = AutocorrectEngine.wipeRestorePlan(
                previous: state.lastContext,
                current: current,
+               afterContext: textDocumentProxy.documentContextAfterInput ?? "",
                allowEmptyCurrent: riskWindow
            ) {
             if plan.walkBack > 0 {

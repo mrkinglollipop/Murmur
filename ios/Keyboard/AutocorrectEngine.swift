@@ -684,9 +684,17 @@ enum AutocorrectEngine {
     static func wipeRestorePlan(
         previous: String,
         current: String,
+        afterContext: String,
         minLoss: Int = 20,
         allowEmptyCurrent: Bool = false
     ) -> (lost: String, walkBack: Int)? {
+        // Moving the caret backward shrinks the before-context EXACTLY like a
+        // tail wipe (shared prefix, big "loss", no extra) — restoring there
+        // pastes the tail mid-text at the caret (shipped 2026-08-26, user hit
+        // it by tapping into the sentence). The discriminator: after a caret
+        // move the "lost" text still exists AFTER the caret; after a real
+        // wipe there is nothing there.
+        guard afterContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         // Empty current is normally send/clear (never resurrect a sent
         // draft) — but a total wipe ALSO empties the field. The caller
         // passes allowEmptyCurrent only within a couple of seconds of a
