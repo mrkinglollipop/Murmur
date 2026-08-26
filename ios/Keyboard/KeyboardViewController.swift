@@ -20,6 +20,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var lastSpaceTap: ContinuousClock.Instant?
     private let autocorrect = AutocorrectController()
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
+    private var takeGuard: (lastContext: String, armedAt: ContinuousClock.Instant, restored: Bool)?
     private let dictionary = DictionaryStore()
     private var swipeCommittedWord: String?
     private var lexiconDocuments: [String] = []
@@ -110,7 +111,43 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
+        checkGroundTruthRestore()
         applyDocumentState()
+    }
+
+    /// The endgame for the 2026-08-25/26 sentence wipes: every reported-state
+    /// defense failed because the host wipes through selections it reports as
+    /// empty. `textDidChange` reflects the document as it actually is — when
+    /// a big span of a just-dictated take silently vanishes between syncs,
+    /// put it back. One restore per take, 90s window, disarmed by return
+    /// (send) and by deliberate multi-char deletes.
+    private func checkGroundTruthRestore() {
+        guard let state = takeGuard else { return }
+        let now = ContinuousClock().now
+        guard now - state.armedAt < .seconds(90) else {
+            takeGuard = nil
+            return
+        }
+        let current = textDocumentProxy.documentContextBeforeInput ?? ""
+        if !state.restored,
+           let plan = AutocorrectEngine.wipeRestorePlan(previous: state.lastContext, current: current) {
+            if plan.walkBack > 0 {
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: -plan.walkBack)
+            }
+            for chunk in AutocorrectEngine.bulkInsertChunks(plan.lost) {
+                textDocumentProxy.insertText(chunk)
+            }
+            if plan.walkBack > 0 {
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: plan.walkBack)
+            }
+            HandoffDiagnostics.record(
+                "keyboard.restore.performed",
+                detail: "lost=\(plan.lost.count) walkBack=\(plan.walkBack)"
+            )
+            takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", state.armedAt, true)
+            return
+        }
+        takeGuard = (current, state.armedAt, state.restored)
     }
 
     override func viewWillLayoutSubviews() {
@@ -198,6 +235,10 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         if root.handleEmojiTyping(text) {
             UIDevice.current.playInputClick()
             return
+        }
+        if text == "\n" {
+            // Return can be Send — never resurrect a sent draft.
+            takeGuard = nil
         }
         // No insert may replace a 1-char selection. Space/return got this
         // guard first (double-tap "ate the last letter"); letters were left
@@ -297,6 +338,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 return
             }
             HandoffDiagnostics.record("keyboard.delete.multiSelect", detail: "len=\(selected.count)")
+            // A deliberate highlight delete must not be "restored".
+            takeGuard = nil
             // UIKit deletes the highlight even when before is empty (caret at
             // document start). Host-drop compare needs a non-empty before;
             // the empty skip stays on the caret path below.
@@ -1047,6 +1090,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 }
                 lastBulkInsert = (text: text, at: ContinuousClock().now)
                 defuseHostSelectionAfterInsert()
+                // Arm the ground-truth restore with the post-insert context.
+                takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", ContinuousClock().now, false)
                 swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()

@@ -667,6 +667,34 @@ enum AutocorrectEngine {
         return output
     }
 
+    /// Ground-truth wipe detection at `textDidChange` time — the one callback
+    /// where the host cannot misreport state. `previous`/`current` are
+    /// `documentContextBeforeInput` snapshots around a host sync. A
+    /// phantom-selection wipe leaves: shared prefix + (≥ `minLoss` chars
+    /// silently gone) + at most a few freshly typed characters. Returns the
+    /// text to reinsert and how many current tail characters to walk back
+    /// over first. Empty `current` is a send/clear — never restore into it.
+    /// Gradual user deletion (one char per sync) never reaches `minLoss`.
+    static func wipeRestorePlan(
+        previous: String,
+        current: String,
+        minLoss: Int = 20
+    ) -> (lost: String, walkBack: Int)? {
+        guard !current.isEmpty else { return nil }
+        let previousChars = Array(previous)
+        let currentChars = Array(current)
+        var shared = 0
+        while shared < previousChars.count,
+              shared < currentChars.count,
+              previousChars[shared] == currentChars[shared] {
+            shared += 1
+        }
+        let lost = previousChars.count - shared
+        let extra = currentChars.count - shared
+        guard lost >= minLoss, extra <= 4 else { return nil }
+        return (String(previousChars[shared...]), extra)
+    }
+
     /// A reported multi-char "highlight" whose text occurs inside the recent
     /// bulk insert is the host's phantom selection of its own pending region
     /// (Messages held the last inserted chunk selected, 2026-08-26) — not a
