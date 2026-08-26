@@ -673,14 +673,25 @@ enum AutocorrectEngine {
     /// phantom-selection wipe leaves: shared prefix + (≥ `minLoss` chars
     /// silently gone) + at most a few freshly typed characters. Returns the
     /// text to reinsert and how many current tail characters to walk back
-    /// over first. Empty `current` is a send/clear — never restore into it.
-    /// Gradual user deletion (one char per sync) never reaches `minLoss`.
+    /// over first. Empty `current` is a send/clear — never restore into it
+    /// unless the caller vouches via `allowEmptyCurrent` (total wipes empty
+    /// the field exactly like sends do; only keystroke timing separates
+    /// them). Gradual user deletion (one char per sync) never reaches
+    /// `minLoss`. Restores are deliberately generous, not surgical: when the
+    /// typed space died inside the wiped span, restoring the span alongside
+    /// the survivor leaves a doubled space (observed live 2026-08-26) —
+    /// preferable to under-restoring by guessing.
     static func wipeRestorePlan(
         previous: String,
         current: String,
-        minLoss: Int = 20
+        minLoss: Int = 20,
+        allowEmptyCurrent: Bool = false
     ) -> (lost: String, walkBack: Int)? {
-        guard !current.isEmpty else { return nil }
+        // Empty current is normally send/clear (never resurrect a sent
+        // draft) — but a total wipe ALSO empties the field. The caller
+        // passes allowEmptyCurrent only within a couple of seconds of a
+        // space/delete keystroke, which sends do not follow that closely.
+        guard !current.isEmpty || allowEmptyCurrent else { return nil }
         let previousChars = Array(previous)
         let currentChars = Array(current)
         var shared = 0

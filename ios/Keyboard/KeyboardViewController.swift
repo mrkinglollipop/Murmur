@@ -22,6 +22,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
     private var takeGuard: (lastContext: String, armedAt: ContinuousClock.Instant, restores: Int)?
     private var restorePollTask: Task<Void, Never>?
+    private var lastRiskKeystrokeAt: ContinuousClock.Instant?
     private let dictionary = DictionaryStore()
     private var swipeCommittedWord: String?
     private var lexiconDocuments: [String] = []
@@ -153,8 +154,21 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             return
         }
         let current = textDocumentProxy.documentContextBeforeInput ?? ""
+        // A total wipe empties the field exactly like a send does; only the
+        // trailing space/delete keystroke distinguishes them (2026-08-26
+        // round: the empty-guard refused a whole-field rescue).
+        let riskWindow: Bool
+        if let last = lastRiskKeystrokeAt {
+            riskWindow = now - last < .milliseconds(2500)
+        } else {
+            riskWindow = false
+        }
         if state.restores < Self.maxRestoresPerTake,
-           let plan = AutocorrectEngine.wipeRestorePlan(previous: state.lastContext, current: current) {
+           let plan = AutocorrectEngine.wipeRestorePlan(
+               previous: state.lastContext,
+               current: current,
+               allowEmptyCurrent: riskWindow
+           ) {
             if plan.walkBack > 0 {
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: -plan.walkBack)
             }
@@ -252,6 +266,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func insertFromKeyboard(_ text: String) {
+        if text == " " { lastRiskKeystrokeAt = ContinuousClock().now }
         scheduleRestorePoll()
         if root.handleGifTyping(text) {
             UIDevice.current.playInputClick()
@@ -329,6 +344,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func deleteFromKeyboard() {
+        lastRiskKeystrokeAt = ContinuousClock().now
         scheduleRestorePoll()
         if root.handleGifDelete() {
             UIDevice.current.playInputClick()
