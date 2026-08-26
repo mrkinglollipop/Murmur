@@ -983,13 +983,26 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 trailingSpace: true
             )
             if !text.isEmpty {
-                self.insertPlain(text)
+                // One big insertText became a single "pending" region in some
+                // hosts (Messages): the next keystroke replaced the WHOLE
+                // insert with itself, wiping the sentence with the selection
+                // reported empty throughout (2026-08-26, third wipe — zero
+                // guard events fired). Two countermeasures: word-boundary
+                // chunks so no single region spans the sentence, then a caret
+                // wiggle, which is how iOS commits pending text state.
+                guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
+                let chunks = AutocorrectEngine.bulkInsertChunks(text)
+                for chunk in chunks {
+                    textDocumentProxy.insertText(chunk)
+                }
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: -1)
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
                 swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
                 HandoffDiagnostics.record(
                     "keyboard.insertion.acknowledged",
-                    detail: "\(payload.id) characters=\(text.count)"
+                    detail: "\(payload.id) characters=\(text.count) chunks=\(chunks.count) committed=caretNudge"
                 )
             }
             DictationHandoff.clear()

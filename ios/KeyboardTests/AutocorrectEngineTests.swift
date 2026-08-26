@@ -563,6 +563,24 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
     }
 
+    /// Bulk inserts go in as word-boundary chunks that rejoin exactly.
+    func testBulkInsertChunksRejoinExactly() {
+        let text = String(repeating: "hello world ", count: 12)  // 144 chars
+        let chunks = AutocorrectEngine.bulkInsertChunks(text)
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertEqual(chunks.joined(), text)
+        for chunk in chunks.dropLast() {
+            XCTAssertTrue(chunk.hasSuffix(" "), "chunks cut only after spaces")
+        }
+    }
+
+    func testBulkInsertChunksShortAndEdgeCases() {
+        XCTAssertEqual(AutocorrectEngine.bulkInsertChunks("short text "), ["short text "])
+        XCTAssertEqual(AutocorrectEngine.bulkInsertChunks(""), [])
+        let blob = String(repeating: "x", count: 120)  // no spaces: one chunk
+        XCTAssertEqual(AutocorrectEngine.bulkInsertChunks(blob), [blob])
+    }
+
     /// Non-deleting double-space-period: trailing-space run to step over.
     func testDoubleSpacePeriodWalk() {
         XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word "), 1)

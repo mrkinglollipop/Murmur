@@ -667,6 +667,27 @@ enum AutocorrectEngine {
         return output
     }
 
+    /// Word-boundary chunks (~48 chars) for bulk inserts. One big insertText
+    /// can become a single pending region that a host silently replaces
+    /// wholesale on the next keystroke (Messages, 2026-08-26 sentence wipe);
+    /// smaller runs cap any such region at one chunk. Chunks cut only after
+    /// a space, and joining them reproduces `text` exactly.
+    static func bulkInsertChunks(_ text: String, targetLength: Int = 48) -> [String] {
+        guard !text.isEmpty else { return [] }
+        guard text.count > targetLength else { return [text] }
+        var chunks: [String] = []
+        var current = ""
+        for character in text {
+            current.append(character)
+            if current.count >= targetLength, character == " " {
+                chunks.append(current)
+                current = ""
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
     /// Period, comma, and friends replace the automatic trailing space after a swipe.
     static func shouldEatTrailingSwipeSpace(beforeInserting text: String) -> Bool {
         if text == "\n" { return true }
