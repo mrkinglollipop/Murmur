@@ -160,6 +160,8 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: ","))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "!"))
         XCTAssertTrue(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "\n"))
+        // A typed space must NOT eat the auto space — that deleteBackward
+        // after a bulk insert wiped a dictated sentence (2026-08-25).
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "a"))
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: "'"))
@@ -494,5 +496,170 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertTrue(AutocorrectEngine.shouldTeach("Schwartz", known: ["the", "and"]))
         XCTAssertFalse(AutocorrectEngine.shouldTeach("東京", known: []))
         XCTAssertFalse(AutocorrectEngine.shouldTeach("a", known: []))
+    }
+
+    // MARK: - Hidden-selection loss recovery (2026-08-25 sentence wipe)
+
+    /// Clean insert: after == before + inserted → nothing lost.
+    func testLostTextAfterInsertCleanInsertIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "The whole sentence", after: "The whole sentence ", inserted: " "))
+    }
+
+    /// The host replaced a hidden selection with the insert: the swallowed
+    /// span is exactly the gap between the surviving prefix and `before`.
+    func testLostTextAfterInsertReturnsSwallowedSelection() {
+        XCTAssertEqual(
+            AutocorrectEngine.lostTextAfterInsert(
+                before: "Hi. The whole sentence", after: "Hi. ", inserted: " "),
+            " The whole sentence"
+        )
+    }
+
+    /// Context window slid (front chars dropped): prefix relation breaks —
+    /// never "restore" from a slid window.
+    func testLostTextAfterInsertWindowSlideIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abcdef", after: "bcdef ", inserted: " "))
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abc", after: "xyz ", inserted: " "))
+    }
+
+    /// Insert missing from the tail (host did something else entirely): nil.
+    func testLostTextAfterInsertMissingInsertIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abc", after: "ab", inserted: " "))
+        XCTAssertNil(AutocorrectEngine.lostTextAfterInsert(
+            before: "abc", after: "abc x", inserted: " "))
+    }
+
+    /// A normal single delete (1 char, or 2 with a combining mark) is clean.
+    func testLostTailAfterSingleDeleteCleanIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTailAfterSingleDelete(before: "word ", after: "word"))
+        XCTAssertNil(AutocorrectEngine.lostTailAfterSingleDelete(before: "word ", after: "wor"))
+    }
+
+    /// deleteBackward took a hidden tail selection: restore everything except
+    /// the one character the user asked to remove.
+    func testLostTailAfterSingleDeleteRestoresAllButIntended() {
+        XCTAssertEqual(
+            AutocorrectEngine.lostTailAfterSingleDelete(
+                before: "Hi. The whole sentence ", after: "Hi. "),
+            "The whole sentence"
+        )
+    }
+
+    /// Loss that is not a tail (remainder is not a prefix): unrecoverable, nil.
+    func testLostTailAfterSingleDeleteNonTailIsNil() {
+        XCTAssertNil(AutocorrectEngine.lostTailAfterSingleDelete(
+            before: "abcdefgh", after: "efgh"))
+    }
+
+    /// A typed space never eats the auto trailing space: that deleteBackward
+    /// right after a bulk dictation insert is what wiped a sentence on hosts
+    /// that treat the insert as one deletable clump. The doubled space is
+    /// handled by the non-deleting period walk instead.
+    func testTypedSpaceDoesNotEatAutoTrailingSpace() {
+        XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
+    }
+
+    /// Ground-truth restore: a wipe leaves shared prefix + big silent loss +
+    /// at most a few typed chars. Gradual deletes and sends never match.
+    func testWipeRestorePlan() {
+        // Phantom wipe: sentence gone, a typed period survives at the tail.
+        let plan = AutocorrectEngine.wipeRestorePlan(
+            previous: "Hi. The whole dictated sentence sits here  ",
+            current: "Hi. .",
+            afterContext: ""
+        )
+        XCTAssertEqual(plan?.lost, "The whole dictated sentence sits here  ")
+        XCTAssertEqual(plan?.walkBack, 1)
+        // Whole-field wipe leaving only the typed space.
+        let whole = AutocorrectEngine.wipeRestorePlan(
+            previous: "The whole dictated sentence sits here ",
+            current: " ",
+            afterContext: ""
+        )
+        XCTAssertEqual(whole?.lost, "The whole dictated sentence sits here ")
+        XCTAssertEqual(whole?.walkBack, 1)
+        // Send / cleared field: never restore into empty by default.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "The whole dictated sentence sits here ", current: "", afterContext: ""))
+        // Total wipe inside the keystroke risk window: restore is allowed.
+        let total = AutocorrectEngine.wipeRestorePlan(
+            previous: "The whole dictated sentence sits here ",
+            current: "",
+            afterContext: "",
+            allowEmptyCurrent: true
+        )
+        XCTAssertEqual(total?.lost, "The whole dictated sentence sits here ")
+        XCTAssertEqual(total?.walkBack, 0)
+        // Normal typing grows the context.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "hello there my friend okay", current: "hello there my friend okayx", afterContext: ""))
+        // Single backspace: loss below threshold.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "hello there my friend okay", current: "hello there my friend oka", afterContext: ""))
+        // Field switch to a longer different field: extra too large.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "the entire dictated sentence lives here",
+            current: "completely different field contents", afterContext: ""))
+    }
+
+    /// Tapping earlier in the text shrinks the before-context exactly like a
+    /// wipe — but the "lost" text still sits after the caret. Never restore
+    /// when anything follows the caret (the paste-on-click regression).
+    func testWipeRestorePlanNeverFiresMidText() {
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "Hi. The whole dictated sentence sits here ",
+            current: "Hi. The",
+            afterContext: " whole dictated sentence sits here "
+        ))
+    }
+
+    /// A reported highlight whose text lives inside the recent dictation
+    /// insert is the host's phantom pending-region selection, never deletable.
+    func testIsLikelyHostHighlight() {
+        let take = "the whole dictated sentence with several words "
+        XCTAssertTrue(AutocorrectEngine.isLikelyHostHighlight(
+            selected: "several words ", recentBulkInsert: take))
+        XCTAssertTrue(AutocorrectEngine.isLikelyHostHighlight(
+            selected: take, recentBulkInsert: take))
+        XCTAssertFalse(AutocorrectEngine.isLikelyHostHighlight(
+            selected: "unrelated text", recentBulkInsert: take))
+        XCTAssertFalse(AutocorrectEngine.isLikelyHostHighlight(
+            selected: "several words", recentBulkInsert: nil))
+        XCTAssertFalse(AutocorrectEngine.isLikelyHostHighlight(
+            selected: " a ", recentBulkInsert: take), "1-char trimmed needle too weak")
+    }
+
+    /// Bulk inserts go in as word-boundary chunks that rejoin exactly.
+    func testBulkInsertChunksRejoinExactly() {
+        let text = String(repeating: "hello world ", count: 12)  // 144 chars
+        let chunks = AutocorrectEngine.bulkInsertChunks(text)
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertEqual(chunks.joined(), text)
+        for chunk in chunks.dropLast() {
+            XCTAssertTrue(chunk.hasSuffix(" "), "chunks cut only after spaces")
+        }
+    }
+
+    func testBulkInsertChunksShortAndEdgeCases() {
+        XCTAssertEqual(AutocorrectEngine.bulkInsertChunks("short text "), ["short text "])
+        XCTAssertEqual(AutocorrectEngine.bulkInsertChunks(""), [])
+        let blob = String(repeating: "x", count: 120)  // no spaces: one chunk
+        XCTAssertEqual(AutocorrectEngine.bulkInsertChunks(blob), [blob])
+    }
+
+    /// Non-deleting double-space-period: trailing-space run to step over.
+    func testDoubleSpacePeriodWalk() {
+        XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word "), 1)
+        XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "sentence  "), 2)
+        XCTAssertEqual(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "ok2 "), 1)
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word   "))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word"))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: "word. "))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: " "))
+        XCTAssertNil(AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: ""))
     }
 }

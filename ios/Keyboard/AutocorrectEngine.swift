@@ -98,6 +98,37 @@ enum AutocorrectEngine {
         return (beforeCount - afterCount) > 2
     }
 
+    /// After `insertText(inserted)` the context should read `before + inserted`.
+    /// Hosts can hold a selection they REPORT as empty; `insertText` then
+    /// replaces it invisibly (2026-08-25: a double-space erased a whole
+    /// dictated sentence with no guard firing). When the post-insert context
+    /// ends with the insert but its base is a strict prefix of `before`, the
+    /// gap is exactly what the host swallowed — return it so the caller can
+    /// put it back. The lost span keeps its boundary whitespace: inserting
+    /// `lost + inserted` after removing `inserted` reproduces
+    /// `before + inserted` exactly. Nil means the insert looks clean (or the
+    /// context window slid, which breaks the prefix relation and must not
+    /// trigger a restore).
+    static func lostTextAfterInsert(before: String, after: String, inserted: String) -> String? {
+        guard !inserted.isEmpty, after.hasSuffix(inserted) else { return nil }
+        let afterBase = String(after.dropLast(inserted.count))
+        guard afterBase.count < before.count else { return nil }
+        guard before.hasPrefix(afterBase) else { return nil }
+        let lost = String(before.dropFirst(afterBase.count))
+        return lost.isEmpty ? nil : lost
+    }
+
+    /// After ONE `deleteBackward`, more than the final character (plus
+    /// combining-mark slack) vanished and the remainder is a prefix of
+    /// `before`: the host deleted a hidden tail selection. Everything except
+    /// the one character the user actually asked to remove is restorable.
+    static func lostTailAfterSingleDelete(before: String, after: String) -> String? {
+        guard before.count - after.count > 2 else { return nil }
+        guard before.hasPrefix(after) else { return nil }
+        let lost = String(before.dropFirst(after.count).dropLast(1))
+        return lost.isEmpty ? nil : lost
+    }
+
     enum DocumentMutationDecision: Equatable {
         case allow
         case deny
@@ -636,11 +667,117 @@ enum AutocorrectEngine {
         return output
     }
 
+    /// Ground-truth wipe detection at `textDidChange` time — the one callback
+    /// where the host cannot misreport state. `previous`/`current` are
+    /// `documentContextBeforeInput` snapshots around a host sync. A
+    /// phantom-selection wipe leaves: shared prefix + (≥ `minLoss` chars
+    /// silently gone) + at most a few freshly typed characters. Returns the
+    /// text to reinsert and how many current tail characters to walk back
+    /// over first. Empty `current` is a send/clear — never restore into it
+    /// unless the caller vouches via `allowEmptyCurrent` (total wipes empty
+    /// the field exactly like sends do; only keystroke timing separates
+    /// them). Gradual user deletion (one char per sync) never reaches
+    /// `minLoss`. Restores are deliberately generous, not surgical: when the
+    /// typed space died inside the wiped span, restoring the span alongside
+    /// the survivor leaves a doubled space (observed live 2026-08-26) —
+    /// preferable to under-restoring by guessing.
+    static func wipeRestorePlan(
+        previous: String,
+        current: String,
+        afterContext: String,
+        minLoss: Int = 20,
+        allowEmptyCurrent: Bool = false
+    ) -> (lost: String, walkBack: Int)? {
+        // Moving the caret backward shrinks the before-context EXACTLY like a
+        // tail wipe (shared prefix, big "loss", no extra) — restoring there
+        // pastes the tail mid-text at the caret (shipped 2026-08-26, user hit
+        // it by tapping into the sentence). The discriminator: after a caret
+        // move the "lost" text still exists AFTER the caret; after a real
+        // wipe there is nothing there.
+        guard afterContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        // Empty current is normally send/clear (never resurrect a sent
+        // draft) — but a total wipe ALSO empties the field. The caller
+        // passes allowEmptyCurrent only within a couple of seconds of a
+        // space/delete keystroke, which sends do not follow that closely.
+        guard !current.isEmpty || allowEmptyCurrent else { return nil }
+        let previousChars = Array(previous)
+        let currentChars = Array(current)
+        var shared = 0
+        while shared < previousChars.count,
+              shared < currentChars.count,
+              previousChars[shared] == currentChars[shared] {
+            shared += 1
+        }
+        let lost = previousChars.count - shared
+        let extra = currentChars.count - shared
+        guard lost >= minLoss, extra <= 4 else { return nil }
+        return (String(previousChars[shared...]), extra)
+    }
+
+    /// A reported multi-char "highlight" whose text occurs inside the recent
+    /// bulk insert is the host's phantom selection of its own pending region
+    /// (Messages held the last inserted chunk selected, 2026-08-26) — not a
+    /// user highlight, and must never be deleted or replaced. Trimmed
+    /// containment so boundary whitespace can't hide the match.
+    static func isLikelyHostHighlight(selected: String, recentBulkInsert: String?) -> Bool {
+        guard let recent = recentBulkInsert, !recent.isEmpty else { return false }
+        let needle = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard needle.count >= 2 else { return false }
+        return recent.contains(needle)
+    }
+
+    /// Word-boundary chunks (~48 chars) for bulk inserts. One big insertText
+    /// can become a single pending region that a host silently replaces
+    /// wholesale on the next keystroke (Messages, 2026-08-26 sentence wipe);
+    /// smaller runs cap any such region at one chunk. Chunks cut only after
+    /// a space, and joining them reproduces `text` exactly.
+    static func bulkInsertChunks(_ text: String, targetLength: Int = 48) -> [String] {
+        guard !text.isEmpty else { return [] }
+        guard text.count > targetLength else { return [text] }
+        var chunks: [String] = []
+        var current = ""
+        for character in text {
+            current.append(character)
+            if current.count >= targetLength, character == " " {
+                chunks.append(current)
+                current = ""
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
     /// Period, comma, and friends replace the automatic trailing space after a swipe.
     static func shouldEatTrailingSwipeSpace(beforeInserting text: String) -> Bool {
         if text == "\n" { return true }
         guard text.count == 1, let character = text.first else { return false }
+        // A typed space must NOT eat the auto trailing space: that fired a
+        // deleteBackward right after a bulk dictation insert, and hosts that
+        // treat the fresh insert as one deletable clump took the whole
+        // sentence with it (2026-08-25, second wipe). Double-space-period
+        // handles the doubled space via doubleSpacePeriodWalk instead.
         return ".,!?;:)]}…".contains(character)
+    }
+
+    /// Non-deleting double-space-period. Returns how many trailing spaces
+    /// (1 or 2) the caret must step back over before inserting "." — nil when
+    /// the context doesn't end in letter/digit + 1–2 spaces. The space paths
+    /// may never call `deleteBackward`: hosts can hold selections they report
+    /// as empty and treat a fresh bulk insert as one deletable clump — both
+    /// 2026-08-25 sentence wipes rode a delete on this path. Walking the
+    /// caret and inserting cannot lose text on any host.
+    static func doubleSpacePeriodWalk(beforeInput: String) -> Int? {
+        var spaces = 0
+        var index = beforeInput.endIndex
+        while index > beforeInput.startIndex, spaces < 3 {
+            let previous = beforeInput.index(before: index)
+            guard beforeInput[previous] == " " else { break }
+            spaces += 1
+            index = previous
+        }
+        guard (1...2).contains(spaces), index > beforeInput.startIndex else { return nil }
+        let anchor = beforeInput[beforeInput.index(before: index)]
+        return (anchor.isLetter || anchor.isNumber) ? spaces : nil
     }
 
     /// Word immediately before trailing whitespace. Empty if the caret follows punctuation.

@@ -168,12 +168,21 @@ load_gh_versioned_release_tags() {
   GH_VERSIONED_TAGS="$out"
 }
 
+FETCH_PRIOR_CURL_STATUS=0
+
 fetch_prior_appcast() {
   # GitHub release asset URLs often 404 on HEAD; use GET -L like Sparkle does.
-  if curl -sfL "$FEED_URL" -o "$PREV_APPCAST" 2>/dev/null; then
+  # $ROOT/build may not exist yet on a fresh checkout/worktree — curl -o into
+  # a missing directory exits 56 and masquerades as a network failure
+  # (hit twice on the 0.1.41 cut, 2026-08-25).
+  mkdir -p "$(dirname "$PREV_APPCAST")"
+  local curl_status=0
+  curl -sfL "$FEED_URL" -o "$PREV_APPCAST" 2>/dev/null || curl_status=$?
+  if [[ "$curl_status" -eq 0 ]]; then
     echo "$PREV_APPCAST"
     return 0
   fi
+  FETCH_PRIOR_CURL_STATUS="$curl_status"
   return 1
 }
 
@@ -351,7 +360,7 @@ else
   # If the release exists (or a versioned release was already published) but the
   # asset URL failed, abort so we never wipe history with a fresh feed.
   if appcast_release_exists; then
-    echo "error: failed to download prior appcast from $FEED_URL," >&2
+    echo "error: failed to download prior appcast from $FEED_URL (curl exit $FETCH_PRIOR_CURL_STATUS)," >&2
     echo "  but gh release 'appcast' exists on $UPDATES_REPO." >&2
     echo "  Refusing to bootstrap (would drop feed history). Fix network/URL and re-run." >&2
     exit 1
@@ -363,7 +372,7 @@ else
   # (must be a direct call — not piped / $() — so exit reaches this shell).
   load_gh_versioned_release_tags
   if printf '%s\n' "$GH_VERSIONED_TAGS" | grep -E '^v[0-9]' >/dev/null 2>&1; then
-    echo "error: failed to download prior appcast from $FEED_URL," >&2
+    echo "error: failed to download prior appcast from $FEED_URL (curl exit $FETCH_PRIOR_CURL_STATUS)," >&2
     echo "  and versioned releases already exist on $UPDATES_REPO, but no appcast release." >&2
     echo "  Refusing to bootstrap. Create/fix the appcast release asset, then re-run." >&2
     exit 1
@@ -680,10 +689,30 @@ PY
 # --- 6) Upload DMG release ---
 TAG="v${SHORT}"
 echo "==> GitHub release $TAG on $UPDATES_REPO"
+WHATSNEW_NOTES="$(python3 - "$SHORT" "$BUILD" <<'PY'
+import json, sys
+from pathlib import Path
+short, build = sys.argv[1], sys.argv[2]
+path = Path("Resources/WhatsNew/releases.json")
+data = json.loads(path.read_text(encoding="utf-8"))
+entry = next((e for e in data if str(e.get("build", "")) == build), None)
+if entry is None:
+    entry = next((e for e in data if str(e.get("version")) == short), None)
+if not entry:
+    print(f"Murmur {short} (build {build})")
+else:
+    title = str(entry.get("title") or f"Murmur {short}").strip()
+    print(title)
+    for item in entry.get("items") or []:
+        item = str(item).strip()
+        if item:
+            print(f"- {item}")
+PY
+)"
 if gh_release_exists "$TAG" "DMG upload"; then
   gh release upload "$TAG" "$DMG" --repo "$UPDATES_REPO" --clobber
 else
-  gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "Murmur $SHORT (build $BUILD)"
+  gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "$WHATSNEW_NOTES"
 fi
 
 # --- 7) Appcast release (only after asserts) ---

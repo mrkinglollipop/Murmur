@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.1.41",
+    "build": "42",
+    "title": "What's New in 0.1.41",
+    "items": [
+      "Dictation can no longer learn a correction that rewrites an everyday word like “type” into another word. A one-off transcription glitch now stays one-off instead of becoming a permanent rule."
+    ]
+  },
+  {
     "version": "0.1.40",
     "build": "41",
     "title": "What's New in 0.1.40",

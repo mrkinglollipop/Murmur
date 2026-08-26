@@ -36,6 +36,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install still-ad deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+          python3 -m pip install --upgrade pip
+          python3 -m pip install 'pillow>=10'
+
       - name: Create X draft from release
         working-directory: studio
         env:
@@ -75,12 +82,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           shopt -s nullglob
-          files=(social/x/drafts/*.json)
-          if [ ${#files[@]} -eq 0 ]; then
+          jsons=(social/x/drafts/*.json)
+          pngs=(social/x/media/murmur-*-ad.png)
+          if [ ${#jsons[@]} -eq 0 ]; then
             echo "No draft JSON created"
             exit 0
           fi
-          git add -f social/x/drafts/*.json
+          git add -f "${jsons[@]}"
+          if [ ${#pngs[@]} -gt 0 ]; then
+            git add -f "${pngs[@]}"
+          fi
           if git diff --staged --quiet; then
             echo "No new draft to commit"
             exit 0
