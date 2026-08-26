@@ -580,9 +580,17 @@ final class AutocorrectEngineTests: XCTestCase {
         )
         XCTAssertEqual(whole?.lost, "The whole dictated sentence sits here ")
         XCTAssertEqual(whole?.walkBack, 1)
-        // Send / cleared field: never restore into empty.
+        // Send / cleared field: never restore into empty by default.
         XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
             previous: "The whole dictated sentence sits here ", current: ""))
+        // Total wipe inside the keystroke risk window: restore is allowed.
+        let total = AutocorrectEngine.wipeRestorePlan(
+            previous: "The whole dictated sentence sits here ",
+            current: "",
+            allowEmptyCurrent: true
+        )
+        XCTAssertEqual(total?.lost, "The whole dictated sentence sits here ")
+        XCTAssertEqual(total?.walkBack, 0)
         // Normal typing grows the context.
         XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
             previous: "hello there my friend okay", current: "hello there my friend okayx"))
