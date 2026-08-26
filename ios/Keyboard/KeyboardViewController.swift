@@ -20,7 +20,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var lastSpaceTap: ContinuousClock.Instant?
     private let autocorrect = AutocorrectController()
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
-    private var takeGuard: (lastContext: String, armedAt: ContinuousClock.Instant, restored: Bool)?
+    private var takeGuard: (lastContext: String, armedAt: ContinuousClock.Instant, restores: Int)?
     private let dictionary = DictionaryStore()
     private var swipeCommittedWord: String?
     private var lexiconDocuments: [String] = []
@@ -119,8 +119,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     /// defense failed because the host wipes through selections it reports as
     /// empty. `textDidChange` reflects the document as it actually is — when
     /// a big span of a just-dictated take silently vanishes between syncs,
-    /// put it back. One restore per take, 90s window, disarmed by return
-    /// (send) and by deliberate multi-char deletes.
+    /// put it back. Up to three restores per take (2026-08-26: Messages wiped
+    /// the SAME take twice; the one-shot rail caught the first and let the
+    /// second through), 90s window, disarmed by return (send) and by
+    /// deliberate multi-char deletes.
+    private static let maxRestoresPerTake = 3
+
     private func checkGroundTruthRestore() {
         guard let state = takeGuard else { return }
         let now = ContinuousClock().now
@@ -129,7 +133,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             return
         }
         let current = textDocumentProxy.documentContextBeforeInput ?? ""
-        if !state.restored,
+        if state.restores < Self.maxRestoresPerTake,
            let plan = AutocorrectEngine.wipeRestorePlan(previous: state.lastContext, current: current) {
             if plan.walkBack > 0 {
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: -plan.walkBack)
@@ -142,12 +146,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             }
             HandoffDiagnostics.record(
                 "keyboard.restore.performed",
-                detail: "lost=\(plan.lost.count) walkBack=\(plan.walkBack)"
+                detail: "lost=\(plan.lost.count) walkBack=\(plan.walkBack) n=\(state.restores + 1)"
             )
-            takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", state.armedAt, true)
+            takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", state.armedAt, state.restores + 1)
             return
         }
-        takeGuard = (current, state.armedAt, state.restored)
+        takeGuard = (current, state.armedAt, state.restores)
     }
 
     override func viewWillLayoutSubviews() {
@@ -1091,7 +1095,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 lastBulkInsert = (text: text, at: ContinuousClock().now)
                 defuseHostSelectionAfterInsert()
                 // Arm the ground-truth restore with the post-insert context.
-                takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", ContinuousClock().now, false)
+                takeGuard = (textDocumentProxy.documentContextBeforeInput ?? "", ContinuousClock().now, 0)
                 swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
