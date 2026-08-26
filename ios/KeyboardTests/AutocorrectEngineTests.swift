@@ -563,6 +563,38 @@ final class AutocorrectEngineTests: XCTestCase {
         XCTAssertFalse(AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: " "))
     }
 
+    /// Ground-truth restore: a wipe leaves shared prefix + big silent loss +
+    /// at most a few typed chars. Gradual deletes and sends never match.
+    func testWipeRestorePlan() {
+        // Phantom wipe: sentence gone, a typed period survives at the tail.
+        let plan = AutocorrectEngine.wipeRestorePlan(
+            previous: "Hi. The whole dictated sentence sits here  ",
+            current: "Hi. ."
+        )
+        XCTAssertEqual(plan?.lost, "The whole dictated sentence sits here  ")
+        XCTAssertEqual(plan?.walkBack, 1)
+        // Whole-field wipe leaving only the typed space.
+        let whole = AutocorrectEngine.wipeRestorePlan(
+            previous: "The whole dictated sentence sits here ",
+            current: " "
+        )
+        XCTAssertEqual(whole?.lost, "The whole dictated sentence sits here ")
+        XCTAssertEqual(whole?.walkBack, 1)
+        // Send / cleared field: never restore into empty.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "The whole dictated sentence sits here ", current: ""))
+        // Normal typing grows the context.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "hello there my friend okay", current: "hello there my friend okayx"))
+        // Single backspace: loss below threshold.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "hello there my friend okay", current: "hello there my friend oka"))
+        // Field switch to a longer different field: extra too large.
+        XCTAssertNil(AutocorrectEngine.wipeRestorePlan(
+            previous: "the entire dictated sentence lives here",
+            current: "completely different field contents"))
+    }
+
     /// A reported highlight whose text lives inside the recent dictation
     /// insert is the host's phantom pending-region selection, never deletable.
     func testIsLikelyHostHighlight() {
