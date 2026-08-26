@@ -21,6 +21,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private let autocorrect = AutocorrectController()
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
     private var takeGuard: (lastContext: String, armedAt: ContinuousClock.Instant, restores: Int)?
+    private var restorePollTask: Task<Void, Never>?
     private let dictionary = DictionaryStore()
     private var swipeCommittedWord: String?
     private var lexiconDocuments: [String] = []
@@ -103,6 +104,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         pollTask = nil
         startTimeoutTask?.cancel()
         startTimeoutTask = nil
+        restorePollTask?.cancel()
+        restorePollTask = nil
         if textDocumentProxy.isSecureTextEntry == true {
             waitingID = nil
             session = .idle
@@ -124,6 +127,23 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     /// second through), 90s window, disarmed by return (send) and by
     /// deliberate multi-char deletes.
     private static let maxRestoresPerTake = 3
+
+    /// iOS surfaces host-side wipes only at the NEXT user interaction, so the
+    /// textDidChange restore fired a tap late — the wiped text sat gone until
+    /// the user touched the field again (reported as "worse", fairly). While
+    /// a take is armed, actively re-check ground truth shortly after every
+    /// keystroke so a wipe is reversed in sub-second time instead.
+    private func scheduleRestorePoll() {
+        guard takeGuard != nil else { return }
+        restorePollTask?.cancel()
+        restorePollTask = Task { [weak self] in
+            for delay in [200, 700, 1500] {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled else { return }
+                await MainActor.run { self?.checkGroundTruthRestore() }
+            }
+        }
+    }
 
     private func checkGroundTruthRestore() {
         guard let state = takeGuard else { return }
@@ -232,6 +252,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func insertFromKeyboard(_ text: String) {
+        scheduleRestorePoll()
         if root.handleGifTyping(text) {
             UIDevice.current.playInputClick()
             return
@@ -308,6 +329,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func deleteFromKeyboard() {
+        scheduleRestorePoll()
         if root.handleGifDelete() {
             UIDevice.current.playInputClick()
             return
