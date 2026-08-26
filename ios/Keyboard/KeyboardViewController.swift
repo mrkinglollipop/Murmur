@@ -19,6 +19,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var startTimeoutTask: Task<Void, Never>?
     private var lastSpaceTap: ContinuousClock.Instant?
     private let autocorrect = AutocorrectController()
+    private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
     private let dictionary = DictionaryStore()
     private var swipeCommittedWord: String?
     private var lexiconDocuments: [String] = []
@@ -227,6 +228,11 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 // tap. A deleteBackward on this path erased whole dictated
                 // sentences twice (2026-08-25) — hosts can treat a fresh bulk
                 // insert as one deletable clump and lie about it afterward.
+                // Re-check the selection at insert time: delete presses can
+                // re-arm the host's phantom highlight after the entry guard
+                // ran (2026-08-26 repro: period → backspace → double-space
+                // wiped the sentence).
+                guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: -walk)
                 textDocumentProxy.insertText(".")
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: walk)
@@ -270,6 +276,20 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             UIDevice.current.playInputClick()
             lastSpaceTap = nil
             swipeCommittedWord = nil
+            // A "highlight" whose text lives inside the recent dictation
+            // insert is the HOST's phantom selection, not the user's — one
+            // deleteBackward ate 40 such characters on 2026-08-26 while the
+            // before-context stayed identical. Refuse and defuse instead.
+            if AutocorrectEngine.isLikelyHostHighlight(
+                selected: selected,
+                recentBulkInsert: recentBulkInsertText()
+            ) {
+                HandoffDiagnostics.record("keyboard.delete.refusedHostHighlight", detail: "len=\(selected.count)")
+                defuseHostSelectionAfterInsert()
+                updateCapitalization()
+                refreshSuggestions()
+                return
+            }
             if AutocorrectEngine.shouldAbortMultiCharDelete(selected: selected, before: context) {
                 HandoffDiagnostics.record("keyboard.delete.multiSelectAborted", detail: "len=\(selected.count)")
                 updateCapitalization()
@@ -536,6 +556,14 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 "keyboard.mutate.denied",
                 detail: "selectedLen=\(textDocumentProxy.selectedText?.count ?? 0)"
             )
+            // If the blocking "selection" is the host's phantom highlight of
+            // our own recent insert, collapse it so the next keystroke works.
+            if AutocorrectEngine.isLikelyHostHighlight(
+                selected: textDocumentProxy.selectedText ?? "",
+                recentBulkInsert: recentBulkInsertText()
+            ) {
+                defuseHostSelectionAfterInsert()
+            }
             return false
         case .collapseOneCharacterSelection:
             textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
@@ -594,6 +622,26 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             }
         }
         return true
+    }
+
+    private func recentBulkInsertText() -> String? {
+        guard let last = lastBulkInsert,
+              ContinuousClock().now - last.at < .seconds(180) else { return nil }
+        return last.text
+    }
+
+    /// Walk the caret to the end of any host-reported selection so a later
+    /// keystroke cannot replace or delete it wholesale. Called right after
+    /// our own bulk insert (caret at document tail — an over-walk on a stale
+    /// report clamps harmlessly) and when a phantom highlight blocks input.
+    private func defuseHostSelectionAfterInsert() {
+        guard let selected = textDocumentProxy.selectedText, !selected.isEmpty else { return }
+        textDocumentProxy.adjustTextPosition(byCharacterOffset: selected.count)
+        let still = textDocumentProxy.selectedText ?? ""
+        HandoffDiagnostics.record(
+            "keyboard.selection.defused",
+            detail: "was=\(selected.count) still=\(still.count)"
+        )
     }
 
     /// One deleteBackward took a hidden tail selection with it — restore
@@ -983,26 +1031,28 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 trailingSpace: true
             )
             if !text.isEmpty {
-                // One big insertText became a single "pending" region in some
-                // hosts (Messages): the next keystroke replaced the WHOLE
-                // insert with itself, wiping the sentence with the selection
-                // reported empty throughout (2026-08-26, third wipe — zero
-                // guard events fired). Two countermeasures: word-boundary
-                // chunks so no single region spans the sentence, then a caret
-                // wiggle, which is how iOS commits pending text state.
+                // Messages holds (part of) a fresh bulk insert as a selection
+                // the user never made — proven 2026-08-26: a 40-char reported
+                // highlight matching the last chunk, eaten by one delete tap
+                // with before-context unchanged. Insert in word-boundary
+                // chunks, remember the take for the highlight guard, and
+                // DEFUSE any selection the host reports afterward by walking
+                // the caret to its end (over-walks clamp at document end).
+                // No caret nudge here — an adjust against an anchored pending
+                // region is a suspect for creating that selection.
                 guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
                 let chunks = AutocorrectEngine.bulkInsertChunks(text)
                 for chunk in chunks {
                     textDocumentProxy.insertText(chunk)
                 }
-                textDocumentProxy.adjustTextPosition(byCharacterOffset: -1)
-                textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
+                lastBulkInsert = (text: text, at: ContinuousClock().now)
+                defuseHostSelectionAfterInsert()
                 swipeCommittedWord = text
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
                 HandoffDiagnostics.record(
                     "keyboard.insertion.acknowledged",
-                    detail: "\(payload.id) characters=\(text.count) chunks=\(chunks.count) committed=caretNudge"
+                    detail: "\(payload.id) characters=\(text.count) chunks=\(chunks.count)"
                 )
             }
             DictationHandoff.clear()

@@ -667,6 +667,18 @@ enum AutocorrectEngine {
         return output
     }
 
+    /// A reported multi-char "highlight" whose text occurs inside the recent
+    /// bulk insert is the host's phantom selection of its own pending region
+    /// (Messages held the last inserted chunk selected, 2026-08-26) — not a
+    /// user highlight, and must never be deleted or replaced. Trimmed
+    /// containment so boundary whitespace can't hide the match.
+    static func isLikelyHostHighlight(selected: String, recentBulkInsert: String?) -> Bool {
+        guard let recent = recentBulkInsert, !recent.isEmpty else { return false }
+        let needle = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard needle.count >= 2 else { return false }
+        return recent.contains(needle)
+    }
+
     /// Word-boundary chunks (~48 chars) for bulk inserts. One big insertText
     /// can become a single pending region that a host silently replaces
     /// wholesale on the next keystroke (Messages, 2026-08-26 sentence wipe);
