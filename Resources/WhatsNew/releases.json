@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.42",
+    "build": "43",
+    "title": "What's New in 0.1.42",
+    "items": [
+      "Google Gemini 3.5 Transcribe Live is now a Settings cloud engine for everyone — add a Gemini API key and pick it the same way as Grok or ElevenLabs.",
+      "If the live Gemini connection fails, Murmur falls back to Gemini batch transcription."
+    ]
+  },
+  {
     "version": "0.1.41",
     "build": "42",
     "title": "What's New in 0.1.41",
