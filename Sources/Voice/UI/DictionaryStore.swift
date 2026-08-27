@@ -178,7 +178,12 @@ final class DictionaryStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else { return }
         do {
-            entries = try JSONDecoder().decode([DictionaryEntry].self, from: data)
+            let decoded = try JSONDecoder().decode([DictionaryEntry].self, from: data)
+            let merged = Self.mergingDuplicateTerms(decoded)
+            entries = merged
+            if merged != decoded {
+                save()
+            }
         } catch {
             quarantineCorruptFile(at: fileURL, label: "dictionary.json", error: error) {
                 self.entries = []
@@ -332,10 +337,10 @@ final class DictionaryStore: ObservableObject {
         _ = addReturningID(term: term, variants: variants, isAutoLearned: false)
     }
 
-    /// Same as `add`, but hands back the id of the created entry so callers
-    /// (namely `recordLearnedVariant`) can track what they just wrote without
-    /// re-searching `entries` by term after the fact. Returns `nil` if the
-    /// term was empty and nothing was created.
+    /// Same as `add`, but hands back the id of the created or merged-into
+    /// entry so callers (namely `recordLearnedVariant`) can track what they
+    /// just wrote without re-searching `entries` by term after the fact.
+    /// Returns `nil` if the term was empty and nothing was created.
     @discardableResult
     private func addReturningID(term: String, variants: [String], isAutoLearned: Bool) -> UUID? {
         let cleanTerm = term.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -343,13 +348,46 @@ final class DictionaryStore: ObservableObject {
         let cleanVariants = variants
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && !PhoneticMatcher.isProtectedEnglishPhrase($0) }
-        let newEntry = DictionaryEntry(term: cleanTerm, variants: cleanVariants, isAutoLearned: isAutoLearned)
+
+        var resultID: UUID?
         let mutate = {
+            if let idx = self.entries.firstIndex(where: {
+                $0.term.caseInsensitiveCompare(cleanTerm) == .orderedSame
+            }) {
+                var updated = self.entries[idx]
+                var changed = false
+                for variant in cleanVariants where !updated.variants.contains(where: {
+                    $0.caseInsensitiveCompare(variant) == .orderedSame
+                }) {
+                    updated.variants.append(variant)
+                    changed = true
+                }
+                if !isAutoLearned && updated.isAutoLearned {
+                    updated.isAutoLearned = false
+                    changed = true
+                }
+                if changed {
+                    self.entries[idx] = updated
+                    self.scheduleSave()
+                }
+                resultID = updated.id
+                return
+            }
+            let newEntry = DictionaryEntry(
+                term: cleanTerm,
+                variants: cleanVariants,
+                isAutoLearned: isAutoLearned
+            )
             self.entries.append(newEntry)
             self.scheduleSave()
+            resultID = newEntry.id
         }
-        Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
-        return newEntry.id
+        if Thread.isMainThread {
+            mutate()
+        } else {
+            DispatchQueue.main.sync(execute: mutate)
+        }
+        return resultID
     }
 
     func update(_ entry: DictionaryEntry) {
@@ -364,10 +402,50 @@ final class DictionaryStore: ObservableObject {
             .filter { !$0.isEmpty && !PhoneticMatcher.isProtectedEnglishPhrase($0) }
         let mutate = {
             guard let idx = self.entries.firstIndex(where: { $0.id == cleaned.id }) else { return }
-            self.entries[idx] = cleaned
+            if let otherIdx = self.entries.firstIndex(where: {
+                $0.id != cleaned.id
+                    && $0.term.caseInsensitiveCompare(cleaned.term) == .orderedSame
+            }) {
+                self.entries[otherIdx] = Self.absorbing(cleaned, into: self.entries[otherIdx])
+                self.entries.removeAll { $0.id == cleaned.id }
+            } else {
+                self.entries[idx] = cleaned
+            }
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
+    }
+
+    /// Collapses entries that share a canonical term (case-insensitive) so
+    /// "Khipu / Keepu" and "Khipu / Keefu" become one row with both variants.
+    /// Keeps the first-seen id and casing; sums `fixCount`; manual wins over auto.
+    static func mergingDuplicateTerms(_ entries: [DictionaryEntry]) -> [DictionaryEntry] {
+        var result: [DictionaryEntry] = []
+        var indexByTerm: [String: Int] = [:]
+        for entry in entries {
+            let key = entry.term.lowercased()
+            if let idx = indexByTerm[key] {
+                result[idx] = absorbing(entry, into: result[idx])
+            } else {
+                indexByTerm[key] = result.count
+                result.append(entry)
+            }
+        }
+        return result
+    }
+
+    private static func absorbing(_ donor: DictionaryEntry, into survivor: DictionaryEntry) -> DictionaryEntry {
+        var result = survivor
+        for variant in donor.variants where !result.variants.contains(where: {
+            $0.caseInsensitiveCompare(variant) == .orderedSame
+        }) {
+            result.variants.append(variant)
+        }
+        result.fixCount += donor.fixCount
+        if !donor.isAutoLearned {
+            result.isAutoLearned = false
+        }
+        return result
     }
 
     func delete(_ entry: DictionaryEntry) {
@@ -830,15 +908,44 @@ final class DictionaryStore: ObservableObject {
     /// Applies unlearn without `onUnlearn` (used by toast Reject).
     @discardableResult
     private func applyUnlearn(_ correction: LearnedCorrection) -> Bool {
-        if correction.createdNewEntry {
-            guard let entry = entries.first(where: { $0.id == correction.entryID }) else {
-                return false
-            }
-            delete(entry)
-            return true
+        if let existing = entries.first(where: { $0.id == correction.entryID }) {
+            return applyUnlearnToEntry(correction, existing, deleteIfCreatedAndEmpty: true)
         }
-        guard let existing = entries.first(where: { $0.id == correction.entryID }) else {
+        // Duplicate-term merge drops absorbed ids; strip the variant on the
+        // survivor instead of no-op. Never delete-by-term on a fallback hit.
+        guard let fallback = entries.first(where: {
+            $0.term.caseInsensitiveCompare(correction.term) == .orderedSame
+        }) else {
             return false
+        }
+        return applyUnlearnToEntry(correction, fallback, deleteIfCreatedAndEmpty: false)
+    }
+
+    /// `createdNewEntry` used to mean "delete this whole row". After same-term
+    /// merge the row may have gained other variants — strip only then.
+    private func applyUnlearnToEntry(
+        _ correction: LearnedCorrection,
+        _ existing: DictionaryEntry,
+        deleteIfCreatedAndEmpty: Bool
+    ) -> Bool {
+        if correction.createdNewEntry {
+            let others = existing.variants.filter {
+                $0.caseInsensitiveCompare(correction.variant) != .orderedSame
+            }
+            if others.isEmpty {
+                if deleteIfCreatedAndEmpty || existing.isAutoLearned {
+                    delete(existing)
+                    return true
+                }
+                var emptied = existing
+                emptied.variants = []
+                update(emptied)
+                return true
+            }
+            var updated = existing
+            updated.variants = others
+            update(updated)
+            return true
         }
         let before = existing.variants.count
         var updated = existing
