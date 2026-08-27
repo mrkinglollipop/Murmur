@@ -20,6 +20,7 @@ final class GeminiLiveTests: XCTestCase {
         XCTAssertNil(aad["prefixPaddingMs"])
         let transcription = try XCTUnwrap(setup["inputAudioTranscription"] as? [String: Any])
         XCTAssertEqual(transcription["mode"] as? String, "SMART")
+        XCTAssertEqual(transcription["languageCodes"] as? [String], ["en-US"])
         XCTAssertEqual(transcription["customVocabulary"] as? [String], ["Murmur"])
         XCTAssertFalse(json.contains("SECRET_KEY"))
     }
@@ -138,5 +139,27 @@ final class GeminiLiveTests: XCTestCase {
         )
         XCTAssertEqual((smartConfig["mode"] as? [String: Any])?["type"] as? String, "smart")
         XCTAssertNil(smartConfig["custom_vocabulary"])
+    }
+
+    func testBCP47LanguageCodesMapISO6391() {
+        XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: "en"), ["en-US"])
+        XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: "en-GB"), ["en-GB"])
+        XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: ""), [])
+        XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: "xx"), [])
+    }
+
+    func testBinaryWebSocketPayloadDecodesAsUTF8JSON() {
+        let binary = Data("{\"setupComplete\":{}}\n".utf8)
+        XCTAssertEqual(
+            GeminiLiveTranscriber.utf8JSONText(fromWebSocketData: binary),
+            "{\"setupComplete\":{}}\n"
+        )
+    }
+
+    func testBatchDecodeStepsContentText() {
+        let stepsBody = Data("""
+        {"status":"completed","steps":[{"content":[{"type":"text","text":"hello from steps"}]}]}
+        """.utf8)
+        XCTAssertEqual(GeminiBatchDecode.decodeTranscript(from: stepsBody), "hello from steps")
     }
 }
