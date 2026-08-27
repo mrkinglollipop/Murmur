@@ -36,6 +36,10 @@ final class DictationController: ObservableObject {
     private var hostPID = 0
     private var learnTask: Task<Void, Never>?
     private var fromActionButton = false
+    private var elevenLabsLiveSession: ElevenLabsRealtimeTranscriber?
+    private var geminiLiveSession: GeminiLiveTranscriber?
+    private var recordingStartedAt: Date?
+    private var liveStartTask: Task<Void, Never>?
 
     private init() {
         let pointer = Unmanaged.passUnretained(self).toOpaque()
@@ -387,20 +391,22 @@ final class DictationController: ObservableObject {
         statusText = "Transcribing…"
         write(.transcribing, text: "", error: "")
         presentLiveActivity(recording: false, label: "Transcribing")
-        let key = AppGroupStore.apiKey
         let language = AppGroupStore.languageCode
         let id = requestID
+        let startedAt = recordingStartedAt ?? Date()
+        let duration = Date().timeIntervalSince(startedAt)
         HandoffDiagnostics.record("app.transcription.started", detail: id)
         transcribeTask = Task {
             defer { try? FileManager.default.removeItem(at: url) }
             do {
-                let raw = try await ElevenLabsBatch.transcribe(
-                    audioURL: url,
-                    apiKey: key,
-                    language: language,
-                    noVerbatim: true,
-                    keyterms: DictionaryStore.selectKeyterms(from: MurmurStores.dictionary.entries)
-                )
+                let liveText = await self.finalizeLiveTranscription(recordingDuration: duration)
+                let raw: String
+                if let liveText,
+                   !liveText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    raw = liveText
+                } else {
+                    raw = try await self.batchTranscribe(audioURL: url, language: language)
+                }
                 await MainActor.run {
                     guard self.requestID == id else { return }
                     let spoken = TranscriptPostProcessor.applySpokenPasses(raw)
@@ -458,6 +464,8 @@ final class DictationController: ObservableObject {
     func discard() {
         clearListenGate()
         stopMetering()
+        cancelLiveTranscription()
+        recorder.onPCMBuffer = nil
         recorder.cancel()
         if !requestID.isEmpty {
             write(.cancelled, text: "", error: "")
@@ -719,7 +727,9 @@ final class DictationController: ObservableObject {
         isAwaitingHostReturn = false
         isRecording = true
         keepaliveEligible = true
+        recordingStartedAt = Date()
         startMetering()
+        startLiveTranscription()
         HandoffDiagnostics.record("app.recording.started", detail: requestID)
         isPaused = false
         statusText = "Listening…"
@@ -935,6 +945,143 @@ final class DictationController: ObservableObject {
             for leftover in Activity<DictationAttributes>.activities {
                 await leftover.end(nil, dismissalPolicy: .immediate)
             }
+        }
+    }
+
+    private func startLiveTranscription() {
+        cancelLiveTranscription()
+        recorder.onPCMBuffer = { [weak self] buffer in
+            self?.elevenLabsLiveSession?.send(buffer)
+            self?.geminiLiveSession?.send(buffer)
+        }
+
+        let language = AppGroupStore.languageCode
+        let vocabulary = GeminiLiveTranscriber.selectVocabulary(from: MurmurStores.dictionary.entries)
+        let keyterms = DictionaryStore.selectKeyterms(from: MurmurStores.dictionary.entries)
+
+        switch AppGroupStore.selectedCloudEngine {
+        case .elevenLabs:
+            let key = AppGroupStore.apiKey
+            guard !key.isEmpty else { return }
+            let session = ElevenLabsRealtimeTranscriber(
+                apiKey: key,
+                language: language,
+                noVerbatim: AppGroupStore.removeFillerWords,
+                keyterms: keyterms,
+                realtimeOptions: AppGroupStore.elevenLabsRealtimeOptions
+            )
+            elevenLabsLiveSession = session
+            liveStartTask = Task {
+                do {
+                    try await session.start()
+                } catch {
+                    await MainActor.run {
+                        session.cancel()
+                        if self.elevenLabsLiveSession === session {
+                            self.elevenLabsLiveSession = nil
+                        }
+                    }
+                }
+            }
+        case .gemini:
+            let key = AppGroupStore.geminiAPIKey
+            guard !key.isEmpty else { return }
+            let session = GeminiLiveTranscriber(
+                apiKey: key,
+                language: language,
+                smartMode: AppGroupStore.removeFillerWords,
+                vocabulary: vocabulary,
+                liveOptions: AppGroupStore.geminiLiveOptions
+            )
+            geminiLiveSession = session
+            liveStartTask = Task {
+                do {
+                    try await session.start()
+                } catch {
+                    await MainActor.run {
+                        session.cancel()
+                        if self.geminiLiveSession === session {
+                            self.geminiLiveSession = nil
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func cancelLiveTranscription() {
+        liveStartTask?.cancel()
+        liveStartTask = nil
+        elevenLabsLiveSession?.cancel()
+        geminiLiveSession?.cancel()
+        elevenLabsLiveSession = nil
+        geminiLiveSession = nil
+        recordingStartedAt = nil
+    }
+
+    /// Matches Mac `StreamingCoordinator.streamResultLooksTruncated` so iOS
+    /// live WS also batch-falls-back on ghost-drop / truncated finals.
+    private static let streamMinCharsPerSecond: Double = 2.0
+    private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
+
+    private static func streamResultLooksTruncated(text: String, duration: TimeInterval) -> Bool {
+        guard duration >= streamTruncationCheckMinDuration else { return false }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return Double(trimmed.count) < duration * streamMinCharsPerSecond
+    }
+
+    private func finalizeLiveTranscription(recordingDuration: TimeInterval) async -> String? {
+        recorder.onPCMBuffer = nil
+        let elSession = elevenLabsLiveSession
+        let gemSession = geminiLiveSession
+        elevenLabsLiveSession = nil
+        geminiLiveSession = nil
+        liveStartTask?.cancel()
+        liveStartTask = nil
+        recordingStartedAt = nil
+
+        let snapshot: String
+        let text: String
+        if let elSession {
+            snapshot = elSession.joinedTranscriptSnapshot()
+            text = await elSession.finalize(recordingDuration: recordingDuration)
+        } else if let gemSession {
+            snapshot = gemSession.joinedTranscriptSnapshot()
+            text = await gemSession.finalize(recordingDuration: recordingDuration)
+        } else {
+            return nil
+        }
+
+        let truncated = Self.streamResultLooksTruncated(text: text, duration: recordingDuration)
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !truncated {
+            return text
+        }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let recovered = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !recovered.isEmpty { return snapshot }
+        }
+        return nil
+    }
+
+    private func batchTranscribe(audioURL: URL, language: String) async throws -> String {
+        switch AppGroupStore.selectedCloudEngine {
+        case .elevenLabs:
+            return try await ElevenLabsBatch.transcribe(
+                audioURL: audioURL,
+                apiKey: AppGroupStore.apiKey,
+                language: language,
+                noVerbatim: AppGroupStore.removeFillerWords,
+                keyterms: DictionaryStore.selectKeyterms(from: MurmurStores.dictionary.entries)
+            )
+        case .gemini:
+            return try await GeminiBatch.transcribe(
+                audioURL: audioURL,
+                apiKey: AppGroupStore.geminiAPIKey,
+                language: language,
+                smartMode: AppGroupStore.removeFillerWords,
+                vocabulary: GeminiLiveTranscriber.selectVocabulary(from: MurmurStores.dictionary.entries)
+            )
         }
     }
 }

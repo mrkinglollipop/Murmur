@@ -65,6 +65,18 @@ final class SettingsStore: ObservableObject {
         static let allowLastResortInputFallback = "voice.settings.allowLastResortInputFallback"
         static let useStreaming = "voice.settings.useStreaming"
         static let removeFillerWords = "voice.settings.removeFillerWords"
+        static let elevenLabsFilterBackgroundAudio = "voice.settings.elevenLabsFilterBackgroundAudio"
+        static let elevenLabsCommitStrategy = "voice.settings.elevenLabsCommitStrategy"
+        static let elevenLabsVadThreshold = "voice.settings.elevenLabsVadThreshold"
+        static let elevenLabsVadSilenceThresholdSecs = "voice.settings.elevenLabsVadSilenceThresholdSecs"
+        static let elevenLabsMinSpeechDurationMs = "voice.settings.elevenLabsMinSpeechDurationMs"
+        static let elevenLabsMinSilenceDurationMs = "voice.settings.elevenLabsMinSilenceDurationMs"
+        static let geminiVadMode = "voice.settings.geminiVadMode"
+        static let geminiStartSensitivity = "voice.settings.geminiStartSensitivity"
+        static let geminiEndSensitivity = "voice.settings.geminiEndSensitivity"
+        static let geminiPrefixPaddingMs = "voice.settings.geminiPrefixPaddingMs"
+        static let geminiSilenceDurationMs = "voice.settings.geminiSilenceDurationMs"
+        static let xaiEndpointingMs = "voice.settings.xaiEndpointingMs"
         static let useToggleLock = "voice.settings.useToggleLock"
         static let smartLeadingSpace = "voice.settings.smartLeadingSpace"
         static let learnFromInlineCorrections = "voice.settings.learnFromInlineCorrections"
@@ -224,6 +236,177 @@ final class SettingsStore: ObservableObject {
             UserDefaults.standard.set(removeFillerWords, forKey: Keys.removeFillerWords)
             applyCloudSettings()
         }
+    }
+
+    /// ElevenLabs Scribe RT: suppress other talkers / ambient false activations.
+    /// Off by default (previous hardcoded socket). Independent of local
+    /// "Focus on my voice" speaker gating.
+    @Published var elevenLabsFilterBackgroundAudio: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                elevenLabsFilterBackgroundAudio,
+                forKey: Keys.elevenLabsFilterBackgroundAudio
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsCommitStrategy: ElevenLabsCommitStrategy {
+        didSet {
+            UserDefaults.standard.set(
+                elevenLabsCommitStrategy.rawValue,
+                forKey: Keys.elevenLabsCommitStrategy
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsVadThreshold: Double {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsVadThreshold,
+                to: ElevenLabsRealtimeOptions.vadThresholdRange
+            )
+            if clamped != elevenLabsVadThreshold {
+                elevenLabsVadThreshold = clamped
+                return
+            }
+            UserDefaults.standard.set(elevenLabsVadThreshold, forKey: Keys.elevenLabsVadThreshold)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsVadSilenceThresholdSecs: Double {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsVadSilenceThresholdSecs,
+                to: ElevenLabsRealtimeOptions.vadSilenceRange
+            )
+            if clamped != elevenLabsVadSilenceThresholdSecs {
+                elevenLabsVadSilenceThresholdSecs = clamped
+                return
+            }
+            UserDefaults.standard.set(
+                elevenLabsVadSilenceThresholdSecs,
+                forKey: Keys.elevenLabsVadSilenceThresholdSecs
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsMinSpeechDurationMs: Int {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsMinSpeechDurationMs,
+                to: ElevenLabsRealtimeOptions.minSpeechMsRange
+            )
+            if clamped != elevenLabsMinSpeechDurationMs {
+                elevenLabsMinSpeechDurationMs = clamped
+                return
+            }
+            UserDefaults.standard.set(
+                elevenLabsMinSpeechDurationMs,
+                forKey: Keys.elevenLabsMinSpeechDurationMs
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsMinSilenceDurationMs: Int {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsMinSilenceDurationMs,
+                to: ElevenLabsRealtimeOptions.minSilenceMsRange
+            )
+            if clamped != elevenLabsMinSilenceDurationMs {
+                elevenLabsMinSilenceDurationMs = clamped
+                return
+            }
+            UserDefaults.standard.set(
+                elevenLabsMinSilenceDurationMs,
+                forKey: Keys.elevenLabsMinSilenceDurationMs
+            )
+            applyCloudSettings()
+        }
+    }
+
+    /// xAI Grok streaming silence window before a new utterance (ms).
+    @Published var xaiEndpointingMs: Int {
+        didSet {
+            let clamped = XAIStreamingTranscriber.clampEndpointingMs(xaiEndpointingMs)
+            if clamped != xaiEndpointingMs {
+                xaiEndpointingMs = clamped
+                return
+            }
+            UserDefaults.standard.set(xaiEndpointingMs, forKey: Keys.xaiEndpointingMs)
+            applyCloudSettings()
+        }
+    }
+
+    var elevenLabsRealtimeOptions: ElevenLabsRealtimeOptions {
+        ElevenLabsRealtimeOptions(
+            filterBackgroundAudio: elevenLabsFilterBackgroundAudio,
+            commitStrategy: elevenLabsCommitStrategy,
+            vadThreshold: elevenLabsVadThreshold,
+            vadSilenceThresholdSecs: elevenLabsVadSilenceThresholdSecs,
+            minSpeechDurationMs: elevenLabsMinSpeechDurationMs,
+            minSilenceDurationMs: elevenLabsMinSilenceDurationMs
+        )
+    }
+
+    @Published var geminiVadMode: GeminiVadMode {
+        didSet {
+            UserDefaults.standard.set(geminiVadMode.rawValue, forKey: Keys.geminiVadMode)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiStartSensitivity: GeminiStartSensitivity {
+        didSet {
+            UserDefaults.standard.set(geminiStartSensitivity.rawValue, forKey: Keys.geminiStartSensitivity)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiEndSensitivity: GeminiEndSensitivity {
+        didSet {
+            UserDefaults.standard.set(geminiEndSensitivity.rawValue, forKey: Keys.geminiEndSensitivity)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiPrefixPaddingMs: Int {
+        didSet {
+            let clamped = GeminiLiveOptions.clamp(geminiPrefixPaddingMs, to: GeminiLiveOptions.prefixPaddingRange)
+            if clamped != geminiPrefixPaddingMs {
+                geminiPrefixPaddingMs = clamped
+                return
+            }
+            UserDefaults.standard.set(geminiPrefixPaddingMs, forKey: Keys.geminiPrefixPaddingMs)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiSilenceDurationMs: Int {
+        didSet {
+            let clamped = GeminiLiveOptions.clamp(geminiSilenceDurationMs, to: GeminiLiveOptions.silenceDurationRange)
+            if clamped != geminiSilenceDurationMs {
+                geminiSilenceDurationMs = clamped
+                return
+            }
+            UserDefaults.standard.set(geminiSilenceDurationMs, forKey: Keys.geminiSilenceDurationMs)
+            applyCloudSettings()
+        }
+    }
+
+    var geminiLiveOptions: GeminiLiveOptions {
+        GeminiLiveOptions(
+            vadMode: geminiVadMode,
+            startSensitivity: geminiStartSensitivity,
+            endSensitivity: geminiEndSensitivity,
+            prefixPaddingMs: geminiPrefixPaddingMs,
+            silenceDurationMs: geminiSilenceDurationMs
+        ).clamped()
     }
 
     /// When enabled, double-tap fn within 400ms toggles locked recording mode
@@ -410,6 +593,98 @@ final class SettingsStore: ObservableObject {
             removeFillerWords = true
         }
 
+        elevenLabsFilterBackgroundAudio = defaults.bool(forKey: Keys.elevenLabsFilterBackgroundAudio)
+
+        if let raw = defaults.string(forKey: Keys.elevenLabsCommitStrategy),
+           let strategy = ElevenLabsCommitStrategy(rawValue: raw) {
+            elevenLabsCommitStrategy = strategy
+        } else {
+            elevenLabsCommitStrategy = .manual
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsVadThreshold) != nil {
+            elevenLabsVadThreshold = ElevenLabsRealtimeOptions.clamp(
+                defaults.double(forKey: Keys.elevenLabsVadThreshold),
+                to: ElevenLabsRealtimeOptions.vadThresholdRange
+            )
+        } else {
+            elevenLabsVadThreshold = ElevenLabsRealtimeOptions.defaults.vadThreshold
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsVadSilenceThresholdSecs) != nil {
+            elevenLabsVadSilenceThresholdSecs = ElevenLabsRealtimeOptions.clamp(
+                defaults.double(forKey: Keys.elevenLabsVadSilenceThresholdSecs),
+                to: ElevenLabsRealtimeOptions.vadSilenceRange
+            )
+        } else {
+            elevenLabsVadSilenceThresholdSecs = ElevenLabsRealtimeOptions.defaults.vadSilenceThresholdSecs
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsMinSpeechDurationMs) != nil {
+            elevenLabsMinSpeechDurationMs = ElevenLabsRealtimeOptions.clamp(
+                defaults.integer(forKey: Keys.elevenLabsMinSpeechDurationMs),
+                to: ElevenLabsRealtimeOptions.minSpeechMsRange
+            )
+        } else {
+            elevenLabsMinSpeechDurationMs = ElevenLabsRealtimeOptions.defaults.minSpeechDurationMs
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsMinSilenceDurationMs) != nil {
+            elevenLabsMinSilenceDurationMs = ElevenLabsRealtimeOptions.clamp(
+                defaults.integer(forKey: Keys.elevenLabsMinSilenceDurationMs),
+                to: ElevenLabsRealtimeOptions.minSilenceMsRange
+            )
+        } else {
+            elevenLabsMinSilenceDurationMs = ElevenLabsRealtimeOptions.defaults.minSilenceDurationMs
+        }
+
+        if let raw = defaults.string(forKey: Keys.geminiVadMode),
+           let mode = GeminiVadMode(rawValue: raw) {
+            geminiVadMode = mode
+        } else {
+            geminiVadMode = .manual
+        }
+
+        if let raw = defaults.string(forKey: Keys.geminiStartSensitivity),
+           let sensitivity = GeminiStartSensitivity(rawValue: raw) {
+            geminiStartSensitivity = sensitivity
+        } else {
+            geminiStartSensitivity = .high
+        }
+
+        if let raw = defaults.string(forKey: Keys.geminiEndSensitivity),
+           let sensitivity = GeminiEndSensitivity(rawValue: raw) {
+            geminiEndSensitivity = sensitivity
+        } else {
+            geminiEndSensitivity = .high
+        }
+
+        if defaults.object(forKey: Keys.geminiPrefixPaddingMs) != nil {
+            geminiPrefixPaddingMs = GeminiLiveOptions.clamp(
+                defaults.integer(forKey: Keys.geminiPrefixPaddingMs),
+                to: GeminiLiveOptions.prefixPaddingRange
+            )
+        } else {
+            geminiPrefixPaddingMs = GeminiLiveOptions.defaults.prefixPaddingMs
+        }
+
+        if defaults.object(forKey: Keys.geminiSilenceDurationMs) != nil {
+            geminiSilenceDurationMs = GeminiLiveOptions.clamp(
+                defaults.integer(forKey: Keys.geminiSilenceDurationMs),
+                to: GeminiLiveOptions.silenceDurationRange
+            )
+        } else {
+            geminiSilenceDurationMs = GeminiLiveOptions.defaults.silenceDurationMs
+        }
+
+        if defaults.object(forKey: Keys.xaiEndpointingMs) != nil {
+            xaiEndpointingMs = XAIStreamingTranscriber.clampEndpointingMs(
+                defaults.integer(forKey: Keys.xaiEndpointingMs)
+            )
+        } else {
+            xaiEndpointingMs = XAIStreamingTranscriber.defaultEndpointingMs
+        }
+
         useToggleLock = defaults.bool(forKey: Keys.useToggleLock)
 
         if defaults.object(forKey: Keys.smartLeadingSpace) != nil {
@@ -538,6 +813,9 @@ final class SettingsStore: ObservableObject {
         }
         asrEngineSelector.xaiStreamingEnabled = useStreaming
         asrEngineSelector.removeFillerWordsEnabled = removeFillerWords
+        asrEngineSelector.elevenLabsRealtimeOptions = elevenLabsRealtimeOptions
+        asrEngineSelector.geminiLiveOptions = geminiLiveOptions
+        asrEngineSelector.xaiEndpointingMs = xaiEndpointingMs
     }
 
     /// Pushes the cleanup toggle, code-aware flag, and a freshly-built

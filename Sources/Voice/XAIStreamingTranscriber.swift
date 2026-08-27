@@ -62,6 +62,17 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     private let apiKey: String
     private let language: String
+    /// Milliseconds of trailing silence before Grok fires `speech_final` and
+    /// starts a new utterance. Default is the API max (5000) so a mid-hold
+    /// pause does not split the take. Settings Advanced can lower it.
+    private let endpointingMs: Int
+
+    static let defaultEndpointingMs = 5000
+    static let endpointingMsRange: ClosedRange<Int> = 500...5000
+
+    static func clampEndpointingMs(_ value: Int) -> Int {
+        min(max(value, endpointingMsRange.lowerBound), endpointingMsRange.upperBound)
+    }
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
@@ -146,10 +157,25 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// the 3s done-timeout when there's no live socket to answer.
     private var socketClosed = false
 
-    init(apiKey: String, language: String = "en") {
+    init(apiKey: String, language: String = "en", endpointingMs: Int = XAIStreamingTranscriber.defaultEndpointingMs) {
         self.apiKey = apiKey
         self.language = language
+        self.endpointingMs = Self.clampEndpointingMs(endpointingMs)
         super.init()
+    }
+
+    /// Builds the Grok STT WebSocket URL. `endpointing` is clamped to
+    /// `endpointingMsRange`; default 5000 is the previous hardcoded value.
+    static func buildSocketURL(language: String, endpointingMs: Int = defaultEndpointingMs) -> URL? {
+        var components = URLComponents(string: "wss://api.x.ai/v1/stt")!
+        components.queryItems = [
+            URLQueryItem(name: "sample_rate", value: "16000"),
+            URLQueryItem(name: "encoding", value: "pcm"),
+            URLQueryItem(name: "interim_results", value: "true"),
+            URLQueryItem(name: "language", value: language),
+            URLQueryItem(name: "endpointing", value: String(clampEndpointingMs(endpointingMs)))
+        ]
+        return components.url
     }
 
     // MARK: - Lifecycle
@@ -160,17 +186,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         vlog("xai-stream: starting session")
         resetTranscriptState()
 
-        var components = URLComponents(string: "wss://api.x.ai/v1/stt")!
-        components.queryItems = [
-            URLQueryItem(name: "sample_rate", value: "16000"),
-            URLQueryItem(name: "encoding", value: "pcm"),
-            URLQueryItem(name: "interim_results", value: "true"),
-            URLQueryItem(name: "language", value: language),
-            // Max endpointing (5000ms) so brief mid-thought pauses during a long
-            // hold don't fire speech_final and start a new utterance segment.
-            URLQueryItem(name: "endpointing", value: "5000")
-        ]
-        guard let url = components.url else {
+        guard let url = Self.buildSocketURL(language: language, endpointingMs: endpointingMs) else {
             throw CloudTranscriptionError(provider: .xai, message: "Failed to build streaming URL")
         }
 

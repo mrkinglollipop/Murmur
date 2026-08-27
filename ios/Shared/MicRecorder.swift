@@ -16,6 +16,9 @@ final class MicRecorder: NSObject {
     private var sessionActive = false
 
     var onSessionUnavailable: (() -> Void)?
+    /// Invoked on the tap thread with a copied PCM buffer while a segment is open.
+    /// The copy is released after the callback returns — do not retain it.
+    var onPCMBuffer: ((AVAudioPCMBuffer) -> Void)?
 
     override init() {
         super.init()
@@ -205,15 +208,19 @@ final class MicRecorder: NSObject {
         }
     }
 
-    /// The audio callback never allocates a queue or retains buffers. A narrow lock
-    /// makes the active sink swap atomic; buffers are discarded when no sink exists.
+    /// The audio callback copies each buffer for optional streaming (`onPCMBuffer`)
+    /// and never retains tap-owned buffers past the callback.
     private func consume(_ buffer: AVAudioPCMBuffer) {
+        var streamingCopy: AVAudioPCMBuffer?
         stateLock.withLock {
             guard let file = segmentFile, !segmentPaused else { return }
             do {
                 try file.write(from: buffer)
             } catch {
                 segmentWriteFailed = true
+            }
+            if onPCMBuffer != nil {
+                streamingCopy = Self.copyPCMBuffer(buffer)
             }
             guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
             let count = Int(buffer.frameLength)
@@ -234,6 +241,24 @@ final class MicRecorder: NSObject {
             smoothedMeterLevel += (target - smoothedMeterLevel) * coefficient
             latestMeterLevel = smoothedMeterLevel
         }
+        if let streamingCopy {
+            onPCMBuffer?(streamingCopy)
+        }
+    }
+
+    private static func copyPCMBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = buffer.frameLength
+        if let src = buffer.floatChannelData, let dst = copy.floatChannelData {
+            let channels = Int(buffer.format.channelCount)
+            let byteCount = Int(buffer.frameLength) * MemoryLayout<Float>.size
+            for ch in 0..<channels {
+                memcpy(dst[ch], src[ch], byteCount)
+            }
+        }
+        return copy
     }
 
     private func discardSegmentFile() {

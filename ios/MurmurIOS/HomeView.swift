@@ -10,7 +10,7 @@ struct HomeView: View {
     @State private var micGranted = false
 
     private var setupIncomplete: Bool {
-        AppGroupStore.apiKey.isEmpty || !micGranted
+        AppGroupStore.selectedEngineAPIKey.isEmpty || !micGranted
     }
 
     var body: some View {

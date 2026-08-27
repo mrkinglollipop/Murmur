@@ -3,8 +3,11 @@ import XCTest
 
 final class CloudModelSelectionTests: XCTestCase {
 
-    func testSelectableContainsExactlyXAIAndElevenLabs() {
-        XCTAssertEqual(Set(CloudModel.selectable), [.xaiGrokSTT, .elevenLabsScribeV2Realtime])
+    func testSelectableContainsXAIElevenLabsAndGemini() {
+        XCTAssertEqual(
+            Set(CloudModel.selectable),
+            [.xaiGrokSTT, .elevenLabsScribeV2Realtime, .gemini35TranscribeLive]
+        )
     }
 
     func testSelectableExcludesRetiredProviders() {
@@ -27,17 +30,14 @@ final class CloudModelSelectionTests: XCTestCase {
     func testFallbackLeavesValidSelectionUntouched() {
         XCTAssertEqual(CloudModel.selectableOrFallback(.xaiGrokSTT), .xaiGrokSTT)
         XCTAssertEqual(CloudModel.selectableOrFallback(.elevenLabsScribeV2Realtime), .elevenLabsScribeV2Realtime)
+        XCTAssertEqual(CloudModel.selectableOrFallback(.gemini35TranscribeLive), .gemini35TranscribeLive)
     }
 
-    /// Regression guard for "leave the scaffolding": the factory must still
-    /// serve a working service for every provider, including the four
-    /// retired-from-the-UI models, so re-enabling one later is a one-line
-    /// change rather than a resurrection.
-    func testFactoryStillServesAllSixProviders() {
+    func testFactoryStillServesAllSevenProviders() {
         for model in CloudModel.allCases {
             let service = CloudTranscriberFactory.service(for: model)
             XCTAssertNotNil(service, "expected a service for \(model.rawValue)")
         }
-        XCTAssertEqual(CloudModel.allCases.count, 6)
+        XCTAssertEqual(CloudModel.allCases.count, 7)
     }
 }

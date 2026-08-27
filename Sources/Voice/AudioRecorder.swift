@@ -1366,6 +1366,12 @@ final class AudioRecorder {
             return
         }
 
+        if streamingCoordinator.tryStartGemini(asrSelector: asrSelector, startMicCapture: { [weak self] in
+            self?.startMicCapture()
+        }) {
+            return
+        }
+
         if streamingCoordinator.tryStartWhisperKit(
             asrSelector: asrSelector,
             wantsRecording: { [weak self] in self?.wantsRecording ?? false },
@@ -1568,6 +1574,7 @@ final class AudioRecorder {
                 // safe no-ops when their session is nil.
                 self.streamingCoordinator.sendToXAI(buffer)
                 self.streamingCoordinator.sendToElevenLabs(buffer)
+                self.streamingCoordinator.sendToGemini(buffer)
             }
             isSetUp = true
         }
@@ -1930,13 +1937,16 @@ final class AudioRecorder {
         // identity keeps the start-time hold unchanged.
         let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold())
 
-        if streamingCoordinator.xaiSession != nil || streamingCoordinator.elevenLabsSession != nil {
+        if streamingCoordinator.xaiSession != nil
+            || streamingCoordinator.elevenLabsSession != nil
+            || streamingCoordinator.geminiSession != nil {
             teardownMicEngine()
         }
 
         let streamTextEver = streamingCoordinator.coordinatorEverHadStreamText
             || (streamingCoordinator.xaiSession?.hasEverHadNonEmptyStreamText ?? false)
             || (streamingCoordinator.elevenLabsSession?.hasEverHadNonEmptyStreamText ?? false)
+            || (streamingCoordinator.geminiSession?.hasEverHadNonEmptyStreamText ?? false)
 
         let xaiContext = StreamingCoordinator.XAIStopContext(
             duration: elapsed,
@@ -2024,6 +2034,57 @@ final class AudioRecorder {
                     self.finishDiscardedHold(
                         reason: "empty-buffer-abort",
                         engineID: "cloud:elevenlabs-streaming",
+                        sessionHeldToken: sessionHold.token
+                    )
+                    return
+                }
+                self.writeToFile(
+                    duration: duration,
+                    buffers: buffers,
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                )
+            }
+        ) {
+            return
+        }
+
+        let geminiContext = StreamingCoordinator.GeminiStopContext(
+            duration: elapsed,
+            hadSpeech: recordingHadSpeech(),
+            bufferedAudio: bufferedAudio,
+            streamTextEver: streamTextEver
+        )
+        if streamingCoordinator.handleStopGemini(
+            context: geminiContext,
+            onSilence: { [weak self] in
+                self?.finishDiscardedHold(
+                    reason: "silence-guard",
+                    engineID: "cloud:gemini-streaming",
+                    sessionHeldToken: sessionHold.token
+                )
+            },
+            onStreamSuccess: { [weak self] text in
+                self?.asrSelector.logStreamedTranscription(
+                    text: text,
+                    engineID: "cloud:gemini-streaming",
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                ) { [weak self] result in
+                    self?.finishHUDAfterPipeline(
+                        result: result,
+                        sessionHeldToken: sessionHold.token
+                    )
+                }
+            },
+            onBatchFallback: { [weak self] buffers, duration in
+                guard let self = self else { return }
+                guard !buffers.isEmpty else {
+                    self.finishDiscardedHold(
+                        reason: "empty-buffer-abort",
+                        engineID: "cloud:gemini-streaming",
                         sessionHeldToken: sessionHold.token
                     )
                     return

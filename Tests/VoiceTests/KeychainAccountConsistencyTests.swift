@@ -28,6 +28,7 @@ final class KeychainAccountConsistencyTests: XCTestCase {
     override func tearDown() {
         store.deleteKey(for: CloudProvider.elevenLabs.keychainAccount)
         store.deleteKey(for: CloudProvider.xai.keychainAccount)
+        store.deleteKey(for: CloudProvider.gemini.keychainAccount)
         super.tearDown()
     }
 
@@ -65,6 +66,8 @@ final class KeychainAccountConsistencyTests: XCTestCase {
 
     func testProviderAccountsAreDistinct() {
         XCTAssertNotEqual(CloudProvider.elevenLabs.keychainAccount, CloudProvider.xai.keychainAccount)
+        XCTAssertNotEqual(CloudProvider.gemini.keychainAccount, CloudProvider.xai.keychainAccount)
+        XCTAssertNotEqual(CloudProvider.gemini.keychainAccount, CloudProvider.elevenLabs.keychainAccount)
     }
 
     // MARK: - Live round trip (legacy keychain — no entitlement required)
@@ -89,6 +92,14 @@ final class KeychainAccountConsistencyTests: XCTestCase {
     func testXAIKeyRoundTripsThroughSharedAccountConstant() {
         let account = CloudProvider.xai.keychainAccount
         let dummy = "dummy-xai-key-\(UUID().uuidString)"
+        store.setKey(dummy, for: account)
+
+        XCTAssertEqual(store.key(for: account), dummy)
+    }
+
+    func testGeminiKeyRoundTripsThroughSharedAccountConstant() {
+        let account = CloudProvider.gemini.keychainAccount
+        let dummy = "dummy-gemini-key-\(UUID().uuidString)"
         store.setKey(dummy, for: account)
 
         XCTAssertEqual(store.key(for: account), dummy)
