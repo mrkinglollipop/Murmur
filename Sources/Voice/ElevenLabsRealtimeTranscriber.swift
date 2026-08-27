@@ -36,9 +36,11 @@ import os.log
 ///   - Non-fatal server errors arrive as distinct message types
 ///     (`input_error`, `transcriber_error`, `chunk_size_exceeded`, etc.) —
 ///     logged and otherwise ignored, mirroring xAI's `"error"` handling.
-///   - Two further query params are built by `buildSocketURL`: `no_verbatim`
-///     (server-side filler-word/disfluency removal) and repeated `keyterms`
-///     (vocabulary bias from the learned dictionary).
+    ///   - Two further query params are built by `buildSocketURL`: `no_verbatim`
+    ///     (server-side filler-word/disfluency removal) and repeated `keyterms`
+    ///     (vocabulary bias from the learned dictionary). Advanced Settings
+    ///     also send `commit_strategy`, optional `filter_background_audio`,
+    ///     and VAD fields when commit is VAD.
 ///
 /// CONCURRENCY DESIGN: identical shape to `XAIStreamingTranscriber` — see
 /// that file's header for the full rationale. Summary: `send(_:)` runs on
@@ -61,6 +63,9 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// selection/cap/dedup happens in `selectKeyterms(from:)` before this
     /// reaches the initializer.
     private let keyterms: [String]
+    /// Advanced socket knobs (filter / commit / VAD). Defaults match the
+    /// previous hardcoded URL.
+    private let realtimeOptions: ElevenLabsRealtimeOptions
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
@@ -136,11 +141,18 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// instead of hanging on the done-timeout.
     private var socketClosed = false
 
-    init(apiKey: String, language: String = "en", noVerbatim: Bool = false, keyterms: [String] = []) {
+    init(
+        apiKey: String,
+        language: String = "en",
+        noVerbatim: Bool = false,
+        keyterms: [String] = [],
+        realtimeOptions: ElevenLabsRealtimeOptions = .defaults
+    ) {
         self.apiKey = apiKey
         self.language = language
         self.noVerbatim = noVerbatim
         self.keyterms = keyterms
+        self.realtimeOptions = realtimeOptions.clamped()
         super.init()
     }
 
@@ -152,7 +164,12 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         vlog("elevenlabs-stream: starting session")
         resetTranscriptState()
 
-        guard let url = Self.buildSocketURL(language: language, noVerbatim: noVerbatim, keyterms: keyterms) else {
+        guard let url = Self.buildSocketURL(
+            language: language,
+            noVerbatim: noVerbatim,
+            keyterms: keyterms,
+            options: realtimeOptions
+        ) else {
             throw CloudTranscriptionError(provider: .elevenLabs, message: "Failed to build streaming URL")
         }
 
@@ -558,7 +575,16 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// `invalid_request` instead of `session_started`, so `start()` times out
     /// and the whole dictation fails — `selectKeyterms(from:)` is what keeps
     /// that from happening. Do not bypass it.
-    static func buildSocketURL(language: String, noVerbatim: Bool, keyterms: [String]) -> URL? {
+    ///
+    /// Advanced knobs (`commit_strategy`, optional `filter_background_audio`,
+    /// VAD fields when commit is VAD) come from `options`. Do not add
+    /// `include_timestamps` here: EL rejects that combo with background filter.
+    static func buildSocketURL(
+        language: String,
+        noVerbatim: Bool,
+        keyterms: [String],
+        options: ElevenLabsRealtimeOptions = .defaults
+    ) -> URL? {
         var components = URLComponents(string: "wss://api.elevenlabs.io/v1/speech-to-text/realtime")!
         var queryItems = [
             URLQueryItem(name: "model_id", value: "scribe_v2_realtime"),
@@ -566,6 +592,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             URLQueryItem(name: "language_code", value: language),
             URLQueryItem(name: "no_verbatim", value: noVerbatim ? "true" : "false")
         ]
+        queryItems.append(contentsOf: options.queryItems())
         queryItems.append(contentsOf: keyterms.map { URLQueryItem(name: "keyterms", value: $0) })
         components.queryItems = queryItems
         // URLComponents leaves `+` literal in query values (RFC 3986 doesn't

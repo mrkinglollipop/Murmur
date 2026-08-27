@@ -28,7 +28,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     private var phase: Phase {
         if textDocumentProxy.isSecureTextEntry == true { return .secure }
-        if !hasFullAccess || AppGroupStore.apiKey.isEmpty { return .setup }
+        if !hasFullAccess || AppGroupStore.selectedEngineAPIKey.isEmpty { return .setup }
         return session
     }
 
@@ -747,7 +747,11 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 if !hasFullAccess {
                     root.setStatus("Turn on Full Access in Settings")
                 } else {
-                    root.setStatus("Add an ElevenLabs key in Murmur")
+                    root.setStatus(
+                        AppGroupStore.selectedCloudEngine == .gemini
+                            ? "Add a Gemini key in Murmur"
+                            : "Add an ElevenLabs key in Murmur"
+                    )
                 }
             } else {
                 root.setStatus(" ")

@@ -173,4 +173,62 @@ final class ElevenLabsKeytermsTests: XCTestCase {
         let keytermItems = components?.queryItems?.filter { $0.name == "keyterms" } ?? []
         XCTAssertTrue(keytermItems.isEmpty)
     }
+
+    func testBuildSocketURLDefaultCommitIsManualWithoutFilterOrVAD() {
+        let url = ElevenLabsRealtimeTranscriber.buildSocketURL(language: "en", noVerbatim: true, keyterms: [])
+        let items = URLComponents(url: url!, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first(where: { $0.name == "commit_strategy" })?.value, "manual")
+        XCTAssertNil(items.first(where: { $0.name == "filter_background_audio" }))
+        XCTAssertNil(items.first(where: { $0.name == "vad_threshold" }))
+        XCTAssertNil(items.first(where: { $0.name == "include_timestamps" }))
+    }
+
+    func testBuildSocketURLIncludesFilterBackgroundAudioWhenEnabled() {
+        var options = ElevenLabsRealtimeOptions.defaults
+        options.filterBackgroundAudio = true
+        let url = ElevenLabsRealtimeTranscriber.buildSocketURL(
+            language: "en",
+            noVerbatim: false,
+            keyterms: [],
+            options: options
+        )
+        let items = URLComponents(url: url!, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first(where: { $0.name == "filter_background_audio" })?.value, "true")
+        XCTAssertNil(items.first(where: { $0.name == "include_timestamps" }))
+    }
+
+    func testBuildSocketURLSendsVADParamsOnlyWhenCommitIsVAD() {
+        var options = ElevenLabsRealtimeOptions.defaults
+        options.commitStrategy = .vad
+        options.vadThreshold = 0.4
+        options.vadSilenceThresholdSecs = 1.5
+        options.minSpeechDurationMs = 100
+        options.minSilenceDurationMs = 100
+        let url = ElevenLabsRealtimeTranscriber.buildSocketURL(
+            language: "en",
+            noVerbatim: true,
+            keyterms: [],
+            options: options
+        )
+        let items = URLComponents(url: url!, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first(where: { $0.name == "commit_strategy" })?.value, "vad")
+        XCTAssertEqual(items.first(where: { $0.name == "vad_threshold" })?.value, "0.4")
+        XCTAssertEqual(items.first(where: { $0.name == "vad_silence_threshold_secs" })?.value, "1.5")
+        XCTAssertEqual(items.first(where: { $0.name == "min_speech_duration_ms" })?.value, "100")
+        XCTAssertEqual(items.first(where: { $0.name == "min_silence_duration_ms" })?.value, "100")
+    }
+
+    func testQueryItemsClampOutOfRangeVADValues() {
+        var options = ElevenLabsRealtimeOptions.defaults
+        options.commitStrategy = .vad
+        options.vadThreshold = 9
+        options.vadSilenceThresholdSecs = 0.01
+        options.minSpeechDurationMs = 1
+        options.minSilenceDurationMs = 9_999
+        let items = options.queryItems()
+        XCTAssertEqual(items.first(where: { $0.name == "vad_threshold" })?.value, "0.9")
+        XCTAssertEqual(items.first(where: { $0.name == "vad_silence_threshold_secs" })?.value, "0.3")
+        XCTAssertEqual(items.first(where: { $0.name == "min_speech_duration_ms" })?.value, "50")
+        XCTAssertEqual(items.first(where: { $0.name == "min_silence_duration_ms" })?.value, "500")
+    }
 }

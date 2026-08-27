@@ -65,8 +65,11 @@ Install needs the iPhone unlocked and trusted.
 
 ## Shipped (PR #35)
 
-Private sideload spike is on GitHub `main`. Batch STT is ElevenLabs
-(`scribe_v2`) via 16-bit / 16 kHz mono WAV. The original “record inside the
+Private sideload spike is on GitHub `main`. Host-app recording streams
+ElevenLabs Scribe v2 Realtime or Gemini 3.5 Transcribe Live during the take
+(16-bit / 16 kHz mono PCM over WebSocket); batch `scribe_v2` or
+`gemini-3.5-transcribe` is fallback when live start/finalize fails. The
+keyboard still bounces to Murmur and does not own the mic. The original “record inside the
 appex / host never backgrounds” P0 is **not** what shipped — do not silently
 revert the bounce path without an explicit new decision.
 

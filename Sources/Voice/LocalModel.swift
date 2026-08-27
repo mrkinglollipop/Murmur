@@ -68,10 +68,11 @@ enum LocalModel: String, CaseIterable, Identifiable, Codable {
 // MARK: - Cloud ASR Model
 
 /// Cloud transcription providers shown in Settings. Selectable cases are
-/// xAI Grok STT and ElevenLabs Scribe v2 Realtime; retired providers remain
-/// for Keychain/factory compatibility but are hidden from the picker.
-/// Batch uploads are wired via `CloudTranscriber`; streaming via
-/// `XAIStreamingTranscriber` / `ElevenLabsRealtimeTranscriber`.
+/// xAI Grok STT, ElevenLabs Scribe v2 Realtime, and Gemini 3.5 Transcribe
+/// Live; retired providers remain for Keychain/factory compatibility but are
+/// hidden from the picker. Batch uploads are wired via `CloudTranscriber`;
+/// streaming via `XAIStreamingTranscriber`, `ElevenLabsRealtimeTranscriber`,
+/// and `GeminiLiveTranscriber`.
 enum CloudModel: String, CaseIterable, Identifiable, Codable {
     /// Retained as scaffolding, not user-selectable: deprecated `speech_model`
     /// param returns HTTP 400 on every request (confirmed 2026-07-09).
@@ -87,6 +88,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
     case groqWhisperLargeV3Turbo = "groqWhisperLargeV3Turbo"
     case xaiGrokSTT             = "xaiGrokSTT"
     case elevenLabsScribeV2Realtime = "elevenLabsScribeV2Realtime"
+    case gemini35TranscribeLive = "gemini35TranscribeLive"
 
     var id: String { rawValue }
 
@@ -99,7 +101,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
     /// `CloudTranscriberFactory` mapping stay compiled and working — this
     /// is a visibility change only (plan 013).
     static var selectable: [CloudModel] {
-        [.xaiGrokSTT, .elevenLabsScribeV2Realtime]
+        [.xaiGrokSTT, .elevenLabsScribeV2Realtime, .gemini35TranscribeLive]
     }
 
     /// Sanitizes a (possibly stale) persisted selection: a model that's
@@ -118,6 +120,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
         case .groqWhisperLargeV3Turbo: return "Groq whisper-large-v3-turbo"
         case .xaiGrokSTT:              return "xAI Grok (grok-stt)"
         case .elevenLabsScribeV2Realtime: return "ElevenLabs Scribe v2 Realtime"
+        case .gemini35TranscribeLive:  return "Gemini 3.5 Transcribe"
         }
     }
 }
