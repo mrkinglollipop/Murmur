@@ -19,11 +19,11 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-		<string>0.1.42</string>
-		<key>CFBundleSignature</key>
-		<string>????</string>
-		<key>CFBundleVersion</key>
-		<string>43</string>
+	<string>0.1.43</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>44</string>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Murmur uses Accessibility to inject transcribed text at your cursor and suppress the emoji picker while the push-to-talk key is held.</string>
 	<key>NSMicrophoneUsageDescription</key>

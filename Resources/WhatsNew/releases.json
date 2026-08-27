@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.43",
+    "build": "44",
+    "title": "What's New in 0.1.43",
+    "items": [
+      "The dictionary keeps every misspelling of a word on that one word, instead of splitting it across duplicate rows.",
+      "Recent corrections can be hidden without undoing a mapping you still want. Revert still removes a bad misspelling without deleting the rest of the word."
+    ]
+  },
+  {
     "version": "0.1.42",
     "build": "43",
     "title": "What's New in 0.1.42",
