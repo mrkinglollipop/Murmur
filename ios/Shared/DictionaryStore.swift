@@ -60,7 +60,12 @@ final class DictionaryStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else { return }
         do {
-            entries = try JSONDecoder().decode([DictionaryEntry].self, from: data)
+            let decoded = try JSONDecoder().decode([DictionaryEntry].self, from: data)
+            let merged = Self.mergingDuplicateTerms(decoded)
+            entries = merged
+            if merged != decoded {
+                save()
+            }
         } catch {
             quarantineCorruptFile(error: error)
         }
@@ -121,26 +126,88 @@ final class DictionaryStore: ObservableObject {
         let cleanVariants = variants
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        let newEntry = DictionaryEntry(
-            term: cleanTerm,
-            variants: cleanVariants,
-            isAutoLearned: isAutoLearned
-        )
         let mutate = {
-            self.entries.append(newEntry)
+            if let idx = self.entries.firstIndex(where: {
+                $0.term.caseInsensitiveCompare(cleanTerm) == .orderedSame
+            }) {
+                var updated = self.entries[idx]
+                var changed = false
+                for variant in cleanVariants where !updated.variants.contains(where: {
+                    $0.caseInsensitiveCompare(variant) == .orderedSame
+                }) {
+                    updated.variants.append(variant)
+                    changed = true
+                }
+                if !isAutoLearned && updated.isAutoLearned {
+                    updated.isAutoLearned = false
+                    changed = true
+                }
+                if changed {
+                    self.entries[idx] = updated
+                    self.scheduleSave()
+                }
+                return
+            }
+            self.entries.append(
+                DictionaryEntry(
+                    term: cleanTerm,
+                    variants: cleanVariants,
+                    isAutoLearned: isAutoLearned
+                )
+            )
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }
 
     func update(_ entry: DictionaryEntry) {
-        guard !entry.term.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let cleanTerm = entry.term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTerm.isEmpty else { return }
+        var cleaned = entry
+        cleaned.term = cleanTerm
         let mutate = {
-            guard let idx = self.entries.firstIndex(where: { $0.id == entry.id }) else { return }
-            self.entries[idx] = entry
+            guard let idx = self.entries.firstIndex(where: { $0.id == cleaned.id }) else { return }
+            if let otherIdx = self.entries.firstIndex(where: {
+                $0.id != cleaned.id
+                    && $0.term.caseInsensitiveCompare(cleaned.term) == .orderedSame
+            }) {
+                self.entries[otherIdx] = Self.absorbing(cleaned, into: self.entries[otherIdx])
+                self.entries.removeAll { $0.id == cleaned.id }
+            } else {
+                self.entries[idx] = cleaned
+            }
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
+    }
+
+    static func mergingDuplicateTerms(_ entries: [DictionaryEntry]) -> [DictionaryEntry] {
+        var result: [DictionaryEntry] = []
+        var indexByTerm: [String: Int] = [:]
+        for entry in entries {
+            let key = entry.term.lowercased()
+            if let idx = indexByTerm[key] {
+                result[idx] = absorbing(entry, into: result[idx])
+            } else {
+                indexByTerm[key] = result.count
+                result.append(entry)
+            }
+        }
+        return result
+    }
+
+    private static func absorbing(_ donor: DictionaryEntry, into survivor: DictionaryEntry) -> DictionaryEntry {
+        var result = survivor
+        for variant in donor.variants where !result.variants.contains(where: {
+            $0.caseInsensitiveCompare(variant) == .orderedSame
+        }) {
+            result.variants.append(variant)
+        }
+        result.fixCount += donor.fixCount
+        if !donor.isAutoLearned {
+            result.isAutoLearned = false
+        }
+        return result
     }
 
     func delete(_ entry: DictionaryEntry) {

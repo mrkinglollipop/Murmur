@@ -11,6 +11,20 @@ final class DictionarySnippetsTests: XCTestCase {
         XCTAssertEqual(store.correct("kubernetisation"), "kubernetisation")
     }
 
+    func testAddSameTermMergesVariants() {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dict-merge-\(UUID().uuidString).json")
+        let store = DictionaryStore(fileURL: url)
+        store.add(term: "Khipu", variants: ["Keepu"])
+        store.add(term: "khipu", variants: ["Keefu"])
+        XCTAssertEqual(store.entries.count, 1)
+        XCTAssertEqual(Set(store.entries.first?.variants.map { $0.lowercased() } ?? []), ["keepu", "keefu"])
+        XCTAssertEqual(
+            store.correct("open Keepu and Keefu"),
+            "open Khipu and Khipu"
+        )
+    }
+
     func testEmptyDictionaryLeavesTextAlone() {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("dict-empty-\(UUID().uuidString).json")

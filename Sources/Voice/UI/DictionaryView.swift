@@ -58,6 +58,7 @@ struct DictionaryView: View {
                     if store.entries.isEmpty {
                         emptyState
                     } else {
+                        termsSectionHeader
                         entryRows
                     }
                     recentCorrectionsSection
@@ -96,10 +97,20 @@ struct DictionaryView: View {
 
     // MARK: - Recent corrections
 
+    private var visibleCorrectionGroups: [CorrectionGroup] {
+        let groups = correctionsLog.groupedRecent(days: 7)
+        let needle = searchText.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !needle.isEmpty else { return groups }
+        return groups.filter { group in
+            group.replaced.lowercased().contains(needle)
+                || group.rows.contains { $0.heard.lowercased().contains(needle) }
+        }
+    }
+
     @ViewBuilder
     private var recentCorrectionsSection: some View {
-        let recent = correctionsLog.recent(days: 7)
-        if !recent.isEmpty {
+        let groups = visibleCorrectionGroups
+        if !groups.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 Text("Recent corrections")
                     .font(.system(size: 12, weight: .semibold))
@@ -108,34 +119,57 @@ struct DictionaryView: View {
                     .padding(.top, 14)
                     .padding(.bottom, 8)
 
-                ForEach(recent) { record in
-                    recentCorrectionRow(record)
+                ForEach(groups) { group in
+                    groupedCorrectionBlock(group)
                     Divider().overlay(Theme.hairline)
                 }
             }
         }
     }
 
-    private func recentCorrectionRow(_ record: CorrectionRecord) -> some View {
-        HStack(alignment: .center, spacing: 8) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("\(record.heard) → \(record.replaced)")
-                    .font(Theme.body(13, weight: .medium))
+    private func groupedCorrectionBlock(_ group: CorrectionGroup) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 8) {
+                Text(group.replaced)
+                    .font(Theme.body(14, weight: .semibold))
                     .foregroundColor(Theme.textPrimary)
 
-                HStack(spacing: 6) {
-                    Text(correctionSourceLabel(record.source))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Theme.textSecondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2)
-                        .murmurGlassCapsule()
+                Spacer()
 
-                    Text(dictionaryRelativeDateFormatter.localizedString(for: record.date, relativeTo: Date()))
-                        .font(.system(size: 10))
-                        .foregroundColor(Theme.textSecondary)
+                Text(dictionaryRelativeDateFormatter.localizedString(for: group.latestDate, relativeTo: Date()))
+                    .font(.system(size: 10))
+                    .foregroundColor(Theme.textSecondary)
+
+                Button("Hide") {
+                    correctionsLog.remove(ids: group.recordIDs)
                 }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
+                .help("Hide from Recent without changing the dictionary")
+                .accessibilityLabel("Hide recent corrections for \(group.replaced)")
             }
+
+            ForEach(group.rows) { record in
+                recentCorrectionRow(record)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func recentCorrectionRow(_ record: CorrectionRecord) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(record.heard)
+                .font(Theme.body(13, weight: .medium))
+                .foregroundColor(Theme.textPrimary)
+
+            Text(correctionSourceLabel(record.source))
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(Theme.textSecondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .murmurGlassCapsule()
 
             Spacer()
 
@@ -173,15 +207,21 @@ struct DictionaryView: View {
 
                 Button("Never") {
                     store.blocklistPair(heard: record.heard, replaced: record.replaced)
-                    correctionsLog.remove(id: record.id)
+                    removeLogPair(record)
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 12))
                 .foregroundColor(Theme.textSecondary)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+    }
+
+    private func removeLogPair(_ record: CorrectionRecord) {
+        let ids = correctionsLog.records.filter {
+            $0.heard.caseInsensitiveCompare(record.heard) == .orderedSame
+                && $0.replaced.caseInsensitiveCompare(record.replaced) == .orderedSame
+        }.map(\.id)
+        correctionsLog.remove(ids: ids)
     }
 
     private func correctionSourceLabel(_ source: CorrectionSource) -> String {
@@ -204,7 +244,7 @@ struct DictionaryView: View {
             announce: false
         )
         // Always dismiss the rejected row, even when learn is a no-op.
-        correctionsLog.remove(id: record.id)
+        removeLogPair(record)
     }
 
     private func handleLearnAcceptedRevert(_ record: CorrectionRecord) {
@@ -216,17 +256,20 @@ struct DictionaryView: View {
                 createdNewEntry: createdNew,
                 entryID: entryID
             )
-            if createdNew {
+            let soleLearnedVariant = store.entries.first(where: { $0.id == entryID }).map {
+                dictionaryEntryHasOnlyHeard($0, heard: record.heard)
+            } ?? false
+            if createdNew && soleLearnedVariant {
                 pendingRevertRecord = record
                 showRevertDeleteConfirmation = true
             } else if store.unlearn(correction) {
-                correctionsLog.remove(id: record.id)
+                removeLogPair(record)
             }
             return
         }
         // Old records without entryID: blocklist + best-effort variant removal.
         if degradeRevertLearnAccepted(record) {
-            correctionsLog.remove(id: record.id)
+            removeLogPair(record)
         }
     }
 
@@ -245,7 +288,7 @@ struct DictionaryView: View {
         }
         store.blocklistPair(heard: record.heard, replaced: record.replaced)
         // User intent = stop this pair; dismiss even if unlearn was a quiet no-op.
-        correctionsLog.remove(id: record.id)
+        removeLogPair(record)
     }
 
     /// Pre-migration learnAccepted rows: pure undo (remove matching variant by CI).
@@ -285,11 +328,12 @@ struct DictionaryView: View {
         if record.source == .autoLearned,
            let entry = store.entries.first(where: {
                $0.term.caseInsensitiveCompare(record.replaced) == .orderedSame
-           }) {
+           }),
+           dictionaryEntryHasOnlyHeard(entry, heard: record.heard) {
             pendingRevertRecord = record
             showRevertDeleteConfirmation = true
         } else {
-            revertCorrection(record, deleteEntry: false)
+            revertCorrection(record, deleteEntry: record.source == .autoLearned)
         }
     }
 
@@ -304,7 +348,7 @@ struct DictionaryView: View {
                 entryID: entryID
             )
             if store.unlearn(correction) {
-                correctionsLog.remove(id: record.id)
+                removeLogPair(record)
             }
             return
         }
@@ -312,10 +356,24 @@ struct DictionaryView: View {
            let entry = store.entries.first(where: {
                $0.term.caseInsensitiveCompare(record.replaced) == .orderedSame
            }) {
-            store.delete(entry)
+            var updated = entry
+            updated.variants.removeAll {
+                $0.caseInsensitiveCompare(record.heard) == .orderedSame
+            }
+            if updated.variants.isEmpty {
+                store.delete(entry)
+            } else if updated.variants.count != entry.variants.count {
+                store.update(updated)
+            }
         }
         store.blocklistPair(heard: record.heard, replaced: record.replaced)
-        correctionsLog.remove(id: record.id)
+        removeLogPair(record)
+    }
+
+    private func dictionaryEntryHasOnlyHeard(_ entry: DictionaryEntry, heard: String) -> Bool {
+        !entry.variants.isEmpty && entry.variants.allSatisfy {
+            $0.caseInsensitiveCompare(heard) == .orderedSame
+        }
     }
 
     // MARK: - Auto-learned entries
@@ -430,6 +488,16 @@ struct DictionaryView: View {
     }
 
     // MARK: - List
+
+    private var termsSectionHeader: some View {
+        Text(searchText.isEmpty ? "Your words (\(store.entries.count))" : "Your words (\(filteredEntries.count))")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(Theme.textSecondary)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 
     @ViewBuilder
     private var entryRows: some View {
