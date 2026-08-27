@@ -421,8 +421,16 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             switch message {
             case .string(let text):
                 handleServerEvent(text)
-            case .data:
-                continue
+            case .data(let data):
+                // Google Live WS delivers BidiGenerateContentServerMessage as
+                // binary UTF-8 JSON (not text frames). Dropping `.data` means
+                // setupComplete and every transcript never arrive — Live
+                // always times out. Verified against the production WSS 2026-08-27.
+                if let text = Self.utf8JSONText(fromWebSocketData: data) {
+                    handleServerEvent(text)
+                } else {
+                    vlog("gemini-stream: received non-utf8 binary frame (\(data.count) bytes)")
+                }
             @unknown default:
                 continue
             }
@@ -526,6 +534,12 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     // MARK: - Static helpers (@testable)
+
+    /// UTF-8 JSON from a binary WebSocket payload. Live API frames are not
+    /// guaranteed to be `.string`.
+    static func utf8JSONText(fromWebSocketData data: Data) -> String? {
+        String(data: data, encoding: .utf8)
+    }
 
     static func buildSocketURL(apiKey: String) -> URL? {
         var components = URLComponents()
@@ -651,6 +665,24 @@ enum GeminiBatchDecode {
                         if !trimmed.isEmpty { return text }
                     }
                 }
+            }
+        }
+        // Interactions `steps[].content[].text` — documented parse path when
+        // `output_text` is omitted (200 responses can have usage-only bodies).
+        if let steps = json["steps"] as? [[String: Any]] {
+            var parts: [String] = []
+            for step in steps {
+                let content = (step["content"] as? [[String: Any]]) ?? []
+                for item in content {
+                    if let text = item["text"] as? String {
+                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty { parts.append(text) }
+                    }
+                }
+            }
+            let joined = parts.joined(separator: " ")
+            if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return joined
             }
         }
         return nil

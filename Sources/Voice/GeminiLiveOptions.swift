@@ -77,6 +77,34 @@ struct GeminiLiveOptions: Equatable {
         min(max(value, range.lowerBound), range.upperBound)
     }
 
+    /// Maps Murmur's ISO 639-1 Settings codes onto Gemini Live's BCP-47 table.
+    /// Bare `"en"` is not in Google's supported list (`en-US` / `en-GB` / `en-IN`).
+    /// Unknown or empty → `[]` (automatic language detection).
+    static func bcp47LanguageCodes(from selectedLanguage: String) -> [String] {
+        let trimmed = selectedLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return [] }
+        if trimmed.contains("-") { return [trimmed] }
+        let mapped: [String: String] = [
+            "en": "en-US",
+            "es": "es-US",
+            "fr": "fr-FR",
+            "de": "de-DE",
+            "it": "it-IT",
+            "pt": "pt-BR",
+            "nl": "nl-NL",
+            "ja": "ja-JP",
+            "ko": "ko-KR",
+            "zh": "cmn-Hans-CN",
+            "ru": "ru-RU",
+            "ar": "ar-EG",
+            "hi": "hi-IN"
+        ]
+        if let code = mapped[trimmed.lowercased()] {
+            return [code]
+        }
+        return []
+    }
+
     /// First client message after the socket opens (camelCase per Google WS examples).
     static func makeSetupMessageJSON(
         language: String,
@@ -87,7 +115,7 @@ struct GeminiLiveOptions: Equatable {
         let opts = options.clamped()
         var inputAudioTranscription: [String: Any] = [
             "mode": smartMode ? "SMART" : "VERBATIM",
-            "languageCodes": [language]
+            "languageCodes": bcp47LanguageCodes(from: language)
         ]
         if !vocabulary.isEmpty {
             inputAudioTranscription["customVocabulary"] = vocabulary
