@@ -766,6 +766,34 @@ final class AudioRecorder {
     /// aborts without tearing down the newer session's mic/stream/hold/cache.
     private var stopGeneration: UInt64 = 0
 
+    /// Users release the push-to-talk key on the final syllable — the mic
+    /// tap must stay installed and the engine running this much longer past
+    /// a NORMAL stop so the trailing word isn't clipped mid-syllable. Not
+    /// applied to the secure-input cancel/abort path, which must discard
+    /// immediately. The grace buffers still ride the RMS silence guard and
+    /// (for streaming engines) must finish landing before
+    /// `ElevenLabsRealtimeTranscriber.finalize()` sends its commit frame —
+    /// see `finishStop`.
+    private static let postReleaseCaptureGrace: TimeInterval = 0.250
+
+    /// Read-only seam so tests can assert on the constant without exposing
+    /// the underlying `private` storage.
+    internal static var postReleaseCaptureGraceForTesting: TimeInterval { postReleaseCaptureGrace }
+
+    /// Bumped whenever a post-release capture grace is scheduled or flushed
+    /// early, so a stale `asyncAfter` callback from a superseded grace never
+    /// runs `finishStop` twice.
+    private var stopGraceGeneration: UInt64 = 0
+
+    /// The deferred finalize body for the currently-pending capture grace,
+    /// if any. Non-nil only between `scheduleStopGrace` and whichever of
+    /// `runStopGraceIfCurrent` / `flushPendingStopGrace` runs it.
+    private var stopGraceFinalize: (() -> Void)?
+
+    /// Release-time app-targeting context, sampled once at `doStop` and
+    /// carried through the capture grace into `finishStop`.
+    private typealias SessionHold = (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?)
+
     /// Returns whether a subtle start/stop sound should play, read fresh at
     /// each call site rather than cached. Wired by `AppDelegate` to
     /// `SettingsStore.playDictationSound`.
@@ -1349,6 +1377,11 @@ final class AudioRecorder {
             clearPendingHeldCaretSnapshot()
             return
         }
+        // A fast re-press can land while the previous hold's post-release
+        // capture grace (Self.postReleaseCaptureGrace) is still pending —
+        // end it now, before touching the mic engine / streaming sessions
+        // below, so the new hold never overlaps the old one's tap/session.
+        flushPendingStopGrace()
         isStopping = false
         streamingCoordinator.resetStreamTextLatch()
         didAnnounceListeningThisTake = false
@@ -1922,20 +1955,81 @@ final class AudioRecorder {
         // and to cover the brief finalize step.
         DispatchQueue.main.async { [weak self] in self?.hud.setProcessing() }
 
-        pcmBuffersLock.lock()
-        let bufferedAudio = pcmBuffers
-        pcmBuffersLock.unlock()
-        let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
-        lastHoldDuration = elapsed
-
         // Capture hold before streaming finalize / file-IO Tasks so a rapid
         // re-press cannot poison inject with a newer will-start snapshot.
         // Then re-anchor it to the app frontmost NOW: releasing the hotkey is
         // the targeting gesture — a hold may legitimately start in one app
         // and end in the one the user wants the text in (multi-screen
         // roaming, press-while-switching). Same app or unknown release
-        // identity keeps the start-time hold unchanged.
+        // identity keeps the start-time hold unchanged. Sampled immediately,
+        // NOT after the capture grace below — the release is the targeting
+        // gesture and must not drift to whatever app is frontmost 250ms
+        // later.
         let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold())
+
+        scheduleStopGrace(sessionHold: sessionHold)
+    }
+
+    /// Schedules `finishStop` to run after `postReleaseCaptureGrace`,
+    /// leaving the mic tap/engine exactly as they are in the meantime so
+    /// trailing buffers keep landing in `pcmBuffers` and keep streaming to
+    /// the active cloud transcriber. A fast re-press ends this early via
+    /// `flushPendingStopGrace()` instead of waiting out the delay.
+    private func scheduleStopGrace(sessionHold: SessionHold) {
+        stopGraceGeneration &+= 1
+        let generation = stopGraceGeneration
+        stopGraceFinalize = { [weak self] in
+            self?.finishStop(sessionHold: sessionHold)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.postReleaseCaptureGrace) { [weak self] in
+            self?.runStopGraceIfCurrent(generation)
+        }
+    }
+
+    /// Pure guard for the scheduled `asyncAfter` grace callback: only the
+    /// generation that scheduled it may run it. `flushPendingStopGrace` and
+    /// a fresh `scheduleStopGrace` both bump `stopGraceGeneration`, so a
+    /// superseded or already-flushed callback finds its generation stale
+    /// and no-ops instead of double-running `finishStop`.
+    internal static func shouldRunStopGrace(generation: UInt64, currentGeneration: UInt64) -> Bool {
+        generation == currentGeneration
+    }
+
+    /// Runs the deferred finalize only if nothing already flushed it early
+    /// (a fast re-press) and no newer stop superseded it.
+    private func runStopGraceIfCurrent(_ generation: UInt64) {
+        guard
+            Self.shouldRunStopGrace(generation: generation, currentGeneration: stopGraceGeneration),
+            let finalize = stopGraceFinalize
+        else { return }
+        stopGraceFinalize = nil
+        finalize()
+    }
+
+    /// Ends a pending post-release capture grace immediately, running its
+    /// finalize body right now instead of waiting out the remaining delay.
+    /// Call this before a new recording starts so a fast re-press can never
+    /// overlap two live holds on the same mic engine / streaming session.
+    private func flushPendingStopGrace() {
+        guard let finalize = stopGraceFinalize else { return }
+        stopGraceFinalize = nil
+        stopGraceGeneration &+= 1 // invalidate the still-pending timer callback
+        finalize()
+    }
+
+    /// The stop/finalize sequence proper — unchanged from before the capture
+    /// grace existed, just deferred by `postReleaseCaptureGrace` (or run
+    /// early by `flushPendingStopGrace`). Tearing the mic tap down here,
+    /// rather than at release, is what gives the grace window its buffers:
+    /// the tap installed in `startMicCapture` keeps firing — appending to
+    /// `pcmBuffers` and calling `sendToXAI`/`sendToElevenLabs`/`sendToGemini`
+    /// — for every buffer that arrives before this runs.
+    private func finishStop(sessionHold: SessionHold) {
+        pcmBuffersLock.lock()
+        let bufferedAudio = pcmBuffers
+        pcmBuffersLock.unlock()
+        let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
+        lastHoldDuration = elapsed
 
         if streamingCoordinator.xaiSession != nil
             || streamingCoordinator.elevenLabsSession != nil

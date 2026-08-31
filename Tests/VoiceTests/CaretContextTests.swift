@@ -1171,6 +1171,31 @@ final class HeldCaretLifecycleTests: XCTestCase {
         )
     }
 
+    // MARK: - Post-release capture grace (250ms trailing-word fix)
+
+    func testPostReleaseCaptureGraceIsTwoHundredFiftyMilliseconds() {
+        XCTAssertEqual(
+            AudioRecorder.postReleaseCaptureGraceForTesting,
+            0.250,
+            "grace window regressed — the last spoken word will clip again"
+        )
+    }
+
+    func testShouldRunStopGrace() {
+        XCTAssertTrue(
+            AudioRecorder.shouldRunStopGrace(generation: 1, currentGeneration: 1),
+            "the scheduling generation must be allowed to run its own grace callback"
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldRunStopGrace(generation: 1, currentGeneration: 2),
+            "a superseded grace (flushed early, or a newer stop scheduled) must not double-run finishStop"
+        )
+        XCTAssertFalse(
+            AudioRecorder.shouldRunStopGrace(generation: 0, currentGeneration: 1),
+            "the never-scheduled default generation must never run a grace callback"
+        )
+    }
+
     /// finishTranscription must prefer a non-nil stop-time session snapshot
     /// even when the live slot still matches the session token but was cleared.
     func testResolveHeldAtStartPrefersNonNilSessionSnapshot() {
