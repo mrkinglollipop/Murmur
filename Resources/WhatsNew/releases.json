@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.46",
+    "build": "47",
+    "title": "What's New in 0.1.46",
+    "items": [
+      "Stamped out the last duplicate-dictation path: delivery retries now require hard evidence that text didn't arrive before trying again, instead of trusting a confirmation channel that can go blind under system load.",
+      "A dictation that can't be verified is accepted once and kept in History — never delivered twice."
+    ]
+  },
+  {
     "version": "0.1.45",
     "build": "46",
     "title": "What's New in 0.1.45",
