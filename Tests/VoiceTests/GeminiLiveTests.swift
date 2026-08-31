@@ -146,6 +146,17 @@ final class GeminiLiveTests: XCTestCase {
         XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: "en-GB"), ["en-GB"])
         XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: ""), [])
         XCTAssertEqual(GeminiLiveOptions.bcp47LanguageCodes(from: "xx"), [])
+        XCTAssertEqual(SettingsStore.geminiLanguageSelection(from: "en"), "en-US")
+        XCTAssertEqual(SettingsStore.geminiLanguageSelection(from: "en-GB"), "en-GB")
+        XCTAssertEqual(SettingsStore.geminiLanguageSelection(from: ""), "")
+        XCTAssertFalse(SettingsStore.geminiLanguages.isEmpty)
+        XCTAssertEqual(SettingsStore.geminiLanguages.first?.code, "")
+        XCTAssertEqual(SettingsStore.isoLanguageCode(from: "en"), "en")
+        XCTAssertEqual(SettingsStore.isoLanguageCode(from: "en-GB"), "en")
+        XCTAssertEqual(SettingsStore.isoLanguageCode(from: "en-US"), "en")
+        XCTAssertEqual(SettingsStore.isoLanguageCode(from: "cmn-Hans-CN"), "zh")
+        XCTAssertEqual(SettingsStore.isoLanguageCode(from: ""), "en")
+        XCTAssertEqual(SettingsStore.isoLanguageCode(from: "xx"), "en")
     }
 
     func testBinaryWebSocketPayloadDecodesAsUTF8JSON() {

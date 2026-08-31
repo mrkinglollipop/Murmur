@@ -7,7 +7,7 @@ import os.log
 /// stays fail-open (`isReady == false`) forever on failure.
 final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
 
-    static let modelId = "fluidaudio-wespeaker-0.15.5"
+    static let modelId = "fluidaudio-wespeaker-0.15.6"
 
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "voice-gate")
     private let stateLock = NSLock()

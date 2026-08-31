@@ -27,10 +27,14 @@ STAGE="$ROOT/build/dmg-stage"
 
 ENTITLEMENTS="$ROOT/Sources/Voice/Voice.entitlements"
 
-echo "==> Building Release (signed)"
+echo "==> Building Release (signed, arm64-only)"
 # Secure timestamp + no injected get-task-allow — required for Apple notarization.
+# ARCHS on the xcodebuild line so SPM packages (FluidAudio) skip x86_64.
 xcodebuild -scheme Voice -configuration Release build \
   -derivedDataPath "$DERIVED" \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
+  EXCLUDED_ARCHS=x86_64 \
   DEVELOPMENT_TEAM="$TEAM" \
   CODE_SIGN_IDENTITY="$IDENTITY" \
   CODE_SIGN_STYLE=Manual \
