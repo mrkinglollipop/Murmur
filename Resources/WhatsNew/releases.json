@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.45",
+    "build": "46",
+    "title": "What's New in 0.1.45",
+    "items": [
+      "Fixed doubled dictation: a brief system stall could make Murmur type the same transcript twice. Delivery retries now wait out slow event delivery instead of re-typing.",
+      "Long dictations that hit the 10-minute Gemini session cap keep everything transcribed so far instead of coming back empty."
+    ]
+  },
+  {
     "version": "0.1.44",
     "build": "45",
     "title": "What's New in 0.1.44",
