@@ -1,49 +1,6 @@
 import Foundation
 import os.log
 
-// MARK: - Cloud Provider
-
-/// The four BYO-API-key cloud transcription providers. Distinct from
-/// `CloudModel` (which is the picker-facing model choice) so that provider
-/// identity — Keychain account, signup link, display name — lives in one
-/// place regardless of which specific model a provider exposes.
-enum CloudProvider: String, CaseIterable, Identifiable {
-    case assemblyAI = "assemblyAI"
-    case deepgram   = "deepgram"
-    case openAI     = "openAI"
-    case groq       = "groq"
-    case xai        = "xai"
-    case elevenLabs = "elevenLabs"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .assemblyAI: return "AssemblyAI"
-        case .deepgram:   return "Deepgram"
-        case .openAI:     return "OpenAI"
-        case .groq:       return "Groq"
-        case .xai:        return "xAI (Grok)"
-        case .elevenLabs: return "ElevenLabs"
-        }
-    }
-
-    /// Keychain account identifier this provider's key is stored under
-    /// (service is fixed in `KeychainStore`).
-    var keychainAccount: String { rawValue }
-
-    var signupURL: URL {
-        switch self {
-        case .assemblyAI: return URL(string: "https://www.assemblyai.com/dashboard/signup")!
-        case .deepgram:   return URL(string: "https://console.deepgram.com/signup")!
-        case .openAI:     return URL(string: "https://platform.openai.com/api-keys")!
-        case .groq:       return URL(string: "https://console.groq.com/keys")!
-        case .xai:        return URL(string: "https://console.x.ai")!
-        case .elevenLabs: return URL(string: "https://elevenlabs.io/app/settings/api-keys")!
-        }
-    }
-}
-
 extension CloudModel {
     /// Which provider backs this cloud model.
     var provider: CloudProvider {
@@ -54,36 +11,8 @@ extension CloudModel {
         case .groqWhisperLargeV3Turbo:    return .groq
         case .xaiGrokSTT:                 return .xai
         case .elevenLabsScribeV2Realtime: return .elevenLabs
+        case .gemini35TranscribeLive:     return .gemini
         }
-    }
-}
-
-// MARK: - Errors
-
-struct CloudTranscriptionError: LocalizedError {
-    let provider: CloudProvider
-    let message: String
-
-    var errorDescription: String? {
-        "\(provider.displayName): \(message)"
-    }
-
-    static func httpStatus(_ status: Int, provider: CloudProvider, body: String? = nil) -> CloudTranscriptionError {
-        let suffix = body.map { " — \(redactedBodyFragment($0))" } ?? ""
-        return CloudTranscriptionError(provider: provider, message: "HTTP \(status)\(suffix)")
-    }
-
-    /// Strips anything key-shaped before a body fragment can reach logs:
-    /// long unbroken token runs (20+ chars of [A-Za-z0-9_-]) are replaced
-    /// with "…". Keeps enough context to diagnose HTTP errors.
-    static func redactedBodyFragment(_ body: String, max: Int = 300) -> String {
-        let pattern = "[A-Za-z0-9_\\-]{20,}"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return String(body.prefix(max))
-        }
-        let range = NSRange(body.startIndex..<body.endIndex, in: body)
-        let redacted = regex.stringByReplacingMatches(in: body, range: range, withTemplate: "…")
-        return String(redacted.prefix(max))
     }
 }
 
@@ -402,6 +331,43 @@ final class ElevenLabsTranscriptionService: CloudTranscriptionService {
     }
 }
 
+// MARK: - Gemini (batch fallback)
+
+final class GeminiTranscriptionService: CloudTranscriptionService {
+    /// Matches Live `SMART`/`VERBATIM`. Set by `TranscriptionPipeline` from
+    /// `SettingsStore.removeFillerWords` before `transcribe`.
+    var smartMode: Bool = true
+    /// Canonical dictionary terms (cap 100). Empty omits `custom_vocabulary`.
+    var vocabulary: [String] = []
+
+    func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String {
+        let payload = try cloudUploadAudio(from: audioURL, provider: .gemini)
+        let body = GeminiLiveOptions.makeBatchRequestBody(
+            wavBase64: payload.data.base64EncodedString(),
+            mimeType: payload.mimeType,
+            smartMode: smartMode,
+            vocabulary: vocabulary
+        )
+
+        var request = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/interactions")!)
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await HTTPClient.session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw CloudTranscriptionError.httpStatus(status, provider: .gemini, body: String(data: data, encoding: .utf8))
+        }
+        guard let text = GeminiBatchDecode.decodeTranscript(from: data),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CloudTranscriptionError(provider: .gemini, message: "No transcript in response")
+        }
+        return text
+    }
+}
+
 // MARK: - Factory
 
 enum CloudTranscriberFactory {
@@ -413,6 +379,7 @@ enum CloudTranscriberFactory {
         case .groq:       return GroqTranscriptionService()
         case .xai:        return XAITranscriptionService()
         case .elevenLabs: return ElevenLabsTranscriptionService()
+        case .gemini:     return GeminiTranscriptionService()
         }
     }
 }

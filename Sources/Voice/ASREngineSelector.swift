@@ -101,6 +101,11 @@ final class ASREngineSelector {
     /// a future per-provider toggle without another switch-site change.
     var elevenLabsStreamingEnabled: Bool = true
 
+    /// Master enable for the Gemini 3.5 Transcribe Live streaming path
+    /// (see `makeGeminiStreamingSession`). Like ElevenLabs, Gemini has no
+    /// separate off toggle — Live is the primary path when selected.
+    var geminiStreamingEnabled: Bool = true
+
     /// Sent as ElevenLabs' `no_verbatim` param (server-side filler-word /
     /// disfluency removal). Set by `SettingsStore` from the persisted
     /// `removeFillerWords` toggle; defaults `true` here to match that
@@ -113,6 +118,19 @@ final class ASREngineSelector {
     /// Wired by `AppDelegate` to `ElevenLabsRealtimeTranscriber.selectKeyterms(from:)`
     /// over `DictionaryStore.entries`, mirroring how `apiKeyProvider` is wired.
     var keytermsProvider: (() -> [String])?
+
+    /// ElevenLabs Scribe RT Advanced socket knobs. Set by `SettingsStore`.
+    var elevenLabsRealtimeOptions: ElevenLabsRealtimeOptions = .defaults
+
+    /// Gemini Live VAD / sensitivity knobs. Set by `SettingsStore`.
+    var geminiLiveOptions: GeminiLiveOptions = .defaults
+
+    /// Resolves Gemini `custom_vocabulary` from the learned dictionary.
+    /// Wired by `AppDelegate` to `GeminiLiveTranscriber.selectVocabulary(from:)`.
+    var geminiVocabularyProvider: (() -> [String])?
+
+    /// xAI Grok streaming `endpointing` (ms). Set by `SettingsStore`.
+    var xaiEndpointingMs: Int = XAIStreamingTranscriber.defaultEndpointingMs
 
     /// Dictionary terms that start with an uppercase letter — used at inject
     /// time to keep proper-noun capitalization mid-sentence. Wired by
@@ -291,7 +309,11 @@ final class ASREngineSelector {
               cloudModel == .xaiGrokSTT,
               let key = apiKeyProvider?(.xai),
               !key.isEmpty else { return nil }
-        return XAIStreamingTranscriber(apiKey: key, language: selectedLanguage)
+        return XAIStreamingTranscriber(
+            apiKey: key,
+            language: selectedLanguage,
+            endpointingMs: xaiEndpointingMs
+        )
     }
 
     /// Builds an ElevenLabs Scribe v2 Realtime streaming session if — and
@@ -308,7 +330,25 @@ final class ASREngineSelector {
             apiKey: key,
             language: selectedLanguage,
             noVerbatim: removeFillerWordsEnabled,
-            keyterms: keytermsProvider?() ?? []
+            keyterms: keytermsProvider?() ?? [],
+            realtimeOptions: elevenLabsRealtimeOptions
+        )
+    }
+
+    /// Builds a Gemini 3.5 Transcribe Live streaming session if — and only if —
+    /// the selected cloud model is Gemini AND a non-empty key is stored.
+    /// Returns `nil` otherwise so the caller uses file/batch fallback.
+    func makeGeminiStreamingSession() -> GeminiLiveTranscriber? {
+        guard geminiStreamingEnabled,
+              cloudModel == .gemini35TranscribeLive,
+              let key = apiKeyProvider?(.gemini),
+              !key.isEmpty else { return nil }
+        return GeminiLiveTranscriber(
+            apiKey: key,
+            language: selectedLanguage,
+            smartMode: removeFillerWordsEnabled,
+            vocabulary: geminiVocabularyProvider?() ?? [],
+            liveOptions: geminiLiveOptions
         )
     }
 

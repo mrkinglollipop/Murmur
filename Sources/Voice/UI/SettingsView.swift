@@ -46,6 +46,14 @@ struct SettingsView: View {
         enrolledProfile != nil
     }
 
+    private var geminiLanguageCaption: String {
+        let tag = SettingsStore.geminiLanguageSelection(from: settingsStore.selectedLanguage)
+        if tag.isEmpty {
+            return "Uses Language above. Gemini will auto-detect (no languageCodes)."
+        }
+        return "Uses Language above. Gemini is sent \(tag)."
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -146,15 +154,17 @@ struct SettingsView: View {
                                 .font(Theme.body(12))
                                 .foregroundColor(Theme.textPrimary)
 
-                            Text("Transcribes as you speak for near-instant results at release. Off falls back to the batch path. ElevenLabs Scribe v2 Realtime (selected separately above) always streams live regardless of this toggle.")
+                            Text("Transcribes as you speak for near-instant results at release. Off falls back to the batch path. ElevenLabs Scribe v2 Realtime and Gemini 3.5 Transcribe (selected separately above) always stream live regardless of this toggle.")
                                 .font(Theme.body(10))
                                 .foregroundColor(Theme.textSecondary)
+
+                            CloudEngineAdvancedView(settingsStore: settingsStore)
                         }
 
                         if settingsStore.selectedCloudModel.provider == .elevenLabs {
                             Divider().overlay(Theme.hairline)
 
-                            Toggle("Remove filler words (ElevenLabs)", isOn: $settingsStore.removeFillerWords)
+                            Toggle("Remove filler words", isOn: $settingsStore.removeFillerWords)
                                 .toggleStyle(.switch)
                                 .font(Theme.body(12))
                                 .foregroundColor(Theme.textPrimary)
@@ -162,6 +172,31 @@ struct SettingsView: View {
                             Text("Strips filler words, false starts, and stuttering during transcription. May occasionally swallow a deliberate spoken correction (e.g. \"um, actually, no —\"). Turn off if that happens.")
                                 .font(Theme.body(10))
                                 .foregroundColor(Theme.textSecondary)
+
+                            CloudEngineAdvancedView(settingsStore: settingsStore)
+                        }
+
+                        if settingsStore.selectedCloudModel.provider == .gemini {
+                            Divider().overlay(Theme.hairline)
+
+                            Text("Preview model — a paid Gemini API key is recommended. Free-tier keys may be used to improve Google products.")
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.textSecondary)
+
+                            Text(geminiLanguageCaption)
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.textSecondary)
+
+                            Toggle("Remove filler words", isOn: $settingsStore.removeFillerWords)
+                                .toggleStyle(.switch)
+                                .font(Theme.body(12))
+                                .foregroundColor(Theme.textPrimary)
+
+                            Text("Smart mode strips filler words and disfluencies; verbatim keeps them. Same toggle applies to ElevenLabs when that engine is selected.")
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.textSecondary)
+
+                            CloudEngineAdvancedView(settingsStore: settingsStore)
                         }
                     }
                 }

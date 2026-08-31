@@ -1,5 +1,35 @@
 [
   {
+    "version": "0.1.44",
+    "build": "45",
+    "title": "What's New in 0.1.44",
+    "items": [
+      "Dictation no longer overwrites your clipboard on the normal path — text is typed in, and paste is only a fallback.",
+      "Very short accidental holds at the silence floor no longer flash a false “Transcription failed.”",
+      "Cloud Advanced captions spell out what each control does; Acknowledgements sit behind an Open-source licenses disclosure.",
+      "What's New in Settings shows the latest release first, with earlier ones one tap away.",
+      "Apple Silicon only from here on (Intel builds dropped). Sparkle, WhisperKit, and FluidAudio are updated underneath."
+    ]
+  },
+  {
+    "version": "0.1.43",
+    "build": "44",
+    "title": "What's New in 0.1.43",
+    "items": [
+      "The dictionary keeps every misspelling of a word on that one word, instead of splitting it across duplicate rows.",
+      "Recent corrections can be hidden without undoing a mapping you still want. Revert still removes a bad misspelling without deleting the rest of the word."
+    ]
+  },
+  {
+    "version": "0.1.42",
+    "build": "43",
+    "title": "What's New in 0.1.42",
+    "items": [
+      "Google Gemini 3.5 Transcribe Live is now a Settings cloud engine for everyone — add a Gemini API key and pick it the same way as Grok or ElevenLabs.",
+      "If the live Gemini connection fails, Murmur falls back to Gemini batch transcription."
+    ]
+  },
+  {
     "version": "0.1.41",
     "build": "42",
     "title": "What's New in 0.1.41",

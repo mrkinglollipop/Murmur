@@ -10,6 +10,8 @@ enum EngineDisplayName {
             return LocalModel.parakeetTDT06BV3.displayName
         case "cloud:elevenlabs-streaming":
             return "\(CloudProvider.elevenLabs.displayName) (streaming)"
+        case "cloud:gemini-streaming":
+            return "\(CloudProvider.gemini.displayName) (streaming)"
         case "cloud:elevenLabs":
             return CloudProvider.elevenLabs.displayName
         case "cloud:xai-streaming":
@@ -49,6 +51,8 @@ enum EngineDisplayName {
         switch suffix {
         case "elevenlabs":
             return CloudProvider.elevenLabs.displayName
+        case "gemini":
+            return CloudProvider.gemini.displayName
         case "xai":
             return CloudProvider.xai.displayName
         default:

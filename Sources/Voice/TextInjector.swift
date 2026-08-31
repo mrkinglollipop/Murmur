@@ -8,12 +8,12 @@ import Foundation
 
 /// Inserts recognised text at the current cursor position in the focused app.
 ///
-/// Primary lane: clipboard + single Cmd-V chord (Wispr Flow style) — two synthetic
-/// events instead of dozens of unicode key events through Tahoe's WindowServer filter.
-/// Fallback: CGEvent unicode typing with delivery confirmation, retry, and postToPid.
-/// Clipboard+Cmd-V without confirmation previously delivered `text+text` in every app
-/// (one `insert` call, two pastes); this implementation posts exactly one chord and
-/// verifies delivery before restoring the user's pasteboard.
+/// Primary lane: CGEvent unicode typing with delivery confirmation, retry, and
+/// postToPid — **does not touch** `NSPasteboard.general`, so the user's prior
+/// copy survives a normal dictate. Fallback: clipboard + single Cmd-V chord
+/// (Wispr-style) when unicode cannot confirm; that path snapshots + restores the
+/// prior pasteboard after `pasteboardRestoreDelay` so slow Electron/Cursor
+/// consumers still read the transcript before restore.
 final class TextInjector {
 
     private static let dedupeLock = NSLock()
@@ -76,10 +76,38 @@ final class TextInjector {
     /// a practical ceiling around this size; chunk longer transcripts.
     private static let unicodeChunkSize = 16
 
-    private static let confirmationTimeout: TimeInterval = 0.4
+    // Confirmation wait is progress-aware, not a flat timeout: a WindowServer
+    // stall DELAYS CGEvent delivery to the observer tap, it does not DROP it.
+    // A flat 0.4s window mistook "still arriving" for "never arrived", retried
+    // by re-typing the whole transcript, and both copies landed once the
+    // stall cleared — doubled text with History recording only one delivery
+    // (2026-08-31 double-injection incident). The wait now starts at
+    // `confirmationBaseWindow` and extends by `confirmationProgressExtension`
+    // every time the observed count moves forward, capped at
+    // `confirmationMaxWait` total — so a genuinely stuck send (observed stays
+    // at 0, or stalls partway with no further progress) still times out
+    // promptly, while a delayed-but-arriving send gets the room it needs.
+    private static let confirmationBaseWindow: TimeInterval = 0.4
+    private static let confirmationProgressExtension: TimeInterval = 0.4
+    private static let confirmationMaxWait: TimeInterval = 2.5
+    /// Chord observation is binary (target 1, no partial-progress signal), so
+    /// it cannot use the progress-extension mechanics above — it gets a flat,
+    /// longer window instead. See `tryPasteLane` for the incident this guards.
+    private static let pasteChordConfirmationWindow: TimeInterval = 1.5
+    /// Brief yield after the paste chord so typical AppKit consumers read first.
+    /// Not a restore gate — see `pasteboardRestoreDelay`.
     private static let pasteConsumerDelay: TimeInterval = 0.25
+    /// How long after a confirmed paste chord we wait before restoring the
+    /// user's prior pasteboard. Must outlast slow Electron/Cursor paste
+    /// handlers; sync restore after `pasteConsumerDelay` alone raced them.
+    static let pasteboardRestoreDelay: TimeInterval = 2.0
     private static let pasteChordTarget = 1
     private static let virtualKeyV: CGKeyCode = 9 // kVK_ANSI_V
+
+    /// Bumped whenever a new deferred restore is scheduled so an older
+    /// callback cannot clobber a newer dictation's pasteboard state.
+    private static let restoreGenerationLock = NSLock()
+    private static var restoreGeneration: UInt64 = 0
 
     static let concealedPasteboardType = NSPasteboard.PasteboardType(
         rawValue: "org.nspasteboard.ConcealedType"
@@ -108,9 +136,47 @@ final class TextInjector {
     }
 
     enum SavedPasteboardRestoreDecision: Equatable {
+        /// Immediate restore — safe when the pasteboard was not the delivery
+        /// channel (unicode typing confirmed).
         case restoreSaved
+        /// Restore later so a slow Cmd-V consumer (Electron/Cursor) cannot
+        /// read the pre-insert snapshot we just put back. Paste-lane only.
+        case restoreSavedDeferred
         case deferRestore
         case doNotRestoreLeaveTranscript
+    }
+
+    /// What to do after a confirmation wait ends, given what the observer
+    /// actually saw. `acceptPartial` is the anti-double case: some but not all
+    /// of the posted text arrived, so the rest is presumed still in flight —
+    /// re-typing here would duplicate the part that already landed.
+    enum DeliveryFollowUp: Equatable {
+        case confirmed
+        case retryEligible
+        case acceptPartial
+    }
+
+    /// Pure post-wait decision — no CGEvents, so directly unit-testable.
+    static func deliveryFollowUp(observed: Int, target: Int) -> DeliveryFollowUp {
+        if observed >= target {
+            return .confirmed
+        }
+        if observed == 0 {
+            return .retryEligible
+        }
+        return .acceptPartial
+    }
+
+    /// Pure deadline arithmetic for the progress-aware confirmation wait.
+    /// Extends `currentDeadline` by `progressExtension` on forward progress,
+    /// never past `startedAt + maxWait`.
+    static func nextConfirmationDeadline(
+        startedAt: Date,
+        currentDeadline: Date,
+        progressExtension: TimeInterval,
+        maxWait: TimeInterval
+    ) -> Date {
+        min(currentDeadline.addingTimeInterval(progressExtension), startedAt.addingTimeInterval(maxWait))
     }
 
     /// Pure fallback ordering for verified unicode insert attempts.
@@ -132,12 +198,21 @@ final class TextInjector {
     }
 
     /// Whether to restore the pre-insert pasteboard snapshot after lane attempts finish.
+    ///
+    /// Paste success must not restore synchronously: confirmation only proves the
+    /// Cmd-V chord fired and the transcript was still on the pasteboard — not that
+    /// the target app already consumed it. Restoring after `pasteConsumerDelay`
+    /// (0.25s) let Cursor paste the prior clipboard while History recorded the
+    /// correct transcript as injected (2026-08-31).
     static func resolveSavedPasteboardRestore(
         pasteSucceeded: Bool,
         unicodeSucceeded: Bool,
         allLanesFailed: Bool
     ) -> SavedPasteboardRestoreDecision {
-        if pasteSucceeded || unicodeSucceeded {
+        if pasteSucceeded {
+            return .restoreSavedDeferred
+        }
+        if unicodeSucceeded {
             return .restoreSaved
         }
         if allLanesFailed {
@@ -232,6 +307,50 @@ final class TextInjector {
         pasteboardHoldsExpectedString(injectedText, on: pasteboard)
     }
 
+    /// Schedules a pasteboard restore after `delay`, re-checking that our
+    /// transcript is still present (Continuity / user copy → skip). Newer
+    /// schedules cancel older ones via `restoreGeneration`.
+    ///
+    /// `asyncAfter` is injectable for tests; production uses main-queue
+    /// `asyncAfter`.
+    static func scheduleDeferredPasteboardRestore(
+        injectedText: String,
+        savedPasteboard: PasteboardSnapshot,
+        on pasteboard: NSPasteboard = .general,
+        delay: TimeInterval = pasteboardRestoreDelay,
+        asyncAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, work in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    ) {
+        restoreGenerationLock.lock()
+        restoreGeneration &+= 1
+        let generation = restoreGeneration
+        restoreGenerationLock.unlock()
+
+        asyncAfter(delay) {
+            restoreGenerationLock.lock()
+            let current = restoreGeneration
+            restoreGenerationLock.unlock()
+            guard generation == current else {
+                log("skip deferred pasteboard restore — superseded")
+                return
+            }
+            guard shouldRestoreSavedPasteboard(injectedText: injectedText, on: pasteboard) else {
+                log("skip deferred pasteboard restore — external overwrite after paste")
+                return
+            }
+            restorePasteboardSnapshot(savedPasteboard, on: pasteboard)
+            log("deferred pasteboard restore chars=\(injectedText.utf16.count)")
+        }
+    }
+
+    /// Test seam: reset generation so deferred-restore tests stay isolated.
+    static func resetDeferredRestoreGenerationForTesting() {
+        restoreGenerationLock.lock()
+        restoreGeneration = 0
+        restoreGenerationLock.unlock()
+    }
+
     /// Restores a captured snapshot, rebuilding every item with all of its
     /// representations. An empty snapshot means the pasteboard was empty before
     /// we touched it, so it is left cleared.
@@ -301,38 +420,41 @@ final class TextInjector {
 
     private func performInsert(_ trimmed: String) -> InsertResult {
         let utf16Count = trimmed.utf16.count
+        // Snapshot before any lane that may write the pasteboard. Unicode-first
+        // never writes on success; paste fallback needs this to put the user's
+        // prior copy back after Cmd-V.
         let savedPasteboard = Self.pasteboardSnapshot(from: NSPasteboard.general)
 
         guard let observer = UnicodeDeliveryObserver.create() else {
             // Paste-blind is unconfirmed — fail closed for watch / InsertResult.
-            _ = insertViaPasteBlind(trimmed, savedPasteboard: savedPasteboard)
+            // Do not restore the pre-insert pasteboard: the pipeline maps this
+            // to `.failed` and the HUD tells the user the transcript is on
+            // the clipboard. A deferred restore would clobber that promise.
+            _ = insertViaPasteBlind(trimmed)
             return .failed
         }
         defer { observer.stop() }
 
-        let pasteSucceeded = tryPasteLane(trimmed, observer: observer)
-        if pasteSucceeded {
-            Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
-            if Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: NSPasteboard.general) {
-                Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
-            } else {
-                Self.log("skip pasteboard restore — external overwrite after paste")
-            }
-            Self.log("paste chord emitted with verified pasteboard chars=\(utf16Count)")
-            return .inserted(deliveredText: trimmed)
-        }
-
+        // Unicode first — happy path never touches NSPasteboard.general.
         observer.resetObservedCount()
         var posted = insertViaUnicodeTyping(trimmed)
         var confirmed = false
         var retryConfirmed = false
 
         if posted > 0 {
-            confirmed = waitForConfirmation(
-                observer: observer,
-                target: posted,
-                counter: .utf16Units
-            )
+            let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
+            switch Self.deliveryFollowUp(observed: observed, target: posted) {
+            case .confirmed:
+                confirmed = true
+            case .acceptPartial:
+                // Some of the posted text already landed; re-typing here would
+                // duplicate it. Accept what arrived and stop — never escalate
+                // to pid fallback or the paste lane on a partial delivery.
+                Self.log("partial delivery observed=\(observed)/\(posted) — accepting without retry (anti-double)")
+                return .inserted(deliveredText: trimmed)
+            case .retryEligible:
+                break // observed == 0: true drop signature, fall through to retry.
+            }
         }
 
         if !confirmed, posted > 0 {
@@ -340,11 +462,16 @@ final class TextInjector {
             observer.resetObservedCount()
             posted = insertViaUnicodeTyping(trimmed)
             if posted > 0 {
-                retryConfirmed = waitForConfirmation(
-                    observer: observer,
-                    target: posted,
-                    counter: .utf16Units
-                )
+                let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
+                switch Self.deliveryFollowUp(observed: observed, target: posted) {
+                case .confirmed:
+                    retryConfirmed = true
+                case .acceptPartial:
+                    Self.log("partial delivery observed=\(observed)/\(posted) — accepting without retry (anti-double)")
+                    return .inserted(deliveredText: trimmed)
+                case .retryEligible:
+                    break // still 0 after retry — fall through to pid/paste fallback.
+                }
             }
         }
 
@@ -366,35 +493,48 @@ final class TextInjector {
         // Keyed on observed delivery, NOT on `shouldReturnTrue`. The two differ
         // only for `.unverifiedFallback`, and that difference is the bug: the
         // pipeline maps it to `.failed`, which surfaces as the HUD's
-        // "it's on your clipboard" flash — so restoring the pre-insert
-        // pasteboard there told the user to paste something that was no longer
-        // there. When delivery is unconfirmed, the transcript stays put and the
-        // promise holds; if the pid fallback did land the text, the cost is a
-        // stale clipboard rather than a lost dictation.
-        let deliveryConfirmed = outcome.path.isConfirmedDelivery
-
-        switch Self.resolveSavedPasteboardRestore(
-            pasteSucceeded: false,
-            unicodeSucceeded: deliveryConfirmed,
-            allLanesFailed: !deliveryConfirmed
-        ) {
-        case .restoreSaved:
-            Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
-        case .doNotRestoreLeaveTranscript:
-            leaveOnClipboard(trimmed)
-        case .deferRestore:
-            break
-        }
-
-        switch outcome.path {
-        case .confirmed, .confirmedOnRetry:
-            Self.log("unicode typing confirmed chars=\(utf16Count)")
+        // "it's on your clipboard" flash — so we must leave the transcript on
+        // the pasteboard for that rare failure path only.
+        if outcome.path.isConfirmedDelivery {
+            Self.log("unicode typing confirmed chars=\(utf16Count) — pasteboard untouched")
             return .inserted(deliveredText: trimmed)
-        case .unverifiedFallback:
-            return .failed
-        case .clipboard:
-            return .failed
         }
+
+        // Paste fallback (Wispr-style). Touches the pasteboard; restore prior
+        // after pasteboardRestoreDelay so Electron/Cursor can still consume.
+        let pasteSucceeded = tryPasteLane(trimmed, observer: observer)
+        if pasteSucceeded {
+            Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
+            switch Self.resolveSavedPasteboardRestore(
+                pasteSucceeded: true,
+                unicodeSucceeded: false,
+                allLanesFailed: false
+            ) {
+            case .restoreSavedDeferred:
+                Self.scheduleDeferredPasteboardRestore(
+                    injectedText: trimmed,
+                    savedPasteboard: savedPasteboard
+                )
+            case .restoreSaved:
+                if Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: NSPasteboard.general) {
+                    Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
+                } else {
+                    Self.log("skip pasteboard restore — external overwrite after paste")
+                }
+            case .doNotRestoreLeaveTranscript:
+                leaveOnClipboard(trimmed)
+            case .deferRestore:
+                break
+            }
+            Self.log("paste chord fallback chars=\(utf16Count)")
+            return .inserted(deliveredText: trimmed)
+        }
+
+        // All lanes failed (or only unverified pid). Leave transcript for the
+        // HUD "paste it yourself" flash — prior clipboard is sacrificed only here.
+        leaveOnClipboard(trimmed)
+        Self.log("inject failed — transcript left on clipboard chars=\(utf16Count)")
+        return .failed
     }
 
     // MARK: - Paste lane
@@ -402,14 +542,13 @@ final class TextInjector {
     /// Paste without delivery confirmation. Returns `false` when the chord was
     /// not posted (unstable pasteboard or event creation failure).
     ///
-    /// Every failure path leaves the transcript on the clipboard rather than
-    /// restoring the prior contents. `performInsert` maps a `false` here to
-    /// `.failed`, which the pipeline surfaces as `.injectionFailed` → the HUD's
-    /// clipboard flash, i.e. "your text is on the clipboard, paste it yourself".
-    /// Restoring here made that promise false and lost the dictation from every
-    /// surface except History.
+    /// Every path leaves the transcript on the clipboard rather than restoring
+    /// the prior contents. `performInsert` maps this lane to `.failed`, which
+    /// the pipeline surfaces as `.injectionFailed` → the HUD's clipboard flash
+    /// ("your text is on the clipboard, paste it yourself"). Restoring — even
+    /// after `pasteboardRestoreDelay` — made that promise false.
     @discardableResult
-    private func insertViaPasteBlind(_ text: String, savedPasteboard: PasteboardSnapshot) -> Bool {
+    private func insertViaPasteBlind(_ text: String) -> Bool {
         guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
             Self.log("paste blind aborted — pasteboard unstable chars=\(text.utf16.count)")
             leaveOnClipboard(text)
@@ -426,10 +565,7 @@ final class TextInjector {
             return false
         }
         Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
-        if Self.shouldRestoreSavedPasteboard(injectedText: text, on: NSPasteboard.general) {
-            Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
-        }
-        Self.log("paste blind chars=\(text.utf16.count)")
+        Self.log("paste blind chars=\(text.utf16.count) — transcript left on clipboard")
         return true
     }
 
@@ -455,11 +591,23 @@ final class TextInjector {
 
             observer.resetObservedCount()
             guard postPasteChord() else { return false }
-            let chordObserved = waitForConfirmation(
+            // Chord observation is binary (target 1) — a WindowServer stall
+            // DELAYS the CGEvent reaching the observer tap, it does not drop
+            // it. The original 0.4s window mistook "still in flight" for
+            // "dropped", fired a second Cmd-V, and once the stall cleared both
+            // chords landed — pasting the transcript twice while History
+            // recorded one delivery (2026-08-31 double-paste incident). 1.5s
+            // gives a stalled WindowServer room to deliver before we escalate
+            // to the single retry below.
+            let observedChordCount = waitForConfirmation(
                 observer: observer,
                 target: Self.pasteChordTarget,
-                counter: .pasteChord
+                counter: .pasteChord,
+                baseWindow: Self.pasteChordConfirmationWindow,
+                progressExtension: 0,
+                maxWait: Self.pasteChordConfirmationWindow
             )
+            let chordObserved = observedChordCount >= Self.pasteChordTarget
             // Chord observed proves WindowServer accepted our events; pasteboard
             // still holding the transcript proves Continuity did not overwrite
             // between prepare and paste. Neither checks target-app content.
@@ -583,12 +731,20 @@ final class TextInjector {
         case pasteChord
     }
 
+    /// Waits for `observedCount()` to reach `target`, extending the deadline on
+    /// forward progress (delayed delivery) rather than timing out the instant a
+    /// fixed window elapses (see `confirmationBaseWindow` doc comment). Returns
+    /// the final observed count — callers decide confirmed / retry / partial via
+    /// `deliveryFollowUp`, not a bare Bool, so a delayed-but-partial delivery is
+    /// distinguishable from a genuine drop.
     private func waitForConfirmation(
         observer: UnicodeDeliveryObserver,
         target: Int,
         counter: ConfirmationCounter,
-        timeout: TimeInterval = TextInjector.confirmationTimeout
-    ) -> Bool {
+        baseWindow: TimeInterval = TextInjector.confirmationBaseWindow,
+        progressExtension: TimeInterval = TextInjector.confirmationProgressExtension,
+        maxWait: TimeInterval = TextInjector.confirmationMaxWait
+    ) -> Int {
         let observedCount: () -> Int = {
             switch counter {
             case .utf16Units:
@@ -599,23 +755,32 @@ final class TextInjector {
         }
 
         let semaphore = DispatchSemaphore(value: 0)
-        var confirmed = false
+        var finalObserved = 0
         DispatchQueue(label: "com.matt.voice-dictation.unicode-delivery-wait").async {
-            let deadline = Date().addingTimeInterval(timeout)
+            let startedAt = Date()
+            var deadline = startedAt.addingTimeInterval(baseWindow)
+            var lastObserved = observedCount()
             while Date() < deadline {
-                if observedCount() >= target {
-                    confirmed = true
+                let current = observedCount()
+                if current > lastObserved {
+                    deadline = Self.nextConfirmationDeadline(
+                        startedAt: startedAt,
+                        currentDeadline: deadline,
+                        progressExtension: progressExtension,
+                        maxWait: maxWait
+                    )
+                    lastObserved = current
+                }
+                if current >= target {
                     break
                 }
                 Thread.sleep(forTimeInterval: 0.005)
             }
-            if !confirmed {
-                confirmed = observedCount() >= target
-            }
+            finalObserved = observedCount()
             semaphore.signal()
         }
         semaphore.wait()
-        return confirmed
+        return finalObserved
     }
 
     private func leaveOnClipboard(_ text: String) {

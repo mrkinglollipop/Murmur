@@ -23,7 +23,7 @@ feature — the palette and Liquid Glass surfaces are tuned for a single look.
 - **Push-to-talk** — global activation (fn / Globe or Right Option) via a HID-level event tap
 - **Toggle-lock** — double-tap fn for hands-free recording
 - **Live HUD** — waveform feedback while you hold the key
-- **Local or cloud ASR** — WhisperKit on-device by default; optional BYO cloud keys (xAI, ElevenLabs)
+- **Local or cloud ASR** — WhisperKit on-device by default; optional BYO cloud keys (xAI, ElevenLabs, Gemini)
 - **Cleanup** — optional grammar / filler cleanup (on-device Apple Intelligence or cloud LLM)
 - **Dictionary & snippets** — corrections learned from edits; spoken phrase expansion
 - **History & Insights** — searchable dictation log, exports, and usage stats
@@ -112,6 +112,7 @@ Manage models in **Settings → Local Model**. Model files live under `~/Library
 |----------|-------|-------|
 | xAI | Grok STT | Optional live WebSocket streaming |
 | ElevenLabs | Scribe v2 Realtime | Always streams (batch only as fallback) |
+| Google Gemini | Gemini 3.5 Transcribe Live | Always streams (batch only as fallback); Preview |
 
 Keys are stored in the macOS Keychain (device-only). Without a key for the selected provider, Murmur falls back to the local engine.
 

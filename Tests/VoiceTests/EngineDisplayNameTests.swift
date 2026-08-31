@@ -13,6 +13,14 @@ final class EngineDisplayNameTests: XCTestCase {
             "\(CloudProvider.elevenLabs.displayName) (streaming)"
         )
         XCTAssertEqual(
+            EngineDisplayName.displayName(for: "cloud:gemini-streaming"),
+            "\(CloudProvider.gemini.displayName) (streaming)"
+        )
+        XCTAssertEqual(
+            EngineDisplayName.displayName(for: "cloud:gemini"),
+            CloudProvider.gemini.displayName
+        )
+        XCTAssertEqual(
             EngineDisplayName.displayName(for: "cloud:elevenLabs"),
             CloudProvider.elevenLabs.displayName
         )

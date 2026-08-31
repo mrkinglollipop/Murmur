@@ -14,7 +14,7 @@ enum Acknowledgements {
             id: "whisperkit",
             name: "WhisperKit",
             licenseType: "MIT",
-            url: URL(string: "https://github.com/argmaxinc/WhisperKit")!,
+            url: URL(string: "https://github.com/argmaxinc/argmax-oss-swift")!,
             licenseResourceName: "WhisperKit-LICENSE"
         ),
         Acknowledgement(

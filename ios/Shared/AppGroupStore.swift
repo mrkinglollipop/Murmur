@@ -1,14 +1,42 @@
 import Foundation
 
+enum SelectedCloudEngine: String, CaseIterable, Identifiable, Codable {
+    case elevenLabs
+    case gemini
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .elevenLabs: return "ElevenLabs Scribe v2"
+        case .gemini: return "Gemini 3.5 Transcribe"
+        }
+    }
+}
+
 enum AppGroupStore {
     static let suiteName = "group.com.matt.murmur.ios"
     static let apiKeyKey = "elevenLabsAPIKey"
+    static let geminiAPIKeyKey = "geminiAPIKey"
+    static let selectedCloudEngineKey = "selectedCloudEngine"
+    static let geminiVadModeKey = "geminiVadMode"
+    static let geminiStartSensitivityKey = "geminiStartSensitivity"
+    static let geminiEndSensitivityKey = "geminiEndSensitivity"
+    static let geminiPrefixPaddingMsKey = "geminiPrefixPaddingMs"
+    static let geminiSilenceDurationMsKey = "geminiSilenceDurationMs"
+    static let elevenLabsFilterBackgroundAudioKey = "elevenLabsFilterBackgroundAudio"
+    static let elevenLabsCommitStrategyKey = "elevenLabsCommitStrategy"
+    static let elevenLabsVadThresholdKey = "elevenLabsVadThreshold"
+    static let elevenLabsVadSilenceThresholdSecsKey = "elevenLabsVadSilenceThresholdSecs"
+    static let elevenLabsMinSpeechDurationMsKey = "elevenLabsMinSpeechDurationMs"
+    static let elevenLabsMinSilenceDurationMsKey = "elevenLabsMinSilenceDurationMs"
     static let giphyAPIKeyKey = "giphyAPIKey"
     static let languageKey = "languageCode"
     static let lastHostKey = "lastHostBundleID"
     static let microphoneLevelKey = "microphoneLevel"
     static let listenGateRequestIDKey = "listenGateRequestID"
     static let swipeTypingEnabledKey = "swipeTypingEnabled"
+    static let removeFillerWordsKey = "removeFillerWords"
     static let recentEmojiKey = "recentEmoji"
     static let interstitialAppsKey = "interstitialReturnAppIDs"
 
@@ -19,6 +47,208 @@ enum AppGroupStore {
     static var apiKey: String {
         get { suite?.string(forKey: apiKeyKey) ?? "" }
         set { suite?.set(newValue, forKey: apiKeyKey) }
+    }
+
+    static var geminiAPIKey: String {
+        get { suite?.string(forKey: geminiAPIKeyKey) ?? "" }
+        set { suite?.set(newValue, forKey: geminiAPIKeyKey) }
+    }
+
+    static var selectedCloudEngine: SelectedCloudEngine {
+        get {
+            guard let raw = suite?.string(forKey: selectedCloudEngineKey),
+                  let engine = SelectedCloudEngine(rawValue: raw) else {
+                return .elevenLabs
+            }
+            return engine
+        }
+        set { suite?.set(newValue.rawValue, forKey: selectedCloudEngineKey) }
+    }
+
+    static var geminiVadMode: GeminiVadMode {
+        get {
+            guard let raw = suite?.string(forKey: geminiVadModeKey),
+                  let mode = GeminiVadMode(rawValue: raw) else {
+                return .manual
+            }
+            return mode
+        }
+        set { suite?.set(newValue.rawValue, forKey: geminiVadModeKey) }
+    }
+
+    static var geminiStartSensitivity: GeminiStartSensitivity {
+        get {
+            guard let raw = suite?.string(forKey: geminiStartSensitivityKey),
+                  let value = GeminiStartSensitivity(rawValue: raw) else {
+                return .high
+            }
+            return value
+        }
+        set { suite?.set(newValue.rawValue, forKey: geminiStartSensitivityKey) }
+    }
+
+    static var geminiEndSensitivity: GeminiEndSensitivity {
+        get {
+            guard let raw = suite?.string(forKey: geminiEndSensitivityKey),
+                  let value = GeminiEndSensitivity(rawValue: raw) else {
+                return .high
+            }
+            return value
+        }
+        set { suite?.set(newValue.rawValue, forKey: geminiEndSensitivityKey) }
+    }
+
+    static var geminiPrefixPaddingMs: Int {
+        get {
+            guard let suite, suite.object(forKey: geminiPrefixPaddingMsKey) != nil else {
+                return GeminiLiveOptions.defaults.prefixPaddingMs
+            }
+            return GeminiLiveOptions.clamp(
+                suite.integer(forKey: geminiPrefixPaddingMsKey),
+                to: GeminiLiveOptions.prefixPaddingRange
+            )
+        }
+        set {
+            suite?.set(
+                GeminiLiveOptions.clamp(newValue, to: GeminiLiveOptions.prefixPaddingRange),
+                forKey: geminiPrefixPaddingMsKey
+            )
+        }
+    }
+
+    static var geminiSilenceDurationMs: Int {
+        get {
+            guard let suite, suite.object(forKey: geminiSilenceDurationMsKey) != nil else {
+                return GeminiLiveOptions.defaults.silenceDurationMs
+            }
+            return GeminiLiveOptions.clamp(
+                suite.integer(forKey: geminiSilenceDurationMsKey),
+                to: GeminiLiveOptions.silenceDurationRange
+            )
+        }
+        set {
+            suite?.set(
+                GeminiLiveOptions.clamp(newValue, to: GeminiLiveOptions.silenceDurationRange),
+                forKey: geminiSilenceDurationMsKey
+            )
+        }
+    }
+
+    static var elevenLabsFilterBackgroundAudio: Bool {
+        get { suite?.bool(forKey: elevenLabsFilterBackgroundAudioKey) ?? false }
+        set { suite?.set(newValue, forKey: elevenLabsFilterBackgroundAudioKey) }
+    }
+
+    static var elevenLabsCommitStrategy: ElevenLabsCommitStrategy {
+        get {
+            guard let raw = suite?.string(forKey: elevenLabsCommitStrategyKey),
+                  let strategy = ElevenLabsCommitStrategy(rawValue: raw) else {
+                return .manual
+            }
+            return strategy
+        }
+        set { suite?.set(newValue.rawValue, forKey: elevenLabsCommitStrategyKey) }
+    }
+
+    static var elevenLabsVadThreshold: Double {
+        get {
+            guard let suite, suite.object(forKey: elevenLabsVadThresholdKey) != nil else {
+                return ElevenLabsRealtimeOptions.defaults.vadThreshold
+            }
+            return ElevenLabsRealtimeOptions.clamp(
+                suite.double(forKey: elevenLabsVadThresholdKey),
+                to: ElevenLabsRealtimeOptions.vadThresholdRange
+            )
+        }
+        set {
+            suite?.set(
+                ElevenLabsRealtimeOptions.clamp(newValue, to: ElevenLabsRealtimeOptions.vadThresholdRange),
+                forKey: elevenLabsVadThresholdKey
+            )
+        }
+    }
+
+    static var elevenLabsVadSilenceThresholdSecs: Double {
+        get {
+            guard let suite, suite.object(forKey: elevenLabsVadSilenceThresholdSecsKey) != nil else {
+                return ElevenLabsRealtimeOptions.defaults.vadSilenceThresholdSecs
+            }
+            return ElevenLabsRealtimeOptions.clamp(
+                suite.double(forKey: elevenLabsVadSilenceThresholdSecsKey),
+                to: ElevenLabsRealtimeOptions.vadSilenceRange
+            )
+        }
+        set {
+            suite?.set(
+                ElevenLabsRealtimeOptions.clamp(newValue, to: ElevenLabsRealtimeOptions.vadSilenceRange),
+                forKey: elevenLabsVadSilenceThresholdSecsKey
+            )
+        }
+    }
+
+    static var elevenLabsMinSpeechDurationMs: Int {
+        get {
+            guard let suite, suite.object(forKey: elevenLabsMinSpeechDurationMsKey) != nil else {
+                return ElevenLabsRealtimeOptions.defaults.minSpeechDurationMs
+            }
+            return ElevenLabsRealtimeOptions.clamp(
+                suite.integer(forKey: elevenLabsMinSpeechDurationMsKey),
+                to: ElevenLabsRealtimeOptions.minSpeechMsRange
+            )
+        }
+        set {
+            suite?.set(
+                ElevenLabsRealtimeOptions.clamp(newValue, to: ElevenLabsRealtimeOptions.minSpeechMsRange),
+                forKey: elevenLabsMinSpeechDurationMsKey
+            )
+        }
+    }
+
+    static var elevenLabsMinSilenceDurationMs: Int {
+        get {
+            guard let suite, suite.object(forKey: elevenLabsMinSilenceDurationMsKey) != nil else {
+                return ElevenLabsRealtimeOptions.defaults.minSilenceDurationMs
+            }
+            return ElevenLabsRealtimeOptions.clamp(
+                suite.integer(forKey: elevenLabsMinSilenceDurationMsKey),
+                to: ElevenLabsRealtimeOptions.minSilenceMsRange
+            )
+        }
+        set {
+            suite?.set(
+                ElevenLabsRealtimeOptions.clamp(newValue, to: ElevenLabsRealtimeOptions.minSilenceMsRange),
+                forKey: elevenLabsMinSilenceDurationMsKey
+            )
+        }
+    }
+
+    static var elevenLabsRealtimeOptions: ElevenLabsRealtimeOptions {
+        ElevenLabsRealtimeOptions(
+            filterBackgroundAudio: elevenLabsFilterBackgroundAudio,
+            commitStrategy: elevenLabsCommitStrategy,
+            vadThreshold: elevenLabsVadThreshold,
+            vadSilenceThresholdSecs: elevenLabsVadSilenceThresholdSecs,
+            minSpeechDurationMs: elevenLabsMinSpeechDurationMs,
+            minSilenceDurationMs: elevenLabsMinSilenceDurationMs
+        )
+    }
+
+    static var geminiLiveOptions: GeminiLiveOptions {
+        GeminiLiveOptions(
+            vadMode: geminiVadMode,
+            startSensitivity: geminiStartSensitivity,
+            endSensitivity: geminiEndSensitivity,
+            prefixPaddingMs: geminiPrefixPaddingMs,
+            silenceDurationMs: geminiSilenceDurationMs
+        ).clamped()
+    }
+
+    /// API key for the currently selected cloud engine.
+    static var selectedEngineAPIKey: String {
+        switch selectedCloudEngine {
+        case .elevenLabs: return apiKey
+        case .gemini: return geminiAPIKey
+        }
     }
 
     static var giphyAPIKey: String {
@@ -98,6 +328,16 @@ enum AppGroupStore {
             return suite.bool(forKey: swipeTypingEnabledKey)
         }
         set { suite?.set(newValue, forKey: swipeTypingEnabledKey) }
+    }
+
+    /// Scribe batch `no_verbatim`. Missing key means on — matches the previous
+    /// hardcoded `noVerbatim: true` in `DictationController`.
+    static var removeFillerWords: Bool {
+        get {
+            guard let suite, suite.object(forKey: removeFillerWordsKey) != nil else { return true }
+            return suite.bool(forKey: removeFillerWordsKey)
+        }
+        set { suite?.set(newValue, forKey: removeFillerWordsKey) }
     }
 
     /// Bundle IDs shown as jump-back tiles on the swipe interstitial, in grid order.

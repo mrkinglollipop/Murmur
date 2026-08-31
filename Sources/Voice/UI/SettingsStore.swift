@@ -65,6 +65,18 @@ final class SettingsStore: ObservableObject {
         static let allowLastResortInputFallback = "voice.settings.allowLastResortInputFallback"
         static let useStreaming = "voice.settings.useStreaming"
         static let removeFillerWords = "voice.settings.removeFillerWords"
+        static let elevenLabsFilterBackgroundAudio = "voice.settings.elevenLabsFilterBackgroundAudio"
+        static let elevenLabsCommitStrategy = "voice.settings.elevenLabsCommitStrategy"
+        static let elevenLabsVadThreshold = "voice.settings.elevenLabsVadThreshold"
+        static let elevenLabsVadSilenceThresholdSecs = "voice.settings.elevenLabsVadSilenceThresholdSecs"
+        static let elevenLabsMinSpeechDurationMs = "voice.settings.elevenLabsMinSpeechDurationMs"
+        static let elevenLabsMinSilenceDurationMs = "voice.settings.elevenLabsMinSilenceDurationMs"
+        static let geminiVadMode = "voice.settings.geminiVadMode"
+        static let geminiStartSensitivity = "voice.settings.geminiStartSensitivity"
+        static let geminiEndSensitivity = "voice.settings.geminiEndSensitivity"
+        static let geminiPrefixPaddingMs = "voice.settings.geminiPrefixPaddingMs"
+        static let geminiSilenceDurationMs = "voice.settings.geminiSilenceDurationMs"
+        static let xaiEndpointingMs = "voice.settings.xaiEndpointingMs"
         static let useToggleLock = "voice.settings.useToggleLock"
         static let smartLeadingSpace = "voice.settings.smartLeadingSpace"
         static let learnFromInlineCorrections = "voice.settings.learnFromInlineCorrections"
@@ -93,6 +105,64 @@ final class SettingsStore: ObservableObject {
         ("ar", "Arabic"),
         ("hi", "Hindi"),
     ]
+
+    /// BCP-47 locales for Gemini Live / batch (`languageCodes`). Empty code =
+    /// omit the hint so Gemini auto-detects. Regional English variants matter
+    /// here — bare `"en"` is not in Google's supported list.
+    static let geminiLanguages: [(code: String, name: String)] = [
+        ("", "Auto-detect"),
+        ("en-US", "English (US)"),
+        ("en-GB", "English (UK)"),
+        ("en-IN", "English (India)"),
+        ("es-US", "Spanish (US)"),
+        ("fr-FR", "French"),
+        ("de-DE", "German"),
+        ("it-IT", "Italian"),
+        ("pt-BR", "Portuguese (Brazil)"),
+        ("nl-NL", "Dutch"),
+        ("ja-JP", "Japanese"),
+        ("ko-KR", "Korean"),
+        ("cmn-Hans-CN", "Chinese (Simplified)"),
+        ("ru-RU", "Russian"),
+        ("ar-EG", "Arabic"),
+        ("hi-IN", "Hindi"),
+    ]
+
+    /// Binding helper: Settings ISO codes → Gemini BCP-47 picker selection.
+    nonisolated static func geminiLanguageSelection(from selectedLanguage: String) -> String {
+        GeminiLiveOptions.bcp47LanguageCodes(from: selectedLanguage).first ?? ""
+    }
+
+    /// Maps a stored language (ISO 639-1 or a Gemini BCP-47 tag) back to the
+    /// ISO codes WhisperKit / xAI / ElevenLabs expect. Empty or unknown → `"en"`.
+    /// Never persist Gemini Auto-detect (`""`) or `en-GB` into this field —
+    /// those values desync the Language picker and are invalid for other engines.
+    nonisolated static func isoLanguageCode(from stored: String) -> String {
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        let supported = Set(supportedLanguages.map(\.code))
+        if supported.contains(trimmed) { return trimmed }
+        let fromGeminiTag: [String: String] = [
+            "en-US": "en", "en-GB": "en", "en-IN": "en",
+            "es-US": "es",
+            "fr-FR": "fr",
+            "de-DE": "de",
+            "it-IT": "it",
+            "pt-BR": "pt",
+            "nl-NL": "nl",
+            "ja-JP": "ja",
+            "ko-KR": "ko",
+            "cmn-Hans-CN": "zh",
+            "ru-RU": "ru",
+            "ar-EG": "ar",
+            "hi-IN": "hi",
+        ]
+        if let iso = fromGeminiTag[trimmed] { return iso }
+        if let prefix = trimmed.split(separator: "-").first.map(String.init),
+           supported.contains(prefix) {
+            return prefix
+        }
+        return "en"
+    }
 
     /// Keychain-backed storage for user-supplied cloud API keys. Not
     /// persisted to UserDefaults — only the boolean toggle and model choice
@@ -226,6 +296,177 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// ElevenLabs Scribe RT: suppress other talkers / ambient false activations.
+    /// Off by default (previous hardcoded socket). Independent of local
+    /// "Focus on my voice" speaker gating.
+    @Published var elevenLabsFilterBackgroundAudio: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                elevenLabsFilterBackgroundAudio,
+                forKey: Keys.elevenLabsFilterBackgroundAudio
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsCommitStrategy: ElevenLabsCommitStrategy {
+        didSet {
+            UserDefaults.standard.set(
+                elevenLabsCommitStrategy.rawValue,
+                forKey: Keys.elevenLabsCommitStrategy
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsVadThreshold: Double {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsVadThreshold,
+                to: ElevenLabsRealtimeOptions.vadThresholdRange
+            )
+            if clamped != elevenLabsVadThreshold {
+                elevenLabsVadThreshold = clamped
+                return
+            }
+            UserDefaults.standard.set(elevenLabsVadThreshold, forKey: Keys.elevenLabsVadThreshold)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsVadSilenceThresholdSecs: Double {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsVadSilenceThresholdSecs,
+                to: ElevenLabsRealtimeOptions.vadSilenceRange
+            )
+            if clamped != elevenLabsVadSilenceThresholdSecs {
+                elevenLabsVadSilenceThresholdSecs = clamped
+                return
+            }
+            UserDefaults.standard.set(
+                elevenLabsVadSilenceThresholdSecs,
+                forKey: Keys.elevenLabsVadSilenceThresholdSecs
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsMinSpeechDurationMs: Int {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsMinSpeechDurationMs,
+                to: ElevenLabsRealtimeOptions.minSpeechMsRange
+            )
+            if clamped != elevenLabsMinSpeechDurationMs {
+                elevenLabsMinSpeechDurationMs = clamped
+                return
+            }
+            UserDefaults.standard.set(
+                elevenLabsMinSpeechDurationMs,
+                forKey: Keys.elevenLabsMinSpeechDurationMs
+            )
+            applyCloudSettings()
+        }
+    }
+
+    @Published var elevenLabsMinSilenceDurationMs: Int {
+        didSet {
+            let clamped = ElevenLabsRealtimeOptions.clamp(
+                elevenLabsMinSilenceDurationMs,
+                to: ElevenLabsRealtimeOptions.minSilenceMsRange
+            )
+            if clamped != elevenLabsMinSilenceDurationMs {
+                elevenLabsMinSilenceDurationMs = clamped
+                return
+            }
+            UserDefaults.standard.set(
+                elevenLabsMinSilenceDurationMs,
+                forKey: Keys.elevenLabsMinSilenceDurationMs
+            )
+            applyCloudSettings()
+        }
+    }
+
+    /// xAI Grok streaming silence window before a new utterance (ms).
+    @Published var xaiEndpointingMs: Int {
+        didSet {
+            let clamped = XAIStreamingTranscriber.clampEndpointingMs(xaiEndpointingMs)
+            if clamped != xaiEndpointingMs {
+                xaiEndpointingMs = clamped
+                return
+            }
+            UserDefaults.standard.set(xaiEndpointingMs, forKey: Keys.xaiEndpointingMs)
+            applyCloudSettings()
+        }
+    }
+
+    var elevenLabsRealtimeOptions: ElevenLabsRealtimeOptions {
+        ElevenLabsRealtimeOptions(
+            filterBackgroundAudio: elevenLabsFilterBackgroundAudio,
+            commitStrategy: elevenLabsCommitStrategy,
+            vadThreshold: elevenLabsVadThreshold,
+            vadSilenceThresholdSecs: elevenLabsVadSilenceThresholdSecs,
+            minSpeechDurationMs: elevenLabsMinSpeechDurationMs,
+            minSilenceDurationMs: elevenLabsMinSilenceDurationMs
+        )
+    }
+
+    @Published var geminiVadMode: GeminiVadMode {
+        didSet {
+            UserDefaults.standard.set(geminiVadMode.rawValue, forKey: Keys.geminiVadMode)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiStartSensitivity: GeminiStartSensitivity {
+        didSet {
+            UserDefaults.standard.set(geminiStartSensitivity.rawValue, forKey: Keys.geminiStartSensitivity)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiEndSensitivity: GeminiEndSensitivity {
+        didSet {
+            UserDefaults.standard.set(geminiEndSensitivity.rawValue, forKey: Keys.geminiEndSensitivity)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiPrefixPaddingMs: Int {
+        didSet {
+            let clamped = GeminiLiveOptions.clamp(geminiPrefixPaddingMs, to: GeminiLiveOptions.prefixPaddingRange)
+            if clamped != geminiPrefixPaddingMs {
+                geminiPrefixPaddingMs = clamped
+                return
+            }
+            UserDefaults.standard.set(geminiPrefixPaddingMs, forKey: Keys.geminiPrefixPaddingMs)
+            applyCloudSettings()
+        }
+    }
+
+    @Published var geminiSilenceDurationMs: Int {
+        didSet {
+            let clamped = GeminiLiveOptions.clamp(geminiSilenceDurationMs, to: GeminiLiveOptions.silenceDurationRange)
+            if clamped != geminiSilenceDurationMs {
+                geminiSilenceDurationMs = clamped
+                return
+            }
+            UserDefaults.standard.set(geminiSilenceDurationMs, forKey: Keys.geminiSilenceDurationMs)
+            applyCloudSettings()
+        }
+    }
+
+    var geminiLiveOptions: GeminiLiveOptions {
+        GeminiLiveOptions(
+            vadMode: geminiVadMode,
+            startSensitivity: geminiStartSensitivity,
+            endSensitivity: geminiEndSensitivity,
+            prefixPaddingMs: geminiPrefixPaddingMs,
+            silenceDurationMs: geminiSilenceDurationMs
+        ).clamped()
+    }
+
     /// When enabled, double-tap fn within 400ms toggles locked recording mode
     /// (recording continues after release until tapped again).
     @Published var useToggleLock: Bool {
@@ -255,6 +496,11 @@ final class SettingsStore: ObservableObject {
     /// ISO 639-1 language code for ASR backends (default `"en"`).
     @Published var selectedLanguage: String {
         didSet {
+            let iso = Self.isoLanguageCode(from: selectedLanguage)
+            if iso != selectedLanguage {
+                selectedLanguage = iso
+                return
+            }
             UserDefaults.standard.set(selectedLanguage, forKey: Keys.selectedLanguage)
             applyLanguage()
         }
@@ -410,6 +656,98 @@ final class SettingsStore: ObservableObject {
             removeFillerWords = true
         }
 
+        elevenLabsFilterBackgroundAudio = defaults.bool(forKey: Keys.elevenLabsFilterBackgroundAudio)
+
+        if let raw = defaults.string(forKey: Keys.elevenLabsCommitStrategy),
+           let strategy = ElevenLabsCommitStrategy(rawValue: raw) {
+            elevenLabsCommitStrategy = strategy
+        } else {
+            elevenLabsCommitStrategy = .manual
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsVadThreshold) != nil {
+            elevenLabsVadThreshold = ElevenLabsRealtimeOptions.clamp(
+                defaults.double(forKey: Keys.elevenLabsVadThreshold),
+                to: ElevenLabsRealtimeOptions.vadThresholdRange
+            )
+        } else {
+            elevenLabsVadThreshold = ElevenLabsRealtimeOptions.defaults.vadThreshold
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsVadSilenceThresholdSecs) != nil {
+            elevenLabsVadSilenceThresholdSecs = ElevenLabsRealtimeOptions.clamp(
+                defaults.double(forKey: Keys.elevenLabsVadSilenceThresholdSecs),
+                to: ElevenLabsRealtimeOptions.vadSilenceRange
+            )
+        } else {
+            elevenLabsVadSilenceThresholdSecs = ElevenLabsRealtimeOptions.defaults.vadSilenceThresholdSecs
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsMinSpeechDurationMs) != nil {
+            elevenLabsMinSpeechDurationMs = ElevenLabsRealtimeOptions.clamp(
+                defaults.integer(forKey: Keys.elevenLabsMinSpeechDurationMs),
+                to: ElevenLabsRealtimeOptions.minSpeechMsRange
+            )
+        } else {
+            elevenLabsMinSpeechDurationMs = ElevenLabsRealtimeOptions.defaults.minSpeechDurationMs
+        }
+
+        if defaults.object(forKey: Keys.elevenLabsMinSilenceDurationMs) != nil {
+            elevenLabsMinSilenceDurationMs = ElevenLabsRealtimeOptions.clamp(
+                defaults.integer(forKey: Keys.elevenLabsMinSilenceDurationMs),
+                to: ElevenLabsRealtimeOptions.minSilenceMsRange
+            )
+        } else {
+            elevenLabsMinSilenceDurationMs = ElevenLabsRealtimeOptions.defaults.minSilenceDurationMs
+        }
+
+        if let raw = defaults.string(forKey: Keys.geminiVadMode),
+           let mode = GeminiVadMode(rawValue: raw) {
+            geminiVadMode = mode
+        } else {
+            geminiVadMode = .manual
+        }
+
+        if let raw = defaults.string(forKey: Keys.geminiStartSensitivity),
+           let sensitivity = GeminiStartSensitivity(rawValue: raw) {
+            geminiStartSensitivity = sensitivity
+        } else {
+            geminiStartSensitivity = .high
+        }
+
+        if let raw = defaults.string(forKey: Keys.geminiEndSensitivity),
+           let sensitivity = GeminiEndSensitivity(rawValue: raw) {
+            geminiEndSensitivity = sensitivity
+        } else {
+            geminiEndSensitivity = .high
+        }
+
+        if defaults.object(forKey: Keys.geminiPrefixPaddingMs) != nil {
+            geminiPrefixPaddingMs = GeminiLiveOptions.clamp(
+                defaults.integer(forKey: Keys.geminiPrefixPaddingMs),
+                to: GeminiLiveOptions.prefixPaddingRange
+            )
+        } else {
+            geminiPrefixPaddingMs = GeminiLiveOptions.defaults.prefixPaddingMs
+        }
+
+        if defaults.object(forKey: Keys.geminiSilenceDurationMs) != nil {
+            geminiSilenceDurationMs = GeminiLiveOptions.clamp(
+                defaults.integer(forKey: Keys.geminiSilenceDurationMs),
+                to: GeminiLiveOptions.silenceDurationRange
+            )
+        } else {
+            geminiSilenceDurationMs = GeminiLiveOptions.defaults.silenceDurationMs
+        }
+
+        if defaults.object(forKey: Keys.xaiEndpointingMs) != nil {
+            xaiEndpointingMs = XAIStreamingTranscriber.clampEndpointingMs(
+                defaults.integer(forKey: Keys.xaiEndpointingMs)
+            )
+        } else {
+            xaiEndpointingMs = XAIStreamingTranscriber.defaultEndpointingMs
+        }
+
         useToggleLock = defaults.bool(forKey: Keys.useToggleLock)
 
         if defaults.object(forKey: Keys.smartLeadingSpace) != nil {
@@ -425,7 +763,11 @@ final class SettingsStore: ObservableObject {
         }
 
         if let lang = defaults.string(forKey: Keys.selectedLanguage), !lang.isEmpty {
-            selectedLanguage = lang
+            let iso = Self.isoLanguageCode(from: lang)
+            selectedLanguage = iso
+            if iso != lang {
+                defaults.set(iso, forKey: Keys.selectedLanguage)
+            }
         } else {
             selectedLanguage = "en"
         }
@@ -538,6 +880,9 @@ final class SettingsStore: ObservableObject {
         }
         asrEngineSelector.xaiStreamingEnabled = useStreaming
         asrEngineSelector.removeFillerWordsEnabled = removeFillerWords
+        asrEngineSelector.elevenLabsRealtimeOptions = elevenLabsRealtimeOptions
+        asrEngineSelector.geminiLiveOptions = geminiLiveOptions
+        asrEngineSelector.xaiEndpointingMs = xaiEndpointingMs
     }
 
     /// Pushes the cleanup toggle, code-aware flag, and a freshly-built
@@ -562,7 +907,7 @@ final class SettingsStore: ObservableObject {
     }
 
     private func applyLanguage() {
-        asrEngineSelector?.selectedLanguage = selectedLanguage
+        asrEngineSelector?.selectedLanguage = Self.isoLanguageCode(from: selectedLanguage)
     }
 
     private func applySpeakerGatingSettings() {

@@ -10,16 +10,16 @@ options:
 
 packages:
   WhisperKit:
-    url: https://github.com/argmaxinc/WhisperKit
-    # MIT licence — confirmed at https://github.com/argmaxinc/WhisperKit/blob/main/LICENSE
-    from: "0.9.0"
+    url: https://github.com/argmaxinc/argmax-oss-swift
+    # MIT — WhisperKit product lives in the argmax-oss-swift monorepo (ex-WhisperKit).
+    from: "1.1.0"
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    from: "2.6.0"
+    from: "2.9.6"
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio
-    # Apache-2.0 licence — confirmed at https://github.com/FluidInference/FluidAudio/blob/v0.15.5/LICENSE
-    exactVersion: "0.15.5"
+    # Apache-2.0 — 0.15.6 needs Float16; Apple Silicon only (see ARCHS / EXCLUDED_ARCHS).
+    exactVersion: "0.15.6"
 
 configs:
   Debug: debug
@@ -35,6 +35,10 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     SWIFT_VERSION: "5.10"
     ENABLE_HARDENED_RUNTIME: YES
+    # Apple Silicon only — FluidAudio 0.15.6+ uses Float16 (unavailable on x86_64 macOS).
+    ARCHS: [arm64]
+    EXCLUDED_ARCHS: x86_64
+    ONLY_ACTIVE_ARCH: YES
     # Permissions required at runtime:
     # Input Monitoring — granted via System Settings, no entitlement needed for CGEvent tap
     # Microphone — entitlement required
@@ -78,8 +82,8 @@ targets:
         CFBundleDisplayName: Murmur
         CFBundleIconFile: AppIcon
         CFBundleIdentifier: com.matt.voice-dictation
-        CFBundleVersion: "42"
-        CFBundleShortVersionString: "0.1.41"
+        CFBundleVersion: "45"
+        CFBundleShortVersionString: "0.1.44"
         CFBundleExecutable: "$(EXECUTABLE_NAME)"
         CFBundlePackageType: APPL
         CFBundleSignature: "????"

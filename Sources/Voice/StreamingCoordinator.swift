@@ -22,6 +22,10 @@ final class StreamingCoordinator {
     /// gated on the same `cloudModel` selection, which is a single value).
     private(set) var elevenLabsSession: ElevenLabsRealtimeTranscriber?
 
+    /// Non-nil while a Gemini 3.5 Transcribe Live streaming session is
+    /// active. Mutually exclusive with the other cloud streaming sessions.
+    private(set) var geminiSession: GeminiLiveTranscriber?
+
     /// Coordinator-wide latch: any non-empty `onInterim` during the current
     /// hold. Survives async start-failure clearing the session reference so
     /// file-based fallthrough can still know stream text existed.
@@ -33,24 +37,31 @@ final class StreamingCoordinator {
     private static let streamMinCharsPerSecond: Double = 2.0
     private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
 
-    /// Below this much captured audio, a hold with no stream text is discarded
-    /// as silence instead of entering the batch→local fallback chain. Evidence
-    /// (2026-08-10 log): a 0.33 s dead-silent tap cascaded through batch
-    /// "No transcript" into a cold WhisperKit load and a 120 s timeout error,
-    /// while a 1.93 s *quiet* hold (also under the RMS threshold) was
-    /// legitimately rescued by the same fallback (14 injected chars). Duration
-    /// separates those two; loudness does not — do NOT gate this on `hadSpeech`.
+    /// Below this much captured audio (inclusive), a hold with no stream text
+    /// is discarded as silence instead of entering the batch→local fallback
+    /// chain. Evidence (2026-08-10 log): a 0.33 s dead-silent tap cascaded
+    /// through batch "No transcript" into a cold WhisperKit load and a 120 s
+    /// timeout error, while a 1.93 s *quiet* hold (also under the RMS
+    /// threshold) was legitimately rescued by the same fallback (14 injected
+    /// chars). Duration separates those two; loudness does not — do NOT gate
+    /// this on `hadSpeech`.
+    ///
+    /// Inclusive (`<=`): a 0.5 s CAF at exactly the floor (48 kHz × 24_000
+    /// frames) previously bypassed silence-cancel (`bufferedSeconds < 0.5`),
+    /// ran empty Gemini finalize → WhisperKit batch, and flashed
+    /// "Transcription failed" beside a later successful Gemini hold
+    /// (2026-08-31 history).
     static let silenceCancelMaxBufferedSeconds: TimeInterval = 0.5
 
     /// Silence cancel only when there was never stream text and the captured
-    /// audio is absent or shorter than `silenceCancelMaxBufferedSeconds`.
+    /// audio is absent or at most `silenceCancelMaxBufferedSeconds`.
     /// Longer buffers bypass local RMS `hadSpeech` — quiet real speech below
     /// the RMS threshold has been rescued by the batch fallback in the field.
     static func shouldTakeSilenceCancel(
         everHadStreamText: Bool,
         bufferedSeconds: TimeInterval
     ) -> Bool {
-        !everHadStreamText && bufferedSeconds < silenceCancelMaxBufferedSeconds
+        !everHadStreamText && bufferedSeconds <= silenceCancelMaxBufferedSeconds
     }
 
     /// Total captured seconds across PCM buffers (frames ÷ sample rate).
@@ -161,6 +172,38 @@ final class StreamingCoordinator {
         return true
     }
 
+    /// Attempts Gemini 3.5 Transcribe Live streaming. Returns `true` when
+    /// a session was opened (caller should start mic capture). Mirrors
+    /// `tryStartElevenLabs`.
+    func tryStartGemini(
+        asrSelector: ASREngineSelector,
+        startMicCapture: @escaping () -> Void
+    ) -> Bool {
+        guard let session = asrSelector.makeGeminiStreamingSession() else { return false }
+
+        session.onInterim = { [weak self] text in
+            self?.noteInterimText(text)
+            asrSelector.onInterimTranscript?(text)
+        }
+        geminiSession = session
+        vlog("doStart — attempting Gemini Live streaming transcription")
+        Task {
+            do {
+                try await session.start()
+            } catch {
+                vlog("gemini streaming: start failed (\(error.localizedDescription)) — continuing in file-buffer mode")
+                session.cancel()
+                DispatchQueue.main.async {
+                    if self.geminiSession === session {
+                        self.geminiSession = nil
+                    }
+                }
+            }
+        }
+        startMicCapture()
+        return true
+    }
+
     /// Attempts WhisperKit streaming. Returns `true` when a session was
     /// opened (mic capture is NOT started here — streaming owns the mic).
     /// On failure, calls `fallbackToFileBased` on main if recording is still wanted.
@@ -204,6 +247,11 @@ final class StreamingCoordinator {
         elevenLabsSession?.send(buffer)
     }
 
+    /// Sends a captured buffer to the active Gemini session, if any.
+    func sendToGemini(_ buffer: AVAudioPCMBuffer) {
+        geminiSession?.send(buffer)
+    }
+
     /// Aborts any in-flight streaming session and drops the reference without
     /// waiting for a final transcript — used when the capture is abandoned
     /// (secure input activated mid-hold) and the audio must not be used.
@@ -212,6 +260,8 @@ final class StreamingCoordinator {
         xaiSession = nil
         elevenLabsSession?.cancel()
         elevenLabsSession = nil
+        geminiSession?.cancel()
+        geminiSession = nil
     }
 
     // MARK: - Stop (xAI)
@@ -345,6 +395,75 @@ final class StreamingCoordinator {
                     self.logger.warning("ElevenLabs streaming looks truncated — falling back to buffered audio.")
                 }
                 vlog("elevenlabs streaming: fallback to buffered audio (\(context.bufferedAudio.count) buffers)")
+                DispatchQueue.main.async {
+                    onBatchFallback(context.bufferedAudio, context.duration)
+                }
+            }
+        }
+        return true
+    }
+
+    // MARK: - Stop (Gemini)
+
+    struct GeminiStopContext {
+        let duration: TimeInterval
+        let hadSpeech: Bool
+        let bufferedAudio: [AVAudioPCMBuffer]
+        let streamTextEver: Bool
+    }
+
+    /// Handles Gemini Live streaming stop. Returns `true` when this path
+    /// consumed the stop. Mirrors `handleStopElevenLabs`.
+    func handleStopGemini(
+        context: GeminiStopContext,
+        onSilence: @escaping () -> Void,
+        onStreamSuccess: @escaping (String) -> Void,
+        onBatchFallback: @escaping ([AVAudioPCMBuffer], TimeInterval) -> Void
+    ) -> Bool {
+        guard let session = geminiSession else { return false }
+
+        let everHad = context.streamTextEver
+            || session.hasEverHadNonEmptyStreamText
+            || coordinatorEverHadStreamText
+        let bufferedSecs = Self.bufferedSeconds(context.bufferedAudio)
+        let preFinalizeSnapshot = session.joinedTranscriptSnapshot()
+        geminiSession = nil
+
+        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, bufferedSeconds: bufferedSecs) {
+            vlog("gemini streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) bufferedSecs=\(String(format: "%.2f", bufferedSecs)) hadSpeech=\(context.hadSpeech)")
+            session.cancel()
+            onSilence()
+            return true
+        }
+
+        if !context.hadSpeech {
+            vlog("gemini streaming: silence bypass — everHad=\(everHad) buffers=\(context.bufferedAudio.count)")
+        }
+
+        let releaseAt = Date()
+        Task {
+            let text = await session.finalize(recordingDuration: context.duration)
+            vlog("gemini streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
+            let truncated = Self.streamResultLooksTruncated(text: text, duration: context.duration)
+            if truncated {
+                vlog("gemini streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
+            }
+            if let success = Self.streamSuccessTextOrBatchFallback(
+                finalizeText: text,
+                preFinalizeSnapshot: preFinalizeSnapshot,
+                truncated: truncated
+            ) {
+                if text.isEmpty {
+                    vlog("gemini streaming: recovered pre-finalize snapshot (\(success.count) chars)")
+                }
+                onStreamSuccess(success)
+            } else {
+                if text.isEmpty {
+                    self.logger.warning("Gemini streaming produced no text — falling back to buffered audio.")
+                } else {
+                    self.logger.warning("Gemini streaming looks truncated — falling back to buffered audio.")
+                }
+                vlog("gemini streaming: fallback to buffered audio (\(context.bufferedAudio.count) buffers)")
                 DispatchQueue.main.async {
                     onBatchFallback(context.bufferedAudio, context.duration)
                 }

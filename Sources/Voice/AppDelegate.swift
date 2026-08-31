@@ -258,6 +258,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return [] }
             return ElevenLabsRealtimeTranscriber.selectKeyterms(from: self.dictionaryStore.entries)
         }
+        activationController?.audioRecorder.asrSelector.geminiVocabularyProvider = { [weak self] in
+            guard let self = self else { return [] }
+            return GeminiLiveTranscriber.selectVocabulary(from: self.dictionaryStore.entries)
+        }
         activationController?.audioRecorder.asrSelector.capitalizedDictionaryTermsProvider = { [weak self] in
             guard let self = self else { return [] }
             return Set(

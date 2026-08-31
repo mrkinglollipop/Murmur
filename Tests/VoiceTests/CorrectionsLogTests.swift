@@ -107,4 +107,71 @@ final class CorrectionsLogTests: XCTestCase {
         log.remove(id: UUID())
         XCTAssertEqual(log.records.count, 1)
     }
+
+    func testRemoveIDsDropsMatchingRecords() {
+        let (log, url) = makeLog()
+        let keep = CorrectionRecord(heard: "a", replaced: "A", source: .dictionary)
+        let dropA = CorrectionRecord(heard: "b", replaced: "B", source: .phonetic)
+        let dropB = CorrectionRecord(heard: "c", replaced: "C", source: .phonetic)
+        log.append([keep, dropA, dropB])
+        log.remove(ids: [dropA.id, dropB.id])
+        log.flush()
+        XCTAssertEqual(log.records.map(\.id), [keep.id])
+
+        let reloaded = CorrectionsLog(fileURL: url)
+        XCTAssertEqual(reloaded.records.map(\.id), [keep.id])
+    }
+
+    func testGroupedRecentCollapsesMisspellingsUnderOneTerm() {
+        let (log, _) = makeLog()
+        let now = Date()
+        log.append([
+            CorrectionRecord(heard: "Keepu", replaced: "Khipu", source: .dictionary, date: now),
+            CorrectionRecord(heard: "Keefu", replaced: "Khipu", source: .phonetic, date: now.addingTimeInterval(-60)),
+            CorrectionRecord(heard: "mana", replaced: "Manna", source: .dictionary, date: now.addingTimeInterval(-120))
+        ])
+        let groups = log.groupedRecent(days: 7, now: now)
+        XCTAssertEqual(groups.map(\.replaced), ["Khipu", "Manna"])
+        XCTAssertEqual(groups[0].rows.map(\.heard), ["Keepu", "Keefu"])
+        XCTAssertEqual(groups[0].recordIDs.count, 2)
+        XCTAssertEqual(groups[1].rows.map(\.heard), ["mana"])
+    }
+
+    func testGroupedRecentCollapsesRepeatFiringsButKeepsAllIDs() {
+        let (log, _) = makeLog()
+        let now = Date()
+        let first = CorrectionRecord(
+            heard: "mana",
+            replaced: "Manna",
+            source: .dictionary,
+            date: now.addingTimeInterval(-3600)
+        )
+        let second = CorrectionRecord(
+            heard: "mana",
+            replaced: "Manna",
+            source: .dictionary,
+            date: now
+        )
+        log.append([first, second])
+        let groups = log.groupedRecent(days: 7, now: now)
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].rows.map(\.id), [second.id])
+        XCTAssertEqual(Set(groups[0].recordIDs), [first.id, second.id])
+    }
+
+    func testGroupedRecentExcludesOldRecords() {
+        let (log, _) = makeLog()
+        let now = Date()
+        log.append([
+            CorrectionRecord(
+                heard: "land",
+                replaced: "Linode",
+                source: .phonetic,
+                date: now.addingTimeInterval(-10 * 24 * 60 * 60)
+            ),
+            CorrectionRecord(heard: "mana", replaced: "Manna", source: .dictionary, date: now)
+        ])
+        let groups = log.groupedRecent(days: 7, now: now)
+        XCTAssertEqual(groups.map(\.replaced), ["Manna"])
+    }
 }

@@ -50,6 +50,19 @@ struct CorrectionRecord: Codable, Identifiable, Equatable {
     }
 }
 
+/// One canonical term's recent misspellings, collapsed for the Dictionary feed.
+struct CorrectionGroup: Identifiable, Equatable {
+    var id: String { replaced.lowercased() }
+    let replaced: String
+    /// Newest unique `heard` spelling first.
+    let rows: [CorrectionRecord]
+    let recordIDs: [UUID]
+
+    var latestDate: Date {
+        rows.map(\.date).max() ?? .distantPast
+    }
+}
+
 /// Persisted log of dictionary/phonetic corrections applied to transcripts
 /// and learn-time accept/reject outcomes.
 final class CorrectionsLog: ObservableObject {
@@ -128,9 +141,16 @@ final class CorrectionsLog: ObservableObject {
 
     /// Removes a single record by id and persists. No-op when id is absent.
     func remove(id: UUID) {
+        remove(ids: [id])
+    }
+
+    /// Removes matching records and persists. No-op when none match.
+    func remove(ids: [UUID]) {
+        let idSet = Set(ids)
+        guard !idSet.isEmpty else { return }
         let mutate = {
             let before = self.records.count
-            self.records.removeAll { $0.id == id }
+            self.records.removeAll { idSet.contains($0.id) }
             guard self.records.count != before else { return }
             self.scheduleSave()
         }
@@ -140,6 +160,42 @@ final class CorrectionsLog: ObservableObject {
     func recent(days: Int = 7, now: Date = Date()) -> [CorrectionRecord] {
         let cutoff = now.addingTimeInterval(-Double(days) * 24 * 60 * 60)
         return records.filter { $0.date >= cutoff }.sorted { $0.date > $1.date }
+    }
+
+    /// Groups the 7-day feed by canonical term so one word's misspellings
+    /// sit together. Repeat firings of the same heard→replaced pair collapse
+    /// to the newest row; `recordIDs` still lists every occurrence for Dismiss.
+    func groupedRecent(days: Int = 7, now: Date = Date()) -> [CorrectionGroup] {
+        let recent = recent(days: days, now: now)
+        guard !recent.isEmpty else { return [] }
+
+        var buckets: [(replaced: String, records: [CorrectionRecord])] = []
+        var indexByKey: [String: Int] = [:]
+        for record in recent {
+            let key = record.replaced.lowercased()
+            if let idx = indexByKey[key] {
+                buckets[idx].records.append(record)
+            } else {
+                indexByKey[key] = buckets.count
+                buckets.append((record.replaced, [record]))
+            }
+        }
+
+        return buckets.map { bucket in
+            var seenHeard = Set<String>()
+            var uniqueRows: [CorrectionRecord] = []
+            for record in bucket.records {
+                let heardKey = record.heard.lowercased()
+                if seenHeard.insert(heardKey).inserted {
+                    uniqueRows.append(record)
+                }
+            }
+            return CorrectionGroup(
+                replaced: bucket.replaced,
+                rows: uniqueRows,
+                recordIDs: bucket.records.map(\.id)
+            )
+        }
     }
 
     func flush() {

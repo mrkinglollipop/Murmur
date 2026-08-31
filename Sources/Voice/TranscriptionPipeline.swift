@@ -303,6 +303,10 @@ final class TranscriptionPipeline {
             Task {
                 do {
                     let service = CloudTranscriberFactory.service(for: cloudModel)
+                    if let gemini = service as? GeminiTranscriptionService {
+                        gemini.smartMode = selector.removeFillerWordsEnabled
+                        gemini.vocabulary = selector.geminiVocabularyProvider?() ?? []
+                    }
                     let text = try await service.transcribe(
                         audioURL: audioURL,
                         apiKey: key,

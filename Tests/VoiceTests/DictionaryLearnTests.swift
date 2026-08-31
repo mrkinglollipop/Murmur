@@ -80,6 +80,133 @@ final class DictionaryLearnTests: XCTestCase {
         XCTAssertTrue(learned.isEmpty)
     }
 
+    func testAddSameTermMergesVariants() {
+        let store = makeStore()
+        store.add(term: "Khipu", variants: ["Keepu"])
+        store.add(term: "khipu", variants: ["Keefu"])
+        XCTAssertEqual(store.entries.count, 1)
+        let entry = store.entries.first
+        XCTAssertEqual(entry?.term, "Khipu")
+        XCTAssertEqual(Set(entry?.variants.map { $0.lowercased() } ?? []), ["keepu", "keefu"])
+    }
+
+    func testAddSameTermDoesNotDuplicateVariant() {
+        let store = makeStore()
+        store.add(term: "Khipu", variants: ["Keepu"])
+        store.add(term: "Khipu", variants: ["keepu"])
+        XCTAssertEqual(store.entries.count, 1)
+        XCTAssertEqual(store.entries.first?.variants, ["Keepu"])
+    }
+
+    func testLoadMergesPersistedDuplicates() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dict-load-merge-\(UUID().uuidString).json")
+        let keepuID = UUID()
+        let payload: [DictionaryEntry] = [
+            DictionaryEntry(id: keepuID, term: "Khipu", variants: ["Keepu"], fixCount: 4),
+            DictionaryEntry(id: UUID(), term: "Khipu", variants: ["Keefu"], fixCount: 0)
+        ]
+        try JSONEncoder().encode(payload).write(to: url)
+
+        let store = DictionaryStore(fileURL: url)
+        XCTAssertEqual(store.entries.count, 1)
+        let entry = try XCTUnwrap(store.entries.first)
+        XCTAssertEqual(entry.id, keepuID)
+        XCTAssertEqual(Set(entry.variants.map { $0.lowercased() }), ["keepu", "keefu"])
+        XCTAssertEqual(entry.fixCount, 4)
+
+        let reloaded = DictionaryStore(fileURL: url)
+        XCTAssertEqual(reloaded.entries.count, 1)
+        XCTAssertEqual(reloaded.entries.first?.id, keepuID)
+    }
+
+    func testUpdateRenamesIntoExistingMerges() {
+        let store = makeStore()
+        store.add(term: "Khipu", variants: ["Keepu"])
+        store.add(term: "Keepoo", variants: ["Keefu"])
+        XCTAssertEqual(store.entries.count, 2)
+        guard var duplicate = store.entries.first(where: { $0.term == "Keepoo" }) else {
+            return XCTFail("missing Keepoo entry")
+        }
+        duplicate.term = "Khipu"
+        store.update(duplicate)
+        XCTAssertEqual(store.entries.count, 1)
+        let entry = store.entries.first
+        XCTAssertEqual(entry?.term, "Khipu")
+        XCTAssertEqual(Set(entry?.variants.map { $0.lowercased() } ?? []), ["keepu", "keefu"])
+    }
+
+    func testManualAddClearsAutoLearnedFlag() {
+        let store = makeStore()
+        _ = store.learn(from: "Keepu", to: "Khipu", userInitiated: true)
+        XCTAssertEqual(store.entries.first?.isAutoLearned, true)
+        store.add(term: "Khipu", variants: ["Keefu"])
+        XCTAssertEqual(store.entries.count, 1)
+        XCTAssertEqual(store.entries.first?.isAutoLearned, false)
+        XCTAssertEqual(Set(store.entries.first?.variants.map { $0.lowercased() } ?? []), ["keepu", "keefu"])
+    }
+
+    func testUnlearnCreatedNewPreservesOtherMergedVariants() {
+        let store = makeStore()
+        let learned = store.learn(from: "Keepu", to: "Khipu", userInitiated: true)
+        XCTAssertEqual(learned.count, 1)
+        XCTAssertEqual(learned.first?.createdNewEntry, true)
+        store.add(term: "Khipu", variants: ["Keefu"])
+        XCTAssertTrue(store.unlearn(learned[0]))
+        XCTAssertEqual(store.entries.count, 1)
+        let entry = store.entries.first
+        XCTAssertEqual(entry?.term, "Khipu")
+        XCTAssertEqual(Set(entry?.variants.map { $0.lowercased() } ?? []), ["keefu"])
+    }
+
+    func testUnlearnCreatedNewStillDeletesSoleVariantEntry() {
+        let store = makeStore()
+        let learned = store.learn(from: "Keepu", to: "Khipu", userInitiated: true)
+        XCTAssertEqual(learned.count, 1)
+        XCTAssertTrue(store.unlearn(learned[0]))
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testUnlearnFallsBackAfterDuplicateTermMerge() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dict-unlearn-merge-\(UUID().uuidString).json")
+        let survivorID = UUID()
+        let absorbedID = UUID()
+        let payload: [DictionaryEntry] = [
+            DictionaryEntry(
+                id: survivorID,
+                term: "Khipu",
+                variants: ["Keepu"],
+                fixCount: 1,
+                isAutoLearned: true
+            ),
+            DictionaryEntry(
+                id: absorbedID,
+                term: "Khipu",
+                variants: ["Keefu"],
+                fixCount: 2,
+                isAutoLearned: false
+            )
+        ]
+        try JSONEncoder().encode(payload).write(to: url)
+
+        let store = DictionaryStore(fileURL: url)
+        XCTAssertEqual(store.entries.count, 1)
+        XCTAssertEqual(store.entries.first?.id, survivorID)
+
+        let correction = LearnedCorrection(
+            variant: "Keefu",
+            term: "Khipu",
+            createdNewEntry: true,
+            entryID: absorbedID
+        )
+        XCTAssertTrue(store.unlearn(correction))
+        let entry = try XCTUnwrap(store.entries.first)
+        XCTAssertEqual(entry.id, survivorID)
+        XCTAssertEqual(Set(entry.variants.map { $0.lowercased() }), ["keepu"])
+        XCTAssertFalse(entry.isAutoLearned)
+    }
+
     /// 2026-08-25 incident: ASR wrote "Type" for "the"; the user's hand-fix
     /// was offered as a learned rule mapping "Type" -> "the", which would have
     /// rewritten every legitimate "type" from then on. "type" is protected
