@@ -69,98 +69,218 @@ final class TextInjectorTests: XCTestCase {
     // MARK: - Fallback ordering
 
     func testResolveOutcome_confirmedOnFirstAttempt() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: true,
-            retryConfirmed: false,
-            pidFallbackSucceeded: false
-        )
+        let outcome = TextInjector.resolveOutcome(confirmed: true, retryConfirmed: false)
         XCTAssertEqual(outcome.path, .confirmed)
         XCTAssertTrue(outcome.shouldReturnTrue)
     }
 
-    func testResolveOutcome_confirmedIgnoresLaterFlags() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: true,
-            retryConfirmed: true,
-            pidFallbackSucceeded: true
-        )
+    func testResolveOutcome_confirmedIgnoresRetryFlag() {
+        let outcome = TextInjector.resolveOutcome(confirmed: true, retryConfirmed: true)
         XCTAssertEqual(outcome.path, .confirmed)
         XCTAssertTrue(outcome.shouldReturnTrue)
     }
 
     func testResolveOutcome_confirmedOnRetry() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: false,
-            retryConfirmed: true,
-            pidFallbackSucceeded: false
-        )
+        let outcome = TextInjector.resolveOutcome(confirmed: false, retryConfirmed: true)
         XCTAssertEqual(outcome.path, .confirmedOnRetry)
-        XCTAssertTrue(outcome.shouldReturnTrue)
-    }
-
-    func testResolveOutcome_confirmedOnRetryIgnoresPidFallback() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: false,
-            retryConfirmed: true,
-            pidFallbackSucceeded: true
-        )
-        XCTAssertEqual(outcome.path, .confirmedOnRetry)
-        XCTAssertTrue(outcome.shouldReturnTrue)
-    }
-
-    func testResolveOutcome_unverifiedFallback() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: false,
-            retryConfirmed: false,
-            pidFallbackSucceeded: true
-        )
-        XCTAssertEqual(outcome.path, .unverifiedFallback)
         XCTAssertTrue(outcome.shouldReturnTrue)
     }
 
     func testResolveOutcome_clipboardWhenAllFail() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: false,
-            retryConfirmed: false,
-            pidFallbackSucceeded: false
-        )
+        let outcome = TextInjector.resolveOutcome(confirmed: false, retryConfirmed: false)
         XCTAssertEqual(outcome.path, .clipboard)
         XCTAssertFalse(outcome.shouldReturnTrue)
     }
 
-    func testResolveOutcome_allEightInputCombinations() {
+    func testResolveOutcome_allFourInputCombinations() {
         let expectations: [(
             confirmed: Bool,
             retryConfirmed: Bool,
-            pidFallbackSucceeded: Bool,
             path: TextInjector.InsertDeliveryPath,
             shouldReturnTrue: Bool
         )] = [
-            (true, false, false, .confirmed, true),
-            (true, false, true, .confirmed, true),
-            (true, true, false, .confirmed, true),
-            (true, true, true, .confirmed, true),
-            (false, true, false, .confirmedOnRetry, true),
-            (false, true, true, .confirmedOnRetry, true),
-            (false, false, true, .unverifiedFallback, true),
-            (false, false, false, .clipboard, false),
+            (true, false, .confirmed, true),
+            (true, true, .confirmed, true),
+            (false, true, .confirmedOnRetry, true),
+            (false, false, .clipboard, false),
         ]
 
         for item in expectations {
             let outcome = TextInjector.resolveOutcome(
                 confirmed: item.confirmed,
-                retryConfirmed: item.retryConfirmed,
-                pidFallbackSucceeded: item.pidFallbackSucceeded
+                retryConfirmed: item.retryConfirmed
             )
             XCTAssertEqual(
                 outcome.path,
                 item.path,
-                "confirmed=\(item.confirmed) retry=\(item.retryConfirmed) pid=\(item.pidFallbackSucceeded)"
+                "confirmed=\(item.confirmed) retry=\(item.retryConfirmed)"
             )
             XCTAssertEqual(
                 outcome.shouldReturnTrue,
                 item.shouldReturnTrue,
-                "confirmed=\(item.confirmed) retry=\(item.retryConfirmed) pid=\(item.pidFallbackSucceeded)"
+                "confirmed=\(item.confirmed) retry=\(item.retryConfirmed)"
+            )
+        }
+    }
+
+    // MARK: - Unicode-lane evidence ladder (2026-08-31 blind-observer fix)
+    //
+    // Evidence: `keyboardGetUnicodeString` payload readback returned 0 for our
+    // own synthetic events during a system stutter while a keycode-matched
+    // Cmd-V chord posted moments later WAS observed. `unicodeLaneVerdict`
+    // exists so "payload readback saw nothing" is never conflated with
+    // "nothing was delivered".
+
+    func testUnicodeLaneVerdict_confirmedWhenUtf16MeetsTarget() {
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 16, utf16Target: 16, keycodeZeroObserved: 0, chunkTarget: 1, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .confirmed)
+    }
+
+    func testUnicodeLaneVerdict_confirmedWhenUtf16ExceedsTarget() {
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 20, utf16Target: 16, keycodeZeroObserved: 0, chunkTarget: 1, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .confirmed)
+    }
+
+    func testUnicodeLaneVerdict_confirmedByKeycodeWhenPayloadReadbackBlind() {
+        // The 2026-08-31 signature: utf16Observed stuck at 0, but every chunk's
+        // keycode-0 keyDown was seen — the events flowed, only the payload
+        // readback is blind.
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 0, utf16Target: 30, keycodeZeroObserved: 2, chunkTarget: 2, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .confirmedByKeycode)
+    }
+
+    func testUnicodeLaneVerdict_partialUtf16AcceptsWithoutEscalation() {
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 10, utf16Target: 30, keycodeZeroObserved: 1, chunkTarget: 2, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .acceptPartial)
+    }
+
+    func testUnicodeLaneVerdict_partialKeycodeOnlyAcceptsWithoutEscalation() {
+        // utf16Observed 0, keycodeZeroObserved short of chunkTarget — some
+        // evidence, not enough for a full keycode confirmation, but nonzero
+        // is still evidence something landed. Anti-double: accept, don't retry.
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 0, utf16Target: 30, keycodeZeroObserved: 1, chunkTarget: 3, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .acceptPartial)
+    }
+
+    func testUnicodeLaneVerdict_bothZeroNeedsCanaryProbe() {
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 0, utf16Target: 30, keycodeZeroObserved: 0, chunkTarget: 2, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .needsCanaryProbe)
+    }
+
+    func testUnicodeLaneVerdict_degenerateZeroTargetConfirmed() {
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 0, utf16Target: 0, keycodeZeroObserved: 0, chunkTarget: 0, wentBlind: false
+        )
+        XCTAssertEqual(verdict, .confirmed)
+    }
+
+    func testUnicodeLaneVerdict_fullUtf16ConfirmedEvenIfWentBlind() {
+        // A tap that blacked out mid-window but still banked a full count
+        // before/after is real confirmation — wentBlind only degrades trust
+        // in partial/keycode-only evidence, not a complete one.
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 16, utf16Target: 16, keycodeZeroObserved: 0, chunkTarget: 1, wentBlind: true
+        )
+        XCTAssertEqual(verdict, .confirmed)
+    }
+
+    func testUnicodeLaneVerdict_wentBlindDefersKeycodeEvidenceToCanaryProbe() {
+        // Same counts as testUnicodeLaneVerdict_confirmedByKeycodeWhenPayloadReadbackBlind,
+        // but the witness admitted blacking out — don't trust the keycode-only
+        // read, fall back to the canary probe instead.
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 0, utf16Target: 30, keycodeZeroObserved: 2, chunkTarget: 2, wentBlind: true
+        )
+        XCTAssertEqual(verdict, .needsCanaryProbe)
+    }
+
+    func testUnicodeLaneVerdict_wentBlindDefersPartialEvidenceToCanaryProbe() {
+        let verdict = TextInjector.unicodeLaneVerdict(
+            utf16Observed: 10, utf16Target: 30, keycodeZeroObserved: 0, chunkTarget: 2, wentBlind: true
+        )
+        XCTAssertEqual(verdict, .needsCanaryProbe)
+    }
+
+    // MARK: - Canary probe decision (2026-08-31 blind-observer fix)
+    //
+    // The F20 canary is a no-op key in effectively every app — it proves the
+    // post→WindowServer→tap pipe is live without mutating the document, so
+    // "observer blind" can be told apart from "text genuinely did not arrive".
+
+    func testCanaryVerdict_observedFirstAttempt_retypeOnce() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: true, wentBlind: false, isSecondAttempt: false)
+        XCTAssertEqual(verdict, .retypeOnce)
+    }
+
+    func testCanaryVerdict_observedSecondAttempt_escalateToPaste() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: true, wentBlind: false, isSecondAttempt: true)
+        XCTAssertEqual(verdict, .escalateToPaste)
+    }
+
+    func testCanaryVerdict_unobservedFirstAttempt_acceptUnverified() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: false, wentBlind: false, isSecondAttempt: false)
+        XCTAssertEqual(verdict, .acceptUnverified)
+    }
+
+    func testCanaryVerdict_unobservedSecondAttempt_acceptUnverified() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: false, wentBlind: false, isSecondAttempt: true)
+        XCTAssertEqual(verdict, .acceptUnverified)
+    }
+
+    func testCanaryVerdict_wentBlindForcesAcceptUnverifiedEvenWhenObservedFirstAttempt() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: true, wentBlind: true, isSecondAttempt: false)
+        XCTAssertEqual(verdict, .acceptUnverified)
+    }
+
+    func testCanaryVerdict_wentBlindForcesAcceptUnverifiedEvenWhenObservedSecondAttempt() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: true, wentBlind: true, isSecondAttempt: true)
+        XCTAssertEqual(verdict, .acceptUnverified)
+    }
+
+    func testCanaryVerdict_wentBlindForcesAcceptUnverifiedWhenAlsoUnobserved() {
+        let verdict = TextInjector.canaryVerdict(canaryObserved: false, wentBlind: true, isSecondAttempt: false)
+        XCTAssertEqual(verdict, .acceptUnverified)
+    }
+
+    func testCanaryVerdict_allEightInputCombinations() {
+        let expectations: [(
+            canaryObserved: Bool,
+            wentBlind: Bool,
+            isSecondAttempt: Bool,
+            verdict: TextInjector.CanaryVerdict
+        )] = [
+            (true, false, false, .retypeOnce),
+            (true, false, true, .escalateToPaste),
+            (true, true, false, .acceptUnverified),
+            (true, true, true, .acceptUnverified),
+            (false, false, false, .acceptUnverified),
+            (false, false, true, .acceptUnverified),
+            (false, true, false, .acceptUnverified),
+            (false, true, true, .acceptUnverified),
+        ]
+
+        for item in expectations {
+            let verdict = TextInjector.canaryVerdict(
+                canaryObserved: item.canaryObserved,
+                wentBlind: item.wentBlind,
+                isSecondAttempt: item.isSecondAttempt
+            )
+            XCTAssertEqual(
+                verdict,
+                item.verdict,
+                "canaryObserved=\(item.canaryObserved) wentBlind=\(item.wentBlind) isSecondAttempt=\(item.isSecondAttempt)"
             )
         }
     }
@@ -487,36 +607,28 @@ final class TextInjectorTests: XCTestCase {
 
     // MARK: - Confirmed-delivery gate for the pasteboard decision (F-01)
 
-    /// `.unverifiedFallback` stops the lane chain but proves nothing, so it must
-    /// not drive a pasteboard restore — the pipeline maps it to `.failed`, which
-    /// the HUD renders as "your text is on the clipboard". Same contract as
-    /// paste-blind (observer tap missing): leave the transcript; never restore
-    /// the pre-insert snapshot on that path.
+    /// `.unverifiedFallback` (pid fallback) was removed 2026-08-31 — it posted
+    /// a second, unverifiable copy of the transcript with no way to confirm
+    /// delivery. With it gone, `isConfirmedDelivery` and `resolveOutcome`'s
+    /// `shouldReturnTrue` now agree on every path: `.confirmed` /
+    /// `.confirmedOnRetry` are both true, `.clipboard` is false for both.
     func testIsConfirmedDelivery_trueOnlyForObservedDelivery() {
         XCTAssertTrue(TextInjector.InsertDeliveryPath.confirmed.isConfirmedDelivery)
         XCTAssertTrue(TextInjector.InsertDeliveryPath.confirmedOnRetry.isConfirmedDelivery)
-        XCTAssertFalse(TextInjector.InsertDeliveryPath.unverifiedFallback.isConfirmedDelivery)
         XCTAssertFalse(TextInjector.InsertDeliveryPath.clipboard.isConfirmedDelivery)
     }
 
-    /// Guards the specific divergence: `shouldReturnTrue` and
-    /// `isConfirmedDelivery` agree everywhere except `.unverifiedFallback`.
-    func testUnverifiedFallbackDivergesFromShouldReturnTrue() {
-        let outcome = TextInjector.resolveOutcome(
-            confirmed: false,
-            retryConfirmed: false,
-            pidFallbackSucceeded: true
-        )
-        XCTAssertEqual(outcome.path, .unverifiedFallback)
-        XCTAssertTrue(outcome.shouldReturnTrue, "lane chain stops here")
-        XCTAssertFalse(outcome.path.isConfirmedDelivery, "but delivery was never observed")
-
-        let decision = TextInjector.resolveSavedPasteboardRestore(
-            pasteSucceeded: false,
-            unicodeSucceeded: outcome.path.isConfirmedDelivery,
-            allLanesFailed: !outcome.path.isConfirmedDelivery
-        )
-        XCTAssertEqual(decision, .doNotRestoreLeaveTranscript)
+    func testResolveOutcome_isConfirmedDeliveryAlwaysMatchesShouldReturnTrue() {
+        for confirmed in [true, false] {
+            for retryConfirmed in [true, false] {
+                let outcome = TextInjector.resolveOutcome(confirmed: confirmed, retryConfirmed: retryConfirmed)
+                XCTAssertEqual(
+                    outcome.path.isConfirmedDelivery,
+                    outcome.shouldReturnTrue,
+                    "confirmed=\(confirmed) retry=\(retryConfirmed)"
+                )
+            }
+        }
     }
 
     // MARK: - Pasteboard race helpers (Universal Clipboard gate)
