@@ -8,12 +8,16 @@ import Foundation
 
 /// Inserts recognised text at the current cursor position in the focused app.
 ///
-/// Primary lane: CGEvent unicode typing with delivery confirmation, retry, and
-/// postToPid — **does not touch** `NSPasteboard.general`, so the user's prior
-/// copy survives a normal dictate. Fallback: clipboard + single Cmd-V chord
-/// (Wispr-style) when unicode cannot confirm; that path snapshots + restores the
-/// prior pasteboard after `pasteboardRestoreDelay` so slow Electron/Cursor
-/// consumers still read the transcript before restore.
+/// Primary lane: CGEvent unicode typing with delivery confirmation, one retry,
+/// and an F20 canary probe when the observation channel's own testimony is
+/// unprovable — **does not touch** `NSPasteboard.general` on any of those
+/// paths, so the user's prior copy survives a normal dictate. `postToPid` was
+/// removed (2026-08-31): it posted a second, unverifiable copy of the
+/// transcript with no way to confirm delivery, compounding the exact
+/// duplication bug this file exists to prevent. Fallback: clipboard + single
+/// Cmd-V chord (Wispr-style) when unicode cannot confirm; that path snapshots
+/// + restores the prior pasteboard after `pasteboardRestoreDelay` so slow
+/// Electron/Cursor consumers still read the transcript before restore.
 final class TextInjector {
 
     private static let dedupeLock = NSLock()
@@ -103,6 +107,12 @@ final class TextInjector {
     static let pasteboardRestoreDelay: TimeInterval = 2.0
     private static let pasteChordTarget = 1
     private static let virtualKeyV: CGKeyCode = 9 // kVK_ANSI_V
+    /// F20 — a no-op key in effectively every app — used as a canary to prove
+    /// the post→WindowServer→tap pipe is live without mutating the document.
+    private static let virtualKeyF20: CGKeyCode = 90 // kVK_F20
+    /// Canary observation is binary (target 1), like the paste chord, so it
+    /// gets a flat window rather than the progress-extension mechanics.
+    private static let canaryConfirmationWindow: TimeInterval = 0.6
 
     /// Bumped whenever a new deferred restore is scheduled so an older
     /// callback cannot clobber a newer dictation's pasteboard state.
@@ -116,21 +126,17 @@ final class TextInjector {
     enum InsertDeliveryPath: String, Equatable {
         case confirmed
         case confirmedOnRetry
-        case unverifiedFallback
         case clipboard
 
-        /// Whether delivery into the focused field was actually *observed*.
-        ///
-        /// Distinct from `resolveOutcome`'s `shouldReturnTrue`, which is about
-        /// whether the lane chain stops here. `.unverifiedFallback` posted
-        /// events to a pid and saw nothing come back, so it stops the chain but
-        /// proves nothing — the pasteboard decision must key on this, not on
-        /// `shouldReturnTrue`, or the user is told their transcript is on the
-        /// clipboard while the pre-insert clipboard is restored over it.
+        /// Whether delivery into the focused field was actually *observed*
+        /// (directly, by keycode evidence, or accepted unverified only after
+        /// the F20 canary proved the observation channel itself was blind —
+        /// see `canaryVerdict`). `.clipboard` means neither attempt landed
+        /// and the paste lane must run.
         var isConfirmedDelivery: Bool {
             switch self {
             case .confirmed, .confirmedOnRetry: return true
-            case .unverifiedFallback, .clipboard: return false
+            case .clipboard: return false
             }
         }
     }
@@ -179,11 +185,12 @@ final class TextInjector {
         min(currentDeadline.addingTimeInterval(progressExtension), startedAt.addingTimeInterval(maxWait))
     }
 
-    /// Pure fallback ordering for verified unicode insert attempts.
+    /// Pure fallback ordering for verified unicode insert attempts. No pid
+    /// fallback tier anymore (removed 2026-08-31 — see class doc) so this
+    /// only ever lands on the first attempt, the retype, or the paste lane.
     static func resolveOutcome(
         confirmed: Bool,
-        retryConfirmed: Bool,
-        pidFallbackSucceeded: Bool
+        retryConfirmed: Bool
     ) -> (path: InsertDeliveryPath, shouldReturnTrue: Bool) {
         if confirmed {
             return (.confirmed, true)
@@ -191,10 +198,91 @@ final class TextInjector {
         if retryConfirmed {
             return (.confirmedOnRetry, true)
         }
-        if pidFallbackSucceeded {
-            return (.unverifiedFallback, true)
-        }
         return (.clipboard, false)
+    }
+
+    /// Terminal decision for a single unicode-typing attempt, given what the
+    /// observer actually saw.
+    ///
+    /// `keycodeZeroObserved` exists because of the 2026-08-31 evidence: during
+    /// a system stutter, `keyboardGetUnicodeString` payload readback returned
+    /// 0 for our own synthetic events while a keycode-matched Cmd-V chord
+    /// posted moments later WAS observed. Payload readback and keycode
+    /// matching are two independent witnesses to the same CGEvent stream —
+    /// when the first goes blind, the second (virtualKey 0, what our unicode
+    /// chunks use) can still prove the chunks flowed. `wentBlind` marks that
+    /// the tap itself reported disabled during this window (see
+    /// `UnicodeDeliveryObserver`): a witness that admits it blacked out
+    /// cannot be trusted for a partial/keycode-only read, only for a count
+    /// already at or past target — anything short of that defers to the
+    /// canary probe instead of being accepted at face value.
+    static func unicodeLaneVerdict(
+        utf16Observed: Int,
+        utf16Target: Int,
+        keycodeZeroObserved: Int,
+        chunkTarget: Int,
+        wentBlind: Bool
+    ) -> UnicodeLaneVerdict {
+        guard utf16Target > 0 else { return .confirmed }
+        if utf16Observed >= utf16Target {
+            return .confirmed
+        }
+        if !wentBlind {
+            if utf16Observed == 0, chunkTarget > 0, keycodeZeroObserved >= chunkTarget {
+                return .confirmedByKeycode
+            }
+            if utf16Observed > 0 || keycodeZeroObserved > 0 {
+                return .acceptPartial
+            }
+        }
+        return .needsCanaryProbe
+    }
+
+    enum UnicodeLaneVerdict: Equatable {
+        /// Payload readback reached target — direct confirmation.
+        case confirmed
+        /// Payload readback stayed at 0 but keycode-zero evidence reached the
+        /// chunk target — delivered, readback itself was blind.
+        case confirmedByKeycode
+        /// Nonzero-but-short on either counter — some of the posted text
+        /// already landed; re-typing would duplicate it. Accept, no escalation.
+        case acceptPartial
+        /// Both counters at 0 (or a mid-window blind-out with no full count
+        /// yet) — cannot tell "not delivered" from "delivered but
+        /// unobservable" without more evidence. Post the F20 canary next.
+        case needsCanaryProbe
+    }
+
+    /// Post-canary decision. The canary (F20 keyDown+keyUp — a no-op key in
+    /// effectively every app) proves the post→WindowServer→tap pipe is live
+    /// *without mutating the document*, distinguishing "observer blind" from
+    /// "text genuinely did not arrive". `wentBlind` is sticky on the observer
+    /// once set (its credibility is shot for this insert), so it forces the
+    /// anti-double-safe outcome even if this particular canary check reports
+    /// observed==true.
+    static func canaryVerdict(
+        canaryObserved: Bool,
+        wentBlind: Bool,
+        isSecondAttempt: Bool
+    ) -> CanaryVerdict {
+        guard canaryObserved, !wentBlind else {
+            return .acceptUnverified
+        }
+        return isSecondAttempt ? .escalateToPaste : .retypeOnce
+    }
+
+    enum CanaryVerdict: Equatable {
+        /// Pipe unprovable (canary unobserved, or the tap admitted going
+        /// blind) — a silently-lost dictation beats duplicated text. Accept
+        /// once, log, stop. No re-type, no paste.
+        case acceptUnverified
+        /// Pipe proven live and our text genuinely did not arrive — one
+        /// re-type, then re-run the same evidence ladder on it.
+        case retypeOnce
+        /// Pipe proven live on the *second* check (post-retype) and text
+        /// still didn't land — fall to the paste lane, whose chord
+        /// confirmation is keycode-based and proven to work.
+        case escalateToPaste
     }
 
     /// Whether to restore the pre-insert pasteboard snapshot after lane attempts finish.
@@ -418,6 +506,70 @@ final class TextInjector {
         return result
     }
 
+    /// Terminal state of one `insertViaUnicodeTyping` attempt, folded down to
+    /// what `performInsert` needs to branch on. `.confirmed` covers all three
+    /// accept sub-verdicts of `unicodeLaneVerdict` (direct, keycode-evidence,
+    /// partial) — each logs its own evidence, but all three stop the chain
+    /// the same way.
+    private enum UnicodeAttemptResult {
+        case confirmed
+        case needsCanaryProbe
+        case postFailed
+    }
+
+    private func attemptUnicodeTyping(
+        _ trimmed: String,
+        observer: UnicodeDeliveryObserver,
+        chunkTarget: Int,
+        attemptLabel: String
+    ) -> UnicodeAttemptResult {
+        observer.resetObservedCount()
+        let posted = insertViaUnicodeTyping(trimmed)
+        guard posted > 0 else { return .postFailed }
+
+        let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
+        let keycodeZeroObserved = observer.keycodeZeroKeyDownCount
+        switch Self.unicodeLaneVerdict(
+            utf16Observed: observed,
+            utf16Target: posted,
+            keycodeZeroObserved: keycodeZeroObserved,
+            chunkTarget: chunkTarget,
+            wentBlind: observer.wentBlind
+        ) {
+        case .confirmed:
+            Self.log("unicode typing confirmed\(attemptLabel) chars=\(trimmed.utf16.count) — pasteboard untouched")
+            return .confirmed
+        case .confirmedByKeycode:
+            Self.log("delivered by keycode evidence (readback blind)\(attemptLabel) chunks=\(chunkTarget)")
+            return .confirmed
+        case .acceptPartial:
+            Self.log("partial delivery observed=\(observed)/\(posted)\(attemptLabel) — accepting without retry (anti-double)")
+            return .confirmed
+        case .needsCanaryProbe:
+            return .needsCanaryProbe
+        }
+    }
+
+    /// Posts the F20 canary, waits a flat window, and folds the result
+    /// through `canaryVerdict`.
+    private func probeCanary(observer: UnicodeDeliveryObserver, isSecondAttempt: Bool) -> CanaryVerdict {
+        observer.resetObservedCount()
+        _ = postCanary()
+        let observedCanary = waitForConfirmation(
+            observer: observer,
+            target: 1,
+            counter: .canary,
+            baseWindow: Self.canaryConfirmationWindow,
+            progressExtension: 0,
+            maxWait: Self.canaryConfirmationWindow
+        )
+        return Self.canaryVerdict(
+            canaryObserved: observedCanary >= 1,
+            wentBlind: observer.wentBlind,
+            isSecondAttempt: isSecondAttempt
+        )
+    }
+
     private func performInsert(_ trimmed: String) -> InsertResult {
         let utf16Count = trimmed.utf16.count
         // Snapshot before any lane that may write the pasteboard. Unicode-first
@@ -435,68 +587,48 @@ final class TextInjector {
         }
         defer { observer.stop() }
 
-        // Unicode first — happy path never touches NSPasteboard.general.
-        observer.resetObservedCount()
-        var posted = insertViaUnicodeTyping(trimmed)
+        let chunkTarget = Self.chunkUTF16Units(trimmed).count
         var confirmed = false
         var retryConfirmed = false
 
-        if posted > 0 {
-            let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
-            switch Self.deliveryFollowUp(observed: observed, target: posted) {
-            case .confirmed:
+        // Evidence ladder (2026-08-31): never escalate to a second delivery
+        // attempt unless the observation channel is PROVEN live at that
+        // moment AND it proves our text did not arrive. Anything unprovable
+        // is accepted once and logged — a silently-lost dictation beats
+        // duplicated text.
+        switch attemptUnicodeTyping(trimmed, observer: observer, chunkTarget: chunkTarget, attemptLabel: "") {
+        case .confirmed:
+            confirmed = true
+        case .postFailed:
+            break // No CGEventSource — skip straight to the paste lane below.
+        case .needsCanaryProbe:
+            switch probeCanary(observer: observer, isSecondAttempt: false) {
+            case .acceptUnverified:
+                Self.log("observer blind — accepting unverified (anti-double)")
                 confirmed = true
-            case .acceptPartial:
-                // Some of the posted text already landed; re-typing here would
-                // duplicate it. Accept what arrived and stop — never escalate
-                // to pid fallback or the paste lane on a partial delivery.
-                Self.log("partial delivery observed=\(observed)/\(posted) — accepting without retry (anti-double)")
-                return .inserted(deliveredText: trimmed)
-            case .retryEligible:
-                break // observed == 0: true drop signature, fall through to retry.
-            }
-        }
-
-        if !confirmed, posted > 0 {
-            Self.log("delivery drop detected — retrying")
-            observer.resetObservedCount()
-            posted = insertViaUnicodeTyping(trimmed)
-            if posted > 0 {
-                let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
-                switch Self.deliveryFollowUp(observed: observed, target: posted) {
+            case .retypeOnce:
+                Self.log("delivery drop detected — retrying")
+                switch attemptUnicodeTyping(trimmed, observer: observer, chunkTarget: chunkTarget, attemptLabel: " on retry") {
                 case .confirmed:
                     retryConfirmed = true
-                case .acceptPartial:
-                    Self.log("partial delivery observed=\(observed)/\(posted) — accepting without retry (anti-double)")
-                    return .inserted(deliveredText: trimmed)
-                case .retryEligible:
-                    break // still 0 after retry — fall through to pid/paste fallback.
+                case .postFailed:
+                    break
+                case .needsCanaryProbe:
+                    switch probeCanary(observer: observer, isSecondAttempt: true) {
+                    case .acceptUnverified:
+                        Self.log("observer blind — accepting unverified (anti-double)")
+                        retryConfirmed = true
+                    case .escalateToPaste, .retypeOnce:
+                        break // Pipe proven live, text still missing — paste lane.
+                    }
                 }
+            case .escalateToPaste:
+                break // Defensive: canaryVerdict never returns this on a first check.
             }
         }
 
-        var pidFallbackSucceeded = false
-        if !confirmed, !retryConfirmed {
-            if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier {
-                pidFallbackSucceeded = insertViaPostToPid(trimmed, pid: pid)
-                if pidFallbackSucceeded {
-                    Self.log("unverified fallback pid=\(pid) chars=\(utf16Count)")
-                }
-            }
-        }
-
-        let outcome = Self.resolveOutcome(
-            confirmed: confirmed,
-            retryConfirmed: retryConfirmed,
-            pidFallbackSucceeded: pidFallbackSucceeded
-        )
-        // Keyed on observed delivery, NOT on `shouldReturnTrue`. The two differ
-        // only for `.unverifiedFallback`, and that difference is the bug: the
-        // pipeline maps it to `.failed`, which surfaces as the HUD's
-        // "it's on your clipboard" flash — so we must leave the transcript on
-        // the pasteboard for that rare failure path only.
+        let outcome = Self.resolveOutcome(confirmed: confirmed, retryConfirmed: retryConfirmed)
         if outcome.path.isConfirmedDelivery {
-            Self.log("unicode typing confirmed chars=\(utf16Count) — pasteboard untouched")
             return .inserted(deliveredText: trimmed)
         }
 
@@ -530,8 +662,8 @@ final class TextInjector {
             return .inserted(deliveredText: trimmed)
         }
 
-        // All lanes failed (or only unverified pid). Leave transcript for the
-        // HUD "paste it yourself" flash — prior clipboard is sacrificed only here.
+        // All lanes failed. Leave transcript for the HUD "paste it yourself"
+        // flash — prior clipboard is sacrificed only here.
         leaveOnClipboard(trimmed)
         Self.log("inject failed — transcript left on clipboard chars=\(utf16Count)")
         return .failed
@@ -655,6 +787,40 @@ final class TextInjector {
         return true
     }
 
+    /// Posts an F20 keyDown+keyUp with no flags — a no-op in effectively
+    /// every app. Proves the post→WindowServer→tap pipe is live without
+    /// mutating the document, so a blind unicode observer can be
+    /// distinguished from a genuinely dropped delivery (see `canaryVerdict`).
+    @discardableResult
+    private func postCanary() -> Bool {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else {
+            Self.log("no CGEventSource")
+            return false
+        }
+        source.localEventsSuppressionInterval = 0
+
+        guard let keyDown = CGEvent(
+            keyboardEventSource: source,
+            virtualKey: Self.virtualKeyF20,
+            keyDown: true
+        ) else {
+            Self.log("failed to create canary keyDown")
+            return false
+        }
+        keyDown.post(tap: .cgSessionEventTap)
+
+        guard let keyUp = CGEvent(
+            keyboardEventSource: source,
+            virtualKey: Self.virtualKeyF20,
+            keyDown: false
+        ) else {
+            Self.log("failed to create canary keyUp")
+            return false
+        }
+        keyUp.post(tap: .cgSessionEventTap)
+        return true
+    }
+
     // MARK: - Unicode typing
 
     /// Posts unicode key events via the session tap. Returns UTF-16 units posted, or 0 on failure.
@@ -692,50 +858,17 @@ final class TextInjector {
         return chunks.reduce(0) { $0 + $1.count }
     }
 
-    private func insertViaPostToPid(_ text: String, pid: pid_t) -> Bool {
-        guard let source = CGEventSource(stateID: .combinedSessionState) else {
-            Self.log("no CGEventSource")
-            return false
-        }
-        source.localEventsSuppressionInterval = 0
-
-        let chunks = Self.chunkUTF16Units(text)
-        guard !chunks.isEmpty else { return false }
-
-        for chunk in chunks {
-            var mutableChunk = chunk
-            guard let keyDown = CGEvent(
-                keyboardEventSource: source,
-                virtualKey: 0,
-                keyDown: true
-            ) else {
-                Self.log("failed to create keyDown for postToPid")
-                return false
-            }
-            keyDown.keyboardSetUnicodeString(stringLength: mutableChunk.count, unicodeString: &mutableChunk)
-            keyDown.postToPid(pid)
-
-            if let keyUp = CGEvent(
-                keyboardEventSource: source,
-                virtualKey: 0,
-                keyDown: false
-            ) {
-                keyUp.postToPid(pid)
-            }
-        }
-        return true
-    }
-
     private enum ConfirmationCounter {
         case utf16Units
         case pasteChord
+        case canary
     }
 
     /// Waits for `observedCount()` to reach `target`, extending the deadline on
     /// forward progress (delayed delivery) rather than timing out the instant a
     /// fixed window elapses (see `confirmationBaseWindow` doc comment). Returns
     /// the final observed count — callers decide confirmed / retry / partial via
-    /// `deliveryFollowUp`, not a bare Bool, so a delayed-but-partial delivery is
+    /// `unicodeLaneVerdict`, not a bare Bool, so a delayed-but-partial delivery is
     /// distinguishable from a genuine drop.
     private func waitForConfirmation(
         observer: UnicodeDeliveryObserver,
@@ -751,6 +884,22 @@ final class TextInjector {
                 return observer.observedUTF16Units
             case .pasteChord:
                 return observer.observedPasteChordCount
+            case .canary:
+                return observer.canaryObservedCount
+            }
+        }
+        // Keycode-zero counting (virtualKey 0, what our unicode chunks use)
+        // keeps working even when payload readback goes blind (2026-08-31
+        // evidence), so it counts as forward progress for the unicode-units
+        // wait too — a stutter that stalls payload readback but not keycode
+        // delivery still earns the wait more time instead of reading as a
+        // drop the instant the base window elapses.
+        let progressCount: () -> Int = {
+            switch counter {
+            case .utf16Units:
+                return observer.observedUTF16Units + observer.keycodeZeroKeyDownCount
+            case .pasteChord, .canary:
+                return observedCount()
             }
         }
 
@@ -759,9 +908,9 @@ final class TextInjector {
         DispatchQueue(label: "com.matt.voice-dictation.unicode-delivery-wait").async {
             let startedAt = Date()
             var deadline = startedAt.addingTimeInterval(baseWindow)
-            var lastObserved = observedCount()
+            var lastObserved = progressCount()
             while Date() < deadline {
-                let current = observedCount()
+                let current = progressCount()
                 if current > lastObserved {
                     deadline = Self.nextConfirmationDeadline(
                         startedAt: startedAt,
@@ -771,7 +920,7 @@ final class TextInjector {
                     )
                     lastObserved = current
                 }
-                if current >= target {
+                if observedCount() >= target {
                     break
                 }
                 Thread.sleep(forTimeInterval: 0.005)
@@ -800,6 +949,13 @@ private final class UnicodeDeliveryObserver {
     private let lock = NSLock()
     private var observedUTF16UnitsStorage = 0
     private var observedPasteChordCountStorage = 0
+    private var keycodeZeroKeyDownCountStorage = 0
+    private var canaryObservedCountStorage = 0
+    /// Sticky once set — never cleared by `resetObservedCount`. Once the tap
+    /// has reported itself disabled during this insert, its testimony is no
+    /// longer trustworthy for the remainder of that insert, even after it is
+    /// re-enabled and starts reporting counts again.
+    private var wentBlindStorage = false
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var workerRunLoop: CFRunLoop?
@@ -809,6 +965,7 @@ private final class UnicodeDeliveryObserver {
     private(set) var isReady = false
     private let processID = Int64(getpid())
     private static let pasteVirtualKey = Int64(9) // kVK_ANSI_V
+    private static let canaryVirtualKey = Int64(90) // kVK_F20
 
     var observedUTF16Units: Int {
         lock.lock()
@@ -822,10 +979,45 @@ private final class UnicodeDeliveryObserver {
         return observedPasteChordCountStorage
     }
 
+    /// Own-PID keyDowns with `keyboardEventKeycode == 0` — the virtualKey our
+    /// unicode chunks post. This counts independently of the unicode payload
+    /// readback (`keyboardGetUnicodeString`), so it keeps working when that
+    /// readback goes blind — the 2026-08-31 evidence for this whole ladder.
+    var keycodeZeroKeyDownCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return keycodeZeroKeyDownCountStorage
+    }
+
+    /// Own-PID keyDowns matching the F20 canary.
+    var canaryObservedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return canaryObservedCountStorage
+    }
+
+    /// Whether the tap has ever reported `tapDisabledByTimeout` or
+    /// `tapDisabledByUserInput` during this observer's lifetime. Sticky.
+    var wentBlind: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return wentBlindStorage
+    }
+
+    /// Clears the per-attempt counters so a fresh attempt starts from zero.
+    /// `wentBlind` is intentionally excluded — see its doc comment.
     func resetObservedCount() {
         lock.lock()
         observedUTF16UnitsStorage = 0
         observedPasteChordCountStorage = 0
+        keycodeZeroKeyDownCountStorage = 0
+        canaryObservedCountStorage = 0
+        lock.unlock()
+    }
+
+    private func markWentBlind() {
+        lock.lock()
+        wentBlindStorage = true
         lock.unlock()
     }
 
@@ -897,6 +1089,17 @@ private final class UnicodeDeliveryObserver {
             return Unmanaged.passUnretained(event)
         }
         let observer = Unmanaged<UnicodeDeliveryObserver>.fromOpaque(refcon).takeUnretainedValue()
+        // Must come before the keyDown check: a stalled tap delivers this
+        // event type instead of keyDowns, and every escalation lane below
+        // trusts "observed==0" as "not delivered" unless it knows the
+        // witness itself blacked out (2026-08-31 evidence).
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            observer.markWentBlind()
+            if let tap = observer.tap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            return Unmanaged.passUnretained(event)
+        }
         if type == .keyDown {
             observer.recordOwnKeyDown(event)
         }
@@ -912,6 +1115,22 @@ private final class UnicodeDeliveryObserver {
             observedPasteChordCountStorage += 1
             lock.unlock()
             return
+        }
+
+        if keycode == Self.canaryVirtualKey {
+            lock.lock()
+            canaryObservedCountStorage += 1
+            lock.unlock()
+            return
+        }
+
+        // Our unicode chunks always post with virtualKey 0. Count this
+        // regardless of whether the payload readback below succeeds — this
+        // is the counter that keeps working when that readback goes blind.
+        if keycode == 0 {
+            lock.lock()
+            keycodeZeroKeyDownCountStorage += 1
+            lock.unlock()
         }
 
         // Query with a real buffer: the nil-buffer/zero-length form of
