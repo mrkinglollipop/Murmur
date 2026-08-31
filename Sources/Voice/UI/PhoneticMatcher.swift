@@ -34,10 +34,24 @@ enum PhoneticMatcher {
         return dp[m][n]
     }
 
-    static func guardAccepts(heard: String, candidate: String, primaryKeyMatch: Bool = false) -> Bool {
+    static func guardAccepts(
+        heard: String,
+        candidate: String,
+        primaryKeyMatch: Bool = false,
+        lexicon: RealWordLexicon = .system
+    ) -> Bool {
         let heardTrimmed = heard.trimmingCharacters(in: .whitespacesAndNewlines)
         let candidateTrimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !heardTrimmed.isEmpty, !candidateTrimmed.isEmpty else { return false }
+
+        // Live data showed the distance/similarity bars below happily rewrite
+        // ordinary English ("is"→bs, "many"→manna, "try"→tauri) once a
+        // metaphone key collides with a jargon dictionary term. A heard word
+        // that's already a real word — or too short to be phonetically
+        // distinctive — is never a mishearing worth "fixing".
+        let heardLower = heardTrimmed.lowercased()
+        guard heardLower.count >= 3 else { return false }
+        guard !lexicon.contains(heardLower) else { return false }
 
         let heardLen = heardTrimmed.count
         let candidateLen = candidateTrimmed.count
@@ -95,6 +109,61 @@ enum PhoneticMatcher {
         "go", "see", "know", "think", "want", "need", "use", "make", "take",
         "look", "say", "said", "let", "may", "right", "left", "good", "new",
         "old", "long", "little", "first", "last", "next", "type",
+    ]
+}
+
+/// Real-English-word membership check used to gate phonetic rewrites: a
+/// heard word that's already a dictionary word is never a mishearing of a
+/// jargon term. Wraps a closure so production can lazily load the system
+/// dictionary while tests inject a small fixed set — the file lives at
+/// `/usr/share/dict/words` on macOS but is neither guaranteed present nor
+/// worth touching from a unit test.
+struct RealWordLexicon {
+    private let membershipCheck: (String) -> Bool
+
+    init(membershipCheck: @escaping (String) -> Bool) {
+        self.membershipCheck = membershipCheck
+    }
+
+    /// `word` should already be lowercased/trimmed by the caller; this also
+    /// lowercases defensively so misuse can't silently miss real words.
+    func contains(_ word: String) -> Bool {
+        membershipCheck(word.lowercased())
+    }
+
+    /// The production lexicon: `/usr/share/dict/words` loaded once, lazily,
+    /// on first use. Falls back to a small built-in set of common English
+    /// function/short words if the file is missing or unreadable.
+    static let system: RealWordLexicon = {
+        let words = loadSystemWords()
+        return RealWordLexicon { words.contains($0) }
+    }()
+
+    private static func loadSystemWords() -> Set<String> {
+        guard
+            let contents = try? String(contentsOfFile: "/usr/share/dict/words", encoding: .utf8),
+            !contents.isEmpty
+        else {
+            return fallbackWords
+        }
+        let words = Set(
+            contents.split(whereSeparator: \.isNewline).map { $0.lowercased() }
+        )
+        return words.isEmpty ? fallbackWords : words
+    }
+
+    static let fallbackWords: Set<String> = [
+        "is", "the", "a", "an", "and", "or", "but", "to", "of", "in", "on",
+        "at", "by", "for", "with", "as", "if", "it", "be", "do", "day",
+        "try", "true", "many", "money", "mine", "main", "ready", "slow",
+        "type", "one", "ones", "sent", "said", "was", "are", "this", "that",
+        "these", "those", "he", "she", "they", "we", "you", "my", "no",
+        "not", "so", "too", "from", "then", "than", "when", "what", "who",
+        "how", "why", "can", "will", "would", "should", "have", "has",
+        "had", "were", "am", "two", "three", "out", "up", "down", "off",
+        "over", "into", "just", "like", "also", "only", "even", "still",
+        "back", "well", "way", "now", "here", "there", "more", "most",
+        "some", "any", "all",
     ]
 }
 
