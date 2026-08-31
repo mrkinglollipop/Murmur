@@ -76,7 +76,24 @@ final class TextInjector {
     /// a practical ceiling around this size; chunk longer transcripts.
     private static let unicodeChunkSize = 16
 
-    private static let confirmationTimeout: TimeInterval = 0.4
+    // Confirmation wait is progress-aware, not a flat timeout: a WindowServer
+    // stall DELAYS CGEvent delivery to the observer tap, it does not DROP it.
+    // A flat 0.4s window mistook "still arriving" for "never arrived", retried
+    // by re-typing the whole transcript, and both copies landed once the
+    // stall cleared — doubled text with History recording only one delivery
+    // (2026-08-31 double-injection incident). The wait now starts at
+    // `confirmationBaseWindow` and extends by `confirmationProgressExtension`
+    // every time the observed count moves forward, capped at
+    // `confirmationMaxWait` total — so a genuinely stuck send (observed stays
+    // at 0, or stalls partway with no further progress) still times out
+    // promptly, while a delayed-but-arriving send gets the room it needs.
+    private static let confirmationBaseWindow: TimeInterval = 0.4
+    private static let confirmationProgressExtension: TimeInterval = 0.4
+    private static let confirmationMaxWait: TimeInterval = 2.5
+    /// Chord observation is binary (target 1, no partial-progress signal), so
+    /// it cannot use the progress-extension mechanics above — it gets a flat,
+    /// longer window instead. See `tryPasteLane` for the incident this guards.
+    private static let pasteChordConfirmationWindow: TimeInterval = 1.5
     /// Brief yield after the paste chord so typical AppKit consumers read first.
     /// Not a restore gate — see `pasteboardRestoreDelay`.
     private static let pasteConsumerDelay: TimeInterval = 0.25
@@ -127,6 +144,39 @@ final class TextInjector {
         case restoreSavedDeferred
         case deferRestore
         case doNotRestoreLeaveTranscript
+    }
+
+    /// What to do after a confirmation wait ends, given what the observer
+    /// actually saw. `acceptPartial` is the anti-double case: some but not all
+    /// of the posted text arrived, so the rest is presumed still in flight —
+    /// re-typing here would duplicate the part that already landed.
+    enum DeliveryFollowUp: Equatable {
+        case confirmed
+        case retryEligible
+        case acceptPartial
+    }
+
+    /// Pure post-wait decision — no CGEvents, so directly unit-testable.
+    static func deliveryFollowUp(observed: Int, target: Int) -> DeliveryFollowUp {
+        if observed >= target {
+            return .confirmed
+        }
+        if observed == 0 {
+            return .retryEligible
+        }
+        return .acceptPartial
+    }
+
+    /// Pure deadline arithmetic for the progress-aware confirmation wait.
+    /// Extends `currentDeadline` by `progressExtension` on forward progress,
+    /// never past `startedAt + maxWait`.
+    static func nextConfirmationDeadline(
+        startedAt: Date,
+        currentDeadline: Date,
+        progressExtension: TimeInterval,
+        maxWait: TimeInterval
+    ) -> Date {
+        min(currentDeadline.addingTimeInterval(progressExtension), startedAt.addingTimeInterval(maxWait))
     }
 
     /// Pure fallback ordering for verified unicode insert attempts.
@@ -392,11 +442,19 @@ final class TextInjector {
         var retryConfirmed = false
 
         if posted > 0 {
-            confirmed = waitForConfirmation(
-                observer: observer,
-                target: posted,
-                counter: .utf16Units
-            )
+            let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
+            switch Self.deliveryFollowUp(observed: observed, target: posted) {
+            case .confirmed:
+                confirmed = true
+            case .acceptPartial:
+                // Some of the posted text already landed; re-typing here would
+                // duplicate it. Accept what arrived and stop — never escalate
+                // to pid fallback or the paste lane on a partial delivery.
+                Self.log("partial delivery observed=\(observed)/\(posted) — accepting without retry (anti-double)")
+                return .inserted(deliveredText: trimmed)
+            case .retryEligible:
+                break // observed == 0: true drop signature, fall through to retry.
+            }
         }
 
         if !confirmed, posted > 0 {
@@ -404,11 +462,16 @@ final class TextInjector {
             observer.resetObservedCount()
             posted = insertViaUnicodeTyping(trimmed)
             if posted > 0 {
-                retryConfirmed = waitForConfirmation(
-                    observer: observer,
-                    target: posted,
-                    counter: .utf16Units
-                )
+                let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
+                switch Self.deliveryFollowUp(observed: observed, target: posted) {
+                case .confirmed:
+                    retryConfirmed = true
+                case .acceptPartial:
+                    Self.log("partial delivery observed=\(observed)/\(posted) — accepting without retry (anti-double)")
+                    return .inserted(deliveredText: trimmed)
+                case .retryEligible:
+                    break // still 0 after retry — fall through to pid/paste fallback.
+                }
             }
         }
 
@@ -528,11 +591,23 @@ final class TextInjector {
 
             observer.resetObservedCount()
             guard postPasteChord() else { return false }
-            let chordObserved = waitForConfirmation(
+            // Chord observation is binary (target 1) — a WindowServer stall
+            // DELAYS the CGEvent reaching the observer tap, it does not drop
+            // it. The original 0.4s window mistook "still in flight" for
+            // "dropped", fired a second Cmd-V, and once the stall cleared both
+            // chords landed — pasting the transcript twice while History
+            // recorded one delivery (2026-08-31 double-paste incident). 1.5s
+            // gives a stalled WindowServer room to deliver before we escalate
+            // to the single retry below.
+            let observedChordCount = waitForConfirmation(
                 observer: observer,
                 target: Self.pasteChordTarget,
-                counter: .pasteChord
+                counter: .pasteChord,
+                baseWindow: Self.pasteChordConfirmationWindow,
+                progressExtension: 0,
+                maxWait: Self.pasteChordConfirmationWindow
             )
+            let chordObserved = observedChordCount >= Self.pasteChordTarget
             // Chord observed proves WindowServer accepted our events; pasteboard
             // still holding the transcript proves Continuity did not overwrite
             // between prepare and paste. Neither checks target-app content.
@@ -656,12 +731,20 @@ final class TextInjector {
         case pasteChord
     }
 
+    /// Waits for `observedCount()` to reach `target`, extending the deadline on
+    /// forward progress (delayed delivery) rather than timing out the instant a
+    /// fixed window elapses (see `confirmationBaseWindow` doc comment). Returns
+    /// the final observed count — callers decide confirmed / retry / partial via
+    /// `deliveryFollowUp`, not a bare Bool, so a delayed-but-partial delivery is
+    /// distinguishable from a genuine drop.
     private func waitForConfirmation(
         observer: UnicodeDeliveryObserver,
         target: Int,
         counter: ConfirmationCounter,
-        timeout: TimeInterval = TextInjector.confirmationTimeout
-    ) -> Bool {
+        baseWindow: TimeInterval = TextInjector.confirmationBaseWindow,
+        progressExtension: TimeInterval = TextInjector.confirmationProgressExtension,
+        maxWait: TimeInterval = TextInjector.confirmationMaxWait
+    ) -> Int {
         let observedCount: () -> Int = {
             switch counter {
             case .utf16Units:
@@ -672,23 +755,32 @@ final class TextInjector {
         }
 
         let semaphore = DispatchSemaphore(value: 0)
-        var confirmed = false
+        var finalObserved = 0
         DispatchQueue(label: "com.matt.voice-dictation.unicode-delivery-wait").async {
-            let deadline = Date().addingTimeInterval(timeout)
+            let startedAt = Date()
+            var deadline = startedAt.addingTimeInterval(baseWindow)
+            var lastObserved = observedCount()
             while Date() < deadline {
-                if observedCount() >= target {
-                    confirmed = true
+                let current = observedCount()
+                if current > lastObserved {
+                    deadline = Self.nextConfirmationDeadline(
+                        startedAt: startedAt,
+                        currentDeadline: deadline,
+                        progressExtension: progressExtension,
+                        maxWait: maxWait
+                    )
+                    lastObserved = current
+                }
+                if current >= target {
                     break
                 }
                 Thread.sleep(forTimeInterval: 0.005)
             }
-            if !confirmed {
-                confirmed = observedCount() >= target
-            }
+            finalObserved = observedCount()
             semaphore.signal()
         }
         semaphore.wait()
-        return confirmed
+        return finalObserved
     }
 
     private func leaveOnClipboard(_ text: String) {

@@ -16,9 +16,18 @@ final class MicRecorder: NSObject {
     private var sessionActive = false
 
     var onSessionUnavailable: (() -> Void)?
+    private var onPCMBufferStorage: ((AVAudioPCMBuffer) -> Void)?
     /// Invoked on the tap thread with a copied PCM buffer while a segment is open.
     /// The copy is released after the callback returns — do not retain it.
-    var onPCMBuffer: ((AVAudioPCMBuffer) -> Void)?
+    ///
+    /// Set/cleared from the main actor (DictationController) but read on the
+    /// audio-tap thread inside `consume()` — both sides must go through
+    /// `stateLock`, mirroring `segmentFile`/`engine`, or the assignment races
+    /// the tap's read of the same storage.
+    var onPCMBuffer: ((AVAudioPCMBuffer) -> Void)? {
+        get { stateLock.withLock { onPCMBufferStorage } }
+        set { stateLock.withLock { onPCMBufferStorage = newValue } }
+    }
 
     override init() {
         super.init()
@@ -212,6 +221,7 @@ final class MicRecorder: NSObject {
     /// and never retains tap-owned buffers past the callback.
     private func consume(_ buffer: AVAudioPCMBuffer) {
         var streamingCopy: AVAudioPCMBuffer?
+        var streamingCallback: ((AVAudioPCMBuffer) -> Void)?
         stateLock.withLock {
             guard let file = segmentFile, !segmentPaused else { return }
             do {
@@ -219,7 +229,10 @@ final class MicRecorder: NSObject {
             } catch {
                 segmentWriteFailed = true
             }
-            if onPCMBuffer != nil {
+            // Read the backing storage directly — already holding stateLock,
+            // and the `onPCMBuffer` computed property would re-acquire it.
+            if let handler = onPCMBufferStorage {
+                streamingCallback = handler
                 streamingCopy = Self.copyPCMBuffer(buffer)
             }
             guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
@@ -241,8 +254,8 @@ final class MicRecorder: NSObject {
             smoothedMeterLevel += (target - smoothedMeterLevel) * coefficient
             latestMeterLevel = smoothedMeterLevel
         }
-        if let streamingCopy {
-            onPCMBuffer?(streamingCopy)
+        if let streamingCallback, let streamingCopy {
+            streamingCallback(streamingCopy)
         }
     }
 

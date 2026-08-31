@@ -167,6 +167,20 @@ final class GeminiLiveTests: XCTestCase {
         )
     }
 
+    /// Regression guard for the 2026-08-31 session-cap text-discard bug:
+    /// `finalize()`'s cap branch used to hardcode `""`, throwing away real
+    /// transcript. plans/028 documents cap-preserves-text as the contract.
+    func testCapReachedFinalizeTextPreservesAccumulatedTranscript() {
+        XCTAssertEqual(
+            GeminiLiveTranscriber.capReachedFinalizeText(accumulatedSoFar: "hello world"),
+            "hello world"
+        )
+    }
+
+    func testCapReachedFinalizeTextPassesThroughEmptyAccumulation() {
+        XCTAssertEqual(GeminiLiveTranscriber.capReachedFinalizeText(accumulatedSoFar: ""), "")
+    }
+
     func testBatchDecodeStepsContentText() {
         let stepsBody = Data("""
         {"status":"completed","steps":[{"content":[{"type":"text","text":"hello from steps"}]}]}

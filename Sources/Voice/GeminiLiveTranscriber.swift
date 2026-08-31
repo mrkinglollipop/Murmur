@@ -226,11 +226,12 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         if capReached {
             tearDownSocket()
-            vlog("gemini-stream: finalize short-circuit (10min cap), 0 chars forced")
+            let capText = Self.capReachedFinalizeText(accumulatedSoFar: accumulatedSoFar)
+            vlog("gemini-stream: finalize short-circuit (10min cap), \(capText.count) chars preserved")
             stateLock.lock()
             resetTranscriptState()
             stateLock.unlock()
-            return ""
+            return capText
         }
 
         if closed {
@@ -581,6 +582,15 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     static func sessionCapExceeded(elapsed: TimeInterval) -> Bool {
         elapsed > sessionCapSeconds
+    }
+
+    /// Text `finalize()` returns when the session cap cuts the socket short.
+    /// The cap (plans/028: 10min, "cancel and batch-fallback") must stop
+    /// further audio from being sent — it must not also discard whatever was
+    /// already transcribed live. Pure so the no-data-loss contract is
+    /// testable without standing up a live 580s session.
+    static func capReachedFinalizeText(accumulatedSoFar: String) -> String {
+        accumulatedSoFar
     }
 
     // MARK: - Format conversion

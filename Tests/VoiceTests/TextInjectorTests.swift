@@ -165,6 +165,69 @@ final class TextInjectorTests: XCTestCase {
         }
     }
 
+    // MARK: - Delayed-vs-dropped delivery follow-up (2026-08-31 double-injection fix)
+
+    func testDeliveryFollowUp_observedMeetsTarget_confirmed() {
+        XCTAssertEqual(TextInjector.deliveryFollowUp(observed: 5, target: 5), .confirmed)
+    }
+
+    func testDeliveryFollowUp_observedExceedsTarget_confirmed() {
+        XCTAssertEqual(TextInjector.deliveryFollowUp(observed: 7, target: 5), .confirmed)
+    }
+
+    func testDeliveryFollowUp_observedZero_retryEligible() {
+        XCTAssertEqual(TextInjector.deliveryFollowUp(observed: 0, target: 5), .retryEligible)
+    }
+
+    func testDeliveryFollowUp_observedZeroTargetZero_confirmed() {
+        // Degenerate case (nothing was posted, nothing to observe) counts as
+        // met rather than eligible for a retry that would post nothing again.
+        XCTAssertEqual(TextInjector.deliveryFollowUp(observed: 0, target: 0), .confirmed)
+    }
+
+    func testDeliveryFollowUp_observedBetweenZeroAndTarget_acceptPartial() {
+        XCTAssertEqual(TextInjector.deliveryFollowUp(observed: 1, target: 5), .acceptPartial)
+        XCTAssertEqual(TextInjector.deliveryFollowUp(observed: 4, target: 5), .acceptPartial)
+    }
+
+    func testNextConfirmationDeadline_extendsByProgressExtension() {
+        let start = Date()
+        let currentDeadline = start.addingTimeInterval(0.4)
+        let next = TextInjector.nextConfirmationDeadline(
+            startedAt: start,
+            currentDeadline: currentDeadline,
+            progressExtension: 0.4,
+            maxWait: 2.5
+        )
+        XCTAssertEqual(next.timeIntervalSince(start), 0.8, accuracy: 0.0001)
+    }
+
+    func testNextConfirmationDeadline_capsAtMaxWaitFromStart() {
+        let start = Date()
+        let currentDeadline = start.addingTimeInterval(2.3)
+        let next = TextInjector.nextConfirmationDeadline(
+            startedAt: start,
+            currentDeadline: currentDeadline,
+            progressExtension: 0.4,
+            maxWait: 2.5
+        )
+        XCTAssertEqual(next.timeIntervalSince(start), 2.5, accuracy: 0.0001)
+    }
+
+    func testNextConfirmationDeadline_neverExceedsMaxWaitAcrossRepeatedProgress() {
+        let start = Date()
+        var deadline = start.addingTimeInterval(0.4)
+        for _ in 0..<20 {
+            deadline = TextInjector.nextConfirmationDeadline(
+                startedAt: start,
+                currentDeadline: deadline,
+                progressExtension: 0.4,
+                maxWait: 2.5
+            )
+        }
+        XCTAssertLessThanOrEqual(deadline.timeIntervalSince(start), 2.5 + 0.0001)
+    }
+
     // MARK: - Saved pasteboard restore decision
 
     func testResolveSavedPasteboardRestore_pasteSucceeded() {
