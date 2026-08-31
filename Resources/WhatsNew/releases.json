@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.47",
+    "build": "48",
+    "title": "What's New in 0.1.47",
+    "items": [
+      "Dictation accuracy: the phonetic auto-correction that maps mishears to your dictionary terms no longer rewrites real English words — only genuine mishears get corrected.",
+      "Your last word survives: the mic now captures a brief grace period after you release the dictation key, so trailing words aren't clipped mid-syllable."
+    ]
+  },
+  {
     "version": "0.1.46",
     "build": "47",
     "title": "What's New in 0.1.46",
