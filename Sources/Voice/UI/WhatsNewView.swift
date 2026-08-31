@@ -57,46 +57,86 @@ struct WhatsNewListView: View {
 
 struct WhatsNewSettingsSectionView: View {
     private let releases = WhatsNewCatalog.load()
+    @State private var showEarlierReleases = false
 
     var body: some View {
         if releases.isEmpty {
             Text("Release notes are not available in this build.")
                 .font(Theme.body(12))
                 .foregroundColor(Theme.textSecondary)
-        } else {
+        } else if let latest = releases.first {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(releases) { release in
-                    DisclosureGroup {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(release.items, id: \.self) { item in
-                                HStack(alignment: .top, spacing: 8) {
-                                    Text("•")
-                                        .font(Theme.body(11, weight: .semibold))
-                                        .foregroundColor(Theme.primary)
-                                    Text(item)
-                                        .font(Theme.body(11))
-                                        .foregroundColor(Theme.textPrimary)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            }
-                        }
-                        .padding(.top, 4)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text(release.title)
-                                .font(Theme.body(12, weight: .medium))
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(latest.title)
+                        .font(Theme.body(12, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Text(latest.version)
+                        .font(Theme.body(10, weight: .semibold))
+                        .foregroundColor(Theme.lavenderText)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .murmurGlassCapsule(tint: Theme.selectionTint)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(latest.items, id: \.self) { item in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("•")
+                                .font(Theme.body(11, weight: .semibold))
+                                .foregroundColor(Theme.primary)
+                            Text(item)
+                                .font(Theme.body(11))
                                 .foregroundColor(Theme.textPrimary)
-                            Spacer()
-                            Text(release.version)
-                                .font(Theme.body(10, weight: .semibold))
-                                .foregroundColor(Theme.lavenderText)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .murmurGlassCapsule(tint: Theme.selectionTint)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
+                    }
+                }
+
+                if releases.count > 1 {
+                    Button {
+                        showEarlierReleases = true
+                    } label: {
+                        Text("Earlier releases (\(releases.count - 1))")
+                            .font(Theme.body(11, weight: .medium))
+                            .foregroundColor(Theme.lavenderText)
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(isPresented: $showEarlierReleases) {
+                        WhatsNewEarlierReleasesSheet(
+                            releases: Array(releases.dropFirst()),
+                            onDismiss: { showEarlierReleases = false }
+                        )
                     }
                 }
             }
         }
+    }
+}
+
+private struct WhatsNewEarlierReleasesSheet: View {
+    let releases: [WhatsNewRelease]
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Earlier releases")
+                    .font(Theme.serifTitle(22, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                Spacer()
+                Button("Done", action: onDismiss)
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+
+            WhatsNewListView(releases: releases, showsBuildSubtitle: true)
+        }
+        .frame(minWidth: 420, minHeight: 480)
+        .background(Theme.bg)
     }
 }

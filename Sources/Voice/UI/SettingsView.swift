@@ -41,6 +41,14 @@ struct SettingsView: View {
         enrolledProfile != nil
     }
 
+    private var geminiLanguageCaption: String {
+        let tag = SettingsStore.geminiLanguageSelection(from: settingsStore.selectedLanguage)
+        if tag.isEmpty {
+            return "Uses Language above. Gemini will auto-detect (no languageCodes)."
+        }
+        return "Uses Language above. Gemini is sent \(tag)."
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -167,6 +175,10 @@ struct SettingsView: View {
                             Divider().overlay(Theme.hairline)
 
                             Text("Preview model — a paid Gemini API key is recommended. Free-tier keys may be used to improve Google products.")
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.textSecondary)
+
+                            Text(geminiLanguageCaption)
                                 .font(Theme.body(10))
                                 .foregroundColor(Theme.textSecondary)
 

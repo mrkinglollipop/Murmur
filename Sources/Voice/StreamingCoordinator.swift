@@ -37,24 +37,31 @@ final class StreamingCoordinator {
     private static let streamMinCharsPerSecond: Double = 2.0
     private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
 
-    /// Below this much captured audio, a hold with no stream text is discarded
-    /// as silence instead of entering the batch→local fallback chain. Evidence
-    /// (2026-08-10 log): a 0.33 s dead-silent tap cascaded through batch
-    /// "No transcript" into a cold WhisperKit load and a 120 s timeout error,
-    /// while a 1.93 s *quiet* hold (also under the RMS threshold) was
-    /// legitimately rescued by the same fallback (14 injected chars). Duration
-    /// separates those two; loudness does not — do NOT gate this on `hadSpeech`.
+    /// Below this much captured audio (inclusive), a hold with no stream text
+    /// is discarded as silence instead of entering the batch→local fallback
+    /// chain. Evidence (2026-08-10 log): a 0.33 s dead-silent tap cascaded
+    /// through batch "No transcript" into a cold WhisperKit load and a 120 s
+    /// timeout error, while a 1.93 s *quiet* hold (also under the RMS
+    /// threshold) was legitimately rescued by the same fallback (14 injected
+    /// chars). Duration separates those two; loudness does not — do NOT gate
+    /// this on `hadSpeech`.
+    ///
+    /// Inclusive (`<=`): a 0.5 s CAF at exactly the floor (48 kHz × 24_000
+    /// frames) previously bypassed silence-cancel (`bufferedSeconds < 0.5`),
+    /// ran empty Gemini finalize → WhisperKit batch, and flashed
+    /// "Transcription failed" beside a later successful Gemini hold
+    /// (2026-08-31 history).
     static let silenceCancelMaxBufferedSeconds: TimeInterval = 0.5
 
     /// Silence cancel only when there was never stream text and the captured
-    /// audio is absent or shorter than `silenceCancelMaxBufferedSeconds`.
+    /// audio is absent or at most `silenceCancelMaxBufferedSeconds`.
     /// Longer buffers bypass local RMS `hadSpeech` — quiet real speech below
     /// the RMS threshold has been rescued by the batch fallback in the field.
     static func shouldTakeSilenceCancel(
         everHadStreamText: Bool,
         bufferedSeconds: TimeInterval
     ) -> Bool {
-        !everHadStreamText && bufferedSeconds < silenceCancelMaxBufferedSeconds
+        !everHadStreamText && bufferedSeconds <= silenceCancelMaxBufferedSeconds
     }
 
     /// Total captured seconds across PCM buffers (frames ÷ sample rate).

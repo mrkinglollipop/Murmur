@@ -173,7 +173,7 @@ final class TextInjectorTests: XCTestCase {
             unicodeSucceeded: false,
             allLanesFailed: false
         )
-        XCTAssertEqual(decision, .restoreSaved)
+        XCTAssertEqual(decision, .restoreSavedDeferred)
     }
 
     func testResolveSavedPasteboardRestore_pasteSucceededIgnoresFailureFlags() {
@@ -182,7 +182,7 @@ final class TextInjectorTests: XCTestCase {
             unicodeSucceeded: false,
             allLanesFailed: true
         )
-        XCTAssertEqual(decision, .restoreSaved)
+        XCTAssertEqual(decision, .restoreSavedDeferred)
     }
 
     func testResolveSavedPasteboardRestore_unicodeSucceededAfterPasteFailed() {
@@ -219,10 +219,10 @@ final class TextInjectorTests: XCTestCase {
             allLanesFailed: Bool,
             decision: TextInjector.SavedPasteboardRestoreDecision
         )] = [
-            (true, false, false, .restoreSaved),
-            (true, false, true, .restoreSaved),
-            (true, true, false, .restoreSaved),
-            (true, true, true, .restoreSaved),
+            (true, false, false, .restoreSavedDeferred),
+            (true, false, true, .restoreSavedDeferred),
+            (true, true, false, .restoreSavedDeferred),
+            (true, true, true, .restoreSavedDeferred),
             (false, true, false, .restoreSaved),
             (false, true, true, .restoreSaved),
             (false, false, true, .doNotRestoreLeaveTranscript),
@@ -241,6 +241,100 @@ final class TextInjectorTests: XCTestCase {
                 "paste=\(item.pasteSucceeded) unicode=\(item.unicodeSucceeded) failed=\(item.allLanesFailed)"
             )
         }
+    }
+
+    /// Paste-lane restore must outlast slow Electron/Cursor consumers — sync
+    /// restore after pasteConsumerDelay alone pastes the prior clipboard.
+    func testPasteboardRestoreDelay_outlastsConsumerYield() {
+        XCTAssertGreaterThan(TextInjector.pasteboardRestoreDelay, 0.25)
+        XCTAssertGreaterThanOrEqual(TextInjector.pasteboardRestoreDelay, 2.0)
+    }
+
+    func testScheduleDeferredPasteboardRestore_runsAfterDelayWhenTextStillPresent() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("prior clipboard", forType: .string)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+
+        TextInjector.preparePasteboardForPaste("injected transcript", on: testPasteboard)
+
+        var scheduledDelay: TimeInterval?
+        var work: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "injected transcript",
+            savedPasteboard: saved,
+            on: testPasteboard,
+            delay: 2.0,
+            asyncAfter: { delay, block in
+                scheduledDelay = delay
+                work = block
+            }
+        )
+
+        XCTAssertEqual(scheduledDelay, 2.0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "injected transcript",
+                       "must not restore synchronously")
+
+        work?()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "prior clipboard")
+    }
+
+    func testScheduleDeferredPasteboardRestore_skipsWhenOverwritten() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("prior clipboard", forType: .string)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+
+        TextInjector.preparePasteboardForPaste("injected transcript", on: testPasteboard)
+
+        var work: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "injected transcript",
+            savedPasteboard: saved,
+            on: testPasteboard,
+            delay: 2.0,
+            asyncAfter: { _, block in work = block }
+        )
+
+        testPasteboard.clearContents()
+        testPasteboard.setString("user copied something else", forType: .string)
+        work?()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "user copied something else")
+    }
+
+    func testScheduleDeferredPasteboardRestore_supersededSkipsOlderCallback() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("original", forType: .string)
+        let savedOriginal = TextInjector.pasteboardSnapshot(from: testPasteboard)
+
+        TextInjector.preparePasteboardForPaste("first", on: testPasteboard)
+        var firstWork: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "first",
+            savedPasteboard: savedOriginal,
+            on: testPasteboard,
+            delay: 2.0,
+            asyncAfter: { _, block in firstWork = block }
+        )
+
+        let savedAfterFirst = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        TextInjector.preparePasteboardForPaste("second", on: testPasteboard)
+        var secondWork: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "second",
+            savedPasteboard: savedAfterFirst,
+            on: testPasteboard,
+            delay: 2.0,
+            asyncAfter: { _, block in secondWork = block }
+        )
+
+        firstWork?()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "second",
+                       "superseded restore must not clobber newer inject")
+
+        secondWork?()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "first")
     }
 
     // MARK: - Pasteboard helpers (named test pasteboard only)
@@ -332,7 +426,9 @@ final class TextInjectorTests: XCTestCase {
 
     /// `.unverifiedFallback` stops the lane chain but proves nothing, so it must
     /// not drive a pasteboard restore — the pipeline maps it to `.failed`, which
-    /// the HUD renders as "your text is on the clipboard".
+    /// the HUD renders as "your text is on the clipboard". Same contract as
+    /// paste-blind (observer tap missing): leave the transcript; never restore
+    /// the pre-insert snapshot on that path.
     func testIsConfirmedDelivery_trueOnlyForObservedDelivery() {
         XCTAssertTrue(TextInjector.InsertDeliveryPath.confirmed.isConfirmedDelivery)
         XCTAssertTrue(TextInjector.InsertDeliveryPath.confirmedOnRetry.isConfirmedDelivery)

@@ -106,6 +106,64 @@ final class SettingsStore: ObservableObject {
         ("hi", "Hindi"),
     ]
 
+    /// BCP-47 locales for Gemini Live / batch (`languageCodes`). Empty code =
+    /// omit the hint so Gemini auto-detects. Regional English variants matter
+    /// here — bare `"en"` is not in Google's supported list.
+    static let geminiLanguages: [(code: String, name: String)] = [
+        ("", "Auto-detect"),
+        ("en-US", "English (US)"),
+        ("en-GB", "English (UK)"),
+        ("en-IN", "English (India)"),
+        ("es-US", "Spanish (US)"),
+        ("fr-FR", "French"),
+        ("de-DE", "German"),
+        ("it-IT", "Italian"),
+        ("pt-BR", "Portuguese (Brazil)"),
+        ("nl-NL", "Dutch"),
+        ("ja-JP", "Japanese"),
+        ("ko-KR", "Korean"),
+        ("cmn-Hans-CN", "Chinese (Simplified)"),
+        ("ru-RU", "Russian"),
+        ("ar-EG", "Arabic"),
+        ("hi-IN", "Hindi"),
+    ]
+
+    /// Binding helper: Settings ISO codes → Gemini BCP-47 picker selection.
+    nonisolated static func geminiLanguageSelection(from selectedLanguage: String) -> String {
+        GeminiLiveOptions.bcp47LanguageCodes(from: selectedLanguage).first ?? ""
+    }
+
+    /// Maps a stored language (ISO 639-1 or a Gemini BCP-47 tag) back to the
+    /// ISO codes WhisperKit / xAI / ElevenLabs expect. Empty or unknown → `"en"`.
+    /// Never persist Gemini Auto-detect (`""`) or `en-GB` into this field —
+    /// those values desync the Language picker and are invalid for other engines.
+    nonisolated static func isoLanguageCode(from stored: String) -> String {
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        let supported = Set(supportedLanguages.map(\.code))
+        if supported.contains(trimmed) { return trimmed }
+        let fromGeminiTag: [String: String] = [
+            "en-US": "en", "en-GB": "en", "en-IN": "en",
+            "es-US": "es",
+            "fr-FR": "fr",
+            "de-DE": "de",
+            "it-IT": "it",
+            "pt-BR": "pt",
+            "nl-NL": "nl",
+            "ja-JP": "ja",
+            "ko-KR": "ko",
+            "cmn-Hans-CN": "zh",
+            "ru-RU": "ru",
+            "ar-EG": "ar",
+            "hi-IN": "hi",
+        ]
+        if let iso = fromGeminiTag[trimmed] { return iso }
+        if let prefix = trimmed.split(separator: "-").first.map(String.init),
+           supported.contains(prefix) {
+            return prefix
+        }
+        return "en"
+    }
+
     /// Keychain-backed storage for user-supplied cloud API keys. Not
     /// persisted to UserDefaults — only the boolean toggle and model choice
     /// are; per-provider key presence is queried live via `hasAPIKey(for:)`.
@@ -438,6 +496,11 @@ final class SettingsStore: ObservableObject {
     /// ISO 639-1 language code for ASR backends (default `"en"`).
     @Published var selectedLanguage: String {
         didSet {
+            let iso = Self.isoLanguageCode(from: selectedLanguage)
+            if iso != selectedLanguage {
+                selectedLanguage = iso
+                return
+            }
             UserDefaults.standard.set(selectedLanguage, forKey: Keys.selectedLanguage)
             applyLanguage()
         }
@@ -700,7 +763,11 @@ final class SettingsStore: ObservableObject {
         }
 
         if let lang = defaults.string(forKey: Keys.selectedLanguage), !lang.isEmpty {
-            selectedLanguage = lang
+            let iso = Self.isoLanguageCode(from: lang)
+            selectedLanguage = iso
+            if iso != lang {
+                defaults.set(iso, forKey: Keys.selectedLanguage)
+            }
         } else {
             selectedLanguage = "en"
         }
@@ -840,7 +907,7 @@ final class SettingsStore: ObservableObject {
     }
 
     private func applyLanguage() {
-        asrEngineSelector?.selectedLanguage = selectedLanguage
+        asrEngineSelector?.selectedLanguage = Self.isoLanguageCode(from: selectedLanguage)
     }
 
     private func applySpeakerGatingSettings() {

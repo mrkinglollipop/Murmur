@@ -67,12 +67,19 @@ final class StreamingSilenceBypassTests: XCTestCase {
                 bufferedSeconds: floor - 0.01
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             StreamingCoordinator.shouldTakeSilenceCancel(
                 everHadStreamText: false,
                 bufferedSeconds: floor
             ),
-            "exactly at the floor proceeds — the floor is a strict less-than"
+            "exactly at the floor is silence — inclusive <= (0.5 s CAF ghost fail 2026-08-31)"
+        )
+        XCTAssertFalse(
+            StreamingCoordinator.shouldTakeSilenceCancel(
+                everHadStreamText: false,
+                bufferedSeconds: floor + 0.01
+            ),
+            "just above the floor still proceeds to batch rescue"
         )
     }
 

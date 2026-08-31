@@ -46,12 +46,12 @@ struct CloudEngineAdvancedView: View {
     @ViewBuilder
     private var xaiAdvanced: some View {
         Stepper(value: $settingsStore.xaiEndpointingMs, in: XAIStreamingTranscriber.endpointingMsRange, step: 100) {
-            Text("Pause before new utterance: \(settingsStore.xaiEndpointingMs) ms")
+            Text("Silence before split: \(settingsStore.xaiEndpointingMs) ms")
                 .font(Theme.body(12))
                 .foregroundColor(Theme.textPrimary)
         }
 
-        Text("How long a pause can last before Grok starts a new utterance. Highest (5000, the previous default) avoids splitting a long hold.")
+        Text("While you hold fn, how long a quiet stretch can last before Grok treats the next speech as a new utterance. Raise it if long pauses mid-sentence get cut.")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
     }
@@ -63,13 +63,13 @@ struct CloudEngineAdvancedView: View {
             .font(Theme.body(12))
             .foregroundColor(Theme.textPrimary)
 
-        Text("Server-side: reduces other talkers and ambient false activations. Separate from Focus on my voice (local speaker gating).")
+        Text("Scribe ignores other speakers and room noise on the server. Separate from Focus on my voice (local speaker match).")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
 
         Divider().overlay(Theme.hairline)
 
-        Text("Commit")
+        Text("When to finalize")
             .font(Theme.body(11, weight: .medium))
             .foregroundColor(Theme.textSecondary)
 
@@ -81,7 +81,7 @@ struct CloudEngineAdvancedView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
 
-        Text("On key release keeps fn-hold as the boundary (previous default). Voice activity auto-commits when Scribe hears silence — can split a long hold.")
+        Text("On key release: transcript locks when you let go of fn. Voice activity: Scribe locks when it hears silence — can split a long hold.")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
 
@@ -89,46 +89,62 @@ struct CloudEngineAdvancedView: View {
             Divider().overlay(Theme.hairline)
 
             sliderRow(
-                title: "Speech threshold",
+                title: "Speech loudness gate",
                 value: $settingsStore.elevenLabsVadThreshold,
                 range: ElevenLabsRealtimeOptions.vadThresholdRange,
                 step: 0.05,
                 format: { String(format: "%.2f", $0) }
             )
 
+            Text("Higher = only louder speech counts as talking.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
+
             sliderRow(
-                title: "Silence to commit",
+                title: "Quiet time to finalize",
                 value: $settingsStore.elevenLabsVadSilenceThresholdSecs,
                 range: ElevenLabsRealtimeOptions.vadSilenceRange,
                 step: 0.1,
                 format: { String(format: "%.1fs", $0) }
             )
 
+            Text("How long Scribe must hear silence before it commits the utterance.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
+
             Stepper(
                 value: $settingsStore.elevenLabsMinSpeechDurationMs,
                 in: ElevenLabsRealtimeOptions.minSpeechMsRange,
                 step: 10
             ) {
-                Text("Minimum speech: \(settingsStore.elevenLabsMinSpeechDurationMs) ms")
+                Text("Ignore blips shorter than: \(settingsStore.elevenLabsMinSpeechDurationMs) ms")
                     .font(Theme.body(12))
                     .foregroundColor(Theme.textPrimary)
             }
+
+            Text("Drops clicks and tiny noise bursts so they never start an utterance.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
 
             Stepper(
                 value: $settingsStore.elevenLabsMinSilenceDurationMs,
                 in: ElevenLabsRealtimeOptions.minSilenceMsRange,
                 step: 10
             ) {
-                Text("Minimum silence: \(settingsStore.elevenLabsMinSilenceDurationMs) ms")
+                Text("Ignore gaps shorter than: \(settingsStore.elevenLabsMinSilenceDurationMs) ms")
                     .font(Theme.body(12))
                     .foregroundColor(Theme.textPrimary)
             }
+
+            Text("Brief pauses inside a sentence stay in the same utterance.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
         }
     }
 
     @ViewBuilder
     private var geminiAdvanced: some View {
-        Text("Voice activity")
+        Text("Who decides you're done talking")
             .font(Theme.body(11, weight: .medium))
             .foregroundColor(Theme.textSecondary)
 
@@ -140,12 +156,16 @@ struct CloudEngineAdvancedView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
 
-        Text("On key release keeps fn-hold as the utterance boundary (default). Voice activity and Hybrid use server VAD; Hybrid also sends stream-end on release.")
+        Text("On key release: you control start/stop with fn (default). Voice activity: Gemini ends the utterance on silence. Hybrid: both — silence can end it, and releasing fn always flushes.")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
 
         if settingsStore.geminiVadMode == .automatic || settingsStore.geminiVadMode == .hybrid {
             Divider().overlay(Theme.hairline)
+
+            Text("Detect speech start")
+                .font(Theme.body(11, weight: .medium))
+                .foregroundColor(Theme.textSecondary)
 
             Picker("Start sensitivity", selection: $settingsStore.geminiStartSensitivity) {
                 ForEach(GeminiStartSensitivity.allCases) { value in
@@ -155,6 +175,14 @@ struct CloudEngineAdvancedView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
+            Text("High picks up quieter starts sooner; Low waits for clearer speech.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
+
+            Text("Detect speech end")
+                .font(Theme.body(11, weight: .medium))
+                .foregroundColor(Theme.textSecondary)
+
             Picker("End sensitivity", selection: $settingsStore.geminiEndSensitivity) {
                 ForEach(GeminiEndSensitivity.allCases) { value in
                     Text(value.displayName).tag(value)
@@ -163,25 +191,37 @@ struct CloudEngineAdvancedView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
+            Text("High ends the utterance after a shorter pause; Low waits longer before cutting.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
+
             Stepper(
                 value: $settingsStore.geminiPrefixPaddingMs,
                 in: GeminiLiveOptions.prefixPaddingRange,
                 step: 10
             ) {
-                Text("Prefix padding: \(settingsStore.geminiPrefixPaddingMs) ms")
+                Text("Audio kept before speech: \(settingsStore.geminiPrefixPaddingMs) ms")
                     .font(Theme.body(12))
                     .foregroundColor(Theme.textPrimary)
             }
+
+            Text("Include a little sound before Gemini decides talking started — protects the first syllable.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
 
             Stepper(
                 value: $settingsStore.geminiSilenceDurationMs,
                 in: GeminiLiveOptions.silenceDurationRange,
                 step: 10
             ) {
-                Text("Silence duration: \(settingsStore.geminiSilenceDurationMs) ms")
+                Text("Silence before end: \(settingsStore.geminiSilenceDurationMs) ms")
                     .font(Theme.body(12))
                     .foregroundColor(Theme.textPrimary)
             }
+
+            Text("Quiet stretch Gemini needs before it treats the utterance as finished.")
+                .font(Theme.body(10))
+                .foregroundColor(Theme.textSecondary)
         }
     }
 
