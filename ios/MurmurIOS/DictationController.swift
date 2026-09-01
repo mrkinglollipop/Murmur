@@ -1021,15 +1021,6 @@ final class DictationController: ObservableObject {
 
     /// Matches Mac `StreamingCoordinator.streamResultLooksTruncated` so iOS
     /// live WS also batch-falls-back on ghost-drop / truncated finals.
-    private static let streamMinCharsPerSecond: Double = 2.0
-    private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
-
-    private static func streamResultLooksTruncated(text: String, duration: TimeInterval) -> Bool {
-        guard duration >= streamTruncationCheckMinDuration else { return false }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        return Double(trimmed.count) < duration * streamMinCharsPerSecond
-    }
 
     private func finalizeLiveTranscription(recordingDuration: TimeInterval) async -> String? {
         recorder.onPCMBuffer = nil
@@ -1053,13 +1044,17 @@ final class DictationController: ObservableObject {
             return nil
         }
 
-        let truncated = Self.streamResultLooksTruncated(text: text, duration: recordingDuration)
-        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !truncated {
-            return text
-        }
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let recovered = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !recovered.isEmpty { return snapshot }
+        let truncated = StreamingCoordinator.streamResultLooksTruncated(
+            text: text,
+            duration: recordingDuration
+        )
+        if let success = StreamingCoordinator.streamSuccessTextOrBatchFallback(
+            finalizeText: text,
+            preFinalizeSnapshot: snapshot,
+            duration: recordingDuration,
+            truncated: truncated
+        ) {
+            return success
         }
         return nil
     }

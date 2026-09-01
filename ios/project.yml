@@ -43,6 +43,7 @@ targets:
       - path: ../Sources/Voice/ElevenLabsRealtimeTranscriber.swift
       - path: ../Sources/Voice/GeminiLiveOptions.swift
       - path: ../Sources/Voice/GeminiLiveTranscriber.swift
+      - path: ../Sources/Voice/StreamingCoordinator.swift
     info:
       path: MurmurIOS/Info.plist
       properties:

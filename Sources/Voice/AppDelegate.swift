@@ -204,6 +204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return [] }
             return GeminiLiveTranscriber.selectVocabulary(from: self.dictionaryStore.entries)
         }
+        activationController?.audioRecorder.asrSelector.museKeywordsProvider = { [weak self] in
+            guard let self = self else { return [] }
+            return MuseLiveTranscriber.selectKeywords(from: self.dictionaryStore.entries)
+        }
         activationController?.audioRecorder.asrSelector.capitalizedDictionaryTermsProvider = { [weak self] in
             guard let self = self else { return [] }
             return Set(

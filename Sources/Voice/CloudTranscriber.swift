@@ -12,6 +12,7 @@ extension CloudModel {
         case .xaiGrokSTT:                 return .xai
         case .elevenLabsScribeV2Realtime: return .elevenLabs
         case .gemini35TranscribeLive:     return .gemini
+        case .museVoiceTranscribeLive:    return .meta
         }
     }
 }
@@ -368,6 +369,54 @@ final class GeminiTranscriptionService: CloudTranscriptionService {
     }
 }
 
+// MARK: - Meta (Muse Voice Transcribe) — batch fallback
+
+final class MuseTranscriptionService: CloudTranscriptionService {
+    func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String {
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let payload = try cloudUploadAudio(from: audioURL, provider: .meta)
+        let requestJSON = try JSONSerialization.data(withJSONObject: [
+            "model": "muse-voice-transcribe-1.0",
+            "mode": "PUSH_TO_TALK",
+            "language": language
+        ])
+
+        var body = Data()
+        func append(_ string: String) {
+            body.append(string.data(using: .utf8)!)
+        }
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"request\"\r\n")
+        append("Content-Type: application/json\r\n\r\n")
+        body.append(requestJSON)
+        append("\r\n")
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"audio\"; filename=\"\(payload.fileName)\"\r\n")
+        append("Content-Type: \(payload.mimeType)\r\n\r\n")
+        body.append(payload.data)
+        append("\r\n--\(boundary)--\r\n")
+
+        var request = URLRequest(url: URL(string: "https://api.meta.ai/v1/asr/transcribe")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        let (data, response) = try await HTTPClient.session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw CloudTranscriptionError.httpStatus(status, provider: .meta, body: String(data: data, encoding: .utf8))
+        }
+        guard let text = MuseBatchDecode.decodeTranscript(from: data),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CloudTranscriptionError(provider: .meta, message: "No transcript in response")
+        }
+        return text
+    }
+}
+
 // MARK: - Factory
 
 enum CloudTranscriberFactory {
@@ -380,6 +429,7 @@ enum CloudTranscriberFactory {
         case .xai:        return XAITranscriptionService()
         case .elevenLabs: return ElevenLabsTranscriptionService()
         case .gemini:     return GeminiTranscriptionService()
+        case .meta:       return MuseTranscriptionService()
         }
     }
 }
