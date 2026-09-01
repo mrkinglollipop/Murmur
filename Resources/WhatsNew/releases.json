@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.48",
+    "build": "49",
+    "title": "What's New in 0.1.48",
+    "items": [
+      "Long dictations keep their ending: cloud streaming now recovers words the live transcript dropped at release, with extra mic grace on holds over 15 seconds.",
+      "Meta Muse Voice Transcribe is a new cloud engine in Settings — add a Meta API key for live streaming or batch fallback.",
+      "Opening sentences are captured reliably again: the mic starts when you press the key while the stream connects in the background."
+    ]
+  },
+  {
     "version": "0.1.47",
     "build": "48",
     "title": "What's New in 0.1.47",
