@@ -14,6 +14,7 @@ enum CloudProvider: String, CaseIterable, Identifiable {
     case xai        = "xai"
     case elevenLabs = "elevenLabs"
     case gemini     = "gemini"
+    case meta       = "meta"
 
     var id: String { rawValue }
 
@@ -26,6 +27,7 @@ enum CloudProvider: String, CaseIterable, Identifiable {
         case .xai:        return "xAI (Grok)"
         case .elevenLabs: return "ElevenLabs"
         case .gemini:     return "Google Gemini"
+        case .meta:       return "Meta"
         }
     }
 
@@ -42,6 +44,7 @@ enum CloudProvider: String, CaseIterable, Identifiable {
         case .xai:        return URL(string: "https://console.x.ai")!
         case .elevenLabs: return URL(string: "https://elevenlabs.io/app/settings/api-keys")!
         case .gemini:     return URL(string: "https://aistudio.google.com/apikey")!
+        case .meta:       return URL(string: "https://dev.meta.ai/docs/quickstart")!
         }
     }
 }

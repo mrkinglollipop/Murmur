@@ -1,12 +1,20 @@
 import AVFoundation
+#if os(macOS)
 import os.log
+#endif
 
 /// Owns xAI / WhisperKit streaming session state and the start/stop decision
 /// logic extracted from `AudioRecorder`. File-based capture stays in the
 /// recorder; this type decides whether to open a streaming session and
 /// handles finalize-at-release for both streaming backends.
+///
+/// iOS compiles this file for the static finalize-recovery helpers only.
+/// Session types (`StreamingTranscriber`, `XAIStreamingTranscriber`,
+/// `ASREngineSelector`) are Mac-target sources and must not be referenced
+/// on iOS.
 final class StreamingCoordinator {
 
+#if os(macOS)
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "streaming")
 
     /// Non-nil while a WhisperKit streaming session owns transcription.
@@ -26,16 +34,27 @@ final class StreamingCoordinator {
     /// active. Mutually exclusive with the other cloud streaming sessions.
     private(set) var geminiSession: GeminiLiveTranscriber?
 
+    /// Non-nil while a Meta Muse Voice Transcribe streaming session is active.
+    private(set) var museSession: MuseLiveTranscriber?
+
     /// Coordinator-wide latch: any non-empty `onInterim` during the current
     /// hold. Survives async start-failure clearing the session reference so
     /// file-based fallthrough can still know stream text existed.
     private(set) var coordinatorEverHadStreamText = false
+#endif
 
     /// Soft floor for "looks truncated" — only force batch fallback when text
     /// is extremely short relative to hold length (false positives at 8 cps
     /// discarded good streams). Empty text already falls back separately.
-    private static let streamMinCharsPerSecond: Double = 2.0
-    private static let streamTruncationCheckMinDuration: TimeInterval = 8.0
+    static let streamMinCharsPerSecond: Double = 2.0
+    static let streamTruncationCheckMinDuration: TimeInterval = 8.0
+
+    /// Long holds where a large snapshot-vs-finalize gap without prefix
+    /// extension means the live stream diverged — batch re-decode is safer.
+    static let lengthMismatchBatchMinDuration: TimeInterval = 15.0
+    static let lengthMismatchMinCharGap: Int = 40
+    /// Minimum extension beyond finalize before treating snapshot as real tail.
+    static let snapshotTailRecoveryMinChars: Int = 3
 
     /// Below this much captured audio (inclusive), a hold with no stream text
     /// is discarded as silence instead of entering the batch→local fallback
@@ -73,27 +92,270 @@ final class StreamingCoordinator {
         }
     }
 
+    /// True when the HUD snapshot at release strictly extends finalize with
+    /// meaningful tail text — finalize dropped words the stream had in-flight.
+    static func snapshotExtendsFinalize(finalize: String, snapshot: String) -> Bool {
+        let finalTrim = finalize.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapTrim = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard snapTrim.count > finalTrim.count, !finalTrim.isEmpty else { return false }
+
+        if snapTrim.hasPrefix(finalTrim) {
+            return snapshotTailIsMeaningful(finalTrim: finalTrim, snapTrim: snapTrim)
+        }
+
+        let finalLower = finalTrim.lowercased()
+        let snapLower = snapTrim.lowercased()
+        if snapLower.hasPrefix(finalLower) {
+            return snapshotTailIsMeaningful(finalTrim: finalTrim, snapTrim: snapTrim)
+        }
+
+        // Finalize often reapplies punctuation the HUD snapshot never had.
+        return snapshotWordPrefixExtends(finalTrim: finalTrim, snapTrim: snapTrim)
+    }
+
+    /// True when snapshot words contain finalize words as a contiguous
+    /// subsequence with meaningful leading content — head-loss where finalize
+    /// is a tail fragment. Punctuation-stripped like Class B prefix checks.
+    static func snapshotSupersetContainsFinalize(finalize: String, snapshot: String) -> Bool {
+        let finalTrim = finalize.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapTrim = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard snapTrim.count > finalTrim.count + snapshotTailRecoveryMinChars else { return false }
+        guard !finalTrim.isEmpty else { return false }
+
+        let finalWords = tokenizeForPrefix(finalTrim)
+        let snapWords = tokenizeForPrefix(snapTrim)
+        guard !finalWords.isEmpty else { return false }
+        guard let index = findWordSubsequenceIndex(needle: finalWords, in: snapWords) else {
+            return false
+        }
+        // Prefix extension is Class B, not superset.
+        if index == 0, snapWords.count > finalWords.count { return false }
+        guard index > 0 else { return false }
+
+        let head = snapWords.prefix(index).joined(separator: " ")
+        guard head.count >= snapshotTailRecoveryMinChars else { return false }
+        return head.contains(where: { $0.isLetter || $0.isNumber })
+    }
+
+    /// Prefer finalize punctuation/cleanup and append only missing snapshot
+    /// tail, or prepend missing snapshot head — avoids re-injecting HUD filler.
+    static func recoveredTextMergingSnapshot(finalize: String, snapshot: String) -> String? {
+        let finalTrim = finalize.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapTrim = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !finalTrim.isEmpty, !snapTrim.isEmpty else { return nil }
+
+        if snapshotExtendsFinalize(finalize: finalize, snapshot: snapshot) {
+            if snapTrim.hasPrefix(finalTrim) {
+                let tail = String(snapTrim.dropFirst(finalTrim.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !tail.isEmpty else { return finalTrim }
+                return appendTail(to: finalTrim, tail: tail)
+            }
+            let finalLower = finalTrim.lowercased()
+            let snapLower = snapTrim.lowercased()
+            if snapLower.hasPrefix(finalLower) {
+                let tail = String(snapTrim.dropFirst(finalTrim.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !tail.isEmpty else { return finalTrim }
+                return appendTail(to: finalTrim, tail: tail)
+            }
+            let finalWords = tokenizeForPrefix(finalTrim)
+            let snapWords = tokenizeForPrefix(snapTrim)
+            guard snapWords.count > finalWords.count,
+                  Array(snapWords.prefix(finalWords.count)) == finalWords else {
+                return nil
+            }
+            let tailWords = Array(snapWords.dropFirst(finalWords.count))
+            guard !tailWords.isEmpty else { return nil }
+            if let last = finalTrim.last, ".!?".contains(last), tailWords.count < 3 {
+                return nil
+            }
+            guard let tail = snapshotSubstringFromWordIndex(
+                snapTrim,
+                wordIndex: finalWords.count
+            ) else {
+                return nil
+            }
+            guard tail.count >= snapshotTailRecoveryMinChars else { return nil }
+            return appendTail(to: finalTrim, tail: tail)
+        }
+
+        if snapshotSupersetContainsFinalize(finalize: finalize, snapshot: snapshot) {
+            let finalWords = tokenizeForPrefix(finalTrim)
+            let snapWords = tokenizeForPrefix(snapTrim)
+            guard let index = findWordSubsequenceIndex(needle: finalWords, in: snapWords),
+                  index > 0,
+                  let head = snapshotSubstringBeforeWordIndex(snapTrim, wordIndex: index),
+                  !head.isEmpty else {
+                return nil
+            }
+            let headEndsSentence = head.last.map { ".!?".contains($0) } ?? false
+            let sep = headEndsSentence ? " " : ". "
+            return head + sep + finalTrim
+        }
+
+        return nil
+    }
+
+    /// Long hold with a large snapshot lead that is not a simple extension —
+    /// live stream and finalize diverged; prefer batch over either string.
+    static func shouldBatchFallbackForLengthMismatch(
+        finalize: String,
+        snapshot: String,
+        duration: TimeInterval
+    ) -> Bool {
+        guard duration >= lengthMismatchBatchMinDuration else { return false }
+        let finalTrim = finalize.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapTrim = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard snapTrim.count > finalTrim.count + lengthMismatchMinCharGap else { return false }
+        return !snapshotExtendsFinalize(finalize: finalTrim, snapshot: snapTrim)
+    }
+
     /// After streaming finalize: prefer non-empty finalize text unless truncated.
     /// If finalize is empty, recover a non-empty pre-finalize snapshot (Class A
     /// residual — silence was bypassed for stream text, then finalize cleared /
-    /// returned empty). Returns success-path text, or `nil` for batch fallback.
+    /// returned empty). When finalize is non-empty but shorter than the release-
+    /// time snapshot that extends it (Class B tail loss), prefer the snapshot.
+    /// Returns success-path text, or `nil` for batch fallback.
     static func streamSuccessTextOrBatchFallback(
         finalizeText: String,
         preFinalizeSnapshot: String,
+        duration: TimeInterval = 0,
         truncated: Bool
     ) -> String? {
-        if !finalizeText.isEmpty, !truncated {
-            return finalizeText
-        }
-        if finalizeText.isEmpty {
-            let recovered = preFinalizeSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !recovered.isEmpty {
+        let finalTrim = finalizeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapTrim = preFinalizeSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if truncated {
+            if snapTrim.count > finalTrim.count,
+               snapshotExtendsFinalize(finalize: finalizeText, snapshot: preFinalizeSnapshot),
+               !streamResultLooksTruncated(text: preFinalizeSnapshot, duration: duration),
+               let merged = recoveredTextMergingSnapshot(
+                   finalize: finalizeText,
+                   snapshot: preFinalizeSnapshot
+               ) {
+                return merged
+            }
+            if finalTrim.isEmpty, !snapTrim.isEmpty {
                 return preFinalizeSnapshot
+            }
+            return nil
+        }
+
+        if finalTrim.isEmpty {
+            return snapTrim.isEmpty ? nil : preFinalizeSnapshot
+        }
+
+        if snapTrim.count > finalTrim.count + snapshotTailRecoveryMinChars,
+           snapshotExtendsFinalize(finalize: finalizeText, snapshot: preFinalizeSnapshot)
+            || snapshotSupersetContainsFinalize(finalize: finalizeText, snapshot: preFinalizeSnapshot),
+           let merged = recoveredTextMergingSnapshot(
+               finalize: finalizeText,
+               snapshot: preFinalizeSnapshot
+           ) {
+            return merged
+        }
+
+        if shouldBatchFallbackForLengthMismatch(
+            finalize: finalTrim,
+            snapshot: snapTrim,
+            duration: duration
+        ) {
+            return nil
+        }
+
+        return finalizeText
+    }
+
+    private static func snapshotTailIsMeaningful(finalTrim: String, snapTrim: String) -> Bool {
+        let tailStart = snapTrim.index(
+            snapTrim.startIndex,
+            offsetBy: min(finalTrim.count, snapTrim.count),
+            limitedBy: snapTrim.endIndex
+        ) ?? snapTrim.endIndex
+        let tail = String(snapTrim[tailStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard tail.count >= snapshotTailRecoveryMinChars else { return false }
+        return tail.contains(where: { $0.isLetter || $0.isNumber })
+    }
+
+    /// True when snapshot words (punctuation-stripped) strictly extend finalize
+    /// words with a meaningful tail — covers finalize inserting a trailing
+    /// period the live HUD never showed.
+    private static func snapshotWordPrefixExtends(finalTrim: String, snapTrim: String) -> Bool {
+        let finalWords = tokenizeForPrefix(finalTrim)
+        let snapWords = tokenizeForPrefix(snapTrim)
+        guard !finalWords.isEmpty, snapWords.count > finalWords.count else { return false }
+        guard Array(snapWords.prefix(finalWords.count)) == finalWords else { return false }
+        let tailWords = Array(snapWords.dropFirst(finalWords.count))
+        if let last = finalTrim.last, ".!?".contains(last), tailWords.count < 3 {
+            return false
+        }
+        let tail = tailWords.joined(separator: " ")
+        guard tail.count >= snapshotTailRecoveryMinChars else { return false }
+        return tail.contains(where: { $0.isLetter || $0.isNumber })
+    }
+
+    private static func tokenizeForPrefix(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0.isWhitespace }).compactMap { token -> String? in
+            let folded = token.trimmingCharacters(in: .punctuationCharacters).lowercased()
+            return folded.isEmpty ? nil : folded
+        }
+    }
+
+    private static func findWordSubsequenceIndex(needle: [String], in haystack: [String]) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        let limit = haystack.count - needle.count
+        for start in 0...limit {
+            if Array(haystack[start..<(start + needle.count)]) == needle {
+                return start
             }
         }
         return nil
     }
 
+    private static func appendTail(to finalize: String, tail: String) -> String {
+        let tailTrim = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tailTrim.isEmpty else { return finalize }
+        var tailOut = tailTrim
+        if let last = finalize.last, ".!?".contains(last), let first = tailOut.first {
+            tailOut = first.uppercased() + tailOut.dropFirst()
+        }
+        return finalize + " " + tailOut
+    }
+
+    private static func wordRanges(in text: String) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var index = text.startIndex
+        while index < text.endIndex {
+            while index < text.endIndex, text[index].isWhitespace {
+                index = text.index(after: index)
+            }
+            if index >= text.endIndex { break }
+            let start = index
+            while index < text.endIndex, !text[index].isWhitespace {
+                index = text.index(after: index)
+            }
+            ranges.append(start..<index)
+        }
+        return ranges
+    }
+
+    private static func snapshotSubstringFromWordIndex(_ snapshot: String, wordIndex: Int) -> String? {
+        let ranges = wordRanges(in: snapshot)
+        guard wordIndex < ranges.count else { return nil }
+        let start = ranges[wordIndex].lowerBound
+        return String(snapshot[start...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func snapshotSubstringBeforeWordIndex(_ snapshot: String, wordIndex: Int) -> String? {
+        let ranges = wordRanges(in: snapshot)
+        guard wordIndex > 0, wordIndex <= ranges.count else { return nil }
+        let end = ranges[wordIndex].lowerBound
+        return String(snapshot[snapshot.startIndex..<end])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+#if os(macOS)
     /// Clears per-hold stream-text latch. Call at the start of each new capture.
     func resetStreamTextLatch() {
         coordinatorEverHadStreamText = false
@@ -140,9 +402,8 @@ final class StreamingCoordinator {
     }
 
     /// Attempts ElevenLabs Scribe v2 Realtime streaming. Returns `true` when
-    /// a session was opened (caller should start mic capture). On start
-    /// failure the session is cleared and `false` is returned so the caller
-    /// falls through to file mode. Mirrors `tryStartXAI`.
+    /// a session was opened. On start failure the session is cleared and
+    /// file-buffer capture continues (mic already running).
     func tryStartElevenLabs(
         asrSelector: ASREngineSelector,
         startMicCapture: @escaping () -> Void
@@ -173,8 +434,7 @@ final class StreamingCoordinator {
     }
 
     /// Attempts Gemini 3.5 Transcribe Live streaming. Returns `true` when
-    /// a session was opened (caller should start mic capture). Mirrors
-    /// `tryStartElevenLabs`.
+    /// a session was opened. Mirrors `tryStartElevenLabs`.
     func tryStartGemini(
         asrSelector: ASREngineSelector,
         startMicCapture: @escaping () -> Void
@@ -196,6 +456,37 @@ final class StreamingCoordinator {
                 DispatchQueue.main.async {
                     if self.geminiSession === session {
                         self.geminiSession = nil
+                    }
+                }
+            }
+        }
+        startMicCapture()
+        return true
+    }
+
+    /// Attempts Meta Muse Voice Transcribe streaming. Returns `true` when
+    /// a session was opened. Mirrors `tryStartGemini`.
+    func tryStartMuse(
+        asrSelector: ASREngineSelector,
+        startMicCapture: @escaping () -> Void
+    ) -> Bool {
+        guard let session = asrSelector.makeMuseStreamingSession() else { return false }
+
+        session.onInterim = { [weak self] text in
+            self?.noteInterimText(text)
+            asrSelector.onInterimTranscript?(text)
+        }
+        museSession = session
+        vlog("doStart — attempting Meta Muse streaming transcription")
+        Task {
+            do {
+                try await session.start()
+            } catch {
+                vlog("muse streaming: start failed (\(error.localizedDescription)) — continuing in file-buffer mode")
+                session.cancel()
+                DispatchQueue.main.async {
+                    if self.museSession === session {
+                        self.museSession = nil
                     }
                 }
             }
@@ -252,6 +543,11 @@ final class StreamingCoordinator {
         geminiSession?.send(buffer)
     }
 
+    /// Sends a captured buffer to the active Meta Muse session, if any.
+    func sendToMuse(_ buffer: AVAudioPCMBuffer) {
+        museSession?.send(buffer)
+    }
+
     /// Aborts any in-flight streaming session and drops the reference without
     /// waiting for a final transcript — used when the capture is abandoned
     /// (secure input activated mid-hold) and the audio must not be used.
@@ -262,6 +558,8 @@ final class StreamingCoordinator {
         elevenLabsSession = nil
         geminiSession?.cancel()
         geminiSession = nil
+        museSession?.cancel()
+        museSession = nil
     }
 
     // MARK: - Stop (xAI)
@@ -313,9 +611,10 @@ final class StreamingCoordinator {
             if let success = Self.streamSuccessTextOrBatchFallback(
                 finalizeText: text,
                 preFinalizeSnapshot: preFinalizeSnapshot,
+                duration: context.duration,
                 truncated: truncated
             ) {
-                if text.isEmpty {
+                if text.isEmpty || success.count > text.count {
                     vlog("xai streaming: recovered pre-finalize snapshot (\(success.count) chars)")
                 }
                 onStreamSuccess(success)
@@ -382,9 +681,10 @@ final class StreamingCoordinator {
             if let success = Self.streamSuccessTextOrBatchFallback(
                 finalizeText: text,
                 preFinalizeSnapshot: preFinalizeSnapshot,
+                duration: context.duration,
                 truncated: truncated
             ) {
-                if text.isEmpty {
+                if text.isEmpty || success.count > text.count {
                     vlog("elevenlabs streaming: recovered pre-finalize snapshot (\(success.count) chars)")
                 }
                 onStreamSuccess(success)
@@ -451,9 +751,10 @@ final class StreamingCoordinator {
             if let success = Self.streamSuccessTextOrBatchFallback(
                 finalizeText: text,
                 preFinalizeSnapshot: preFinalizeSnapshot,
+                duration: context.duration,
                 truncated: truncated
             ) {
-                if text.isEmpty {
+                if text.isEmpty || success.count > text.count {
                     vlog("gemini streaming: recovered pre-finalize snapshot (\(success.count) chars)")
                 }
                 onStreamSuccess(success)
@@ -464,6 +765,76 @@ final class StreamingCoordinator {
                     self.logger.warning("Gemini streaming looks truncated — falling back to buffered audio.")
                 }
                 vlog("gemini streaming: fallback to buffered audio (\(context.bufferedAudio.count) buffers)")
+                DispatchQueue.main.async {
+                    onBatchFallback(context.bufferedAudio, context.duration)
+                }
+            }
+        }
+        return true
+    }
+
+    // MARK: - Stop (Muse)
+
+    struct MuseStopContext {
+        let duration: TimeInterval
+        let hadSpeech: Bool
+        let bufferedAudio: [AVAudioPCMBuffer]
+        let streamTextEver: Bool
+    }
+
+    /// Handles Meta Muse streaming stop. Returns `true` when this path
+    /// consumed the stop. Mirrors `handleStopGemini`.
+    func handleStopMuse(
+        context: MuseStopContext,
+        onSilence: @escaping () -> Void,
+        onStreamSuccess: @escaping (String) -> Void,
+        onBatchFallback: @escaping ([AVAudioPCMBuffer], TimeInterval) -> Void
+    ) -> Bool {
+        guard let session = museSession else { return false }
+
+        let everHad = context.streamTextEver
+            || session.hasEverHadNonEmptyStreamText
+            || coordinatorEverHadStreamText
+        let bufferedSecs = Self.bufferedSeconds(context.bufferedAudio)
+        let preFinalizeSnapshot = session.joinedTranscriptSnapshot()
+        museSession = nil
+
+        if Self.shouldTakeSilenceCancel(everHadStreamText: everHad, bufferedSeconds: bufferedSecs) {
+            vlog("muse streaming: no speech — skipping (silence guard) everHad=\(everHad) buffers=\(context.bufferedAudio.count) bufferedSecs=\(String(format: "%.2f", bufferedSecs)) hadSpeech=\(context.hadSpeech)")
+            session.cancel()
+            onSilence()
+            return true
+        }
+
+        if !context.hadSpeech {
+            vlog("muse streaming: silence bypass — everHad=\(everHad) buffers=\(context.bufferedAudio.count)")
+        }
+
+        let releaseAt = Date()
+        Task {
+            let text = await session.finalize(recordingDuration: context.duration)
+            vlog("muse streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
+            let truncated = Self.streamResultLooksTruncated(text: text, duration: context.duration)
+            if truncated {
+                vlog("muse streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
+            }
+            if let success = Self.streamSuccessTextOrBatchFallback(
+                finalizeText: text,
+                preFinalizeSnapshot: preFinalizeSnapshot,
+                duration: context.duration,
+                truncated: truncated
+            ) {
+                if text.isEmpty || success.count > text.count {
+                    vlog("muse streaming: recovered pre-finalize snapshot (\(success.count) chars)")
+                }
+                onStreamSuccess(success)
+            } else {
+                if text.isEmpty {
+                    self.logger.warning("Meta Muse streaming produced no text — falling back to buffered audio.")
+                } else {
+                    self.logger.warning("Meta Muse streaming looks truncated — falling back to buffered audio.")
+                }
+                vlog("muse streaming: fallback to buffered audio (\(context.bufferedAudio.count) buffers)")
                 DispatchQueue.main.async {
                     onBatchFallback(context.bufferedAudio, context.duration)
                 }
@@ -495,6 +866,7 @@ final class StreamingCoordinator {
         }
         return true
     }
+#endif
 
     static func streamResultLooksTruncated(text: String, duration: TimeInterval) -> Bool {
         guard duration >= streamTruncationCheckMinDuration else { return false }

@@ -106,6 +106,11 @@ final class ASREngineSelector {
     /// separate off toggle — Live is the primary path when selected.
     var geminiStreamingEnabled: Bool = true
 
+    /// Master enable for the Meta Muse Voice Transcribe streaming path
+    /// (see `makeMuseStreamingSession`). Like ElevenLabs/Gemini, Live is the
+    /// primary path when selected.
+    var museStreamingEnabled: Bool = true
+
     /// Sent as ElevenLabs' `no_verbatim` param (server-side filler-word /
     /// disfluency removal). Set by `SettingsStore` from the persisted
     /// `removeFillerWords` toggle; defaults `true` here to match that
@@ -128,6 +133,10 @@ final class ASREngineSelector {
     /// Resolves Gemini `custom_vocabulary` from the learned dictionary.
     /// Wired by `AppDelegate` to `GeminiLiveTranscriber.selectVocabulary(from:)`.
     var geminiVocabularyProvider: (() -> [String])?
+
+    /// Resolves Meta Muse `keywords` from the learned dictionary.
+    /// Wired by `AppDelegate` to `MuseLiveTranscriber.selectKeywords(from:)`.
+    var museKeywordsProvider: (() -> [String])?
 
     /// xAI Grok streaming `endpointing` (ms). Set by `SettingsStore`.
     var xaiEndpointingMs: Int = XAIStreamingTranscriber.defaultEndpointingMs
@@ -349,6 +358,21 @@ final class ASREngineSelector {
             smartMode: removeFillerWordsEnabled,
             vocabulary: geminiVocabularyProvider?() ?? [],
             liveOptions: geminiLiveOptions
+        )
+    }
+
+    /// Builds a Meta Muse Voice Transcribe streaming session if — and only if —
+    /// the selected cloud model is Muse AND a non-empty key is stored.
+    /// Returns `nil` otherwise so the caller uses file/batch fallback.
+    func makeMuseStreamingSession() -> MuseLiveTranscriber? {
+        guard museStreamingEnabled,
+              cloudModel == .museVoiceTranscribeLive,
+              let key = apiKeyProvider?(.meta),
+              !key.isEmpty else { return nil }
+        return MuseLiveTranscriber(
+            apiKey: key,
+            language: selectedLanguage,
+            keywords: museKeywordsProvider?() ?? []
         )
     }
 

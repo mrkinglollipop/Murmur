@@ -142,7 +142,213 @@ final class StreamingSilenceBypassTests: XCTestCase {
                 preFinalizeSnapshot: "longer snapshot text",
                 truncated: true
             ),
-            "truncated non-empty finalize still takes batch fallback"
+            "truncated non-empty finalize still takes batch fallback when snapshot does not extend"
+        )
+    }
+
+    func testTailLossRecoversSnapshotWhenFinalizeIsPrefix() {
+        let finalize = "I notice it happens with longer dictations."
+        let snapshot = finalize + " That's when I'm noticing it."
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: finalize,
+                preFinalizeSnapshot: snapshot,
+                duration: 22,
+                truncated: false
+            ),
+            "I notice it happens with longer dictations. That's when I'm noticing it."
+        )
+    }
+
+    func testTailLossRecoversSnapshotOnLongHoldEvenWhenFinalizeIsNonEmpty() {
+        let firstHalf = String(repeating: "word ", count: 80).trimmingCharacters(in: .whitespaces)
+        let secondHalf = "and this is the missing tail at the end."
+        let snapshot = firstHalf + " " + secondHalf
+        let finalize = firstHalf
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: finalize,
+                preFinalizeSnapshot: snapshot,
+                duration: 90,
+                truncated: false
+            ),
+            snapshot
+        )
+    }
+
+    func testTruncatedFinalizeStillRecoversWhenSnapshotExtends() {
+        let finalize = "short"
+        let snapshot = "short but the hud had the whole sentence here"
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: finalize,
+                preFinalizeSnapshot: snapshot,
+                duration: 20,
+                truncated: true
+            ),
+            "short but the hud had the whole sentence here"
+        )
+    }
+
+    func testLongHoldLengthMismatchWithoutExtensionFallsBackToBatch() {
+        XCTAssertNil(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "hello the world",
+                preFinalizeSnapshot: "completely different much longer snapshot text that diverged",
+                duration: 60,
+                truncated: false
+            ),
+            "long hold with diverged snapshot must batch re-decode from buffered audio"
+        )
+    }
+
+    func testShortHoldLengthMismatchDoesNotForceBatch() {
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "hello the world",
+                preFinalizeSnapshot: "completely different much longer snapshot text",
+                duration: 10,
+                truncated: false
+            ),
+            "hello the world",
+            "below duration floor, prefer finalize over batch"
+        )
+    }
+
+    func testSnapshotExtendsFinalizeCaseInsensitive() {
+        XCTAssertTrue(
+            StreamingCoordinator.snapshotExtendsFinalize(
+                finalize: "Hello There",
+                snapshot: "hello there friend"
+            )
+        )
+    }
+
+    func testSnapshotDoesNotExtendWhenUnrelated() {
+        XCTAssertFalse(
+            StreamingCoordinator.snapshotExtendsFinalize(
+                finalize: "final words",
+                snapshot: "stale"
+            )
+        )
+    }
+
+    func testSnapshotExtendsWhenFinalizeAddsTrailingPunctuation() {
+        XCTAssertTrue(
+            StreamingCoordinator.snapshotExtendsFinalize(
+                finalize: "I notice it happens with longer dictations.",
+                snapshot: "I notice it happens with longer dictations that's when I'm noticing it"
+            )
+        )
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "I notice it happens with longer dictations.",
+                preFinalizeSnapshot: "I notice it happens with longer dictations that's when I'm noticing it",
+                duration: 22,
+                truncated: false
+            ),
+            "I notice it happens with longer dictations. That's when I'm noticing it"
+        )
+    }
+
+    func testTruncatedExtendingSnapshotStillBelowCpsFallsBackToBatch() {
+        XCTAssertNil(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "short",
+                preFinalizeSnapshot: "short and extra",
+                duration: 20,
+                truncated: true
+            ),
+            "snapshot that still fails the cps floor must batch, not inject a short HUD"
+        )
+    }
+
+    func testPostReleaseCaptureGraceScalesForLongHolds() {
+        XCTAssertEqual(
+            AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 10),
+            0.250,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 60),
+            0.475,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 180),
+            1.0,
+            accuracy: 0.0001,
+            "long holds cap at one second of post-release capture"
+        )
+    }
+
+    func testSnapshotSupersetContainsFinalizeHeadLoss() {
+        let finalize = "Rest of the sentence."
+        let snapshot = "First sentence. Rest of the sentence."
+        XCTAssertTrue(
+            StreamingCoordinator.snapshotSupersetContainsFinalize(
+                finalize: finalize,
+                snapshot: snapshot
+            )
+        )
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: finalize,
+                preFinalizeSnapshot: snapshot,
+                duration: 22,
+                truncated: false
+            ),
+            "First sentence. Rest of the sentence."
+        )
+    }
+
+    func testSnapshotSupersetRecoversHeadLossDespiteFinalizePunctuation() {
+        let finalize = "then we went home."
+        let snapshot = "so first we ate then we went home"
+        XCTAssertTrue(
+            StreamingCoordinator.snapshotSupersetContainsFinalize(
+                finalize: finalize,
+                snapshot: snapshot
+            )
+        )
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: finalize,
+                preFinalizeSnapshot: snapshot,
+                duration: 22,
+                truncated: false
+            ),
+            "so first we ate. then we went home."
+        )
+    }
+
+    func testTailRecoveryKeepsFinalizeWithoutSnapshotFiller() {
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "we should go.",
+                preFinalizeSnapshot: "we should go you know",
+                duration: 12,
+                truncated: false
+            ),
+            "we should go."
+        )
+    }
+
+    func testSnapshotSupersetDoesNotRecoverUnrelatedText() {
+        XCTAssertFalse(
+            StreamingCoordinator.snapshotSupersetContainsFinalize(
+                finalize: "hello the world",
+                snapshot: "completely different much longer snapshot text"
+            )
+        )
+    }
+
+    func testSnapshotSupersetRejectsTriviallyShortFinalizeWithoutMeaningfulExtra() {
+        XCTAssertFalse(
+            StreamingCoordinator.snapshotSupersetContainsFinalize(
+                finalize: "ok",
+                snapshot: "ok then"
+            )
         )
     }
 }

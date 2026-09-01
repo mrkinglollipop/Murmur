@@ -198,6 +198,14 @@ struct SettingsView: View {
 
                             CloudEngineAdvancedView(settingsStore: settingsStore)
                         }
+
+                        if settingsStore.selectedCloudModel.provider == .meta {
+                            Divider().overlay(Theme.hairline)
+
+                            Text("Meta Model API — Muse Voice Transcribe streams live at release. Get an API key from Meta AI Studio.")
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.textSecondary)
+                        }
                     }
                 }
 
