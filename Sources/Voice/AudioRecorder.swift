@@ -773,12 +773,23 @@ final class AudioRecorder {
     /// immediately. The grace buffers still ride the RMS silence guard and
     /// (for streaming engines) must finish landing before
     /// `ElevenLabsRealtimeTranscriber.finalize()` sends its commit frame —
-    /// see `finishStop`.
-    private static let postReleaseCaptureGrace: TimeInterval = 0.250
+    /// see `finishStop`. Scales up on long holds (cap 1s).
+    private static let postReleaseCaptureGraceBase: TimeInterval = 0.250
+    private static let postReleaseCaptureGraceMax: TimeInterval = 1.0
+    private static let postReleaseCaptureGraceScaleStart: TimeInterval = 15.0
+    private static let postReleaseCaptureGraceScalePerSecond: TimeInterval = 0.005
 
-    /// Read-only seam so tests can assert on the constant without exposing
-    /// the underlying `private` storage.
-    internal static var postReleaseCaptureGraceForTesting: TimeInterval { postReleaseCaptureGrace }
+    /// Grace after fn-release before finalize; longer holds get more tail room.
+    static func postReleaseCaptureGrace(forHoldDuration duration: TimeInterval) -> TimeInterval {
+        guard duration > postReleaseCaptureGraceScaleStart else {
+            return postReleaseCaptureGraceBase
+        }
+        let extra = (duration - postReleaseCaptureGraceScaleStart) * postReleaseCaptureGraceScalePerSecond
+        return min(postReleaseCaptureGraceMax, postReleaseCaptureGraceBase + extra)
+    }
+
+    /// Read-only seam so tests can assert on the short-hold base constant.
+    internal static var postReleaseCaptureGraceForTesting: TimeInterval { postReleaseCaptureGraceBase }
 
     /// Bumped whenever a post-release capture grace is scheduled or flushed
     /// early, so a stale `asyncAfter` callback from a superseded grace never
@@ -1405,6 +1416,12 @@ final class AudioRecorder {
             return
         }
 
+        if streamingCoordinator.tryStartMuse(asrSelector: asrSelector, startMicCapture: { [weak self] in
+            self?.startMicCapture()
+        }) {
+            return
+        }
+
         if streamingCoordinator.tryStartWhisperKit(
             asrSelector: asrSelector,
             wantsRecording: { [weak self] in self?.wantsRecording ?? false },
@@ -1608,6 +1625,7 @@ final class AudioRecorder {
                 self.streamingCoordinator.sendToXAI(buffer)
                 self.streamingCoordinator.sendToElevenLabs(buffer)
                 self.streamingCoordinator.sendToGemini(buffer)
+                self.streamingCoordinator.sendToMuse(buffer)
             }
             isSetUp = true
         }
@@ -1966,22 +1984,24 @@ final class AudioRecorder {
         // gesture and must not drift to whatever app is frontmost 250ms
         // later.
         let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold())
+        let holdDuration = startTime.map { Date().timeIntervalSince($0) } ?? 0
 
-        scheduleStopGrace(sessionHold: sessionHold)
+        scheduleStopGrace(sessionHold: sessionHold, holdDuration: holdDuration)
     }
 
-    /// Schedules `finishStop` to run after `postReleaseCaptureGrace`,
+    /// Schedules `finishStop` to run after `postReleaseCaptureGrace(forHoldDuration:)`,
     /// leaving the mic tap/engine exactly as they are in the meantime so
     /// trailing buffers keep landing in `pcmBuffers` and keep streaming to
     /// the active cloud transcriber. A fast re-press ends this early via
     /// `flushPendingStopGrace()` instead of waiting out the delay.
-    private func scheduleStopGrace(sessionHold: SessionHold) {
+    private func scheduleStopGrace(sessionHold: SessionHold, holdDuration: TimeInterval) {
         stopGraceGeneration &+= 1
         let generation = stopGraceGeneration
+        let grace = Self.postReleaseCaptureGrace(forHoldDuration: holdDuration)
         stopGraceFinalize = { [weak self] in
             self?.finishStop(sessionHold: sessionHold)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.postReleaseCaptureGrace) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
             self?.runStopGraceIfCurrent(generation)
         }
     }
@@ -2022,8 +2042,8 @@ final class AudioRecorder {
     /// early by `flushPendingStopGrace`). Tearing the mic tap down here,
     /// rather than at release, is what gives the grace window its buffers:
     /// the tap installed in `startMicCapture` keeps firing — appending to
-    /// `pcmBuffers` and calling `sendToXAI`/`sendToElevenLabs`/`sendToGemini`
-    /// — for every buffer that arrives before this runs.
+    /// `pcmBuffers` and calling `sendToXAI`/`sendToElevenLabs`/`sendToGemini`/
+    /// `sendToMuse` — for every buffer that arrives before this runs.
     private func finishStop(sessionHold: SessionHold) {
         pcmBuffersLock.lock()
         let bufferedAudio = pcmBuffers
@@ -2033,7 +2053,8 @@ final class AudioRecorder {
 
         if streamingCoordinator.xaiSession != nil
             || streamingCoordinator.elevenLabsSession != nil
-            || streamingCoordinator.geminiSession != nil {
+            || streamingCoordinator.geminiSession != nil
+            || streamingCoordinator.museSession != nil {
             teardownMicEngine()
         }
 
@@ -2041,6 +2062,7 @@ final class AudioRecorder {
             || (streamingCoordinator.xaiSession?.hasEverHadNonEmptyStreamText ?? false)
             || (streamingCoordinator.elevenLabsSession?.hasEverHadNonEmptyStreamText ?? false)
             || (streamingCoordinator.geminiSession?.hasEverHadNonEmptyStreamText ?? false)
+            || (streamingCoordinator.museSession?.hasEverHadNonEmptyStreamText ?? false)
 
         let xaiContext = StreamingCoordinator.XAIStopContext(
             duration: elapsed,
@@ -2179,6 +2201,57 @@ final class AudioRecorder {
                     self.finishDiscardedHold(
                         reason: "empty-buffer-abort",
                         engineID: "cloud:gemini-streaming",
+                        sessionHeldToken: sessionHold.token
+                    )
+                    return
+                }
+                self.writeToFile(
+                    duration: duration,
+                    buffers: buffers,
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                )
+            }
+        ) {
+            return
+        }
+
+        let museContext = StreamingCoordinator.MuseStopContext(
+            duration: elapsed,
+            hadSpeech: recordingHadSpeech(),
+            bufferedAudio: bufferedAudio,
+            streamTextEver: streamTextEver
+        )
+        if streamingCoordinator.handleStopMuse(
+            context: museContext,
+            onSilence: { [weak self] in
+                self?.finishDiscardedHold(
+                    reason: "silence-guard",
+                    engineID: "cloud:meta-streaming",
+                    sessionHeldToken: sessionHold.token
+                )
+            },
+            onStreamSuccess: { [weak self] text in
+                self?.asrSelector.logStreamedTranscription(
+                    text: text,
+                    engineID: "cloud:meta-streaming",
+                    sessionHeldToken: sessionHold.token,
+                    sessionHeldSnapshot: sessionHold.snapshot,
+                    sessionHeldFrontmostPID: sessionHold.pid
+                ) { [weak self] result in
+                    self?.finishHUDAfterPipeline(
+                        result: result,
+                        sessionHeldToken: sessionHold.token
+                    )
+                }
+            },
+            onBatchFallback: { [weak self] buffers, duration in
+                guard let self = self else { return }
+                guard !buffers.isEmpty else {
+                    self.finishDiscardedHold(
+                        reason: "empty-buffer-abort",
+                        engineID: "cloud:meta-streaming",
                         sessionHeldToken: sessionHold.token
                     )
                     return

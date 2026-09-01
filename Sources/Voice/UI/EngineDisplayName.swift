@@ -12,6 +12,8 @@ enum EngineDisplayName {
             return "\(CloudProvider.elevenLabs.displayName) (streaming)"
         case "cloud:gemini-streaming":
             return "\(CloudProvider.gemini.displayName) (streaming)"
+        case "cloud:meta-streaming":
+            return "\(CloudProvider.meta.displayName) (streaming)"
         case "cloud:elevenLabs":
             return CloudProvider.elevenLabs.displayName
         case "cloud:xai-streaming":
@@ -53,6 +55,8 @@ enum EngineDisplayName {
             return CloudProvider.elevenLabs.displayName
         case "gemini":
             return CloudProvider.gemini.displayName
+        case "meta":
+            return CloudProvider.meta.displayName
         case "xai":
             return CloudProvider.xai.displayName
         default:

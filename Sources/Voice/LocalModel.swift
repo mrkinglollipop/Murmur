@@ -89,6 +89,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
     case xaiGrokSTT             = "xaiGrokSTT"
     case elevenLabsScribeV2Realtime = "elevenLabsScribeV2Realtime"
     case gemini35TranscribeLive = "gemini35TranscribeLive"
+    case museVoiceTranscribeLive = "museVoiceTranscribeLive"
 
     var id: String { rawValue }
 
@@ -101,7 +102,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
     /// `CloudTranscriberFactory` mapping stay compiled and working — this
     /// is a visibility change only (plan 013).
     static var selectable: [CloudModel] {
-        [.xaiGrokSTT, .elevenLabsScribeV2Realtime, .gemini35TranscribeLive]
+        [.xaiGrokSTT, .elevenLabsScribeV2Realtime, .gemini35TranscribeLive, .museVoiceTranscribeLive]
     }
 
     /// Sanitizes a (possibly stale) persisted selection: a model that's
@@ -121,6 +122,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
         case .xaiGrokSTT:              return "xAI Grok (grok-stt)"
         case .elevenLabsScribeV2Realtime: return "ElevenLabs Scribe v2 Realtime"
         case .gemini35TranscribeLive:  return "Gemini 3.5 Transcribe"
+        case .museVoiceTranscribeLive: return "Meta Muse Voice Transcribe"
         }
     }
 }

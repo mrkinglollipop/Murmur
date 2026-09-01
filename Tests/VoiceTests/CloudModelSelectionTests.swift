@@ -3,10 +3,10 @@ import XCTest
 
 final class CloudModelSelectionTests: XCTestCase {
 
-    func testSelectableContainsXAIElevenLabsAndGemini() {
+    func testSelectableContainsXAIElevenLabsGeminiAndMuse() {
         XCTAssertEqual(
             Set(CloudModel.selectable),
-            [.xaiGrokSTT, .elevenLabsScribeV2Realtime, .gemini35TranscribeLive]
+            [.xaiGrokSTT, .elevenLabsScribeV2Realtime, .gemini35TranscribeLive, .museVoiceTranscribeLive]
         )
     }
 
@@ -31,13 +31,14 @@ final class CloudModelSelectionTests: XCTestCase {
         XCTAssertEqual(CloudModel.selectableOrFallback(.xaiGrokSTT), .xaiGrokSTT)
         XCTAssertEqual(CloudModel.selectableOrFallback(.elevenLabsScribeV2Realtime), .elevenLabsScribeV2Realtime)
         XCTAssertEqual(CloudModel.selectableOrFallback(.gemini35TranscribeLive), .gemini35TranscribeLive)
+        XCTAssertEqual(CloudModel.selectableOrFallback(.museVoiceTranscribeLive), .museVoiceTranscribeLive)
     }
 
-    func testFactoryStillServesAllSevenProviders() {
+    func testFactoryStillServesAllEightProviders() {
         for model in CloudModel.allCases {
             let service = CloudTranscriberFactory.service(for: model)
             XCTAssertNotNil(service, "expected a service for \(model.rawValue)")
         }
-        XCTAssertEqual(CloudModel.allCases.count, 7)
+        XCTAssertEqual(CloudModel.allCases.count, 8)
     }
 }
