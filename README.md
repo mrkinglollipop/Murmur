@@ -10,6 +10,8 @@ It is built for people who dictate into real apps all day: local or cloud speech
 
 **Requirements:** macOS 26 or later · Apple Silicon or Intel Mac with a supported CoreML stack for local models.
 
+**Android:** Keyboard-first IME + companion app lives in [`android/`](android/) (`applicationId` `com.matt.murmur.android`). Linux may `cd android && ./gradlew :logic:test :cloud:test :app:assembleDebug`. Mac and iOS rules in this file are unchanged. This repository has **no CI by design** — do not add a GitHub Actions workflow unless a maintainer decides to.
+
 **Appearance:** Murmur's interface is **dark by design** and does not follow the
 system light/dark setting. That is a deliberate product decision, not a missing
 feature — the palette and Liquid Glass surfaces are tuned for a single look.

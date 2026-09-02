@@ -17,6 +17,14 @@ Separate XcodeGen project under [`ios/`](ios/README.md). Do **not** add those
 targets to the Mac `project.yml`. Spike shipped in PR #35; that README is the
 in-repo worksheet. Linux cloud agents cannot build or device-test it.
 
+## Android
+
+Separate Gradle project under [`android/`](android/README.md). Do **not** add
+those targets to Mac or iOS `project.yml`. Linux may run
+`cd android && ./gradlew :logic:test :cloud:test :app:assembleDebug`. Mac/iOS
+verify commands in this file are unchanged. Do not add a GitHub Actions
+workflow unless a maintainer decides to.
+
 ## Setup
 
 ```bash
