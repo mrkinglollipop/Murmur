@@ -2,7 +2,7 @@
 
 Keyboard-first Android port. Sibling of `ios/`. Do **not** add these targets to Mac `project.yml` or `ios/project.yml`.
 
-v1 is an IME plus a companion app (`applicationId` `com.matt.murmur.android`). This spike proves packaging, IME enablement, and `InputConnection.commitText`. The mic key is a **visible placeholder** — no `RECORD_AUDIO` yet.
+v1 is an IME plus a companion app (`applicationId` `com.matt.murmur.android`). This build records 16 kHz mono PCM, wraps WAV, and can batch-transcribe through ElevenLabs. The IME fail-closed promotes itself to `FOREGROUND_SERVICE_TYPE_MICROPHONE` while the input view is shown. Tap-to-toggle insert is a later PR.
 
 **Distribution:** sideload / GitHub APK, like iOS. Play listing is not a v1 deliverable. Code stays Play-capable (no Accessibility Service, no overlay).
 
@@ -34,10 +34,10 @@ kotlin.compiler.execution.strategy=in-process
 
 ```bash
 cd android
-./gradlew :logic:test :app:assembleDebug
+./gradlew :logic:test :cloud:test :app:assembleDebug
 ```
 
-Expect `BUILD SUCCESSFUL`. `:logic` is JVM JUnit (Linux-safe). `assembleDebug` is unsigned.
+Expect `BUILD SUCCESSFUL`. `:logic` and `:cloud` are JVM JUnit (Linux-safe). `assembleDebug` is unsigned.
 
 This repository has **no CI by design**. Run Gradle locally. Do not add a GitHub Actions workflow.
 
@@ -46,17 +46,33 @@ This repository has **no CI by design**. Run Gradle locally. Do not add a GitHub
 1. Install the debug APK (`app/build/outputs/apk/debug/app-debug.apk`).
 2. Open Murmur → **Enable Murmur keyboard** (opens input-method settings).
 3. Turn Murmur on, then switch to it from a text field (globe / picker).
-4. Type `hello` in Keep, Messages, or the companion scratch field. The field should contain `hello`.
+4. Grant microphone (and notifications) from the companion. Paste an ElevenLabs key and **Save key**.
 
-QWERTY still types if dictation is not wired. The coral mic key does not record in this build.
+QWERTY still types if the key or mic is missing. Dictation insert is not wired yet.
+
+## Device gate (Pixel and Samsung)
+
+Named, blocking for the v1 mic path. This environment cannot run devices — JVM tests + `assembleDebug` are the compile gate.
+
+1. Companion **Record 3s and transcribe** produces a transcript (Activity-owned mic).
+2. IME-visible: with Murmur as the current keyboard and the input view shown, tap the coral mic. The IME service must start microphone FGS **while the input view is shown**, then `AudioRecord` (`VOICE_RECOGNITION`, 16 kHz mono). Status shows a byte count. Logcat: `murmur: fgs.start` then `murmur: mic.capture.started`. No `fgs.start.denied`, `AudioRecord.init.failed`, or tombstone.
+3. Optional spike: IME-visible without FGS — log silence vs audio. Do not ship the no-FGS path unless **both** Pixel and Samsung pass.
+
+If gate (2) fails on **both** Pixel and Samsung: **stop the v1 mic path and reopen K1**. Do **not** bounce recording to the companion Activity (that is the iOS constraint). Overlay / Accessibility is still post-v1.
+
+Hide-while-recording is best-effort: keep an already-started FGS; do not `startForeground(MICROPHONE)` in `onFinishInputView`. Tap-while-visible is the supported path.
 
 ## Layout
 
 ```
 android/
   gradle/libs.versions.toml   # AGP, Kotlin, compileSdk 36 / targetSdk 36 / minSdk 33
-  logic/                      # pure Kotlin, JUnit on JVM
-  app/                        # IME (Views) + companion Activity (Compose)
+  logic/                      # WavWriter, ApiKeyStore envelope, FGS gate — JUnit on JVM
+  cloud/                      # ElevenLabs batch (OkHttp), JUnit + MockWebServer
+  app/                        # IME (Views) + companion Activity (Compose) + AudioRecord
+  docs/cloud-protocols.md
 ```
 
 IME chrome is **Views**, not Compose. Companion is dark-first. IME follows system night mode.
+
+API keys: `filesDir/murmur/apikeys.bin` envelope `0x01 || 12-byte IV || ciphertext||tag`, AES-GCM wrapping key in Android Keystore alias `com.matt.murmur.android.apikeys`. Tests use throwaway alias `com.matt.murmur.android.apikeys.TESTS`.

@@ -17,7 +17,7 @@ import android.widget.TextView
 import com.matt.murmur.android.R
 
 /**
- * Views QWERTY + mic placeholder. Letter keys [commitText] through [Listener].
+ * Views QWERTY + mic. Letter keys [commitText] through [Listener].
  * Follows system night mode; companion UI is dark-first and lives elsewhere.
  */
 class ImeChrome(
@@ -30,7 +30,7 @@ class ImeChrome(
         fun onDelete()
         fun onEnter()
         fun onSwitchIme()
-        fun onMicPlaceholder()
+        fun onMicTap()
     }
 
     private var shifted = false
@@ -57,13 +57,12 @@ class ImeChrome(
         }
         micButton = ImageView(context).apply {
             setImageResource(R.drawable.ic_mic)
-            contentDescription = "Microphone (placeholder)"
+            contentDescription = "Microphone"
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(10.dp, 10.dp, 10.dp, 10.dp)
             setOnClickListener {
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                statusLabel.text = "Mic is a placeholder — no recording in this build"
-                listener.onMicPlaceholder()
+                listener.onMicTap()
             }
         }
 
@@ -73,6 +72,10 @@ class ImeChrome(
         addView(buildShiftRow())
         addView(buildActionRow())
         applyChromeColors()
+    }
+
+    fun setStatus(text: String) {
+        statusLabel.text = text
     }
 
     private fun buildStatusStrip(): LinearLayout {
