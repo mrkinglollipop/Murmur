@@ -205,7 +205,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         val capture = MicCapture(this)
         val take = Take(
             capture = capture,
-            connection = currentInputConnection,
+            editor = currentInputEditorInfo.editorKey(),
             apiKey = key,
         )
         currentTake = take
@@ -296,15 +296,15 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             chrome?.setStatus("Murmur")
             return
         }
-        val ic = currentInputConnection
-        val info = currentInputEditorInfo
-        if (ic == null || ic !== take.connection || info.isSecureDictationTarget()) {
+        var ic = currentInputConnection
+        var info = currentInputEditorInfo
+        if (!canInsert(take, ic, info)) {
             logSecureSkip(info)
             chrome?.setStatus("Murmur")
             return
         }
         val before = try {
-            ic.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+            ic!!.getTextBeforeCursor(64, 0)?.toString().orEmpty()
         } catch (_: Exception) {
             ""
         }
@@ -315,10 +315,28 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         }
         val chunks = bulkInsertChunks(prepared)
         for (chunk in chunks) {
-            ic.commitText(chunk, 1)
+            ic = currentInputConnection
+            info = currentInputEditorInfo
+            if (take.skipInsert || !canInsert(take, ic, info)) {
+                logSecureSkip(info)
+                chrome?.setStatus("Murmur")
+                return
+            }
+            ic!!.commitText(chunk, 1)
         }
         Log.i(TAG, "insert.ok chars=${prepared.length} chunks=${chunks.size}")
         chrome?.setStatus("Murmur")
+    }
+
+    private fun canInsert(take: Take, ic: InputConnection?, info: EditorInfo?): Boolean {
+        if (ic == null || info == null || take.editor == null) return false
+        if (info.isSecureDictationTarget()) return false
+        return info.editorKey() == take.editor
+    }
+
+    private fun EditorInfo?.editorKey(): EditorKey? {
+        if (this == null) return null
+        return EditorKey(packageName, fieldId)
     }
 
     private fun launchPermission() {
@@ -330,13 +348,15 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
 
     private fun logSecureSkip(info: EditorInfo?) {
         val hex = info?.inputType?.toString(16) ?: "none"
-        val hints = info?.autofillHintsOrNull()?.joinToString(",").orEmpty()
+        val hints = info?.autofillHintsForLog().orEmpty()
         Log.i(TAG, "insert.secure_skip inputType=$hex hints=$hints")
     }
 
+    private data class EditorKey(val packageName: String?, val fieldId: Int)
+
     private class Take(
         val capture: MicCapture,
-        val connection: InputConnection?,
+        val editor: EditorKey?,
         val apiKey: String,
     ) {
         @Volatile

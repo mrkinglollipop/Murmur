@@ -72,7 +72,7 @@ class ImeChrome(
                         true
                     }
                     MotionEvent.ACTION_UP -> {
-                        listener.onMicPointer(ImePointer.UP)
+                        v.performClick()
                         true
                     }
                     MotionEvent.ACTION_CANCEL -> {
@@ -83,7 +83,6 @@ class ImeChrome(
                 }
             }
             setOnClickListener {
-                performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                 listener.onMicPointer(ImePointer.DOWN)
                 listener.onMicPointer(ImePointer.UP)
             }

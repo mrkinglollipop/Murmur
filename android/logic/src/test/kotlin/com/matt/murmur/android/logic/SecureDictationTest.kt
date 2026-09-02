@@ -81,6 +81,16 @@ class SecureDictationTest {
 
     @Test
     fun nullHintsOnPlainTextAreNotSecure() {
-        assertFalse(isSecureDictationTarget(TYPE_CLASS_TEXT, null))
+        assertFalse(isSecureDictationTarget(TYPE_CLASS_TEXT, null, hintsReadable = true))
+    }
+
+    @Test
+    fun unreadableHintsOnPlainTextAreSecure() {
+        assertTrue(isSecureDictationTarget(TYPE_CLASS_TEXT, null, hintsReadable = false))
+    }
+
+    @Test
+    fun readableEmptyHintsOnPlainTextAreNotSecure() {
+        assertFalse(isSecureDictationTarget(TYPE_CLASS_TEXT, emptyArray(), hintsReadable = true))
     }
 }

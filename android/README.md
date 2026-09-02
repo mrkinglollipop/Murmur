@@ -43,9 +43,9 @@ Product oracle (device logcat after a take):
 
 ```bash
 bash android/scripts/oracle-dictation-start.sh
-# 0 = mic.capture.started this window
+# 0 = IME take this window (ime.mic.start or fgs.start, and last event mic.capture.started)
 # 1 = crash or start failed
-# 2 = no take in the window — not a pass
+# 2 = no IME take in the window — not a pass (companion-only capture is exit 2)
 ```
 
 Offline helper selftest (Linux-safe): `bash android/scripts/test-oracle-dictation-start-helpers.sh` → `ORACLE OK`.

@@ -19,6 +19,7 @@ object SecureDictation {
     fun isSecureDictationTarget(
         inputType: Int,
         autofillHints: Array<out String>? = null,
+        hintsReadable: Boolean = true,
     ): Boolean {
         val cls = inputType and TYPE_MASK_CLASS
         val varn = inputType and TYPE_MASK_VARIATION
@@ -30,15 +31,17 @@ object SecureDictation {
             TYPE_CLASS_NUMBER -> varn == TYPE_NUMBER_VARIATION_PASSWORD
             else -> false
         }
-        val hints = autofillHints?.any {
+        if (passwordType) return true
+        if (!hintsReadable) return true
+        return autofillHints?.any {
             it.equals(AUTOFILL_HINT_PASSWORD, ignoreCase = true) ||
                 it.equals(AUTOFILL_HINT_NEW_PASSWORD, ignoreCase = true)
         } == true
-        return passwordType || hints
     }
 }
 
 fun isSecureDictationTarget(
     inputType: Int,
     autofillHints: Array<out String>? = null,
-): Boolean = SecureDictation.isSecureDictationTarget(inputType, autofillHints)
+    hintsReadable: Boolean = true,
+): Boolean = SecureDictation.isSecureDictationTarget(inputType, autofillHints, hintsReadable)
