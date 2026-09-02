@@ -20,6 +20,11 @@ This clone also contains **`ios/`** (Murmur iOS keyboard). Same rule: do **not**
 attempt `xcodegen` / `xcodebuild` / simulator / device work on Linux. iOS verify
 is Mac + physical device only — [`ios/README.md`](ios/README.md).
 
+**Android** lives in [`android/`](android/). Linux cloud agents **may** run
+`cd android && ./gradlew :logic:test :cloud:test :app:assembleDebug`. Do not
+install a Swift toolchain or fake a Mac/iOS build. Mac/iOS rules above are
+unchanged. Do **not** add a GitHub Actions workflow.
+
 On a Linux cloud agent: do **not** attempt to install a Swift toolchain or fake
 a build. Use the commands in [`CLAUDE.md`](CLAUDE.md) on a Mac with Xcode.
 

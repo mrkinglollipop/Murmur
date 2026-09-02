@@ -4,6 +4,8 @@ Keyboard-first Android port. Sibling of `ios/`. Do **not** add these targets to 
 
 v1 is an IME plus a companion app (`applicationId` `com.matt.murmur.android`). Default engine is ElevenLabs Scribe v2 Realtime; Gemini 3.5 Transcribe Live is selectable. Live start/finalize failure falls back to batch WAV. Tap the IME mic to start, tap again to stop; partials stay on the status strip and the field gets spaced text via `commitText` only after stop. The IME fail-closed promotes itself to `FOREGROUND_SERVICE_TYPE_MICROPHONE` on the start tap while the input view is shown.
 
+The companion is dark-first (Dictionary, Snippets, Style, History, Settings). JSON files under `filesDir/murmur/` use **iOS** shapes: `dictionary.json` (`id/term/variants/fixCount/isAutoLearned`), `snippets.json` (`id/trigger/expansion`), `history.json` (`id/date/text/failed`, cap **200**), `style.json` (`formal` / `casual` / `very_casual` — local caps/punct, not Mac LLM copy). Mac `history.json` also has `engine`, `injected`, `audioPath` and caps at **1000**; that is a superset and needs a mapper — do not treat the files as interchangeable. Dictionary canonical terms are sent to Scribe as repeated `keyterms`.
+
 **Distribution:** sideload / GitHub APK, like iOS. Play listing is not a v1 deliverable. Code stays Play-capable (no Accessibility Service, no overlay).
 
 ## Setup
@@ -57,8 +59,8 @@ This repository has **no CI by design**. Run Gradle locally. Do not add a GitHub
 1. Install the debug APK (`app/build/outputs/apk/debug/app-debug.apk`).
 2. Open Murmur → **Enable Murmur keyboard** (opens input-method settings).
 3. Turn Murmur on, then switch to it from a text field (globe / picker).
-4. Grant microphone (and notifications) from the companion (or the IME will open that prompt on the first mic tap). Paste an ElevenLabs and/or Gemini key, pick the engine, and save.
-5. In Keep / Messages, tap the coral mic, speak, tap stop. Partials appear on the status strip only; the field should contain spaced text after stop.
+4. Grant microphone (and notifications) from Settings (or the IME will open that prompt on the first mic tap). Paste an ElevenLabs and/or Gemini key, pick the engine, and save.
+5. In Keep / Messages, tap the coral mic, speak, tap stop. Partials stay on the status strip; the field gets spaced text after stop. Successful inserts appear under Home → Today (local history, cap 200).
 
 QWERTY still types if the key or mic is missing. Password fields skip dictation (no insert, no clipboard).
 

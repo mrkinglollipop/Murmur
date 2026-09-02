@@ -24,12 +24,18 @@ import com.matt.murmur.android.cloud.LiveStartException
 import com.matt.murmur.android.cloud.LiveTranscriber
 import com.matt.murmur.android.crypto.MurmurSecrets
 import com.matt.murmur.android.logic.CloudEngine
+import com.matt.murmur.android.logic.DictionaryStore
 import com.matt.murmur.android.logic.GeminiLiveGate
+import com.matt.murmur.android.logic.HistoryStore
 import com.matt.murmur.android.logic.ImeActivationCommand
 import com.matt.murmur.android.logic.ImeActivationLogic
 import com.matt.murmur.android.logic.ImePointer
+import com.matt.murmur.android.logic.MurmurFiles
+import com.matt.murmur.android.logic.SettingsStore
 import com.matt.murmur.android.logic.SilenceCancel
+import com.matt.murmur.android.logic.SnippetsStore
 import com.matt.murmur.android.logic.StreamingCoordinator
+import com.matt.murmur.android.logic.StyleStore
 import com.matt.murmur.android.logic.TranscriptPipeline
 import com.matt.murmur.android.logic.WavWriter
 import com.matt.murmur.android.logic.bulkInsertChunks
@@ -87,6 +93,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         inputViewVisible = true
+        refreshActivationMode()
         abortIfSecure(info)
     }
 
@@ -229,15 +236,17 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         }
         fgsRunning = true
         val capture = MicCapture(this)
+        val keyterms = dictionaryKeyterms()
         val attemptLive = engine != CloudEngine.GEMINI ||
             GeminiLiveGate.shouldAttemptLive(EnginePrefs.geminiLiveHandshakeFailed(this))
-        val session = if (attemptLive) makeLiveSession(engine, key) else null
+        val session = if (attemptLive) makeLiveSession(engine, key, keyterms) else null
         val take = Take(
             capture = capture,
             editor = currentInputEditorInfo.editorKey(),
             engine = engine,
             apiKey = key,
             session = session,
+            keyterms = keyterms,
         )
         currentTake = take
         chrome?.setStatus(getString(R.string.ime_recording))
@@ -370,7 +379,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             truncated = truncated,
         )
         if (liveText != null) {
-            val processed = TranscriptPipeline.apply(liveText)
+            val processed = processTranscript(liveText)
             mainHandler.post { insertTake(take, processed) }
             return
         }
@@ -383,7 +392,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         try {
             WavWriter.writePcm16(pcm, wav)
             val raw = batchTranscribe(take, wav)
-            val processed = TranscriptPipeline.apply(raw)
+            val processed = processTranscript(raw)
             mainHandler.post { insertTake(take, processed) }
         } catch (_: Exception) {
             mainHandler.post {
@@ -394,70 +403,110 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         }
     }
 
+    private fun processTranscript(raw: String): String {
+        val settings = SettingsStore(MurmurFiles.settings(filesDir))
+        val dictionary = DictionaryStore(file = MurmurFiles.dictionary(filesDir))
+        val snippets = SnippetsStore(file = MurmurFiles.snippets(filesDir))
+        val style = StyleStore(MurmurFiles.style(filesDir))
+        return TranscriptPipeline.apply(
+            raw,
+            codeAware = settings.codeAware,
+            dictionary = dictionary,
+            style = style.selected,
+            snippets = snippets,
+        )
+    }
+
+    private fun dictionaryKeyterms(): List<String> {
+        return try {
+            DictionaryStore.selectKeyterms(
+                DictionaryStore(file = MurmurFiles.dictionary(filesDir)).entries,
+            )
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
     private fun batchTranscribe(take: Take, wav: File): String {
+        val settings = try {
+            SettingsStore(MurmurFiles.settings(filesDir))
+        } catch (_: Exception) {
+            null
+        }
+        val noVerbatim = settings?.removeFillerWords ?: true
         return when (take.engine) {
             CloudEngine.ELEVEN_LABS -> ElevenLabsBatch.transcribe(
                 audio = wav,
                 apiKey = take.apiKey,
-                keyterms = emptyList(),
+                noVerbatim = noVerbatim,
+                keyterms = take.keyterms,
             )
             CloudEngine.GEMINI -> GeminiBatch.transcribe(
                 audio = wav,
                 apiKey = take.apiKey,
-                vocabulary = emptyList(),
+                vocabulary = take.keyterms,
             )
         }
     }
 
-    private fun makeLiveSession(engine: CloudEngine, key: String): LiveTranscriber {
+    private fun makeLiveSession(engine: CloudEngine, key: String, keyterms: List<String>): LiveTranscriber {
         return when (engine) {
             CloudEngine.ELEVEN_LABS -> ElevenLabsRealtimeTranscriber(
                 apiKey = key,
-                keyterms = emptyList(),
+                keyterms = keyterms,
             )
             CloudEngine.GEMINI -> GeminiLiveTranscriber(
                 apiKey = key,
-                vocabulary = emptyList(),
+                vocabulary = keyterms,
             )
         }
     }
 
     private fun insertTake(take: Take, text: String) {
-        if (take.skipInsert) {
-            if (take.secureSkip) Log.i(TAG, "insert.secure_skip")
-            chrome?.setStatus("Murmur")
-            return
-        }
-        var ic = currentInputConnection
-        var info = currentInputEditorInfo
-        if (!canInsert(take, ic, info)) {
-            logSecureSkip(info)
-            chrome?.setStatus("Murmur")
-            return
-        }
-        val before = try {
-            ic!!.getTextBeforeCursor(64, 0)?.toString().orEmpty()
-        } catch (_: Exception) {
-            ""
-        }
-        val prepared = preparedDictationInsert(text, before, trailingSpace = true)
-        if (prepared.isEmpty()) {
-            chrome?.setStatus("Murmur")
-            return
-        }
-        val chunks = bulkInsertChunks(prepared)
-        for (chunk in chunks) {
-            ic = currentInputConnection
-            info = currentInputEditorInfo
-            if (take.skipInsert || !canInsert(take, ic, info)) {
-                logSecureSkip(info)
-                chrome?.setStatus("Murmur")
+        try {
+            if (take.skipInsert) {
+                if (take.secureSkip) Log.i(TAG, "insert.secure_skip")
                 return
             }
-            ic!!.commitText(chunk, 1)
+            var ic = currentInputConnection
+            var info = currentInputEditorInfo
+            if (!canInsert(take, ic, info)) {
+                logSecureSkip(info)
+                return
+            }
+            val before = try {
+                ic!!.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+            val prepared = preparedDictationInsert(text, before, trailingSpace = true)
+            if (prepared.isEmpty()) return
+            val chunks = bulkInsertChunks(prepared)
+            for (chunk in chunks) {
+                ic = currentInputConnection
+                info = currentInputEditorInfo
+                if (take.skipInsert || !canInsert(take, ic, info)) {
+                    logSecureSkip(info)
+                    return
+                }
+                ic!!.commitText(chunk, 1)
+            }
+            Log.i(TAG, "insert.ok chars=${prepared.length} chunks=${chunks.size}")
+            try {
+                HistoryStore(file = MurmurFiles.history(filesDir)).append(text, failed = false)
+            } catch (_: Exception) {
+            }
+        } finally {
+            chrome?.setStatus("Murmur")
         }
-        Log.i(TAG, "insert.ok chars=${prepared.length} chunks=${chunks.size}")
-        chrome?.setStatus("Murmur")
+    }
+
+    private fun refreshActivationMode() {
+        activation.mode = try {
+            SettingsStore(MurmurFiles.settings(filesDir)).activationMode
+        } catch (_: Exception) {
+            activation.mode
+        }
     }
 
     private fun canInsert(take: Take, ic: InputConnection?, info: EditorInfo?): Boolean {
@@ -492,6 +541,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         val engine: CloudEngine,
         val apiKey: String,
         val session: LiveTranscriber?,
+        val keyterms: List<String>,
     ) {
         @Volatile
         var skipInsert: Boolean = false

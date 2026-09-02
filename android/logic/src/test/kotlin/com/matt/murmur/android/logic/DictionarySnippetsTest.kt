@@ -1,6 +1,7 @@
 package com.matt.murmur.android.logic
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DictionarySnippetsTest {
@@ -96,5 +97,32 @@ class DictionarySnippetsTest {
         assertEquals(keepuId, merged.first().id)
         assertEquals(setOf("keepu", "keefu"), merged.first().variants.map { it.lowercase() }.toSet())
         assertEquals(4, merged.first().fixCount)
+    }
+
+    @Test
+    fun testUpdateMergesSameTermAndDeleteRemoves() {
+        val store = DictionaryStore()
+        store.add(term = "Khipu", variants = listOf("Keepu"))
+        store.add(term = "Other", variants = listOf("uddur"))
+        val other = store.entries.first { it.term == "Other" }
+        store.update(other.copy(term = "Khipu", variants = listOf("Keefu")))
+        assertEquals(1, store.entries.size)
+        assertEquals(
+            setOf("keepu", "keefu"),
+            store.entries.first().variants.map { it.lowercase() }.toSet(),
+        )
+        store.delete(store.entries.first())
+        assertTrue(store.entries.isEmpty())
+    }
+
+    @Test
+    fun testSnippetUpdateAndDelete() {
+        val store = SnippetsStore()
+        store.add(trigger = "sig", expansion = "old")
+        val snippet = store.snippets.first()
+        store.update(snippet.copy(expansion = "new"))
+        assertEquals("new", store.snippets.first().expansion)
+        store.delete(store.snippets.first())
+        assertTrue(store.snippets.isEmpty())
     }
 }

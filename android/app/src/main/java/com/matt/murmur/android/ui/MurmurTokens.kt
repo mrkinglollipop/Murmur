@@ -9,4 +9,9 @@ object MurmurTokens {
     val coralLight = Color(0xFFF0997B)
     val textPrimary = Color(0xFFF5F5F7)
     val textSecondary = Color(0xFF9A9AA2)
+    val card = Color(0xFF1C1C20)
+    val hero = Color(0xFF18161A)
+    val hairline = Color(0x22FFFFFF)
+    val failed = Color(0xFFD96B2E)
+    const val cardRadius = 22
 }
