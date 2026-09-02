@@ -141,6 +141,39 @@ class JsonStoreTest {
     }
 
     @Test
+    fun atomicWriteLeavesNoSharedTmpName() {
+        val dir = tmpDir()
+        val file = File(dir, MurmurFiles.DICTIONARY)
+        DictionaryStore(file = file).add(term = "A", variants = listOf("a"))
+        assertFalse(File(dir, "dictionary.json.tmp").exists())
+        assertTrue(dir.listFiles()!!.none { it.name.startsWith("dictionary.json.tmp.") })
+        assertTrue(file.isFile)
+    }
+
+    @Test
+    fun dictionaryCorrectMergesCompanionDiskEdits() {
+        val file = File(tmpDir(), MurmurFiles.DICTIONARY)
+        val ime = DictionaryStore(file = file)
+        ime.add(term = "Kubernetes", variants = listOf("kubernetis"))
+        val companion = DictionaryStore(file = file)
+        companion.add(term = "Murmur", variants = listOf("murmer"))
+        assertEquals("deploy Kubernetes", ime.correct("deploy kubernetis"))
+        val disk = DictionaryStore(file = file)
+        assertEquals(setOf("Kubernetes", "Murmur"), disk.entries.map { it.term }.toSet())
+        assertEquals(1, disk.entries.first { it.term == "Kubernetes" }.fixCount)
+    }
+
+    @Test
+    fun settingsCacheUpdatesOnPersist() {
+        val file = File(tmpDir(), MurmurFiles.SETTINGS)
+        val store = SettingsStore(file)
+        store.setPressAndHold(true)
+        assertEquals(ImeActivationMode.PRESS_AND_HOLD, SettingsStore.cachedActivationMode)
+        store.setPressAndHold(false)
+        assertEquals(ImeActivationMode.TAP_TOGGLE, SettingsStore.cachedActivationMode)
+    }
+
+    @Test
     fun selectKeytermsNeverEmitsVariantsAndCaps() {
         val entries = (0 until 60).map { i ->
             DictionaryEntry(term = "Term$i", variants = listOf("var$i"), fixCount = i)

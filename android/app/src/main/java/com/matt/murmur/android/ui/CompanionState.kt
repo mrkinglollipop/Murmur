@@ -121,62 +121,79 @@ class CompanionState(context: Context) {
         engine = value
     }
 
+    fun reloadHistory() {
+        histFileStore.reload()
+        history = histFileStore.entries
+    }
+
     fun addDictionary(term: String, variants: List<String>) {
+        dictFileStore.reload()
         dictFileStore.add(term, variants)
         dictionaryEntries = dictFileStore.entries
     }
 
     fun updateDictionary(entry: DictionaryEntry) {
+        dictFileStore.reload()
         dictFileStore.update(entry)
         dictionaryEntries = dictFileStore.entries
     }
 
     fun deleteDictionary(entry: DictionaryEntry) {
+        dictFileStore.reload()
         dictFileStore.delete(entry)
         dictionaryEntries = dictFileStore.entries
     }
 
     fun addSnippet(trigger: String, expansion: String) {
+        snipFileStore.reload()
         snipFileStore.add(trigger, expansion)
         snippets = snipFileStore.snippets
     }
 
     fun updateSnippet(snippet: Snippet) {
+        snipFileStore.reload()
         snipFileStore.update(snippet)
         snippets = snipFileStore.snippets
     }
 
     fun deleteSnippet(snippet: Snippet) {
+        snipFileStore.reload()
         snipFileStore.delete(snippet)
         snippets = snipFileStore.snippets
     }
 
     fun chooseStyle(profile: StyleProfile) {
+        styleFileStore.reload()
         styleFileStore.selected = profile
         style = styleFileStore.selected
     }
 
     fun chooseCodeAware(value: Boolean) {
+        settingsFileStore.reload()
         settingsFileStore.setCodeAware(value)
         codeAware = settingsFileStore.codeAware
     }
 
     fun choosePressAndHold(value: Boolean) {
+        settingsFileStore.reload()
         settingsFileStore.setPressAndHold(value)
         pressAndHold = settingsFileStore.pressAndHold
     }
 
     fun chooseRemoveFillerWords(value: Boolean) {
+        settingsFileStore.reload()
         settingsFileStore.setRemoveFillerWords(value)
         removeFillerWords = settingsFileStore.removeFillerWords
     }
 
     fun dismissDictionaryIntro() {
+        settingsFileStore.reload()
         settingsFileStore.dismissDictionaryIntro()
         dictionaryIntroDismissed = true
     }
 
     fun dismissSnippetsIntro() {
+        settingsFileStore.reload()
         settingsFileStore.dismissSnippetsIntro()
         snippetsIntroDismissed = true
     }

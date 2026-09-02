@@ -177,6 +177,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     }
 
     override fun onMicPointer(event: ImePointer) {
+        activation.mode = SettingsStore.cachedActivationMode
         applyActivation(activation.onPointer(event))
     }
 

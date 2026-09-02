@@ -24,6 +24,7 @@ class SettingsStore(
 
     init {
         reload()
+        rememberMode()
     }
 
     fun reload() {
@@ -35,6 +36,7 @@ class SettingsStore(
         removeFillerWords = loaded.removeFillerWords
         dictionaryIntroDismissed = loaded.dictionaryIntroDismissed
         snippetsIntroDismissed = loaded.snippetsIntroDismissed
+        rememberMode()
     }
 
     fun setEngine(value: String) {
@@ -85,6 +87,13 @@ class SettingsStore(
                 ),
             ),
         )
+        rememberMode()
+    }
+
+    private fun rememberMode() {
+        if (file != null) {
+            cachedActivationMode = activationMode
+        }
     }
 
     data class Snapshot(
@@ -99,6 +108,9 @@ class SettingsStore(
     companion object {
         const val ENGINE_ELEVEN_LABS = "elevenLabs"
         const val ENGINE_DISPLAY_NAME = "ElevenLabs Scribe v2"
+
+        @Volatile
+        var cachedActivationMode: ImeActivationMode = ImeActivationMode.TAP_TOGGLE
     }
 }
 

@@ -6,6 +6,7 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
+import java.util.UUID
 
 /** Compact JSON tree for iOS-shaped store files. Not a general library. */
 internal sealed class JsonVal {
@@ -64,28 +65,31 @@ internal object AtomicJson {
     fun write(file: File, text: String) {
         val parent = file.parentFile ?: throw IllegalArgumentException("json file needs a parent")
         ensurePrivateDir(parent)
-        val tmp = File(parent, file.name + ".tmp")
-        FileOutputStream(tmp).use { fos ->
-            fos.write(text.toByteArray(Charsets.UTF_8))
-            fos.flush()
-            fos.fd.sync()
-        }
+        val tmp = File(parent, "${file.name}.tmp.${UUID.randomUUID()}")
         try {
-            Files.move(
-                tmp.toPath(),
-                file.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE,
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            try {
-                Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            } catch (_: Exception) {
-                tmp.delete()
-                throw IllegalStateException("could not replace ${file.name}")
+            FileOutputStream(tmp).use { fos ->
+                fos.write(text.toByteArray(Charsets.UTF_8))
+                fos.flush()
+                fos.fd.sync()
             }
+            try {
+                Files.move(
+                    tmp.toPath(),
+                    file.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                try {
+                    Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                } catch (_: Exception) {
+                    throw IllegalStateException("could not replace ${file.name}")
+                }
+            }
+            setOwnerOnlyFile(file)
+        } finally {
+            if (tmp.exists()) tmp.delete()
         }
-        setOwnerOnlyFile(file)
     }
 
     fun quarantine(file: File) {

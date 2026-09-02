@@ -134,7 +134,7 @@ class DictionaryStore(
                 entriesMut[idx] = entry.copy(fixCount = entry.fixCount + count)
             }
         }
-        persist()
+        persistFixCounts(fixCounts)
         return result
     }
 
@@ -143,6 +143,30 @@ class DictionaryStore(
     private fun persist() {
         val f = file ?: return
         AtomicJson.write(f, DictionaryJson.encode(entriesMut))
+    }
+
+    /**
+     * Merge fixCount deltas onto the on-disk list so a companion edit during
+     * transcribe is not clobbered. Persist failure must not throw to the caller.
+     */
+    private fun persistFixCounts(deltas: Map<String, Int>) {
+        val f = file ?: return
+        try {
+            val onDisk = mergingDuplicateTerms(DictionaryJson.read(f)).toMutableList()
+            for ((id, count) in deltas) {
+                val idx = onDisk.indexOfFirst { it.id == id }
+                if (idx >= 0) {
+                    val entry = onDisk[idx]
+                    onDisk[idx] = entry.copy(fixCount = entry.fixCount + count)
+                }
+            }
+            entriesMut.clear()
+            entriesMut.addAll(onDisk)
+            rebuildRegexCache()
+            persist()
+        } catch (_: Exception) {
+            // insert still proceeds
+        }
     }
 
     private fun rebuildRegexCache() {

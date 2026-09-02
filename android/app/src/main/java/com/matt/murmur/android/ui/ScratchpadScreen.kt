@@ -30,9 +30,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.matt.murmur.android.capture.MicCapture
-import com.matt.murmur.android.cloud.ElevenLabsBatch
 import com.matt.murmur.android.crypto.MurmurSecrets
 import com.matt.murmur.android.logic.WavWriter
+import com.matt.murmur.android.pipeline.DictationProcess
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -61,7 +61,7 @@ fun ScratchpadScreen(state: CompanionState) {
     ) {
         Text("Scratchpad", color = MurmurTokens.textPrimary, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Text(
-            "Try the Murmur keyboard here, or copy text out. Record 3s is a companion-only debug take.",
+            "Try the Murmur keyboard here, or copy text out. Record 3s uses the same dictation pipeline as the keyboard.",
             color = MurmurTokens.textSecondary,
             fontSize = 15.sp,
         )
@@ -102,7 +102,7 @@ fun ScratchpadScreen(state: CompanionState) {
                                 WavWriter.writePcm16(pcm, wav)
                                 val key = MurmurSecrets.apiKeyStore(context).elevenLabsKey()
                                     ?: throw IllegalStateException("no-key")
-                                ElevenLabsBatch.transcribe(wav, key)
+                                DictationProcess.transcribeWav(context, wav, key)
                             } finally {
                                 wav.delete()
                             }
@@ -120,6 +120,7 @@ fun ScratchpadScreen(state: CompanionState) {
                         status != "Mic capture failed"
                     ) {
                         scratch = if (scratch.isBlank()) status else "$scratch $status"
+                        state.reload()
                     }
                     busy = false
                 }
