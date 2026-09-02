@@ -23,7 +23,12 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     }
 
     override fun onDelete() {
-        currentInputConnection?.deleteSurroundingText(1, 0)
+        val ic = currentInputConnection ?: return
+        if (!ic.getSelectedText(0).isNullOrEmpty()) {
+            ic.commitText("", 1)
+        } else {
+            ic.deleteSurroundingText(1, 0)
+        }
     }
 
     override fun onEnter() {

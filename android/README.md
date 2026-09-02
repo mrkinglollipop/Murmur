@@ -8,7 +8,7 @@ v1 is an IME plus a companion app (`applicationId` `com.matt.murmur.android`). T
 
 ## Setup
 
-JDK 17 and an Android SDK. On this machine:
+JDK 17 and an Android SDK. Example Homebrew layout:
 
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
@@ -16,13 +16,19 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
 ```
 
-`android/local.properties` must contain `sdk.dir` (gitignored). Create it if missing:
+`android/local.properties` must contain `sdk.dir` (gitignored) pointing at a **writable** SDK that has `platforms;android-36` (or can install it). Create it if missing:
 
 ```bash
 echo "sdk.dir=$ANDROID_HOME" > android/local.properties
 ```
 
-compileSdk / targetSdk are **36**. Do not bump to 37. AGP will download `platforms;android-36` if the SDK does not already have it.
+If `$ANDROID_HOME` is not writable, copy/install the SDK somewhere you can write and point `sdk.dir` there. compileSdk / targetSdk are **36**. Do not bump to 37.
+
+The Kotlin daemon is the default. If compile fails with “Could not connect to Kotlin compile daemon” (read-only home), add this to `~/.gradle/gradle.properties` — do not commit it:
+
+```
+kotlin.compiler.execution.strategy=in-process
+```
 
 ## Verify
 

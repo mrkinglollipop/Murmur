@@ -207,8 +207,6 @@ class ImeChrome(
         }
         micButton.background = micBg
         val letterFill = if (dark) LETTER_FILL_DARK else LETTER_FILL_LIGHT
-        val specialFill = if (shifted && dark) SHIFTED_FILL_DARK else if (shifted) SHIFTED_FILL_LIGHT
-            else if (dark) SPECIAL_FILL_DARK else SPECIAL_FILL_LIGHT
         val glyph = if (dark) Color.WHITE else Color.BLACK
         for (key in letterKeys) {
             key.setTextColor(glyph)
@@ -220,10 +218,6 @@ class ImeChrome(
             } else if (dark) SPECIAL_FILL_DARK else SPECIAL_FILL_LIGHT
             key.setTextColor(if (key === shiftKey && shifted) Color.WHITE else glyph)
             key.background = keyDrawable(fill, glyph)
-        }
-        // silence unused when shift is off
-        if (!shifted) {
-            shiftKey.background = keyDrawable(specialFill, glyph)
         }
     }
 
@@ -261,7 +255,5 @@ class ImeChrome(
         private val LETTER_FILL_LIGHT = Color.WHITE
         private val SPECIAL_FILL_DARK = Color.rgb(56, 56, 56)
         private val SPECIAL_FILL_LIGHT = Color.rgb(173, 178, 186)
-        private val SHIFTED_FILL_DARK = Color.rgb(80, 80, 80)
-        private val SHIFTED_FILL_LIGHT = Color.rgb(200, 200, 204)
     }
 }

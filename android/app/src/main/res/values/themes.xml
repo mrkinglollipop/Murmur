@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Companion is dark-first and does not follow system light mode. -->
+    <!-- Companion only: dark-first, does not follow system light mode. -->
     <style name="Theme.Murmur" parent="android:Theme.Material.NoActionBar">
         <item name="android:statusBarColor">@color/murmur_bg</item>
         <item name="android:navigationBarColor">@color/murmur_bg</item>

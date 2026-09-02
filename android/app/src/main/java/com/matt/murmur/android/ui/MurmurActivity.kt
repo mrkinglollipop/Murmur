@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
@@ -34,11 +35,16 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.matt.murmur.android.R
 
 class MurmurActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        val barScrim = getColor(R.color.murmur_bg)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(barScrim),
+            navigationBarStyle = SystemBarStyle.dark(barScrim),
+        )
         setContent {
             MurmurCompanionTheme {
                 EnableImeScreen(
