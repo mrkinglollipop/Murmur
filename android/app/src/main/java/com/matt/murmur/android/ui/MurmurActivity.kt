@@ -16,6 +16,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -48,8 +49,11 @@ import androidx.compose.ui.unit.sp
 import com.matt.murmur.android.R
 import com.matt.murmur.android.capture.MicCapture
 import com.matt.murmur.android.cloud.ElevenLabsBatch
+import com.matt.murmur.android.cloud.GeminiBatch
 import com.matt.murmur.android.crypto.MurmurSecrets
+import com.matt.murmur.android.logic.CloudEngine
 import com.matt.murmur.android.logic.WavWriter
+import com.matt.murmur.android.prefs.EnginePrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -96,6 +100,8 @@ private fun CompanionScreen(onEnableKeyboard: () -> Unit) {
     val scope = rememberCoroutineScope()
     var scratch by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
+    var geminiKey by remember { mutableStateOf("") }
+    var engine by remember { mutableStateOf(EnginePrefs.engine(context)) }
     var status by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
 
@@ -129,11 +135,30 @@ private fun CompanionScreen(onEnableKeyboard: () -> Unit) {
     ) {
         Text("Murmur", color = MurmurTokens.coralLight, fontSize = 28.sp)
         Text(
-            "Enable Murmur as a keyboard, paste an ElevenLabs key, then tap the mic in a " +
-                "text field to dictate. The debug button still records 3s and transcribes here.",
+            "Enable Murmur as a keyboard, paste a cloud key, then tap the mic in a " +
+                "text field to dictate. Partials stay on the IME status strip until you stop.",
             color = MurmurTokens.textSecondary,
             fontSize = 16.sp,
         )
+        Text("Engine", color = MurmurTokens.textPrimary, fontSize = 14.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (choice in CloudEngine.entries) {
+                val selected = engine == choice
+                Button(
+                    onClick = {
+                        engine = choice
+                        EnginePrefs.setEngine(context, choice)
+                        status = "Engine: ${choice.displayName}"
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) MurmurTokens.coral else Color.White.copy(alpha = 0.12f),
+                    ),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Text(choice.displayName, fontSize = 13.sp)
+                }
+            }
+        }
         Button(
             onClick = onEnableKeyboard,
             colors = ButtonDefaults.buttonColors(containerColor = MurmurTokens.coral),
@@ -178,7 +203,47 @@ private fun CompanionScreen(onEnableKeyboard: () -> Unit) {
             colors = ButtonDefaults.buttonColors(containerColor = MurmurTokens.coral),
             shape = RoundedCornerShape(24.dp),
         ) {
-            Text("Save key")
+            Text("Save ElevenLabs key")
+        }
+        Text("Gemini API key", color = MurmurTokens.textPrimary, fontSize = 14.sp)
+        BasicTextField(
+            value = geminiKey,
+            onValueChange = { geminiKey = it },
+            textStyle = TextStyle(color = MurmurTokens.textPrimary, fontSize = 16.sp),
+            cursorBrush = SolidColor(MurmurTokens.coralLight),
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color.White.copy(alpha = 0.07f), RoundedCornerShape(12.dp))
+                .padding(16.dp),
+            decorationBox = { inner ->
+                Box {
+                    if (geminiKey.isEmpty()) {
+                        Text("Paste Gemini key", color = MurmurTokens.textSecondary, fontSize = 16.sp)
+                    }
+                    inner()
+                }
+            },
+        )
+        Button(
+            onClick = {
+                val trimmed = geminiKey.trim()
+                if (trimmed.isEmpty()) {
+                    status = "Paste a Gemini key first"
+                    return@Button
+                }
+                try {
+                    MurmurSecrets.apiKeyStore(context).saveGeminiKey(trimmed)
+                    EnginePrefs.setGeminiLiveHandshakeFailed(context, false)
+                    status = "Gemini key saved"
+                } catch (_: Exception) {
+                    status = "Could not save key"
+                }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = MurmurTokens.coral),
+            shape = RoundedCornerShape(24.dp),
+        ) {
+            Text("Save Gemini key")
         }
         Button(
             onClick = {
@@ -198,15 +263,29 @@ private fun CompanionScreen(onEnableKeyboard: () -> Unit) {
                             val wav = File.createTempFile("murmur-", ".wav", context.cacheDir)
                             try {
                                 WavWriter.writePcm16(pcm, wav)
-                                val key = MurmurSecrets.apiKeyStore(context).elevenLabsKey()
-                                    ?: throw IllegalStateException("no-key")
-                                ElevenLabsBatch.transcribe(wav, key)
+                                val keys = MurmurSecrets.apiKeyStore(context)
+                                when (EnginePrefs.engine(context)) {
+                                    CloudEngine.ELEVEN_LABS -> {
+                                        val key = keys.elevenLabsKey()
+                                            ?: throw IllegalStateException("no-key")
+                                        ElevenLabsBatch.transcribe(wav, key)
+                                    }
+                                    CloudEngine.GEMINI -> {
+                                        val key = keys.geminiKey()
+                                            ?: throw IllegalStateException("no-gemini-key")
+                                        GeminiBatch.transcribe(wav, key)
+                                    }
+                                }
                             } finally {
                                 wav.delete()
                             }
                         }
                     } catch (e: IllegalStateException) {
-                        if (e.message == "no-key") "Paste and save an ElevenLabs key" else "Mic capture failed"
+                        when (e.message) {
+                            "no-key" -> "Paste and save an ElevenLabs key"
+                            "no-gemini-key" -> "Paste and save a Gemini key"
+                            else -> "Mic capture failed"
+                        }
                     } catch (_: SecurityException) {
                         "Allow microphone in Murmur"
                     } catch (_: Exception) {

@@ -54,6 +54,20 @@ class ApiKeyStoreTest {
     }
 
     @Test
+    fun roundTripGeminiKeyPreservesElevenLabs() {
+        val dir = tmpDir()
+        val key = softwareKey()
+        val store = ApiKeyStore(dir, ApiKeyStore.TEST_ALIAS, key)
+        store.saveElevenLabsKey("xi-one")
+        store.saveGeminiKey("gm-two")
+        assertEquals("xi-one", store.elevenLabsKey())
+        assertEquals("gm-two", store.geminiKey())
+        store.saveElevenLabsKey("xi-three")
+        assertEquals("xi-three", store.elevenLabsKey())
+        assertEquals("gm-two", store.geminiKey())
+    }
+
+    @Test
     fun missingFileReturnsNull() {
         val store = ApiKeyStore(tmpDir(), ApiKeyStore.TEST_ALIAS, softwareKey())
         assertNull(store.elevenLabsKey())

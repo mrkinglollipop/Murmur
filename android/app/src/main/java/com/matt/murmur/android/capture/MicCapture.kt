@@ -27,14 +27,23 @@ class MicCapture(private val context: Context) {
     @Volatile
     private var released = false
 
-    fun record(durationMs: Long): ByteArray {
-        val startedAt = SystemClock.elapsedRealtime()
-        return captureWhile { SystemClock.elapsedRealtime() - startedAt < durationMs }
+    fun interface PcmListener {
+        /** Recording thread. Copy if retaining; do not block on network. */
+        fun onPcm(chunk: ByteArray, length: Int)
     }
 
-    fun recordUntilStopped(): ByteArray = captureWhile { true }
+    fun record(durationMs: Long, onPcm: PcmListener? = null): ByteArray {
+        val startedAt = SystemClock.elapsedRealtime()
+        return captureWhile(
+            keepReading = { SystemClock.elapsedRealtime() - startedAt < durationMs },
+            onPcm = onPcm,
+        )
+    }
 
-    private fun captureWhile(keepReading: () -> Boolean): ByteArray {
+    fun recordUntilStopped(onPcm: PcmListener? = null): ByteArray =
+        captureWhile(keepReading = { true }, onPcm = onPcm)
+
+    private fun captureWhile(keepReading: () -> Boolean, onPcm: PcmListener? = null): ByteArray {
         if (released) return ByteArray(0)
         if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
@@ -106,7 +115,10 @@ class MicCapture(private val context: Context) {
                         Log.w(TAG, "mic.capture.failed")
                         throw IllegalStateException("mic.capture.failed")
                     }
-                    if (n > 0) out.write(chunk, 0, n)
+                    if (n > 0) {
+                        out.write(chunk, 0, n)
+                        onPcm?.onPcm(chunk, n)
+                    }
                 }
             }
             return out.toByteArray()

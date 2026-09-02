@@ -2,7 +2,7 @@
 
 Keyboard-first Android port. Sibling of `ios/`. Do **not** add these targets to Mac `project.yml` or `ios/project.yml`.
 
-v1 is an IME plus a companion app (`applicationId` `com.matt.murmur.android`). This build records 16 kHz mono PCM, wraps WAV, and can batch-transcribe through ElevenLabs. Tap the IME mic to start, tap again to stop; the field gets spaced text via `commitText`. The IME fail-closed promotes itself to `FOREGROUND_SERVICE_TYPE_MICROPHONE` on the start tap while the input view is shown.
+v1 is an IME plus a companion app (`applicationId` `com.matt.murmur.android`). Default engine is ElevenLabs Scribe v2 Realtime; Gemini 3.5 Transcribe Live is selectable. Live start/finalize failure falls back to batch WAV. Tap the IME mic to start, tap again to stop; partials stay on the status strip and the field gets spaced text via `commitText` only after stop. The IME fail-closed promotes itself to `FOREGROUND_SERVICE_TYPE_MICROPHONE` on the start tap while the input view is shown.
 
 **Distribution:** sideload / GitHub APK, like iOS. Play listing is not a v1 deliverable. Code stays Play-capable (no Accessibility Service, no overlay).
 
@@ -57,8 +57,8 @@ This repository has **no CI by design**. Run Gradle locally. Do not add a GitHub
 1. Install the debug APK (`app/build/outputs/apk/debug/app-debug.apk`).
 2. Open Murmur → **Enable Murmur keyboard** (opens input-method settings).
 3. Turn Murmur on, then switch to it from a text field (globe / picker).
-4. Grant microphone (and notifications) from the companion (or the IME will open that prompt on the first mic tap). Paste an ElevenLabs key and **Save key**.
-5. In Keep / Messages, tap the coral mic, speak, tap stop. The field should contain spaced text.
+4. Grant microphone (and notifications) from the companion (or the IME will open that prompt on the first mic tap). Paste an ElevenLabs and/or Gemini key, pick the engine, and save.
+5. In Keep / Messages, tap the coral mic, speak, tap stop. Partials appear on the status strip only; the field should contain spaced text after stop.
 
 QWERTY still types if the key or mic is missing. Password fields skip dictation (no insert, no clipboard).
 
@@ -80,7 +80,7 @@ Hide-while-recording is best-effort: keep an already-started FGS; do not `startF
 android/
   gradle/libs.versions.toml   # AGP, Kotlin, compileSdk 36 / targetSdk 36 / minSdk 33
   logic/                      # pipeline, insert spacing, activation, FGS gate — JUnit on JVM
-  cloud/                      # ElevenLabs batch (OkHttp), JUnit + MockWebServer
+  cloud/                      # ElevenLabs + Gemini live WS and batch (OkHttp), JUnit + MockWebServer
   app/                        # IME (Views) + companion Activity (Compose) + AudioRecord
   scripts/                    # oracle-dictation-start.sh + helpers selftest
   docs/cloud-protocols.md
