@@ -29,14 +29,23 @@ class ApiKeyStore(
     }
 
     fun saveElevenLabsKey(value: String) {
-        writePayload(encodeElevenLabs(value))
+        val keys = readKeys()
+        writePayload(encodeKeys(keys.copy(elevenLabs = value)))
     }
 
-    fun elevenLabsKey(): String? {
+    fun saveGeminiKey(value: String) {
+        val keys = readKeys()
+        writePayload(encodeKeys(keys.copy(gemini = value)))
+    }
+
+    fun elevenLabsKey(): String? = readKeys().elevenLabs?.takeIf { it.isNotBlank() }
+
+    fun geminiKey(): String? = readKeys().gemini?.takeIf { it.isNotBlank() }
+
+    private fun readKeys(): StoredKeys {
         val file = File(murmurDir, FILENAME)
-        if (!file.isFile) return null
-        val plain = decrypt(file.readBytes())
-        return decodeElevenLabs(plain)?.takeIf { it.isNotBlank() }
+        if (!file.isFile) return StoredKeys()
+        return decodeKeys(decrypt(file.readBytes()))
     }
 
     fun clear() {
@@ -126,13 +135,34 @@ class ApiKeyStore(
             }
         }
 
-        internal fun encodeElevenLabs(value: String): ByteArray {
-            return "{\"elevenLabs\":\"${jsonEscape(value)}\"}".toByteArray(Charsets.UTF_8)
+        internal data class StoredKeys(
+            val elevenLabs: String? = null,
+            val gemini: String? = null,
+        )
+
+        internal fun encodeKeys(keys: StoredKeys): ByteArray {
+            val parts = mutableListOf<String>()
+            keys.elevenLabs?.let { parts += "\"elevenLabs\":\"${jsonEscape(it)}\"" }
+            keys.gemini?.let { parts += "\"gemini\":\"${jsonEscape(it)}\"" }
+            return "{${parts.joinToString(",")}}".toByteArray(Charsets.UTF_8)
         }
 
-        internal fun decodeElevenLabs(plain: ByteArray): String? {
+        internal fun decodeKeys(plain: ByteArray): StoredKeys {
             val s = plain.toString(Charsets.UTF_8)
-            val marker = "\"elevenLabs\":\""
+            return StoredKeys(
+                elevenLabs = decodeField(s, "elevenLabs"),
+                gemini = decodeField(s, "gemini"),
+            )
+        }
+
+        internal fun encodeElevenLabs(value: String): ByteArray {
+            return encodeKeys(StoredKeys(elevenLabs = value))
+        }
+
+        internal fun decodeElevenLabs(plain: ByteArray): String? = decodeKeys(plain).elevenLabs
+
+        private fun decodeField(s: String, name: String): String? {
+            val marker = "\"$name\":\""
             val start = s.indexOf(marker)
             if (start < 0) return null
             return jsonUnescape(s, start + marker.length)

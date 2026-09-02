@@ -12,6 +12,7 @@
     <string name="ime_secure">Dictation off in password fields</string>
     <string name="ime_allow_mic">Allow microphone in Murmur</string>
     <string name="ime_need_key">Paste and save an ElevenLabs key</string>
+    <string name="ime_need_gemini_key">Paste and save a Gemini key</string>
     <string name="ime_mic_denied">Microphone start denied</string>
     <string name="ime_mic_failed">Mic capture failed</string>
     <string name="ime_transcribe_failed">Transcribe failed</string>

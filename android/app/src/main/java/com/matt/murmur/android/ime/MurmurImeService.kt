@@ -17,16 +17,24 @@ import android.view.inputmethod.InputConnection
 import com.matt.murmur.android.R
 import com.matt.murmur.android.capture.MicCapture
 import com.matt.murmur.android.cloud.ElevenLabsBatch
+import com.matt.murmur.android.cloud.ElevenLabsRealtimeTranscriber
+import com.matt.murmur.android.cloud.GeminiBatch
+import com.matt.murmur.android.cloud.GeminiLiveTranscriber
+import com.matt.murmur.android.cloud.LiveTranscriber
 import com.matt.murmur.android.crypto.MurmurSecrets
+import com.matt.murmur.android.logic.CloudEngine
+import com.matt.murmur.android.logic.GeminiLiveGate
 import com.matt.murmur.android.logic.ImeActivationCommand
 import com.matt.murmur.android.logic.ImeActivationLogic
 import com.matt.murmur.android.logic.ImePointer
 import com.matt.murmur.android.logic.SilenceCancel
+import com.matt.murmur.android.logic.StreamingCoordinator
 import com.matt.murmur.android.logic.TranscriptPipeline
 import com.matt.murmur.android.logic.WavWriter
 import com.matt.murmur.android.logic.bulkInsertChunks
 import com.matt.murmur.android.logic.preparedDictationInsert
 import com.matt.murmur.android.perm.MurmurPermissionActivity
+import com.matt.murmur.android.prefs.EnginePrefs
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -34,6 +42,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
+    private val liveStart = Executors.newCachedThreadPool()
     private val activation = ImeActivationLogic()
     private var chrome: ImeChrome? = null
     private var inputViewVisible = false
@@ -115,12 +124,14 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         ImeMicForeground.stop(this)
         fgsRunning = false
         currentTake?.skipInsert = true
+        currentTake?.session?.cancel()
         currentTake?.capture?.stop()
         currentTake = null
         try {
             unregisterReceiver(stopReceiver)
         } catch (_: Exception) {
         }
+        liveStart.shutdownNow()
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -185,13 +196,25 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             activation.reset()
             return
         }
-        val key = try {
-            MurmurSecrets.apiKeyStore(this).elevenLabsKey()
+        val engine = EnginePrefs.engine(this)
+        val store = try {
+            MurmurSecrets.apiKeyStore(this)
         } catch (_: Exception) {
             null
         }
+        val key = when (engine) {
+            CloudEngine.ELEVEN_LABS -> store?.elevenLabsKey()
+            CloudEngine.GEMINI -> store?.geminiKey()
+        }
         if (key.isNullOrBlank()) {
-            chrome?.setStatus(getString(R.string.ime_need_key))
+            chrome?.setStatus(
+                getString(
+                    when (engine) {
+                        CloudEngine.ELEVEN_LABS -> R.string.ime_need_key
+                        CloudEngine.GEMINI -> R.string.ime_need_gemini_key
+                    },
+                ),
+            )
             activation.reset()
             return
         }
@@ -203,20 +226,51 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         }
         fgsRunning = true
         val capture = MicCapture(this)
+        val attemptLive = engine != CloudEngine.GEMINI ||
+            GeminiLiveGate.shouldAttemptLive(EnginePrefs.geminiLiveHandshakeFailed(this))
+        val session = if (attemptLive) makeLiveSession(engine, key) else null
         val take = Take(
             capture = capture,
             editor = currentInputEditorInfo.editorKey(),
+            engine = engine,
             apiKey = key,
+            session = session,
         )
         currentTake = take
         chrome?.setStatus(getString(R.string.ime_recording))
         Log.i(TAG, "ime.mic.start")
+        session?.arm()
+        session?.onInterim = { text ->
+            if (text.isNotBlank()) {
+                mainHandler.post {
+                    if (currentTake === take && !take.skipInsert) {
+                        chrome?.setStatus(text)
+                    }
+                }
+            }
+        }
+        if (session != null) {
+            liveStart.execute {
+                try {
+                    session.start()
+                } catch (_: Exception) {
+                    take.liveStartFailed = true
+                    session.cancel()
+                    if (engine == CloudEngine.GEMINI) {
+                        EnginePrefs.setGeminiLiveHandshakeFailed(this, true)
+                    }
+                }
+            }
+        }
         worker.execute {
             try {
-                val pcm = capture.recordUntilStopped()
+                val pcm = capture.recordUntilStopped { chunk, length ->
+                    session?.sendPcm16(chunk.copyOf(length))
+                }
                 completeTake(take, pcm)
             } catch (_: Exception) {
                 Log.w(TAG, "mic.capture.failed")
+                session?.cancel()
                 mainHandler.post {
                     chrome?.setStatus(getString(R.string.ime_mic_failed))
                 }
@@ -241,6 +295,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     private fun cancelTake() {
         val take = currentTake ?: return
         take.skipInsert = true
+        take.session?.cancel()
         take.capture.stop()
         mainHandler.post { chrome?.setStatus("Murmur") }
     }
@@ -251,20 +306,47 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         take.skipInsert = true
         take.secureSkip = true
         logSecureSkip(info)
+        take.session?.cancel()
         take.capture.stop()
         chrome?.setStatus(getString(R.string.ime_secure))
     }
 
     private fun completeTake(take: Take, pcm: ByteArray) {
         if (take.skipInsert) {
+            take.session?.cancel()
             if (take.secureSkip) Log.i(TAG, "insert.secure_skip")
             mainHandler.post { chrome?.setStatus("Murmur") }
             return
         }
         val seconds = SilenceCancel.pcm16MonoSeconds(pcm.size)
-        if (SilenceCancel.shouldTakeSilenceCancel(everHadStreamText = false, bufferedSeconds = seconds)) {
+        val session = take.session
+        val everHad = session?.hasEverHadNonEmptyStreamText == true
+        if (StreamingCoordinator.shouldTakeSilenceCancel(everHad, seconds)) {
+            session?.cancel()
             Log.i(TAG, "ime.silence_cancel")
             mainHandler.post { chrome?.setStatus("Murmur") }
+            return
+        }
+        mainHandler.post {
+            chrome?.setStatus(getString(R.string.ime_transcribing))
+        }
+        val snapshot = session?.joinedTranscriptSnapshot().orEmpty()
+        val finalizeText = if (session != null && !take.liveStartFailed) {
+            session.finalize(seconds)
+        } else {
+            session?.cancel()
+            ""
+        }
+        val truncated = StreamingCoordinator.streamResultLooksTruncated(finalizeText, seconds)
+        val liveText = StreamingCoordinator.streamSuccessTextOrBatchFallback(
+            finalizeText = finalizeText,
+            preFinalizeSnapshot = snapshot,
+            duration = seconds,
+            truncated = truncated,
+        )
+        if (liveText != null) {
+            val processed = TranscriptPipeline.apply(liveText)
+            mainHandler.post { insertTake(take, processed) }
             return
         }
         if (pcm.size < 2) {
@@ -272,13 +354,10 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             return
         }
         Log.i(TAG, "ime.pcm.bytes=${pcm.size}")
-        mainHandler.post {
-            chrome?.setStatus(getString(R.string.ime_transcribing))
-        }
         val wav = File.createTempFile("murmur-", ".wav", cacheDir)
         try {
             WavWriter.writePcm16(pcm, wav)
-            val raw = ElevenLabsBatch.transcribe(wav, take.apiKey)
+            val raw = batchTranscribe(take, wav)
             val processed = TranscriptPipeline.apply(raw)
             mainHandler.post { insertTake(take, processed) }
         } catch (_: Exception) {
@@ -287,6 +366,34 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             }
         } finally {
             wav.delete()
+        }
+    }
+
+    private fun batchTranscribe(take: Take, wav: File): String {
+        return when (take.engine) {
+            CloudEngine.ELEVEN_LABS -> ElevenLabsBatch.transcribe(
+                audio = wav,
+                apiKey = take.apiKey,
+                keyterms = emptyList(),
+            )
+            CloudEngine.GEMINI -> GeminiBatch.transcribe(
+                audio = wav,
+                apiKey = take.apiKey,
+                vocabulary = emptyList(),
+            )
+        }
+    }
+
+    private fun makeLiveSession(engine: CloudEngine, key: String): LiveTranscriber {
+        return when (engine) {
+            CloudEngine.ELEVEN_LABS -> ElevenLabsRealtimeTranscriber(
+                apiKey = key,
+                keyterms = emptyList(),
+            )
+            CloudEngine.GEMINI -> GeminiLiveTranscriber(
+                apiKey = key,
+                vocabulary = emptyList(),
+            )
         }
     }
 
@@ -357,12 +464,16 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     private class Take(
         val capture: MicCapture,
         val editor: EditorKey?,
+        val engine: CloudEngine,
         val apiKey: String,
+        val session: LiveTranscriber?,
     ) {
         @Volatile
         var skipInsert: Boolean = false
         @Volatile
         var secureSkip: Boolean = false
+        @Volatile
+        var liveStartFailed: Boolean = false
     }
 
     companion object {
