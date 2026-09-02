@@ -45,13 +45,16 @@ object ImeMicForeground {
             Log.i(TAG, "fgs.start")
             true
         } catch (e: Exception) {
-            Log.w(TAG, "fgs.start.denied")
+            Log.w(TAG, "fgs.start.denied", e)
             false
         }
     }
 
     fun stop(service: Service) {
-        service.stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        try {
+            service.stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+        }
     }
 
     private fun ensureChannel(service: Service) {

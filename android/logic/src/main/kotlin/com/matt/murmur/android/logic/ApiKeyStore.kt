@@ -2,6 +2,7 @@ package com.matt.murmur.android.logic
 
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
@@ -62,12 +63,14 @@ class ApiKeyStore(
                 StandardCopyOption.REPLACE_EXISTING,
                 StandardCopyOption.ATOMIC_MOVE,
             )
-        } catch (_: Exception) {
-            if (target.exists() && !target.delete()) {
-                tmp.delete()
-                throw ApiKeyStoreException.Io("could not replace $FILENAME")
-            }
-            if (!tmp.renameTo(target)) {
+        } catch (_: AtomicMoveNotSupportedException) {
+            try {
+                Files.move(
+                    tmp.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: Exception) {
                 tmp.delete()
                 throw ApiKeyStoreException.Io("could not replace $FILENAME")
             }
@@ -90,20 +93,7 @@ class ApiKeyStore(
     }
 
     private fun decrypt(envelope: ByteArray): ByteArray {
-        if (envelope.isEmpty()) throw ApiKeyStoreException.Corrupt
-        val version = envelope[0]
-        if (version != VERSION) throw ApiKeyStoreException.UnknownVersion(version)
-        if (envelope.size < 1 + IV_BYTES + TAG_BYTES) throw ApiKeyStoreException.Corrupt
-        val iv = envelope.copyOfRange(1, 1 + IV_BYTES)
-        val body = envelope.copyOfRange(1 + IV_BYTES, envelope.size)
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, iv))
-        cipher.updateAAD(AAD)
-        return try {
-            cipher.doFinal(body)
-        } catch (e: Exception) {
-            throw ApiKeyStoreException.Corrupt
-        }
+        return decryptEnvelope(envelope, key, AAD)
     }
 
     companion object {
@@ -117,7 +107,24 @@ class ApiKeyStore(
         const val TRANSFORMATION = "AES/GCM/NoPadding"
 
         private const val TMP_FILENAME = "apikeys.bin.tmp"
-        private val AAD = FILENAME.toByteArray(Charsets.UTF_8)
+        internal val AAD = FILENAME.toByteArray(Charsets.UTF_8)
+
+        internal fun decryptEnvelope(envelope: ByteArray, key: SecretKey, aad: ByteArray): ByteArray {
+            if (envelope.isEmpty()) throw ApiKeyStoreException.Corrupt
+            val version = envelope[0]
+            if (version != VERSION) throw ApiKeyStoreException.UnknownVersion(version)
+            if (envelope.size < 1 + IV_BYTES + TAG_BYTES) throw ApiKeyStoreException.Corrupt
+            val iv = envelope.copyOfRange(1, 1 + IV_BYTES)
+            val body = envelope.copyOfRange(1 + IV_BYTES, envelope.size)
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, iv))
+            cipher.updateAAD(aad)
+            return try {
+                cipher.doFinal(body)
+            } catch (_: Exception) {
+                throw ApiKeyStoreException.Corrupt
+            }
+        }
 
         internal fun encodeElevenLabs(value: String): ByteArray {
             return "{\"elevenLabs\":\"${jsonEscape(value)}\"}".toByteArray(Charsets.UTF_8)

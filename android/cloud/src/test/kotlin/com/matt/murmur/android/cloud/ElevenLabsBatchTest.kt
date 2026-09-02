@@ -134,6 +134,72 @@ class ElevenLabsBatchTest {
     }
 
     @Test
+    fun transcribeUsesTopLevelTextWhenWordsComeFirst() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """{"words":[{"text":"first","type":"word"},{"text":" ","type":"spacing"}],"text":"hello world"}""",
+            ),
+        )
+        server.start()
+        try {
+            val text = ElevenLabsBatch.transcribeAt(
+                audio = tempWav(),
+                apiKey = "k",
+                language = "en",
+                noVerbatim = true,
+                keyterms = emptyList(),
+                client = OkHttpClient(),
+                endpoint = server.url("/").toString(),
+            )
+            assertEquals("hello world", text)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun transcribeUsesTopLevelTextWhenWordsComeAfter() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setBody(
+                """{"text":"hello world","words":[{"text":"hello","type":"word"},{"text":"world","type":"word"}]}""",
+            ),
+        )
+        server.start()
+        try {
+            val text = ElevenLabsBatch.transcribeAt(
+                audio = tempWav(),
+                apiKey = "k",
+                language = "en",
+                noVerbatim = true,
+                keyterms = emptyList(),
+                client = OkHttpClient(),
+                endpoint = server.url("/").toString(),
+            )
+            assertEquals("hello world", text)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun parseTranscriptTextIgnoresNestedWordText() {
+        assertEquals(
+            "hello world",
+            parseTranscriptText(
+                """{"words":[{"text":"first"}],"text":"hello world"}""",
+            ),
+        )
+        assertEquals(
+            "hello world",
+            parseTranscriptText(
+                """{"text":"hello world","words":[{"text":"hello"}]}""",
+            ),
+        )
+    }
+
+    @Test
     fun redactedBodyFragmentStripsTwentyPlusCharTokens() {
         val body = "err key=abcdefghijklmnopqrstuvwxyz leftover"
         assertEquals("err key=… leftover", redactedBodyFragment(body))

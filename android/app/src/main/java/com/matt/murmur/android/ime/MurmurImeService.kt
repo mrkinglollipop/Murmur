@@ -19,6 +19,8 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     private val captureInFlight = AtomicBoolean(false)
     private var chrome: ImeChrome? = null
     private var inputViewVisible = false
+    @Volatile
+    private var activeCapture: MicCapture? = null
 
     override fun onCreateInputView(): View {
         inputViewVisible = true
@@ -51,6 +53,10 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     override fun onEvaluateFullscreenMode(): Boolean = false
 
     override fun onDestroy() {
+        ImeMicForeground.stop(this)
+        activeCapture?.stop()
+        activeCapture = null
+        captureInFlight.set(false)
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -86,8 +92,6 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     }
 
     override fun onMicTap() {
-        // Device-gate capture only — not the tap-to-toggle dictation loop (PR 3).
-        // No commitText, no cloud. FGS starts while the input view is shown.
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -102,13 +106,21 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             return
         }
         chrome?.setStatus("Recording…")
+        val capture = MicCapture(this)
+        activeCapture = capture
         worker.execute {
             try {
-                val pcm = MicCapture(this).record(3_000L)
-                mainHandler.post { chrome?.setStatus("captured ${pcm.size} bytes") }
+                val pcm = capture.record(3_000L)
+                if (captureInFlight.get()) {
+                    mainHandler.post { chrome?.setStatus("captured ${pcm.size} bytes") }
+                }
             } catch (_: Exception) {
-                mainHandler.post { chrome?.setStatus("Mic capture failed") }
+                if (captureInFlight.get()) {
+                    mainHandler.post { chrome?.setStatus("Mic capture failed") }
+                }
             } finally {
+                capture.stop()
+                if (activeCapture === capture) activeCapture = null
                 ImeMicForeground.stop(this)
                 captureInFlight.set(false)
             }

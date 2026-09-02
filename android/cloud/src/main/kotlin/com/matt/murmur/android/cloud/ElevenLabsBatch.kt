@@ -112,43 +112,137 @@ fun redactedBodyFragment(body: String, max: Int = 300): String {
     return if (redacted.length <= max) redacted else redacted.substring(0, max)
 }
 
+/** Top-level JSON `"text"` only — nested `words[].text` must not win. */
 internal fun parseTranscriptText(json: String): String? {
-    val marker = "\"text\""
-    val start = json.indexOf(marker)
-    if (start < 0) return null
-    var i = start + marker.length
-    while (i < json.length && json[i].isWhitespace()) i++
-    if (i >= json.length || json[i] != ':') return null
-    i++
-    while (i < json.length && json[i].isWhitespace()) i++
-    if (i >= json.length || json[i] != '"') return null
-    i++
-    val sb = StringBuilder()
-    while (i < json.length) {
-        val c = json[i]
-        when {
-            c == '"' -> return sb.toString()
-            c == '\\' && i + 1 < json.length -> {
-                when (val n = json[i + 1]) {
-                    'n' -> sb.append('\n')
-                    'r' -> sb.append('\r')
-                    't' -> sb.append('\t')
-                    '"' -> sb.append('"')
-                    '\\' -> sb.append('\\')
-                    'u' -> {
-                        if (i + 5 >= json.length) return null
-                        sb.append(json.substring(i + 2, i + 6).toInt(16).toChar())
-                        i += 4
-                    }
-                    else -> sb.append(n)
-                }
-                i += 2
+    return JsonReader(json).topLevelString("text")
+}
+
+private class JsonReader(private val s: String) {
+    private var i = 0
+
+    fun topLevelString(want: String): String? {
+        skipWs()
+        if (!consume('{')) return null
+        while (true) {
+            skipWs()
+            if (peek() == '}') return null
+            if (peek() != '"') return null
+            val key = parseString() ?: return null
+            skipWs()
+            if (!consume(':')) return null
+            skipWs()
+            if (key == want && peek() == '"') {
+                return parseString()
             }
-            else -> {
-                sb.append(c)
-                i++
+            if (!skipValue()) return null
+            skipWs()
+            when (peek()) {
+                ',' -> i++
+                '}' -> return null
+                else -> return null
             }
         }
     }
-    return null
+
+    private fun parseString(): String? {
+        if (!consume('"')) return null
+        val sb = StringBuilder()
+        while (i < s.length) {
+            val c = s[i]
+            when {
+                c == '"' -> {
+                    i++
+                    return sb.toString()
+                }
+                c == '\\' && i + 1 < s.length -> {
+                    when (val n = s[i + 1]) {
+                        'n' -> sb.append('\n')
+                        'r' -> sb.append('\r')
+                        't' -> sb.append('\t')
+                        '"' -> sb.append('"')
+                        '\\' -> sb.append('\\')
+                        '/' -> sb.append('/')
+                        'u' -> {
+                            if (i + 5 >= s.length) return null
+                            sb.append(s.substring(i + 2, i + 6).toInt(16).toChar())
+                            i += 4
+                        }
+                        else -> sb.append(n)
+                    }
+                    i += 2
+                }
+                else -> {
+                    sb.append(c)
+                    i++
+                }
+            }
+        }
+        return null
+    }
+
+    private fun skipValue(): Boolean {
+        skipWs()
+        val c = peek() ?: return false
+        return when (c) {
+            '"' -> parseString() != null
+            '{' -> skipDelimited('{', '}')
+            '[' -> skipDelimited('[', ']')
+            't' -> consumeLiteral("true")
+            'f' -> consumeLiteral("false")
+            'n' -> consumeLiteral("null")
+            '-' -> skipNumber()
+            in '0'..'9' -> skipNumber()
+            else -> false
+        }
+    }
+
+    private fun skipDelimited(open: Char, close: Char): Boolean {
+        if (!consume(open)) return false
+        var depth = 1
+        while (i < s.length && depth > 0) {
+            when (s[i]) {
+                '"' -> {
+                    if (parseString() == null) return false
+                    continue
+                }
+                open -> depth++
+                close -> depth--
+            }
+            i++
+        }
+        return depth == 0
+    }
+
+    private fun skipNumber(): Boolean {
+        if (peek() == '-') i++
+        if (i >= s.length) return false
+        val start = i
+        while (i < s.length) {
+            val c = s[i]
+            if (c.isDigit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+                i++
+            } else {
+                break
+            }
+        }
+        return i > start
+    }
+
+    private fun consumeLiteral(lit: String): Boolean {
+        if (!s.startsWith(lit, i)) return false
+        i += lit.length
+        return true
+    }
+
+    private fun consume(c: Char): Boolean {
+        if (peek() != c) return false
+        i++
+        return true
+    }
+
+    private fun peek(): Char? = if (i < s.length) s[i] else null
+
+    private fun skipWs() {
+        while (i < s.length && s[i].isWhitespace()) i++
+    }
 }

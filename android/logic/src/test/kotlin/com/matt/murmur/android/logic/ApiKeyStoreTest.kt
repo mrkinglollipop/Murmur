@@ -37,7 +37,6 @@ class ApiKeyStoreTest {
         assertEquals(ApiKeyStore.VERSION, raw[0])
         assertTrue(raw.size >= 1 + ApiKeyStore.IV_BYTES + ApiKeyStore.TAG_BYTES)
         assertEquals(0x01.toByte(), raw[0])
-        // IV occupies bytes 1..12; remainder is ciphertext||tag from doFinal.
         val body = raw.copyOfRange(1 + ApiKeyStore.IV_BYTES, raw.size)
         assertTrue(body.size >= ApiKeyStore.TAG_BYTES)
         assertNull(File(dir, "apikeys.bin.tmp").takeIf { it.exists() })
@@ -109,6 +108,32 @@ class ApiKeyStoreTest {
         assertEquals("apikeys.bin", ApiKeyStore.FILENAME)
         val encoded = ApiKeyStore.encodeElevenLabs("k")
         assertEquals("k", ApiKeyStore.decodeElevenLabs(encoded))
+    }
+
+    @Test
+    fun wrongAssociatedDataIsCorrupt() {
+        val dir = tmpDir()
+        val key = softwareKey()
+        ApiKeyStore(dir, ApiKeyStore.TEST_ALIAS, key).saveElevenLabsKey("secret")
+        val envelope = File(dir, ApiKeyStore.FILENAME).readBytes()
+        try {
+            ApiKeyStore.decryptEnvelope(envelope, key, "not-apikeys.bin".toByteArray())
+            fail("expected Corrupt")
+        } catch (_: ApiKeyStoreException.Corrupt) {
+        }
+        val plain = ApiKeyStore.decryptEnvelope(envelope, key, ApiKeyStore.AAD)
+        assertEquals("secret", ApiKeyStore.decodeElevenLabs(plain))
+    }
+
+    @Test
+    fun wrongWrappingKeyIsCorrupt() {
+        val dir = tmpDir()
+        ApiKeyStore(dir, ApiKeyStore.TEST_ALIAS, softwareKey()).saveElevenLabsKey("secret")
+        try {
+            ApiKeyStore(dir, ApiKeyStore.TEST_ALIAS, softwareKey()).elevenLabsKey()
+            fail("expected Corrupt")
+        } catch (_: ApiKeyStoreException.Corrupt) {
+        }
     }
 
     @Test

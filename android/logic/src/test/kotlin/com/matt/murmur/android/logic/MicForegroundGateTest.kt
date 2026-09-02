@@ -12,7 +12,6 @@ class MicForegroundGateTest {
 
     @Test
     fun startDeniedAfterInputViewGone() {
-        // onFinishInputView / hide: do not startForeground(MICROPHONE).
         assertFalse(MicForegroundGate.canStartMicrophoneForeground(inputViewShown = false))
     }
 }
