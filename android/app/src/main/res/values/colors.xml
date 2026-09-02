@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="murmur_bg">#101014</color>
+    <color name="murmur_coral">#D85A30</color>
+    <color name="murmur_coral_light">#F0997B</color>
+    <color name="murmur_text_primary">#F5F5F7</color>
+</resources>

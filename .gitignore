@@ -32,3 +32,9 @@ Voice.xcodeproj
 ios/*.xcodeproj
 ios/build/
 ios/build-*/
+
+# Android (sibling of ios/; local.properties is machine SDK path)
+android/local.properties
+android/.gradle/
+android/.kotlin/
+*.iml
