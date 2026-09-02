@@ -1,14 +1,48 @@
 package com.matt.murmur.android.ime
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import com.matt.murmur.android.capture.MicCapture
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MurmurImeService : InputMethodService(), ImeChrome.Listener {
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val worker = Executors.newSingleThreadExecutor()
+    private val captureInFlight = AtomicBoolean(false)
+    private var chrome: ImeChrome? = null
+    private var inputViewVisible = false
+    @Volatile
+    private var activeCapture: MicCapture? = null
+
     override fun onCreateInputView(): View {
-        return ImeChrome(this, this)
+        inputViewVisible = true
+        val view = ImeChrome(this, this)
+        chrome = view
+        return view
+    }
+
+    override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        inputViewVisible = true
+    }
+
+    override fun onWindowShown() {
+        super.onWindowShown()
+        inputViewVisible = true
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        inputViewVisible = false
+        // Keep an already-started microphone FGS. Do not startForeground here.
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -17,6 +51,15 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     }
 
     override fun onEvaluateFullscreenMode(): Boolean = false
+
+    override fun onDestroy() {
+        ImeMicForeground.stop(this)
+        activeCapture?.stop()
+        activeCapture = null
+        captureInFlight.set(false)
+        worker.shutdownNow()
+        super.onDestroy()
+    }
 
     override fun onCommit(text: String) {
         currentInputConnection?.commitText(text, 1)
@@ -48,7 +91,39 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         switchToNextInputMethod(false)
     }
 
-    override fun onMicPlaceholder() {
-        // Visible only. Recording is a later PR; do not request RECORD_AUDIO.
+    override fun onMicTap() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            chrome?.setStatus("Allow microphone in Murmur")
+            return
+        }
+        if (!captureInFlight.compareAndSet(false, true)) return
+        val viewShown = inputViewVisible
+        if (!ImeMicForeground.start(this, inputViewShown = viewShown)) {
+            captureInFlight.set(false)
+            chrome?.setStatus("Microphone start denied")
+            return
+        }
+        chrome?.setStatus("Recording…")
+        val capture = MicCapture(this)
+        activeCapture = capture
+        worker.execute {
+            try {
+                val pcm = capture.record(3_000L)
+                if (captureInFlight.get()) {
+                    mainHandler.post { chrome?.setStatus("captured ${pcm.size} bytes") }
+                }
+            } catch (_: Exception) {
+                if (captureInFlight.get()) {
+                    mainHandler.post { chrome?.setStatus("Mic capture failed") }
+                }
+            } finally {
+                capture.stop()
+                if (activeCapture === capture) activeCapture = null
+                ImeMicForeground.stop(this)
+                captureInFlight.set(false)
+            }
+        }
     }
 }

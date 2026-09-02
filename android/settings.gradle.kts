@@ -23,3 +23,4 @@ dependencyResolutionManagement {
 rootProject.name = "Murmur"
 include(":app")
 include(":logic")
+include(":cloud")
