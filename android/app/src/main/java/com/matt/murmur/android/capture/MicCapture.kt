@@ -5,8 +5,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
-import android.media.AudioManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.SystemClock
@@ -22,7 +22,6 @@ import java.io.ByteArrayOutputStream
 class MicCapture(private val context: Context) {
     private val lock = Any()
     private var recorder: AudioRecord? = null
-    private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
 
     @Volatile
@@ -73,54 +72,73 @@ class MicCapture(private val context: Context) {
                 return ByteArray(0)
             }
             recorder = rec
-            audioManager = am
             focusRequest = focus
-        }
-        am.requestAudioFocus(focus)
-        val out = ByteArrayOutputStream()
-        val chunk = ByteArray(minBuf)
-        try {
-            rec.startRecording()
-            Log.i(TAG, "mic.capture.started")
-            val deadline = SystemClock.elapsedRealtime() + durationMs
-            while (!released && SystemClock.elapsedRealtime() < deadline) {
-                val n = try {
-                    rec.read(chunk, 0, chunk.size)
-                } catch (_: IllegalStateException) {
-                    break
-                }
-                if (released) break
-                if (n < 0) {
-                    Log.w(TAG, "mic.capture.failed")
-                    throw IllegalStateException("mic.capture.failed")
-                }
-                if (n > 0) out.write(chunk, 0, n)
+            am.requestAudioFocus(focus)
+            if (released) {
+                am.abandonAudioFocusRequest(focus)
+                focusRequest = null
+                recorder = null
+                rec.release()
+                return ByteArray(0)
             }
-        } finally {
-            stop()
         }
-        return out.toByteArray()
+        try {
+            val out = ByteArrayOutputStream()
+            val chunk = ByteArray(minBuf)
+            if (!released) {
+                rec.startRecording()
+                Log.i(TAG, "mic.capture.started")
+                val deadline = SystemClock.elapsedRealtime() + durationMs
+                while (!released && SystemClock.elapsedRealtime() < deadline) {
+                    val n = try {
+                        rec.read(chunk, 0, chunk.size)
+                    } catch (_: IllegalStateException) {
+                        break
+                    }
+                    if (released) break
+                    if (n < 0) {
+                        Log.w(TAG, "mic.capture.failed")
+                        throw IllegalStateException("mic.capture.failed")
+                    }
+                    if (n > 0) out.write(chunk, 0, n)
+                }
+            }
+            return out.toByteArray()
+        } finally {
+            // Native teardown stays on this thread. Concurrent stop() only rec.stop()s.
+            releaseOnRecordingThread(rec, am, focus)
+        }
     }
 
-    /** Unblocks a blocking [record] from another thread. Idempotent if never started. */
+    /**
+     * Unblocks a blocking [record] from another thread. Does not [AudioRecord.release]
+     * — that must run on the recording thread after [read] returns.
+     */
     fun stop() {
         released = true
         synchronized(lock) {
-            val rec = recorder
-            recorder = null
-            if (rec != null) {
-                try {
-                    rec.stop()
-                } catch (_: Exception) {
-                }
-                rec.release()
+            try {
+                recorder?.stop()
+            } catch (_: Exception) {
             }
-            val req = focusRequest
+        }
+    }
+
+    private fun releaseOnRecordingThread(
+        rec: AudioRecord,
+        am: AudioManager,
+        focus: AudioFocusRequest,
+    ) {
+        released = true
+        synchronized(lock) {
+            try {
+                rec.stop()
+            } catch (_: Exception) {
+            }
+            rec.release()
+            if (recorder === rec) recorder = null
             focusRequest = null
-            if (req != null) {
-                audioManager?.abandonAudioFocusRequest(req)
-            }
-            audioManager = null
+            am.abandonAudioFocusRequest(focus)
         }
     }
 
