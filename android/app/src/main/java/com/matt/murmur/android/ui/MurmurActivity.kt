@@ -129,8 +129,8 @@ private fun CompanionScreen(onEnableKeyboard: () -> Unit) {
     ) {
         Text("Murmur", color = MurmurTokens.coralLight, fontSize = 28.sp)
         Text(
-            "Enable Murmur as a keyboard, paste an ElevenLabs key, then use the debug " +
-                "button to record 3s and transcribe. Dictation insert is a later build.",
+            "Enable Murmur as a keyboard, paste an ElevenLabs key, then tap the mic in a " +
+                "text field to dictate. The debug button still records 3s and transcribes here.",
             color = MurmurTokens.textSecondary,
             fontSize = 16.sp,
         )

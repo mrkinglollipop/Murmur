@@ -10,11 +10,13 @@ import android.graphics.drawable.RippleDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.matt.murmur.android.R
+import com.matt.murmur.android.logic.ImePointer
 
 /**
  * Views QWERTY + mic. Letter keys [commitText] through [Listener].
@@ -30,7 +32,7 @@ class ImeChrome(
         fun onDelete()
         fun onEnter()
         fun onSwitchIme()
-        fun onMicTap()
+        fun onMicPointer(event: ImePointer)
     }
 
     private var shifted = false
@@ -60,9 +62,30 @@ class ImeChrome(
             contentDescription = "Microphone"
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(10.dp, 10.dp, 10.dp, 10.dp)
+            isClickable = true
+            isFocusable = true
+            setOnTouchListener { v, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        listener.onMicPointer(ImePointer.DOWN)
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        listener.onMicPointer(ImePointer.UP)
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        listener.onMicPointer(ImePointer.CANCEL)
+                        true
+                    }
+                    else -> false
+                }
+            }
             setOnClickListener {
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                listener.onMicTap()
+                listener.onMicPointer(ImePointer.DOWN)
+                listener.onMicPointer(ImePointer.UP)
             }
         }
 

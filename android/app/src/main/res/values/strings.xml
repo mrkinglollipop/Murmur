@@ -3,7 +3,18 @@
     <string name="app_name">Murmur</string>
     <string name="ime_name">Murmur</string>
     <string name="ime_subtype_en_us">English (US)</string>
-    <string name="fgs_listening">Murmur is recording</string>
+    <string name="fgs_listening">Murmur is listening — tap to stop.</string>
+    <string name="fgs_stop">Stop</string>
     <string name="fgs_channel_name">Microphone</string>
     <string name="fgs_channel_desc">Shown while Murmur is recording</string>
+    <string name="ime_recording">Recording…</string>
+    <string name="ime_transcribing">Transcribing…</string>
+    <string name="ime_secure">Dictation off in password fields</string>
+    <string name="ime_allow_mic">Allow microphone in Murmur</string>
+    <string name="ime_need_key">Paste and save an ElevenLabs key</string>
+    <string name="ime_mic_denied">Microphone start denied</string>
+    <string name="ime_mic_failed">Mic capture failed</string>
+    <string name="ime_transcribe_failed">Transcribe failed</string>
+    <string name="permission_disclosure">Murmur records only while a dictation session is on. Audio goes to the speech service you configured. We do not sell your data.</string>
+    <string name="permission_continue">Continue</string>
 </resources>

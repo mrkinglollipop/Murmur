@@ -26,6 +26,17 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".perm.MurmurPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.Murmur">
+            <intent-filter>
+                <action android:name="com.matt.murmur.android.REQUEST_MIC" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".ime.MurmurImeService"
             android:exported="true"

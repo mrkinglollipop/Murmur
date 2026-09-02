@@ -28,6 +28,13 @@ class MicCapture(private val context: Context) {
     private var released = false
 
     fun record(durationMs: Long): ByteArray {
+        val startedAt = SystemClock.elapsedRealtime()
+        return captureWhile { SystemClock.elapsedRealtime() - startedAt < durationMs }
+    }
+
+    fun recordUntilStopped(): ByteArray = captureWhile { true }
+
+    private fun captureWhile(keepReading: () -> Boolean): ByteArray {
         if (released) return ByteArray(0)
         if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
@@ -88,8 +95,7 @@ class MicCapture(private val context: Context) {
             if (!released) {
                 rec.startRecording()
                 Log.i(TAG, "mic.capture.started")
-                val deadline = SystemClock.elapsedRealtime() + durationMs
-                while (!released && SystemClock.elapsedRealtime() < deadline) {
+                while (!released && keepReading()) {
                     val n = try {
                         rec.read(chunk, 0, chunk.size)
                     } catch (_: IllegalStateException) {
