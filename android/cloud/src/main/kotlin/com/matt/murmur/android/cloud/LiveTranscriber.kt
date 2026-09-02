@@ -22,4 +22,12 @@ interface LiveTranscriber {
     fun cancel()
 }
 
-class LiveStartException(message: String) : Exception(message)
+class LiveStartException(
+    message: String,
+    val handshake: Boolean,
+) : Exception(message) {
+    companion object {
+        fun handshake(message: String) = LiveStartException(message, handshake = true)
+        fun cancelled(message: String = "cancelled") = LiveStartException(message, handshake = false)
+    }
+}

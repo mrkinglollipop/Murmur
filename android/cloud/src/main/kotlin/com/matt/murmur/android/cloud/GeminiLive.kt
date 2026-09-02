@@ -182,7 +182,8 @@ class GeminiLiveTranscriber(
     @Volatile private var socketClosed = false
     @Volatile private var finalizeRequested = false
     @Volatile private var readyResolved = false
-    @Volatile private var readyError: Exception? = null
+    @Volatile private var sessionReady = false
+    @Volatile private var readyError: LiveStartException? = null
     @Volatile private var doneResolved = false
     @Volatile private var everHad = false
     @Volatile private var sessionCapReached = false
@@ -213,7 +214,7 @@ class GeminiLiveTranscriber(
     override fun start() {
         arm()
         synchronized(lock) {
-            if (tornDown) throw LiveStartException("cancelled")
+            if (tornDown) throw LiveStartException.cancelled()
             resetTranscriptStateLocked()
             sessionStartMs = System.currentTimeMillis()
         }
@@ -231,14 +232,7 @@ class GeminiLiveTranscriber(
                 options = liveOptions,
             ),
         )
-        if (!readyLatch.await(5, TimeUnit.SECONDS)) {
-            cancel()
-            throw LiveStartException("Timed out waiting for setupComplete")
-        }
-        readyError?.let {
-            cancel()
-            throw it
-        }
+        awaitReady("Timed out waiting for setupComplete")
         if (liveOptions.vadMode == GeminiVadMode.MANUAL && !activityStartSent) {
             ws.send(GeminiLiveOptions.makeActivityStartFrameJson())
             activityStartSent = true
@@ -271,15 +265,23 @@ class GeminiLiveTranscriber(
             accepting = false
             capReached = sessionCapReached
         }
+        failReadyLatch(LiveStartException.cancelled("finalized"))
         frames.offer(poison)
         senderThread?.join(2_000)
         senderThread = null
 
         val closed: Boolean
         val accumulated: String
+        val ready: Boolean
         synchronized(lock) {
             closed = socketClosed
+            ready = sessionReady
             accumulated = joinedTranscript(committedSegments, latestPartial)
+        }
+        if (!ready) {
+            tearDownSocket()
+            synchronized(lock) { resetTranscriptStateLocked() }
+            return accumulated
         }
         if (capReached) {
             tearDownSocket()
@@ -316,7 +318,7 @@ class GeminiLiveTranscriber(
             accepting = false
         }
         frames.offer(poison)
-        failReady("cancelled")
+        failReady(LiveStartException.cancelled())
         completeDone(synchronized(lock) { joinedTranscript(committedSegments, latestPartial) })
         synchronized(lock) { resetTranscriptStateLocked() }
         tearDownSocket()
@@ -404,18 +406,46 @@ class GeminiLiveTranscriber(
     private fun markReady() {
         if (readyResolved) return
         readyResolved = true
+        sessionReady = true
         readyError = null
         readyLatch.countDown()
     }
 
-    private fun failReady(reason: String) {
-        socketClosed = true
+    private fun awaitReady(timeoutMessage: String) {
+        val countedDown = try {
+            readyLatch.await(5, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw LiveStartException.cancelled("interrupted")
+        }
+        if (!countedDown) {
+            if (tornDown) throw LiveStartException.cancelled()
+            cancel()
+            throw LiveStartException.handshake(timeoutMessage)
+        }
+        val error = readyError
+        if (error != null) {
+            if (error.handshake) cancel()
+            throw error
+        }
+    }
+
+    private fun failReadyLatch(error: LiveStartException) {
         if (!readyResolved) {
             readyResolved = true
-            readyError = LiveStartException(reason)
+            readyError = error
             readyLatch.countDown()
         }
+    }
+
+    private fun failReady(error: LiveStartException) {
+        socketClosed = true
+        failReadyLatch(error)
         completeDone(synchronized(lock) { joinedTranscript(committedSegments, latestPartial) })
+    }
+
+    private fun failReady(reason: String) {
+        failReady(LiveStartException.handshake(reason))
     }
 
     private fun completeDone(text: String) {
@@ -435,13 +465,16 @@ class GeminiLiveTranscriber(
         activityStartSent = false
         sessionCapReached = false
         sessionStartMs = 0L
+        sessionReady = false
     }
 
     private fun tearDownSocket() {
         senderThread?.interrupt()
         senderThread = null
-        webSocket?.close(1000, null)
+        val ws = webSocket
         webSocket = null
+        ws?.close(1000, null)
+        ws?.cancel()
     }
 
     private inner class Listener : WebSocketListener() {

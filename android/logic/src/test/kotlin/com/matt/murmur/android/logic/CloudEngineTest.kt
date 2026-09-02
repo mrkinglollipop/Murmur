@@ -29,4 +29,48 @@ class CloudEngineTest {
         assertTrue(GeminiLiveGate.shouldAttemptLive(handshakeFailed = false))
         assertFalse(GeminiLiveGate.shouldAttemptLive(handshakeFailed = true))
     }
+
+    @Test
+    fun persistHandshakeFailureOnlyWhileTakeIsActive() {
+        assertTrue(
+            GeminiLiveGate.shouldPersistHandshakeFailure(
+                handshakeFailure = true,
+                skipInsert = false,
+                sessionClosedByIme = false,
+                interrupted = false,
+            ),
+        )
+        assertFalse(
+            GeminiLiveGate.shouldPersistHandshakeFailure(
+                handshakeFailure = true,
+                skipInsert = true,
+                sessionClosedByIme = false,
+                interrupted = false,
+            ),
+        )
+        assertFalse(
+            GeminiLiveGate.shouldPersistHandshakeFailure(
+                handshakeFailure = true,
+                skipInsert = false,
+                sessionClosedByIme = true,
+                interrupted = false,
+            ),
+        )
+        assertFalse(
+            GeminiLiveGate.shouldPersistHandshakeFailure(
+                handshakeFailure = true,
+                skipInsert = false,
+                sessionClosedByIme = false,
+                interrupted = true,
+            ),
+        )
+        assertFalse(
+            GeminiLiveGate.shouldPersistHandshakeFailure(
+                handshakeFailure = false,
+                skipInsert = false,
+                sessionClosedByIme = false,
+                interrupted = false,
+            ),
+        )
+    }
 }

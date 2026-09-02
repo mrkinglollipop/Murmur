@@ -17,4 +17,15 @@ enum class CloudEngine(val raw: String, val displayName: String) {
 /** Gemini Live handshake is unverified; skip live after a failed start. */
 object GeminiLiveGate {
     fun shouldAttemptLive(handshakeFailed: Boolean): Boolean = !handshakeFailed
+
+    /**
+     * Persist the device gate only for a real setup failure while the take
+     * is still active. Local teardown (cancel, finalize, interrupt) must not.
+     */
+    fun shouldPersistHandshakeFailure(
+        handshakeFailure: Boolean,
+        skipInsert: Boolean,
+        sessionClosedByIme: Boolean,
+        interrupted: Boolean,
+    ): Boolean = handshakeFailure && !skipInsert && !sessionClosedByIme && !interrupted
 }

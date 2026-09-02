@@ -179,7 +179,7 @@ object StreamingCoordinator {
 
     internal fun tokenizeForPrefix(text: String): List<String> {
         return text.split(Regex("\\s+")).mapNotNull { token ->
-            val folded = token.trim { it.isSwiftPunctuation() }.lowercase()
+            val folded = token.trim { it.isTrimmedPunctuation() }.lowercase()
             folded.ifEmpty { null }
         }
     }
@@ -231,7 +231,7 @@ object StreamingCoordinator {
     }
 }
 
-private fun Char.isSwiftPunctuation(): Boolean {
+private fun Char.isTrimmedPunctuation(): Boolean {
     val type = Character.getType(this).toByte()
     return type == Character.CONNECTOR_PUNCTUATION ||
         type == Character.DASH_PUNCTUATION ||

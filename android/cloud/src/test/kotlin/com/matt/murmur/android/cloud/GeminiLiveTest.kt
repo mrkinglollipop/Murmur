@@ -4,6 +4,9 @@ import com.matt.murmur.android.logic.DictionaryEntry
 import com.matt.murmur.android.logic.WavWriter
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
@@ -13,7 +16,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class GeminiLiveTest {
 
@@ -133,6 +138,57 @@ class GeminiLiveTest {
         val text = transcriber.finalize(10.0)
         assertEquals("", text)
         assertTrue(System.currentTimeMillis() - started < 1500)
+    }
+
+    @Test
+    fun finalizeUnblocksStartAsCancelledNotHandshake() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    // no setupComplete — handshake still in flight
+                }
+            }),
+        )
+        server.start()
+        val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.SECONDS).build()
+        val session = GeminiLiveTranscriber(
+            apiKey = "k",
+            client = client,
+            urlOverride = wsUrl(server, "/"),
+        )
+        val error = AtomicReference<Exception?>()
+        val entered = CountDownLatch(1)
+        val startDone = CountDownLatch(1)
+        val startThread = Thread {
+            entered.countDown()
+            try {
+                session.start()
+            } catch (e: Exception) {
+                error.set(e)
+            } finally {
+                startDone.countDown()
+            }
+        }
+        try {
+            startThread.start()
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            Thread.sleep(80)
+            val t0 = System.currentTimeMillis()
+            session.finalize(0.0)
+            assertTrue("start() must unblock on finalize", startDone.await(1, TimeUnit.SECONDS))
+            assertTrue(System.currentTimeMillis() - t0 < 1500)
+            val thrown = error.get()
+            assertTrue("expected LiveStartException, got $thrown", thrown is LiveStartException)
+            assertFalse((thrown as LiveStartException).handshake)
+        } finally {
+            session.cancel()
+            try {
+                server.shutdown()
+            } catch (_: java.io.IOException) {
+            }
+            client.dispatcher.executorService.shutdown()
+        }
     }
 
     @Test
@@ -264,5 +320,12 @@ class GeminiLiveTest {
         WavWriter.writePcm16(pcm, file)
         file.deleteOnExit()
         return file
+    }
+
+    companion object {
+        fun wsUrl(server: MockWebServer, path: String): String {
+            val http = server.url(path).toString()
+            return http.replaceFirst("http://", "ws://")
+        }
     }
 }

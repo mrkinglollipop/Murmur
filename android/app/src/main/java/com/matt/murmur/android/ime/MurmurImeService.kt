@@ -20,6 +20,7 @@ import com.matt.murmur.android.cloud.ElevenLabsBatch
 import com.matt.murmur.android.cloud.ElevenLabsRealtimeTranscriber
 import com.matt.murmur.android.cloud.GeminiBatch
 import com.matt.murmur.android.cloud.GeminiLiveTranscriber
+import com.matt.murmur.android.cloud.LiveStartException
 import com.matt.murmur.android.cloud.LiveTranscriber
 import com.matt.murmur.android.crypto.MurmurSecrets
 import com.matt.murmur.android.logic.CloudEngine
@@ -124,6 +125,8 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         ImeMicForeground.stop(this)
         fgsRunning = false
         currentTake?.skipInsert = true
+        currentTake?.sessionClosedByIme = true
+        currentTake?.session?.onInterim = null
         currentTake?.session?.cancel()
         currentTake?.capture?.stop()
         currentTake = null
@@ -253,11 +256,23 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
             liveStart.execute {
                 try {
                     session.start()
-                } catch (_: Exception) {
-                    take.liveStartFailed = true
-                    session.cancel()
-                    if (engine == CloudEngine.GEMINI) {
+                } catch (e: Exception) {
+                    if (e is InterruptedException) Thread.currentThread().interrupt()
+                    val persist = engine == CloudEngine.GEMINI &&
+                        GeminiLiveGate.shouldPersistHandshakeFailure(
+                            handshakeFailure = (e as? LiveStartException)?.handshake == true,
+                            skipInsert = take.skipInsert,
+                            sessionClosedByIme = take.sessionClosedByIme,
+                            interrupted = e is InterruptedException,
+                        )
+                    if (persist) {
+                        take.liveStartFailed = true
                         EnginePrefs.setGeminiLiveHandshakeFailed(this, true)
+                    } else if (!take.sessionClosedByIme) {
+                        take.liveStartFailed = true
+                    }
+                    if (!take.sessionClosedByIme) {
+                        session.cancel()
                     }
                 }
             }
@@ -270,6 +285,8 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
                 completeTake(take, pcm)
             } catch (_: Exception) {
                 Log.w(TAG, "mic.capture.failed")
+                take.sessionClosedByIme = true
+                session?.onInterim = null
                 session?.cancel()
                 mainHandler.post {
                     chrome?.setStatus(getString(R.string.ime_mic_failed))
@@ -295,6 +312,8 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
     private fun cancelTake() {
         val take = currentTake ?: return
         take.skipInsert = true
+        take.sessionClosedByIme = true
+        take.session?.onInterim = null
         take.session?.cancel()
         take.capture.stop()
         mainHandler.post { chrome?.setStatus("Murmur") }
@@ -305,23 +324,28 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         if (!info.isSecureDictationTarget()) return
         take.skipInsert = true
         take.secureSkip = true
+        take.sessionClosedByIme = true
         logSecureSkip(info)
+        take.session?.onInterim = null
         take.session?.cancel()
         take.capture.stop()
         chrome?.setStatus(getString(R.string.ime_secure))
     }
 
     private fun completeTake(take: Take, pcm: ByteArray) {
+        val session = take.session
+        session?.onInterim = null
         if (take.skipInsert) {
-            take.session?.cancel()
+            take.sessionClosedByIme = true
+            session?.cancel()
             if (take.secureSkip) Log.i(TAG, "insert.secure_skip")
             mainHandler.post { chrome?.setStatus("Murmur") }
             return
         }
         val seconds = SilenceCancel.pcm16MonoSeconds(pcm.size)
-        val session = take.session
         val everHad = session?.hasEverHadNonEmptyStreamText == true
         if (StreamingCoordinator.shouldTakeSilenceCancel(everHad, seconds)) {
+            take.sessionClosedByIme = true
             session?.cancel()
             Log.i(TAG, "ime.silence_cancel")
             mainHandler.post { chrome?.setStatus("Murmur") }
@@ -330,6 +354,7 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         mainHandler.post {
             chrome?.setStatus(getString(R.string.ime_transcribing))
         }
+        take.sessionClosedByIme = true
         val snapshot = session?.joinedTranscriptSnapshot().orEmpty()
         val finalizeText = if (session != null && !take.liveStartFailed) {
             session.finalize(seconds)
@@ -474,6 +499,8 @@ class MurmurImeService : InputMethodService(), ImeChrome.Listener {
         var secureSkip: Boolean = false
         @Volatile
         var liveStartFailed: Boolean = false
+        @Volatile
+        var sessionClosedByIme: Boolean = false
     }
 
     companion object {
