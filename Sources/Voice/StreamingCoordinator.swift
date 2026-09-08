@@ -41,6 +41,20 @@ final class StreamingCoordinator {
     /// hold. Survives async start-failure clearing the session reference so
     /// file-based fallthrough can still know stream text existed.
     private(set) var coordinatorEverHadStreamText = false
+
+    init(
+        xaiSession: XAIStreamingTranscriber? = nil,
+        elevenLabsSession: ElevenLabsRealtimeTranscriber? = nil,
+        geminiSession: GeminiLiveTranscriber? = nil,
+        museSession: MuseLiveTranscriber? = nil
+    ) {
+        self.xaiSession = xaiSession
+        self.elevenLabsSession = elevenLabsSession
+        self.geminiSession = geminiSession
+        self.museSession = museSession
+    }
+#else
+    init() {}
 #endif
 
     /// Soft floor for "looks truncated" — only force batch fallback when text
@@ -51,8 +65,10 @@ final class StreamingCoordinator {
 
     /// Long holds where a large snapshot-vs-finalize gap without prefix
     /// extension means the live stream diverged — batch re-decode is safer.
-    static let lengthMismatchBatchMinDuration: TimeInterval = 15.0
-    static let lengthMismatchMinCharGap: Int = 40
+    /// Floor is intentionally below "long dictation" (15s+) so a rewritten
+    /// last clause on a normal hold still triggers batch when the gap is big.
+    static let lengthMismatchBatchMinDuration: TimeInterval = 8.0
+    static let lengthMismatchMinCharGap: Int = 25
     /// Minimum extension beyond finalize before treating snapshot as real tail.
     static let snapshotTailRecoveryMinChars: Int = 3
 
@@ -204,11 +220,36 @@ final class StreamingCoordinator {
         snapshot: String,
         duration: TimeInterval
     ) -> Bool {
-        guard duration >= lengthMismatchBatchMinDuration else { return false }
         let finalTrim = finalize.trimmingCharacters(in: .whitespacesAndNewlines)
         let snapTrim = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        if snapshotHasCompetingLongerTail(finalize: finalTrim, snapshot: snapTrim) {
+            return true
+        }
+        guard duration >= lengthMismatchBatchMinDuration else { return false }
         guard snapTrim.count > finalTrim.count + lengthMismatchMinCharGap else { return false }
         return !snapshotExtendsFinalize(finalize: finalTrim, snapshot: snapTrim)
+    }
+
+    /// A speculative snapshot and authoritative final share a substantial
+    /// prefix but disagree on the ending, with the snapshot carrying more
+    /// words. Neither string can safely win by character count; re-decode the
+    /// retained audio. This is structural evidence and needs no duration gate.
+    static func snapshotHasCompetingLongerTail(finalize: String, snapshot: String) -> Bool {
+        let finalTrim = finalize.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapTrim = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard snapTrim.count >= finalTrim.count + snapshotTailRecoveryMinChars else { return false }
+
+        let finalWords = tokenizeForPrefix(finalTrim)
+        let snapWords = tokenizeForPrefix(snapTrim)
+        guard finalWords.count >= 3, snapWords.count > finalWords.count else { return false }
+
+        var commonPrefix = 0
+        while commonPrefix < min(finalWords.count, snapWords.count),
+              finalWords[commonPrefix] == snapWords[commonPrefix] {
+            commonPrefix += 1
+        }
+        guard commonPrefix >= 2, commonPrefix < finalWords.count else { return false }
+        return commonPrefix * 2 >= finalWords.count
     }
 
     /// After streaming finalize: prefer non-empty finalize text unless truncated.
@@ -604,7 +645,15 @@ final class StreamingCoordinator {
         Task {
             let text = await session.finalize(recordingDuration: context.duration)
             vlog("xai streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
+            if session.requiresBufferedAudioRecovery {
+                self.logger.warning("xAI streaming integrity failed — falling back to buffered audio.")
+                DispatchQueue.main.async {
+                    onBatchFallback(context.bufferedAudio, context.duration)
+                }
+                return
+            }
             let truncated = Self.streamResultLooksTruncated(text: text, duration: context.duration)
+                || Self.streamTextLooksAbruptlyCut(text)
             if truncated {
                 vlog("xai streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
             }
@@ -674,7 +723,16 @@ final class StreamingCoordinator {
         Task {
             let text = await session.finalize(recordingDuration: context.duration)
             vlog("elevenlabs streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
+            if session.requiresBufferedAudioRecovery {
+                self.logger.warning("ElevenLabs stream coverage was not established — falling back to buffered audio.")
+                vlog("elevenlabs streaming: integrity or finality failure — buffered-audio fallback")
+                DispatchQueue.main.async {
+                    onBatchFallback(context.bufferedAudio, context.duration)
+                }
+                return
+            }
             let truncated = Self.streamResultLooksTruncated(text: text, duration: context.duration)
+                || Self.streamTextLooksAbruptlyCut(text)
             if truncated {
                 vlog("elevenlabs streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
             }
@@ -744,7 +802,15 @@ final class StreamingCoordinator {
         Task {
             let text = await session.finalize(recordingDuration: context.duration)
             vlog("gemini streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
+            if session.requiresBufferedAudioRecovery {
+                self.logger.warning("Gemini streaming integrity failed or reached its cap — falling back to buffered audio.")
+                DispatchQueue.main.async {
+                    onBatchFallback(context.bufferedAudio, context.duration)
+                }
+                return
+            }
             let truncated = Self.streamResultLooksTruncated(text: text, duration: context.duration)
+                || Self.streamTextLooksAbruptlyCut(text)
             if truncated {
                 vlog("gemini streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
             }
@@ -814,7 +880,15 @@ final class StreamingCoordinator {
         Task {
             let text = await session.finalize(recordingDuration: context.duration)
             vlog("muse streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
+            if session.requiresBufferedAudioRecovery {
+                self.logger.warning("Meta Muse streaming integrity failed — falling back to buffered audio.")
+                DispatchQueue.main.async {
+                    onBatchFallback(context.bufferedAudio, context.duration)
+                }
+                return
+            }
             let truncated = Self.streamResultLooksTruncated(text: text, duration: context.duration)
+                || Self.streamTextLooksAbruptlyCut(text)
             if truncated {
                 vlog("muse streaming: truncated (\(text.count) chars / \(String(format: "%.1f", context.duration))s) — batch fallback")
             }
@@ -873,5 +947,30 @@ final class StreamingCoordinator {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         return Double(trimmed.count) < duration * streamMinCharsPerSecond
+    }
+
+    /// True when live/finalize text has an incomplete ending (e.g.
+    /// `…language that-` or `unfinished thought...`). These endings request
+    /// buffered recovery even when transcript density appears normal.
+    static func streamTextLooksAbruptlyCut(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return false }
+
+        if trimmed.last == "-" {
+            let hyphenIndex = trimmed.index(before: trimmed.endIndex)
+            let beforeHyphen = trimmed[trimmed.index(before: hyphenIndex)]
+            return beforeHyphen.isLetter || beforeHyphen.isNumber
+        }
+
+        // Closing quotes can follow punctuation emitted by the provider. Keep
+        // this deliberately narrow: only quotes are skipped, so internal
+        // ellipses and ordinary sentence punctuation remain successful text.
+        let closingQuotes: Set<Character> = ["\"", "'", "”", "’"]
+        var ending = trimmed[...]
+        while let last = ending.last, closingQuotes.contains(last) {
+            ending.removeLast()
+        }
+        guard ending.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
+        return ending.last == "…" || ending.hasSuffix("...")
     }
 }

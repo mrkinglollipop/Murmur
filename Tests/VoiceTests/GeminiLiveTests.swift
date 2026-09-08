@@ -83,6 +83,42 @@ final class GeminiLiveTests: XCTestCase {
         XCTAssertEqual(joined, "hello world")
     }
 
+    func testCommittedTranscriptReplacesLongerSpeculativePartial() {
+        let session = GeminiLiveTranscriber(apiKey: "test-key")
+        session.handleServerEvent("""
+        {"serverContent":{"interimInputTranscription":{"text":"It's just an absolute joke."}}}
+        """)
+        session.handleServerEvent("""
+        {"serverContent":{"inputTranscription":{"text":"It's just an ad."}}}
+        """)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "It's just an ad.")
+    }
+
+    func testFinalizeWaitsForTurnCompleteAfterAuthoritativeTranscript() async {
+        let session = GeminiLiveTranscriber(apiKey: "test-key")
+        let probe = GeminiCompletionProbe()
+        let finalizer = Task {
+            let text = await session.finalize(recordingDuration: 0)
+            await probe.finish(text)
+            return text
+        }
+        // Beyond the baseline's 600ms pre-signal sleep: the control then
+        // exposes its first-inputTranscription early-resolution bug.
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        session.handleServerEvent("""
+        {"serverContent":{"inputTranscription":{"text":"complete sentence"}}}
+        """)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let completedBeforeTurn = await probe.isComplete()
+        XCTAssertFalse(completedBeforeTurn)
+
+        session.handleServerEvent("""
+        {"serverContent":{"turnComplete":true}}
+        """)
+        let finalized = await finalizer.value
+        XCTAssertEqual(finalized, "complete sentence")
+    }
+
     func testBuildSocketURLHostPathAndKeyQuery() {
         let url = GeminiLiveTranscriber.buildSocketURL(apiKey: "test-key-value")
         XCTAssertEqual(url?.host, "generativelanguage.googleapis.com")
@@ -187,4 +223,15 @@ final class GeminiLiveTests: XCTestCase {
         """.utf8)
         XCTAssertEqual(GeminiBatchDecode.decodeTranscript(from: stepsBody), "hello from steps")
     }
+}
+
+private actor GeminiCompletionProbe {
+    private var completed = false
+
+    func finish(_ text: String) {
+        _ = text
+        completed = true
+    }
+
+    func isComplete() -> Bool { completed }
 }

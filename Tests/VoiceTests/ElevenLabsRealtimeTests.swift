@@ -180,6 +180,56 @@ final class ElevenLabsRealtimeTests: XCTestCase {
         XCTAssertTrue(session.hasEverHadNonEmptyStreamText)
     }
 
+    func testCommittedTranscriptReplacesLongerSpeculativePartial() {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "test-key")
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":"I'm on ElevenLabs right now and it highlighted the"}
+        """)
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript","text":"I'm on ElevenLabs right now"}
+        """)
+        XCTAssertEqual(
+            session.joinedTranscriptSnapshot(),
+            "I'm on ElevenLabs right now",
+            "committed text is authoritative even when a speculative partial was longer"
+        )
+        XCTAssertTrue(session.hasEverHadNonEmptyStreamText)
+    }
+
+    func testTimestampCompanionDoesNotDuplicateCommittedSegment() {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "test-key")
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript","text":"hello world"}
+        """)
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript_with_timestamps","text":"hello world","words":[]}
+        """)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "hello world")
+    }
+
+    func testFinalizeDrainResetsForLatePartialAndCommittedSegment() async {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "test-key")
+        let finalizer = Task { await session.finalize(recordingDuration: 0) }
+
+        // Keep this beyond the removed 600ms pre-commit sleep so the baseline
+        // implementation demonstrably resolves on the first commit.
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript","text":"automatic segment"}
+        """)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        session.handleServerEvent("""
+        {"message_type":"partial_transcript","text":"manual tail"}
+        """)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        session.handleServerEvent("""
+        {"message_type":"committed_transcript","text":"manual tail"}
+        """)
+
+        let finalized = await finalizer.value
+        XCTAssertEqual(finalized, "automatic segment manual tail")
+    }
+
     // MARK: - tornDown / doneContinuation concurrency (audit item E)
 
     /// A start-failure `cancel()` racing a stop-triggered `finalize()` on the

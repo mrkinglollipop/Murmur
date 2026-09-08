@@ -11,6 +11,7 @@ import os.log
 /// ready/done `CheckedContinuation` bridge — but sends raw binary PCM16 LE
 /// frames (not base64 JSON) per the Meta Model API.
 final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
+    typealias MessageSender = (URLSessionWebSocketTask.Message) async throws -> Void
 
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "muse-streaming")
 
@@ -18,6 +19,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private let language: String
     private let keywords: [String]
     private let sessionId: String
+    private let injectedMessageSender: MessageSender?
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
@@ -61,19 +63,32 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var doneResolved = false
 
     private var finalizeRequested = false
+    private var finalizeBoundaryArmed = false
+    private var finalizeSpeechCompleteSeen = false
     private var tornDown = false
     private var socketClosed = false
+    private var streamIntegrityFailed = false
+    private var lastFinalizeRequiresBufferedAudioRecovery = false
+    private var intentionalSocketShutdown = false
+
+    var requiresBufferedAudioRecovery: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lastFinalizeRequiresBufferedAudioRecovery || streamIntegrityFailed
+    }
 
     init(
         apiKey: String,
         language: String = "en",
         keywords: [String] = [],
-        sessionId: String = UUID().uuidString
+        sessionId: String = UUID().uuidString,
+        messageSender: MessageSender? = nil
     ) {
         self.apiKey = apiKey
         self.language = language
         self.keywords = keywords
         self.sessionId = sessionId
+        self.injectedMessageSender = messageSender
         super.init()
     }
 
@@ -81,6 +96,11 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     func start() async throws {
         vlog("muse-stream: starting session")
+        stateLock.lock()
+        streamIntegrityFailed = false
+        lastFinalizeRequiresBufferedAudioRecovery = false
+        intentionalSocketShutdown = false
+        stateLock.unlock()
         resetTranscriptState()
 
         guard let url = Self.buildSocketURL(sessionId: sessionId) else {
@@ -150,6 +170,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 do {
                     try await task.send(.data(pcmData))
                 } catch {
+                    self.markStreamIntegrityFailed()
                     vlog("muse-stream: send failed, stopping sender: \(error.localizedDescription)")
                     break
                 }
@@ -165,6 +186,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.unlock()
         guard let continuation else { return }
         guard let pcmData = convertToPCM16(buffer) else {
+            markStreamIntegrityFailed()
             vlog("muse-stream: send — conversion produced no data, dropping buffer")
             return
         }
@@ -180,6 +202,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
         tornDown = true
         finalizeRequested = true
+        finalizeBoundaryArmed = false
+        finalizeSpeechCompleteSeen = false
         stateLock.unlock()
         let finalizeStart = Date()
 
@@ -193,20 +217,46 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         stateLock.lock()
         let closed = socketClosed
+        let integrityFailed = streamIntegrityFailed
         let accumulatedSoFar = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         stateLock.unlock()
-        if closed {
+        if closed || integrityFailed {
+            if closed { markStreamIntegrityFailed() }
             tearDownSocket()
-            vlog("muse-stream: finalize short-circuit (socket closed), \(accumulatedSoFar.count) chars")
+            vlog("muse-stream: finalize short-circuit (socket/integrity), \(accumulatedSoFar.count) chars")
             stateLock.lock()
             resetTranscriptState()
             stateLock.unlock()
             return accumulatedSoFar
         }
 
-        if let task {
-            try? await task.send(.string(Self.makeEndStreamJSON()))
+        stateLock.lock()
+        finalizeSpeechCompleteSeen = false
+        stateLock.unlock()
+        if task != nil || injectedMessageSender != nil {
+            do {
+                try await sendMessage(.string(Self.makeEndStreamJSON()))
+            } catch {
+                markStreamIntegrityFailed()
+                tearDownSocket()
+                stateLock.lock()
+                let text = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+                resetTranscriptState()
+                stateLock.unlock()
+                return text
+            }
         }
+        stateLock.lock()
+        finalizeBoundaryArmed = true
+        let shouldResolveDone = finalizeSpeechCompleteSeen && !doneResolved
+        let earlyContinuation = shouldResolveDone ? doneContinuation : nil
+        let earlyText = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+        if shouldResolveDone {
+            doneResolved = true
+            doneContinuation = nil
+        }
+        stateLock.unlock()
+        earlyContinuation?.resume(returning: earlyText)
 
         let waitSeconds = min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
         let waitNs = UInt64(waitSeconds * 1_000_000_000)
@@ -217,7 +267,10 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 return await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
                     self.stateLock.lock()
                     if self.doneResolved {
-                        let text = Self.joinedTranscript(segments: self.committedSegments, partial: self.latestPartial)
+                        let text = Self.joinedTranscript(
+                            segments: self.committedSegments,
+                            partial: self.latestPartial
+                        )
                         self.stateLock.unlock()
                         continuation.resume(returning: text)
                         return
@@ -235,7 +288,12 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                     return nil
                 }
                 let pending = self.doneContinuation
-                let text = Self.joinedTranscript(segments: self.committedSegments, partial: self.latestPartial)
+                self.lastFinalizeRequiresBufferedAudioRecovery = true
+                self.streamIntegrityFailed = true
+                let text = Self.joinedTranscript(
+                    segments: self.committedSegments,
+                    partial: self.latestPartial
+                )
                 self.doneResolved = true
                 self.doneContinuation = nil
                 self.stateLock.unlock()
@@ -298,9 +356,14 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         latestPartial = ""
         everHadNonEmptyStreamText = false
         finalizeRequested = false
+        finalizeBoundaryArmed = false
+        finalizeSpeechCompleteSeen = false
     }
 
     private func tearDownSocket() {
+        stateLock.lock()
+        intentionalSocketShutdown = true
+        stateLock.unlock()
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
         senderTask?.cancel()
@@ -320,7 +383,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         vlog("muse-stream: socket closed (code=\(closeCode.rawValue) reason=\(reasonStr))")
-        failReadyIfPending("closed code \(closeCode.rawValue)")
+        noteSocketClosed(closeCode: closeCode)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -330,6 +393,10 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         } else {
             vlog("muse-stream: task completed httpStatus=\(status) error=none")
         }
+        stateLock.lock()
+        let intentional = intentionalSocketShutdown
+        stateLock.unlock()
+        if error != nil, !intentional { markStreamIntegrityFailed() }
         failReadyIfPending("task completed httpStatus=\(status)")
     }
 
@@ -356,6 +423,10 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             } catch {
                 let ns = error as NSError
                 vlog("muse-stream: receive loop ended: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
+                stateLock.lock()
+                let intentional = intentionalSocketShutdown
+                stateLock.unlock()
+                if !intentional { markStreamIntegrityFailed() }
                 failReadyIfPending("receive: \(ns.domain)#\(ns.code)")
                 break
             }
@@ -366,6 +437,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             case .data(let data):
                 if let text = String(data: data, encoding: .utf8) {
                     handleServerEvent(text)
+                } else {
+                    markStreamIntegrityFailed()
                 }
             @unknown default:
                 continue
@@ -377,6 +450,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
+            markStreamIntegrityFailed()
             vlog("muse-stream: received unparseable event")
             return
         }
@@ -389,6 +463,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 handleSpeechCompleteEvent(json)
             case "error":
                 let message = (json["message"] as? String) ?? (json["error"] as? String) ?? "unknown"
+                markStreamIntegrityFailed()
                 vlog("muse-stream: server error: \(CloudTranscriptionError.redactedBodyFragment(message))")
             default:
                 vlog("muse-stream: unhandled type: \(type)")
@@ -418,6 +493,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         if isFinal {
             if !trimmed.isEmpty {
+                // Replacing the full transcript must not join new final +
+                // stale partial (duplicates).
                 committedSegments = [trimmed]
                 everHadNonEmptyStreamText = true
                 latestPartial = ""
@@ -427,15 +504,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             everHadNonEmptyStreamText = true
         }
         let running = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
-        let shouldResolveDone = finalizeRequested && isFinal && !doneResolved
-        let continuation = shouldResolveDone ? doneContinuation : nil
-        if shouldResolveDone {
-            doneResolved = true
-            doneContinuation = nil
-        }
         stateLock.unlock()
 
-        continuation?.resume(returning: running)
         onInterim?(running)
         vlog("muse-stream: transcript final=\(isFinal) (\(trimmed.count) chars)")
     }
@@ -448,12 +518,14 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         stateLock.lock()
         if !trimmed.isEmpty {
+            // Do not join final + stale partial.
             committedSegments = [trimmed]
             latestPartial = ""
             everHadNonEmptyStreamText = true
         }
         let running = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
-        let shouldResolveDone = finalizeRequested && !doneResolved
+        if finalizeRequested { finalizeSpeechCompleteSeen = true }
+        let shouldResolveDone = finalizeRequested && finalizeBoundaryArmed && !doneResolved
         let continuation = shouldResolveDone ? doneContinuation : nil
         if shouldResolveDone {
             doneResolved = true
@@ -464,6 +536,35 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         continuation?.resume(returning: running)
         onInterim?(running)
         vlog("muse-stream: speechComplete (\(trimmed.count) chars)")
+    }
+
+    private func sendMessage(_ message: URLSessionWebSocketTask.Message) async throws {
+        if let injectedMessageSender {
+            try await injectedMessageSender(message)
+            return
+        }
+        guard let task else {
+            throw CloudTranscriptionError(provider: .meta, message: "stream socket unavailable")
+        }
+        try await task.send(message)
+    }
+
+    private func markStreamIntegrityFailed() {
+        stateLock.lock()
+        streamIntegrityFailed = true
+        lastFinalizeRequiresBufferedAudioRecovery = true
+        stateLock.unlock()
+    }
+
+    func noteSocketClosed(closeCode: URLSessionWebSocketTask.CloseCode) {
+        stateLock.lock()
+        socketClosed = true
+        let terminalComplete = doneResolved
+        let shouldFail = !intentionalSocketShutdown
+            && !(closeCode == .normalClosure && terminalComplete)
+        stateLock.unlock()
+        if shouldFail { markStreamIntegrityFailed() }
+        failReadyIfPending("closed code \(closeCode.rawValue)")
     }
 
     // MARK: - Static helpers (@testable)

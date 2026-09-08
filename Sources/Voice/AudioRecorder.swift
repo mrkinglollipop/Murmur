@@ -773,9 +773,11 @@ final class AudioRecorder {
     /// immediately. The grace buffers still ride the RMS silence guard and
     /// (for streaming engines) must finish landing before
     /// `ElevenLabsRealtimeTranscriber.finalize()` sends its commit frame —
-    /// see `finishStop`. Scales up on long holds (cap 1s).
-    private static let postReleaseCaptureGraceBase: TimeInterval = 0.250
-    private static let postReleaseCaptureGraceMax: TimeInterval = 1.0
+    /// see `finishStop`. Scales up on long holds (cap 1.25s).
+    /// Base listen-after-release. 500ms still clipped trailing sentences in
+    /// field use; 750ms covers a short last clause after finger-off.
+    private static let postReleaseCaptureGraceBase: TimeInterval = 0.750
+    private static let postReleaseCaptureGraceMax: TimeInterval = 1.25
     private static let postReleaseCaptureGraceScaleStart: TimeInterval = 15.0
     private static let postReleaseCaptureGraceScalePerSecond: TimeInterval = 0.005
 
@@ -1585,12 +1587,9 @@ final class AudioRecorder {
                     }
                 }
 
-                // Speaker gating: attenuate native buffer before downstream
-                // pcmBuffers / streaming when the latched decision says so.
-                // RMS/HUD level above uses the pre-attenuation buffer.
-                self.voiceGateProcessor?.processBuffer(buffer)
-
-                // ALWAYS buffer a copy of the audio — this is the safety net.
+                // ALWAYS copy the unmodified mic buffer before speaker gating.
+                // This is the bounded recovery/history source: a false gate
+                // decision must not destroy the only recording of the hold.
                 // If a streaming session fails mid-utterance (socket drops,
                 // handshake error), the file/batch fallback can still
                 // transcribe the FULL audio instead of losing the front of it.
@@ -1616,6 +1615,11 @@ final class AudioRecorder {
                     self.pcmBuffers.append(copy)
                     self.pcmBuffersLock.unlock()
                 }
+
+                // Gate only the buffer sent to the live provider. The stream
+                // processor evaluates the raw samples and snapshots its latch
+                // before any async evaluation can affect this buffer.
+                self.voiceGateProcessor?.processBuffer(buffer)
 
                 // Streaming mode: ALSO convert + stream this buffer to the
                 // socket (the session consumes it synchronously). Only one of
@@ -2045,9 +2049,6 @@ final class AudioRecorder {
     /// `pcmBuffers` and calling `sendToXAI`/`sendToElevenLabs`/`sendToGemini`/
     /// `sendToMuse` — for every buffer that arrives before this runs.
     private func finishStop(sessionHold: SessionHold) {
-        pcmBuffersLock.lock()
-        let bufferedAudio = pcmBuffers
-        pcmBuffersLock.unlock()
         let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
         lastHoldDuration = elapsed
 
@@ -2057,6 +2058,13 @@ final class AudioRecorder {
             || streamingCoordinator.museSession != nil {
             teardownMicEngine()
         }
+
+        // Stop/remove the tap before taking the recovery snapshot. An
+        // in-flight callback finishes under this same lock, so its final raw
+        // buffer is included rather than racing the stop path.
+        pcmBuffersLock.lock()
+        let bufferedAudio = pcmBuffers
+        pcmBuffersLock.unlock()
 
         let streamTextEver = streamingCoordinator.coordinatorEverHadStreamText
             || (streamingCoordinator.xaiSession?.hasEverHadNonEmptyStreamText ?? false)
@@ -2080,17 +2088,20 @@ final class AudioRecorder {
                 )
             },
             onStreamSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(
-                    text: text,
-                    engineID: "cloud:xai-streaming",
-                    sessionHeldToken: sessionHold.token,
-                    sessionHeldSnapshot: sessionHold.snapshot,
-                    sessionHeldFrontmostPID: sessionHold.pid
-                ) { [weak self] result in
-                    self?.finishHUDAfterPipeline(
-                        result: result,
-                        sessionHeldToken: sessionHold.token
-                    )
+                self?.retainStreamedAudio(buffers: bufferedAudio) { [weak self] retainedURL in
+                    self?.asrSelector.logStreamedTranscription(
+                        text: text,
+                        engineID: "cloud:xai-streaming",
+                        retainedAudioURL: retainedURL,
+                        sessionHeldToken: sessionHold.token,
+                        sessionHeldSnapshot: sessionHold.snapshot,
+                        sessionHeldFrontmostPID: sessionHold.pid
+                    ) { [weak self] result in
+                        self?.finishHUDAfterPipeline(
+                            result: result,
+                            sessionHeldToken: sessionHold.token
+                        )
+                    }
                 }
             },
             onBatchFallback: { [weak self] buffers, duration in
@@ -2131,17 +2142,20 @@ final class AudioRecorder {
                 )
             },
             onStreamSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(
-                    text: text,
-                    engineID: "cloud:elevenlabs-streaming",
-                    sessionHeldToken: sessionHold.token,
-                    sessionHeldSnapshot: sessionHold.snapshot,
-                    sessionHeldFrontmostPID: sessionHold.pid
-                ) { [weak self] result in
-                    self?.finishHUDAfterPipeline(
-                        result: result,
-                        sessionHeldToken: sessionHold.token
-                    )
+                self?.retainStreamedAudio(buffers: bufferedAudio) { [weak self] retainedURL in
+                    self?.asrSelector.logStreamedTranscription(
+                        text: text,
+                        engineID: "cloud:elevenlabs-streaming",
+                        retainedAudioURL: retainedURL,
+                        sessionHeldToken: sessionHold.token,
+                        sessionHeldSnapshot: sessionHold.snapshot,
+                        sessionHeldFrontmostPID: sessionHold.pid
+                    ) { [weak self] result in
+                        self?.finishHUDAfterPipeline(
+                            result: result,
+                            sessionHeldToken: sessionHold.token
+                        )
+                    }
                 }
             },
             onBatchFallback: { [weak self] buffers, duration in
@@ -2182,17 +2196,20 @@ final class AudioRecorder {
                 )
             },
             onStreamSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(
-                    text: text,
-                    engineID: "cloud:gemini-streaming",
-                    sessionHeldToken: sessionHold.token,
-                    sessionHeldSnapshot: sessionHold.snapshot,
-                    sessionHeldFrontmostPID: sessionHold.pid
-                ) { [weak self] result in
-                    self?.finishHUDAfterPipeline(
-                        result: result,
-                        sessionHeldToken: sessionHold.token
-                    )
+                self?.retainStreamedAudio(buffers: bufferedAudio) { [weak self] retainedURL in
+                    self?.asrSelector.logStreamedTranscription(
+                        text: text,
+                        engineID: "cloud:gemini-streaming",
+                        retainedAudioURL: retainedURL,
+                        sessionHeldToken: sessionHold.token,
+                        sessionHeldSnapshot: sessionHold.snapshot,
+                        sessionHeldFrontmostPID: sessionHold.pid
+                    ) { [weak self] result in
+                        self?.finishHUDAfterPipeline(
+                            result: result,
+                            sessionHeldToken: sessionHold.token
+                        )
+                    }
                 }
             },
             onBatchFallback: { [weak self] buffers, duration in
@@ -2233,17 +2250,20 @@ final class AudioRecorder {
                 )
             },
             onStreamSuccess: { [weak self] text in
-                self?.asrSelector.logStreamedTranscription(
-                    text: text,
-                    engineID: "cloud:meta-streaming",
-                    sessionHeldToken: sessionHold.token,
-                    sessionHeldSnapshot: sessionHold.snapshot,
-                    sessionHeldFrontmostPID: sessionHold.pid
-                ) { [weak self] result in
-                    self?.finishHUDAfterPipeline(
-                        result: result,
-                        sessionHeldToken: sessionHold.token
-                    )
+                self?.retainStreamedAudio(buffers: bufferedAudio) { [weak self] retainedURL in
+                    self?.asrSelector.logStreamedTranscription(
+                        text: text,
+                        engineID: "cloud:meta-streaming",
+                        retainedAudioURL: retainedURL,
+                        sessionHeldToken: sessionHold.token,
+                        sessionHeldSnapshot: sessionHold.snapshot,
+                        sessionHeldFrontmostPID: sessionHold.pid
+                    ) { [weak self] result in
+                        self?.finishHUDAfterPipeline(
+                            result: result,
+                            sessionHeldToken: sessionHold.token
+                        )
+                    }
                 }
             },
             onBatchFallback: { [weak self] buffers, duration in
@@ -2460,6 +2480,64 @@ final class AudioRecorder {
 
     // MARK: - Write captured audio
 
+    /// Persist the raw tap snapshot for a successful cloud stream. This uses
+    /// the same retention budget as batch recordings, but never feeds a
+    /// second ASR path or shares the filtered provider buffer.
+    private func retainStreamedAudio(
+        buffers: [AVAudioPCMBuffer],
+        completion: @escaping (URL?) -> Void
+    ) {
+        guard let first = buffers.first else {
+            completion(nil)
+            return
+        }
+        let format = first.format
+        let buffersCopy = buffers
+        audioIOQueue.async { [weak self] in
+            guard let self else { return }
+            let totalFrames = buffersCopy.reduce(0) { $0 + AVAudioFrameCount($1.frameLength) }
+            guard let combined = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames),
+                  let dst = combined.floatChannelData else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            var offset: AVAudioFrameCount = 0
+            for buffer in buffersCopy {
+                guard let src = buffer.floatChannelData else { continue }
+                for channel in 0 ..< Int(format.channelCount) {
+                    memcpy(
+                        dst[channel].advanced(by: Int(offset)),
+                        src[channel],
+                        Int(buffer.frameLength) * MemoryLayout<Float>.size
+                    )
+                }
+                offset += buffer.frameLength
+            }
+            combined.frameLength = offset
+            let temporaryURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("voice-\(UUID().uuidString).caf")
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            do {
+                let file = try AVAudioFile(
+                    forWriting: temporaryURL,
+                    settings: format.settings,
+                    commonFormat: .pcmFormatFloat32,
+                    interleaved: false
+                )
+                try file.write(from: combined)
+                let retainedURL = RecordingRetention.retain(
+                    from: temporaryURL,
+                    keepPaths: self.protectedAudioPathsProvider?() ?? [],
+                    maxBytes: self.recordingBudgetBytesProvider?()
+                        ?? Int64(RecordingRetention.defaultBudgetMB) * 1024 * 1024
+                )
+                DispatchQueue.main.async { completion(retainedURL) }
+            } catch {
+                DispatchQueue.main.async { completion(nil) }
+            }
+        }
+    }
+
     private func writeToFile(
         duration: TimeInterval,
         buffers: [AVAudioPCMBuffer],
@@ -2518,7 +2596,7 @@ final class AudioRecorder {
 
             // Write to /tmp
             let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("voice-\(Int(Date().timeIntervalSince1970)).caf")
+                .appendingPathComponent("voice-\(UUID().uuidString).caf")
 
             do {
                 let file = try AVAudioFile(

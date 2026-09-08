@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.1.49",
+    "build": "50",
+    "title": "What's New in 0.1.49",
+    "items": [
+      "Improved preservation of final words during audio capture, cloud conversion, and recovery from incomplete live transcripts.",
+      "Recognized sound labels such as coughing and sniffling are removed from dictation while ordinary parenthetical text is preserved.",
+      "Missing final periods are added to ordinary prose, with safeguards for code, formatting, and edits within existing text.",
+      "ElevenLabs skips a redundant streaming wait when complete-recording recovery is already required.",
+      "Successful streaming recordings can be retried from History within the existing audio-retention limit."
+    ]
+  },
+  {
     "version": "0.1.48",
     "build": "49",
     "title": "What's New in 0.1.48",

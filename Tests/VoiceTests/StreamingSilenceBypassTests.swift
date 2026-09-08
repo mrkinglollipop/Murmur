@@ -207,11 +207,97 @@ final class StreamingSilenceBypassTests: XCTestCase {
             StreamingCoordinator.streamSuccessTextOrBatchFallback(
                 finalizeText: "hello the world",
                 preFinalizeSnapshot: "completely different much longer snapshot text",
-                duration: 10,
+                duration: 5,
                 truncated: false
             ),
             "hello the world",
             "below duration floor, prefer finalize over batch"
+        )
+    }
+
+    func testCompetingLongerSnapshotTailFallsBackToBufferedAudio() {
+        XCTAssertNil(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "It's just an ad.",
+                preFinalizeSnapshot: "It's just an absolute joke.",
+                duration: 12,
+                truncated: false
+            ),
+            "a corrected but shorter final must not silently discard a competing snapshot tail"
+        )
+    }
+
+    func testMinorAuthoritativeCorrectionDoesNotForceBatch() {
+        XCTAssertEqual(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: "I want the red car.",
+                preFinalizeSnapshot: "I want the blue car.",
+                duration: 12,
+                truncated: false
+            ),
+            "I want the red car."
+        )
+    }
+
+    func testAbruptlyCutTrailingHyphen() {
+        XCTAssertTrue(
+            StreamingCoordinator.streamTextLooksAbruptlyCut(
+                "I don't know what language that-"
+            )
+        )
+        XCTAssertTrue(
+            StreamingCoordinator.streamTextLooksAbruptlyCut(
+                "and instead of injecting, it highlighted the-"
+            )
+        )
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut(
+                "Complete sentence with a dash — fine."
+            )
+        )
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut(
+                "Complete sentence."
+            )
+        )
+    }
+
+    func testAbruptlyCutTrailingEllipsis() {
+        XCTAssertTrue(
+            StreamingCoordinator.streamTextLooksAbruptlyCut(
+                "I don't know what language that...   \n"
+            )
+        )
+        XCTAssertTrue(
+            StreamingCoordinator.streamTextLooksAbruptlyCut(
+                "I don't know what language that…\""
+            )
+        )
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut("."))
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut("..."))
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut("…"))
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut("Wait... then continue."))
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut("Complete sentence."))
+        XCTAssertFalse(
+            StreamingCoordinator.streamTextLooksAbruptlyCut("A complete question?"))
+    }
+
+    func testAbruptlyCutForcesBatchEvenWhenCpsLooksFine() {
+        let cut = "Also, where it says the name Aegis, next to its logo, underneath the main image, and next to Mission Control, I don't know what language that-"
+        XCTAssertTrue(StreamingCoordinator.streamTextLooksAbruptlyCut(cut))
+        XCTAssertNil(
+            StreamingCoordinator.streamSuccessTextOrBatchFallback(
+                finalizeText: cut,
+                preFinalizeSnapshot: cut,
+                duration: 12,
+                truncated: true
+            ),
+            "mid-word hyphen must not inject — batch from buffered audio"
         )
     }
 
@@ -266,19 +352,19 @@ final class StreamingSilenceBypassTests: XCTestCase {
     func testPostReleaseCaptureGraceScalesForLongHolds() {
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 10),
-            0.250,
+            0.750,
             accuracy: 0.0001
         )
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 60),
-            0.475,
+            0.975,
             accuracy: 0.0001
         )
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 180),
-            1.0,
+            1.25,
             accuracy: 0.0001,
-            "long holds cap at one second of post-release capture"
+            "long holds cap at 1.25s of post-release capture"
         )
     }
 

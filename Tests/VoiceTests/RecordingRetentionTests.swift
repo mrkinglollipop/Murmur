@@ -123,6 +123,35 @@ final class RecordingRetentionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: a.path), "protected file must survive")
     }
 
+    func testRetainAssignsUniquePathsForSameSourceName() {
+        let firstSource = writeTempSource(named: "same-name.caf", bytes: 128)
+        let secondDirectory = tempRoot.appendingPathComponent("other", isDirectory: true)
+        try! FileManager.default.createDirectory(
+            at: secondDirectory,
+            withIntermediateDirectories: true
+        )
+        let secondSource = secondDirectory.appendingPathComponent("same-name.caf")
+        try! Data(repeating: 0xCD, count: 256).write(to: secondSource)
+
+        let first = RecordingRetention.retain(from: firstSource, maxCount: 10, maxBytes: 10_000)
+        let second = RecordingRetention.retain(from: secondSource, maxCount: 10, maxBytes: 10_000)
+
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(second)
+        XCTAssertNotEqual(first?.path, second?.path)
+        XCTAssertEqual(RecordingRetention.fileCount(), 2)
+        XCTAssertEqual(TranscriptionPipeline.streamedAudioPath(first), first?.path)
+    }
+
+    func testRetainReturnsNilWhenBudgetImmediatelyPrunesNewFile() {
+        let source = writeTempSource(named: "too-large.caf", bytes: 512)
+        let retained = RecordingRetention.retain(from: source, maxCount: 10, maxBytes: 1)
+
+        XCTAssertNil(retained)
+        XCTAssertEqual(RecordingRetention.fileCount(), 0)
+        XCTAssertNil(TranscriptionPipeline.streamedAudioPath(retained))
+    }
+
     func testExportZipPackagesAudioAndTranscripts() throws {
         let src = writeTempSource(named: "export-me.caf", bytes: 512)
         guard let retained = RecordingRetention.retain(

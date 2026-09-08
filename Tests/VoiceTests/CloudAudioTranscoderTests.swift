@@ -29,7 +29,8 @@ final class CloudAudioTranscoderTests: XCTestCase {
         channels: AVAudioChannelCount,
         commonFormat: AVAudioCommonFormat,
         frameCount: AVAudioFrameCount,
-        interleaved: Bool
+        interleaved: Bool,
+        tailMarkerFraction: Double? = nil
     ) throws -> URL {
         guard let format = AVAudioFormat(
             commonFormat: commonFormat,
@@ -49,13 +50,15 @@ final class CloudAudioTranscoderTests: XCTestCase {
         if let floatData = buffer.floatChannelData {
             for ch in 0 ..< Int(channels) {
                 for i in 0 ..< Int(frameCount) {
-                    floatData[ch][i] = 0.05 * sinf(Float(i) * 0.05)
+                    let markerStart = tailMarkerFraction.map { Int(Double(frameCount) * $0) } ?? 0
+                    floatData[ch][i] = i >= markerStart ? 0.2 * sinf(Float(i) * 0.05) : 0
                 }
             }
         } else if let int16Data = buffer.int16ChannelData {
             for ch in 0 ..< Int(channels) {
                 for i in 0 ..< Int(frameCount) {
-                    int16Data[ch][i] = Int16(1600 * sin(Double(i) * 0.05))
+                    let markerStart = tailMarkerFraction.map { Int(Double(frameCount) * $0) } ?? 0
+                    int16Data[ch][i] = i >= markerStart ? Int16(6400 * sin(Double(i) * 0.05)) : 0
                 }
             }
         }
@@ -72,6 +75,7 @@ final class CloudAudioTranscoderTests: XCTestCase {
         ]
         let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: commonFormat, interleaved: interleaved)
         try file.write(from: buffer)
+        file.close()
         return url
     }
 
@@ -96,6 +100,30 @@ final class CloudAudioTranscoderTests: XCTestCase {
         let format = file.processingFormat
         XCTAssertEqual(format.sampleRate, 16_000, accuracy: 0.1)
         XCTAssertEqual(format.channelCount, 1)
+    }
+
+    private func assertFrameCoverageAndTailMarker(
+        _ url: URL,
+        sourceFrames: AVAudioFrameCount,
+        sourceRate: Double
+    ) throws {
+        let file = try AVAudioFile(forReading: url)
+        let expectedFrames = Int64((Double(sourceFrames) * 16_000 / sourceRate).rounded())
+        XCTAssertLessThanOrEqual(abs(file.length - expectedFrames), 1)
+
+        let frames = AVAudioFrameCount(file.length)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames) else {
+            return XCTFail("failed to allocate output inspection buffer")
+        }
+        try file.read(into: buffer)
+        guard let samples = buffer.floatChannelData?[0] else {
+            return XCTFail("missing converted samples")
+        }
+        let tailStart = max(0, Int(buffer.frameLength) - max(16, Int(buffer.frameLength) / 20))
+        let tailPeak = (tailStart ..< Int(buffer.frameLength)).reduce(Float.zero) {
+            max($0, abs(samples[$1]))
+        }
+        XCTAssertGreaterThan(tailPeak, 0.05, "final audio marker was truncated")
     }
 
     // MARK: - Errors
@@ -131,6 +159,42 @@ final class CloudAudioTranscoderTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
         XCTAssertEqual(out.pathExtension.lowercased(), "wav")
         try assertIsWAV16kMonoInt16(out)
+    }
+
+    func testTranscodeLongProductionRatesPreservesEveryFrameAndTail() throws {
+        for rate in [8_000.0, 16_000.0, 44_100.0, 48_000.0] {
+            let sourceFrames = AVAudioFrameCount(rate * 2)
+            let input = try writeAudioFile(
+                name: "long-\(Int(rate)).caf",
+                sampleRate: rate,
+                channels: 1,
+                commonFormat: .pcmFormatFloat32,
+                frameCount: sourceFrames,
+                interleaved: false,
+                tailMarkerFraction: 0.8
+            )
+            let out = try CloudAudioTranscoder.transcodeToWAV16k(input)
+            defer { try? FileManager.default.removeItem(at: out) }
+            try assertFrameCoverageAndTailMarker(out, sourceFrames: sourceFrames, sourceRate: rate)
+        }
+    }
+
+    func testTranscodeShortAndOddFrameInputsPreserveCoverageAndTail() throws {
+        for (rate, sourceFrames) in [(48_000.0, AVAudioFrameCount(4_800)),
+                                     (44_100.0, AVAudioFrameCount(88_201))] {
+            let input = try writeAudioFile(
+                name: "edge-\(Int(rate))-\(sourceFrames).caf",
+                sampleRate: rate,
+                channels: 1,
+                commonFormat: .pcmFormatFloat32,
+                frameCount: sourceFrames,
+                interleaved: false,
+                tailMarkerFraction: 0.8
+            )
+            let out = try CloudAudioTranscoder.transcodeToWAV16k(input)
+            defer { try? FileManager.default.removeItem(at: out) }
+            try assertFrameCoverageAndTailMarker(out, sourceFrames: sourceFrames, sourceRate: rate)
+        }
     }
 
     func testTranscodeFloat32Stereo48k_Produces16kMonoWAV() throws {
@@ -177,21 +241,28 @@ final class CloudAudioTranscoderTests: XCTestCase {
 
     // MARK: - Upload payload
 
-    func testWavUploadPayload_mimeAndCleanup() throws {
+    func testWavUploadPayload_preservesLongTailAndMetadata() throws {
+        let sourceFrames: AVAudioFrameCount = 96_000
         let input = try writeAudioFile(
             name: "payload-src.caf",
             sampleRate: 48_000,
             channels: 1,
             commonFormat: .pcmFormatFloat32,
-            frameCount: 2400,
-            interleaved: false
+            frameCount: sourceFrames,
+            interleaved: false,
+            tailMarkerFraction: 0.8
         )
         let payload = try CloudAudioTranscoder.wavUploadPayload(from: input)
         XCTAssertEqual(payload.fileName, CloudAudioTranscoder.uploadFileName)
         XCTAssertEqual(payload.mimeType, CloudAudioTranscoder.uploadMimeType)
-        XCTAssertFalse(payload.data.isEmpty)
-        // WAV header starts with RIFF
         XCTAssertEqual(Array(payload.data.prefix(4)), Array("RIFF".utf8))
+        let persistedPayload = tempDir.appendingPathComponent("persisted-payload.wav")
+        try payload.data.write(to: persistedPayload)
+        try assertFrameCoverageAndTailMarker(
+            persistedPayload,
+            sourceFrames: sourceFrames,
+            sourceRate: 48_000
+        )
     }
 
     func testErrorDescriptionsAreNonEmpty() {
@@ -202,6 +273,7 @@ final class CloudAudioTranscoderTests: XCTestCase {
             .converterConstructionFailed,
             .bufferAllocationFailed,
             .conversionFailed,
+            .incompleteConversion(expectedFrames: 10, actualFrames: 9),
             .writeFailed
         ]
         for error in cases {

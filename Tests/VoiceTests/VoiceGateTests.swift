@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import Voice
 
@@ -47,6 +48,16 @@ final class VoiceGateTests: XCTestCase {
         func embedding(for samples: [Float]) -> [Float]? {
             guard isReady else { return nil }
             return vector
+        }
+    }
+
+    private final class CapturingEmbeddingProvider: SpeakerEmbeddingProviding {
+        var isReady = true
+        private(set) var windows: [[Float]] = []
+
+        func embedding(for samples: [Float]) -> [Float]? {
+            windows.append(samples)
+            return [0, 1]
         }
     }
 
@@ -121,7 +132,7 @@ final class VoiceGateTests: XCTestCase {
         let dir = tempDirectory()
         let store = VoiceProfileStore(directoryURL: dir)
         let provider = FakeEmbeddingProvider(isReady: false, embeddings: [[1, 0]])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertNil(gate.enroll(segments: [[1, 2, 3]]))
     }
 
@@ -129,7 +140,7 @@ final class VoiceGateTests: XCTestCase {
         let dir = tempDirectory()
         let store = VoiceProfileStore(directoryURL: dir)
         let provider = FakeEmbeddingProvider(isReady: true, embeddings: [])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertNil(gate.enroll(segments: [[1, 2, 3]]))
     }
 
@@ -151,13 +162,13 @@ final class VoiceGateTests: XCTestCase {
         store.save(VoiceProfile(embedding: profileVector, createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: true, vector: queryVector)
 
-        let lowGate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .low)
+        let lowGate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .low, modelId: "test")
         XCTAssertEqual(lowGate.evaluate(window: [0]).decision, .pass)
 
-        let mediumGate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let mediumGate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertEqual(mediumGate.evaluate(window: [0]).decision, .attenuate)
 
-        let highGate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .high)
+        let highGate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .high, modelId: "test")
         XCTAssertEqual(highGate.evaluate(window: [0]).decision, .attenuate)
     }
 
@@ -168,7 +179,7 @@ final class VoiceGateTests: XCTestCase {
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: profileVector, createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: true, vector: queryVector)
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .high)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .high, modelId: "test")
         XCTAssertEqual(gate.evaluate(window: [0]).decision, .pass)
     }
 
@@ -178,7 +189,7 @@ final class VoiceGateTests: XCTestCase {
         let dir = tempDirectory()
         let store = VoiceProfileStore(directoryURL: dir)
         let provider = ConstantEmbeddingProvider(isReady: true, vector: [1, 0])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertEqual(gate.evaluate(window: [0]).decision, .pass)
     }
 
@@ -187,7 +198,7 @@ final class VoiceGateTests: XCTestCase {
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: false, vector: [1, 0])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertEqual(gate.evaluate(window: [0]).decision, .pass)
     }
 
@@ -196,8 +207,25 @@ final class VoiceGateTests: XCTestCase {
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: true, vector: nil)
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertEqual(gate.evaluate(window: [0]).decision, .pass)
+    }
+
+    func testEvaluateProfileModelMismatchFailsOpenWithoutEmbedding() {
+        let dir = tempDirectory()
+        let store = VoiceProfileStore(directoryURL: dir)
+        store.save(VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "old-model"))
+        let provider = FakeEmbeddingProvider(embeddings: [[0, 1]])
+        let gate = VoiceGate(
+            profileStore: store,
+            embeddingProvider: provider,
+            sensitivity: .medium,
+            modelId: "current-model"
+        )
+
+        let result = gate.evaluate(window: [0])
+        XCTAssertEqual(result.decision, .pass)
+        XCTAssertNil(result.similarity)
     }
 
     func testEvaluateLowSimilarityAttenuates() {
@@ -205,7 +233,7 @@ final class VoiceGateTests: XCTestCase {
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: true, vector: [0, 1])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertEqual(gate.evaluate(window: [0]).decision, .attenuate)
     }
 
@@ -214,7 +242,7 @@ final class VoiceGateTests: XCTestCase {
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: true, vector: [1, 0])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
         XCTAssertEqual(gate.evaluate(window: [0]).decision, .pass)
     }
 
@@ -311,7 +339,7 @@ final class VoiceGateTests: XCTestCase {
         let dir = tempDirectory()
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: profile, createdAt: Date(), modelId: "test"))
-        return VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        return VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
     }
 
     private func makeStreamProcessor(
@@ -448,6 +476,31 @@ final class VoiceGateTests: XCTestCase {
         XCTAssertEqual(processor.latchedDecisionForTesting, .attenuate)
         XCTAssertEqual(session.snapshot().attemptedWindows, 1)
         XCTAssertEqual(session.snapshot().attenuatedWindows, 1)
+    }
+
+    func testProcessorClassifiesRawWindowBeforeAttenuatingProviderBuffer() {
+        let session = VoiceGateRecordingSession()
+        let provider = CapturingEmbeddingProvider()
+        let gate = makeVoiceGate(provider: provider)
+        let processor = makeStreamProcessor(gate: gate, session: session, runEvaluation: { $0() })
+        processor.beginRecordingSession()
+        processor.evaluateWindowForTesting([Float](repeating: 1, count: 16_000))
+        XCTAssertEqual(processor.latchedDecisionForTesting, .attenuate)
+
+        let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        )!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16_000)!
+        buffer.frameLength = 16_000
+        for index in 0 ..< 16_000 { buffer.floatChannelData![0][index] = 0.8 }
+
+        processor.processBuffer(buffer)
+
+        XCTAssertEqual(provider.windows.last?.first ?? 0, 0.8, accuracy: 0.0001)
+        XCTAssertEqual(buffer.floatChannelData![0][0], 0.04, accuracy: 0.0001)
     }
 
     func testProcessorRejectsStaleEvalWhenNewSessionStartsDuringEmbedding() {
@@ -710,7 +763,7 @@ final class VoiceGateTests: XCTestCase {
         let store = VoiceProfileStore(directoryURL: dir)
         store.save(VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "test"))
         let provider = ConstantEmbeddingProvider(isReady: true, vector: [1, 0])
-        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium)
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
 
         let scored = gate.evaluate(window: [0])
         XCTAssertEqual(scored.decision, .pass)
@@ -723,7 +776,8 @@ final class VoiceGateTests: XCTestCase {
         let notReadyGate = VoiceGate(
             profileStore: store,
             embeddingProvider: ConstantEmbeddingProvider(isReady: false, vector: [1, 0]),
-            sensitivity: .medium
+            sensitivity: .medium,
+            modelId: "test"
         )
         let unscored = notReadyGate.evaluate(window: [0])
         XCTAssertEqual(unscored.decision, .pass)
