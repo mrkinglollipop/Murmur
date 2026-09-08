@@ -173,6 +173,19 @@ final class ClipboardStoreTests: XCTestCase {
         )
     }
 
+    func testFingerprintFramesCanonicalPayloadsPerItem() {
+        let first: TextInjector.PasteboardSnapshot = [
+            [.string: Data("ab".utf8)], [.string: Data("c".utf8)]
+        ]
+        let second: TextInjector.PasteboardSnapshot = [
+            [.string: Data("a".utf8)], [.string: Data("bc".utf8)]
+        ]
+        XCTAssertNotEqual(
+            ClipboardFingerprint.fingerprint(for: first),
+            ClipboardFingerprint.fingerprint(for: second)
+        )
+    }
+
     // MARK: - Encryption and round-trip
 
     func testPayloadRoundTripPreservesEveryRepresentation() {
@@ -693,6 +706,92 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.entries.first?.sourceBundleID, "com.apple.Safari")
         guard let entry = reloaded.entries.first else { return XCTFail("no entry") }
         XCTAssertEqual(reloaded.payload(for: entry)?.first?[.string], Data("persisted".utf8))
+    }
+
+    func testFlushPersistsCompletedBlobWhoseMainInsertIsStillQueued() {
+        let directory = tempDirectory()
+        let key = SymmetricKey(size: .bits256)
+        let store = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        store.record(snapshot: textSnapshot("must survive quit"), sourceBundleID: nil)
+        store.flush()
+
+        let reloaded = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        XCTAssertEqual(reloaded.entries.count, 1)
+        XCTAssertEqual(reloaded.entries.first?.preview, "must survive quit")
+    }
+
+    func testCorruptMetadataPreservesRecoverableBlobsWithoutReconciliation() throws {
+        let directory = tempDirectory()
+        let key = SymmetricKey(size: .bits256)
+        let store = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        store.record(snapshot: textSnapshot("recoverable"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        let entry = try XCTUnwrap(store.entries.first)
+        store.flush()
+        let blob = directory.appendingPathComponent("blobs").appendingPathComponent(entry.id.uuidString)
+
+        try Data("{ malformed".utf8).write(to: directory.appendingPathComponent("clipboard.json"))
+        let reopened = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        settle()
+
+        XCTAssertTrue(reopened.entries.isEmpty)
+        XCTAssertTrue(reopened.isMetadataCorrupt)
+        XCTAssertFalse(reopened.canCapture)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: blob.path))
+        reopened.flush()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json").path))
+
+        // The quarantine marker survives a second launch, preventing a later
+        // clean-looking empty metadata load from deleting recoverable blobs.
+        let relaunched = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        settle()
+        XCTAssertTrue(relaunched.isMetadataCorrupt)
+        XCTAssertFalse(relaunched.canCapture)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: blob.path))
+    }
+
+    func testExplicitCorruptHistoryDiscardDeletesFilesAndRestoresCapture() throws {
+        let directory = tempDirectory()
+        let key = SymmetricKey(size: .bits256)
+        let store = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        store.record(snapshot: textSnapshot("recover only after confirmation"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        let entry = try XCTUnwrap(store.entries.first)
+        store.flush()
+        let blob = directory.appendingPathComponent("blobs").appendingPathComponent(entry.id.uuidString)
+        try Data("{ malformed".utf8).write(to: directory.appendingPathComponent("clipboard.json"))
+
+        let reopened = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        XCTAssertTrue(reopened.isMetadataCorrupt)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: blob.path))
+
+        reopened.discardCorruptHistory()
+        XCTAssertTrue(waitUntil { !reopened.isMetadataCorrupt })
+        XCTAssertTrue(reopened.canCapture)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: blob.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json").path))
+    }
+
+    func testCorruptHistoryDiscardRetainsQuarantineWhenBlobEnumerationFails() throws {
+        let directory = tempDirectory()
+        try Data("{ malformed".utf8).write(to: directory.appendingPathComponent("clipboard.json"))
+        // An existing non-directory at this path makes enumeration fail. The
+        // recovery must not translate that unknown result into "empty."
+        try Data("not a directory".utf8).write(to: directory.appendingPathComponent("blobs"))
+        let marker = directory.appendingPathComponent("clipboard.json.quarantine")
+        let store = activated(ClipboardStore(
+            directory: directory,
+            crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        ))
+        XCTAssertTrue(store.isMetadataCorrupt)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+
+        store.discardCorruptHistory()
+        settle()
+
+        XCTAssertTrue(store.isMetadataCorrupt)
+        XCTAssertFalse(store.canCapture)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
     }
 
     func testDeleteRemovesEntryAndBlob() {
