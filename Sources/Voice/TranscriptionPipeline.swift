@@ -360,6 +360,7 @@ final class TranscriptionPipeline {
     func logStreamedTranscription(
         text: String,
         engineID: String,
+        retainedAudioURL: URL? = nil,
         sessionHeldToken providedToken: UInt64? = nil,
         sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
         sessionHeldFrontmostPID providedPID: pid_t? = nil,
@@ -377,7 +378,7 @@ final class TranscriptionPipeline {
             self.finishTranscription(
                 text: transformed,
                 engineID: engineID,
-                audioPath: nil,
+                audioPath: Self.streamedAudioPath(retainedAudioURL),
                 replaceHistoryEntryID: nil,
                 sessionHeldToken: sessionHeldToken,
                 sessionHeldSnapshot: sessionHeldSnapshot,
@@ -385,6 +386,13 @@ final class TranscriptionPipeline {
                 completion: completion
             )
         }
+    }
+
+    /// The stream success path has no audio URL until `AudioRecorder` has
+    /// retained its raw snapshot. Keep nil explicit when retention failed so
+    /// a successful transcript never gets a fabricated history path.
+    static func streamedAudioPath(_ retainedAudioURL: URL?) -> String? {
+        retainedAudioURL?.path
     }
 
     /// Resolve provided stop-time hold, or sample `heldCaret*` once on main.
@@ -466,11 +474,13 @@ final class TranscriptionPipeline {
         }
     }
 
-    /// Caps always, then SpokenPunctuation (full table if codeAware; sentence
-    /// commands always), then DotCompound. Package-visible for pipeline-gate
-    /// unit tests. Caps is not gated on codeAware or cleanup.
+    /// Strips known provider audio-event captions, then applies caps, spoken
+    /// punctuation (full table if codeAware; sentence commands always), and
+    /// DotCompound. Package-visible for pipeline-gate unit tests. This applies
+    /// regardless of optional AI cleanup so every ASR path gets the same guard.
     static func preprocessBeforeCleanup(_ text: String, codeAware: Bool) -> String {
-        let capped = SpokenCapitalization.apply(text)
+        let withoutSoundTags = NonSpeechAnnotations.stripRecognizedTags(text)
+        let capped = SpokenCapitalization.apply(withoutSoundTags)
         return DotCompoundNumberNormalizer.apply(
             SpokenPunctuation.apply(capped, codeAware: codeAware)
         )
@@ -550,6 +560,12 @@ final class TranscriptionPipeline {
         sessionHeldFrontmostPID: pid_t?,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
+        // `trimmed` below deliberately normalizes usual ASR edge whitespace,
+        // but an explicit spoken newline is formatting and must opt out before
+        // that normalization hides it from terminal-period eligibility.
+        let hadExplicitTrailingNewline = text.reversed().first(where: {
+            !($0.isWhitespace && !$0.isNewline)
+        })?.isNewline == true
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
@@ -572,6 +588,8 @@ final class TranscriptionPipeline {
             let (corrected, records) = self.onTranscription?(trimmed, engineID) ?? (trimmed, [])
             if !records.isEmpty { self.onCorrectionsRecorded?(records) }
             let expanded = self.onSnippetExpand?(corrected) ?? corrected
+            let snippetExpansionOccurred = expanded != corrected
+            let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
             let capitalizedTerms = self.engineSelector?.capitalizedDictionaryTermsProvider?() ?? []
             // Prefer the stop-time session snapshot when present. Token match
             // for clear still uses sessionHeldToken; live held is only a
@@ -642,7 +660,14 @@ final class TranscriptionPipeline {
                         IsSecureEventInputEnabled()
                     }
                     textToInject = Self.applyInjectTransforms(
-                        expanded: expanded,
+                        expanded: Self.prepareResolvedSnapshotTextForInjection(
+                            expanded: expanded,
+                            snapshot: resolved,
+                            codeAware: self.codeAware,
+                            hasExplicitCustomTransform: hasExplicitCustomTransform,
+                            snippetExpansionOccurred: snippetExpansionOccurred,
+                            hadExplicitTrailingNewline: hadExplicitTrailingNewline
+                        ),
                         snapshot: resolved,
                         secureInput: liveSecure,
                         smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
@@ -803,6 +828,27 @@ final class TranscriptionPipeline {
             transcriptFirstChar: text.first
         )
         return shouldPrepend ? " " + text : text
+    }
+
+    /// Preparation that runs after the final AX snapshot resolves, so it can
+    /// reject a period before visible text while remaining independent of AI
+    /// cleanup and provider selection.
+    static func prepareResolvedSnapshotTextForInjection(
+        expanded: String,
+        snapshot: CaretContext.Snapshot,
+        codeAware: Bool,
+        hasExplicitCustomTransform: Bool,
+        snippetExpansionOccurred: Bool,
+        hadExplicitTrailingNewline: Bool = false
+    ) -> String {
+        TerminalPunctuation.prepare(
+            expanded,
+            snapshot: snapshot,
+            codeAware: codeAware,
+            hasExplicitCustomTransform: hasExplicitCustomTransform,
+            snippetExpansionOccurred: snippetExpansionOccurred,
+            hadExplicitTrailingNewline: hadExplicitTrailingNewline
+        )
     }
 
     /// Pure decision seam for the secure-input / history-logging / HUD outcome

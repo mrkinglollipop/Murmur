@@ -15,7 +15,11 @@ import AppKit
 // process entry point, executed before `app.run()` starts the run loop —
 // so `assumeIsolated` is a correct, not just convenient, way to construct it.
 let app = NSApplication.shared
-let delegate = MainActor.assumeIsolated { AppDelegate() }
+// Hosted unit tests must not start global hotkeys, microphone services, or
+// stores backed by the signed-in user's data.
+let isTestHost = NSClassFromString("XCTestCase") != nil
+    || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+let delegate: AppDelegate? = isTestHost ? nil : MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
-app.setActivationPolicy(.regular)  // normal Dock app: shows in the Dock, Cmd-Q quits
+app.setActivationPolicy(isTestHost ? .prohibited : .regular)
 app.run()

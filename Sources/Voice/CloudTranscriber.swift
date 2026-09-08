@@ -316,7 +316,10 @@ final class ElevenLabsTranscriptionService: CloudTranscriptionService {
             mimeType: payload.mimeType,
             fields: [
                 "model_id": "scribe_v2",
-                "language_code": language
+                "language_code": language,
+                // Scribe otherwise returns captions such as "[coughing]" for
+                // audio events. Dictation wants spoken words only.
+                "tag_audio_events": "false"
             ]
         )
 

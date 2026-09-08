@@ -60,6 +60,42 @@ final class MuseLiveTests: XCTestCase {
         XCTAssertEqual(transcriber.joinedTranscriptSnapshot(), "hello world")
     }
 
+    func testFinalTranscriptReplacesLongerSpeculativePartial() {
+        let session = MuseLiveTranscriber(apiKey: "key")
+        session.handleServerEvent("""
+        {"type":"transcript","transcript":"It's just an absolute joke.","final":false}
+        """)
+        session.handleServerEvent("""
+        {"type":"transcript","transcript":"It's just an ad.","final":true}
+        """)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "It's just an ad.")
+    }
+
+    func testFinalizeWaitsForSpeechCompleteAfterSegmentFinal() async {
+        let session = MuseLiveTranscriber(apiKey: "key")
+        let probe = MuseCompletionProbe()
+        let finalizer = Task {
+            let text = await session.finalize(recordingDuration: 0)
+            await probe.finish(text)
+            return text
+        }
+        // Beyond the baseline's 600ms pre-signal sleep: the control then
+        // exposes its segment-final early-resolution bug.
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        session.handleServerEvent("""
+        {"type":"transcript","transcript":"segment final","final":true}
+        """)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let completedBeforeSessionFinal = await probe.isComplete()
+        XCTAssertFalse(completedBeforeSessionFinal)
+
+        session.handleServerEvent("""
+        {"type":"speechComplete","transcript":"full turn text"}
+        """)
+        let finalized = await finalizer.value
+        XCTAssertEqual(finalized, "full turn text")
+    }
+
     func testHandshakeAckEventHasNoTypeField() {
         let transcriber = MuseLiveTranscriber(apiKey: "key")
         transcriber.handleServerEvent("{\"sessionId\":\"sess-1\"}")
@@ -86,4 +122,15 @@ final class MuseLiveTests: XCTestCase {
         )
         XCTAssertEqual(joined, "hello world")
     }
+}
+
+private actor MuseCompletionProbe {
+    private var completed = false
+
+    func finish(_ text: String) {
+        _ = text
+        completed = true
+    }
+
+    func isComplete() -> Bool { completed }
 }

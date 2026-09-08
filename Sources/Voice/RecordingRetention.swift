@@ -50,13 +50,14 @@ enum RecordingRetention {
         maxCount: Int = runawayFileCeiling,
         maxBytes: Int64 = Int64(defaultBudgetMB) * 1024 * 1024
     ) -> URL? {
-        let destination = recordingsDirectory.appendingPathComponent(tempURL.lastPathComponent)
+        let ext = tempURL.pathExtension.isEmpty ? "caf" : tempURL.pathExtension
+        // A wall-clock filename is not an identity: rapid releases can land in
+        // the same second. Every retained recording gets its own stable path.
+        let destination = recordingsDirectory
+            .appendingPathComponent("voice-\(UUID().uuidString).\(ext)")
         let fileManager = FileManager.default
 
         do {
-            if fileManager.fileExists(atPath: destination.path) {
-                try fileManager.removeItem(at: destination)
-            }
             try fileManager.copyItem(at: tempURL, to: destination)
         } catch {
             return nil
@@ -68,7 +69,9 @@ enum RecordingRetention {
             keepPaths: Set(keepPaths),
             in: recordingsDirectory
         )
-        return destination
+        // A newly copied file can be pruned immediately when its size exceeds
+        // the selected budget. Never hand history a dangling audio path.
+        return fileManager.fileExists(atPath: destination.path) ? destination : nil
     }
 
     /// Total bytes of retained recording files (0 if the directory is empty/missing).

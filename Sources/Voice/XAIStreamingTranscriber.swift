@@ -57,6 +57,7 @@ struct TranscriptWord: Equatable {
 ///     written from the receive-loop `Task` and read from `send`/`finalize`
 ///     on other threads/tasks.
 final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
+    typealias MessageSender = (URLSessionWebSocketTask.Message) async throws -> Void
 
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "xai-streaming")
 
@@ -66,6 +67,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// starts a new utterance. Default is the API max (5000) so a mid-hold
     /// pause does not split the take. Settings Advanced can lower it.
     private let endpointingMs: Int
+    private let injectedMessageSender: MessageSender?
 
     static let defaultEndpointingMs = 5000
     static let endpointingMsRange: ClosedRange<Int> = 500...5000
@@ -156,11 +158,26 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// receive error). Lets `finalize()` short-circuit instead of hanging on
     /// the 3s done-timeout when there's no live socket to answer.
     private var socketClosed = false
+    private var streamIntegrityFailed = false
+    private var lastFinalizeRequiresBufferedAudioRecovery = false
+    private var intentionalSocketShutdown = false
 
-    init(apiKey: String, language: String = "en", endpointingMs: Int = XAIStreamingTranscriber.defaultEndpointingMs) {
+    var requiresBufferedAudioRecovery: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lastFinalizeRequiresBufferedAudioRecovery || streamIntegrityFailed
+    }
+
+    init(
+        apiKey: String,
+        language: String = "en",
+        endpointingMs: Int = XAIStreamingTranscriber.defaultEndpointingMs,
+        messageSender: MessageSender? = nil
+    ) {
         self.apiKey = apiKey
         self.language = language
         self.endpointingMs = Self.clampEndpointingMs(endpointingMs)
+        self.injectedMessageSender = messageSender
         super.init()
     }
 
@@ -184,6 +201,11 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// connection/auth failure or if readiness doesn't arrive within ~5s.
     func start() async throws {
         vlog("xai-stream: starting session")
+        stateLock.lock()
+        streamIntegrityFailed = false
+        lastFinalizeRequiresBufferedAudioRecovery = false
+        intentionalSocketShutdown = false
+        stateLock.unlock()
         resetTranscriptState()
 
         guard let url = Self.buildSocketURL(language: language, endpointingMs: endpointingMs) else {
@@ -272,6 +294,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                 do {
                     try await task.send(.data(frame))
                 } catch {
+                    self.markStreamIntegrityFailed()
                     vlog("xai-stream: send failed, stopping sender: \(error.localizedDescription)")
                     break
                 }
@@ -291,6 +314,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.unlock()
         guard let continuation else { return }
         guard let pcmData = convertToPCM16(buffer) else {
+            markStreamIntegrityFailed()
             vlog("xai-stream: send — conversion produced no data, dropping buffer")
             return
         }
@@ -329,11 +353,13 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         // the 3s done-timeout (this is the dead-socket path the user hit).
         stateLock.lock()
         let closed = socketClosed
+        let integrityFailed = streamIntegrityFailed
         let confirmedSoFar = mergeConfirmedWithInterim()
         stateLock.unlock()
-        if closed {
+        if closed || integrityFailed {
+            if closed { markStreamIntegrityFailed() }
             tearDownSocket()
-            vlog("xai-stream: finalize short-circuit (socket closed), \(confirmedSoFar.count) chars")
+            vlog("xai-stream: finalize short-circuit (socket/integrity), \(confirmedSoFar.count) chars")
             let processed = Self.postProcessTranscript(confirmedSoFar)
             stateLock.lock()
             resetTranscriptState()
@@ -341,9 +367,19 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             return processed
         }
 
-        if let task {
+        if task != nil || injectedMessageSender != nil {
             let doneMessage = "{\"type\":\"audio.done\"}"
-            try? await task.send(.string(doneMessage))
+            do {
+                try await sendMessage(.string(doneMessage))
+            } catch {
+                markStreamIntegrityFailed()
+                tearDownSocket()
+                let processed = Self.postProcessTranscript(confirmedSoFar)
+                stateLock.lock()
+                resetTranscriptState()
+                stateLock.unlock()
+                return processed
+            }
         }
 
         // Long recordings need more time for the server to stitch the full
@@ -378,6 +414,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                     return nil
                 }
                 let pending = self.doneContinuation
+                self.lastFinalizeRequiresBufferedAudioRecovery = true
+                self.streamIntegrityFailed = true
                 let text = self.mergeConfirmedWithInterim()
                 self.doneResolved = true
                 self.doneContinuation = nil
@@ -457,6 +495,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func tearDownSocket() {
+        stateLock.lock()
+        intentionalSocketShutdown = true
+        stateLock.unlock()
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
         senderTask?.cancel()
@@ -476,7 +517,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         vlog("xai-stream: socket closed (code=\(closeCode.rawValue) reason=\(reasonStr))")
-        failReadyIfPending("closed code \(closeCode.rawValue)")
+        noteSocketClosed(closeCode: closeCode)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -491,6 +532,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         } else {
             vlog("xai-stream: task completed httpStatus=\(status) error=none")
         }
+        stateLock.lock()
+        let intentional = intentionalSocketShutdown
+        stateLock.unlock()
+        if error != nil, !intentional { markStreamIntegrityFailed() }
         failReadyIfPending("task completed httpStatus=\(status)")
     }
 
@@ -520,6 +565,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             } catch {
                 let ns = error as NSError
                 vlog("xai-stream: receive loop ended: \(ns.domain)#\(ns.code) \(error.localizedDescription)")
+                stateLock.lock()
+                let intentional = intentionalSocketShutdown
+                stateLock.unlock()
+                if !intentional { markStreamIntegrityFailed() }
                 failReadyIfPending("receive: \(ns.domain)#\(ns.code)")
                 break
             }
@@ -530,6 +579,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             case .data:
                 // Server only ever sends text/JSON events per the documented
                 // protocol; ignore any binary frame rather than failing.
+                markStreamIntegrityFailed()
                 continue
             @unknown default:
                 continue
@@ -537,11 +587,12 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private func handleServerEvent(_ text: String) {
+    func handleServerEvent(_ text: String) {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = json["type"] as? String
         else {
+            markStreamIntegrityFailed()
             vlog("xai-stream: received unparseable event")
             return
         }
@@ -607,11 +658,41 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             // Per the protocol, an error event does not close the
             // connection — log and keep the receive loop running.
             let message = (json["message"] as? String) ?? "unknown"
+            markStreamIntegrityFailed()
             vlog("xai-stream: server error event: \(CloudTranscriptionError.redactedBodyFragment(message))")
 
         default:
             vlog("xai-stream: unhandled event type: \(type)")
         }
+    }
+
+    private func sendMessage(_ message: URLSessionWebSocketTask.Message) async throws {
+        if let injectedMessageSender {
+            try await injectedMessageSender(message)
+            return
+        }
+        guard let task else {
+            throw CloudTranscriptionError(provider: .xai, message: "stream socket unavailable")
+        }
+        try await task.send(message)
+    }
+
+    private func markStreamIntegrityFailed() {
+        stateLock.lock()
+        streamIntegrityFailed = true
+        lastFinalizeRequiresBufferedAudioRecovery = true
+        stateLock.unlock()
+    }
+
+    func noteSocketClosed(closeCode: URLSessionWebSocketTask.CloseCode) {
+        stateLock.lock()
+        socketClosed = true
+        let terminalComplete = doneResolved
+        let shouldFail = !intentionalSocketShutdown
+            && !(closeCode == .normalClosure && terminalComplete)
+        stateLock.unlock()
+        if shouldFail { markStreamIntegrityFailed() }
+        failReadyIfPending("closed code \(closeCode.rawValue)")
     }
 
     /// Combines stitched chunk finals with the in-progress interim tail.
