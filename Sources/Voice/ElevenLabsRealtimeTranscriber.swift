@@ -137,16 +137,24 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// window after the latest committed segment before completing finalize.
     private var doneDrainTask: Task<Void, Never>?
     private var doneDrainGeneration: UInt64 = 0
+    private var finalizeWorkerTask: Task<Void, Never>?
+    private var finalizeDeadlineTask: Task<Void, Never>?
+    private var finalizeGeneration: UInt64 = 0
     private var finalizeCommitSeen = false
     private var finalizeCommitHadText = false
     private var lastFinalizeRequiresBufferedAudioRecovery = false
     private var streamIntegrityFailed = false
     private var intentionalSocketShutdown = false
     private var finalizeCoverageAmbiguous = false
-    /// Product latency budget after the latest relevant server event. This is
-    /// not a provider "done" guarantee; ElevenLabs has no session-final event.
-    /// The recording-scaled finalize timeout remains the hard global bound.
+    /// ElevenLabs has no session-final event. Bound the whole stop-time path —
+    /// queued audio drain, terminal send, provider wait, and committed-event
+    /// quiet drain — then recover from the complete retained recording.
+    private static let finalizeBudgetNanoseconds: UInt64 = 1_500_000_000
     private static let committedDrainNanoseconds: UInt64 = 250_000_000
+    private var finalizeStartedAt: Date?
+    private var finalizeSenderDrainedAt: Date?
+    private var finalizeTerminalSentAt: Date?
+    private var finalizeFirstEventAt: Date?
 
     var requiresBufferedAudioRecovery: Bool {
         stateLock.lock()
@@ -298,9 +306,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     }
 
     /// Sends a final `commit:true` frame (with an empty audio payload — all
-    /// captured audio was already streamed via `send(_:)`), awaits the final
-    /// `committed_transcript` (timeout scales with recording length), and
-    /// returns the joined committed transcript. Tears the socket down either way.
+    /// captured audio was already streamed via `send(_:)`) and awaits the final
+    /// `committed_transcript` within the product latency budget. If any part of
+    /// finalization exceeds that budget, the coordinator recovers from the
+    /// complete retained recording. Tears the socket down either way.
     func finalize(recordingDuration: TimeInterval = 0) async -> String {
         stateLock.lock()
         if tornDown {
@@ -311,8 +320,13 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         tornDown = true
         finalizeRequested = true
         finalizeDrainArmed = false
+        finalizeGeneration &+= 1
+        let generation = finalizeGeneration
+        finalizeStartedAt = Date()
+        finalizeSenderDrainedAt = nil
+        finalizeTerminalSentAt = nil
+        finalizeFirstEventAt = nil
         stateLock.unlock()
-        let finalizeStart = Date()
 
         // Stop accepting new frames, then wait for the sender to flush every
         // already-captured frame before sending the commit frame — otherwise
@@ -320,127 +334,151 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         stateLock.lock()
         let framesToFinish = frameContinuation
         frameContinuation = nil
+        let senderToDrain = senderTask
         stateLock.unlock()
         framesToFinish?.finish()
-        await senderTask?.value
-        senderTask = nil
+
+        let result = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+            stateLock.lock()
+            doneContinuation = continuation
+            stateLock.unlock()
+
+            let deadline = Task { [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: Self.finalizeBudgetNanoseconds)
+                } catch {
+                    return
+                }
+                self?.completeFinalize(generation: generation, requiresBufferedRecovery: true)
+            }
+            let worker = Task { [weak self] in
+                guard let self else { return }
+                await self.runFinalizeWork(
+                    recordingDuration: recordingDuration,
+                    senderToDrain: senderToDrain,
+                    generation: generation
+                )
+            }
+            stateLock.lock()
+            if finalizeGeneration == generation, !doneResolved {
+                finalizeDeadlineTask = deadline
+                finalizeWorkerTask = worker
+                stateLock.unlock()
+            } else {
+                stateLock.unlock()
+                deadline.cancel()
+                worker.cancel()
+            }
+        }
+
+        tearDownSocket()
 
         stateLock.lock()
+        let startedAt = finalizeStartedAt
+        let senderDrainedAt = finalizeSenderDrainedAt
+        let terminalSentAt = finalizeTerminalSentAt
+        let firstEventAt = finalizeFirstEventAt
+        let recovered = lastFinalizeRequiresBufferedAudioRecovery || streamIntegrityFailed
+        resetTranscriptState()
+        stateLock.unlock()
+        let elapsed = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let senderDrain = Self.elapsedDescription(senderDrainedAt, since: startedAt)
+        let terminalSend = Self.elapsedDescription(terminalSentAt, since: startedAt)
+        let firstEvent = Self.elapsedDescription(firstEventAt, since: startedAt)
+        vlog("elevenlabs-stream: finalize took \(String(format: "%.3f", elapsed))s recovery=\(recovered) senderDrain=\(senderDrain) terminalSend=\(terminalSend) firstEvent=\(firstEvent), \(result.count) chars")
+        return result
+    }
+
+    private func runFinalizeWork(
+        recordingDuration: TimeInterval,
+        senderToDrain: Task<Void, Never>?,
+        generation: UInt64
+    ) async {
+        await senderToDrain?.value
+        stateLock.lock()
+        guard finalizeGeneration == generation, !doneResolved else {
+            stateLock.unlock()
+            return
+        }
+        finalizeSenderDrainedAt = Date()
         let closed = socketClosed
         let integrityFailed = streamIntegrityFailed
         finalizeCoverageAmbiguous = recordingDuration >= 30
             || realtimeOptions.commitStrategy == .vad
             || !committedSegments.isEmpty
         let needsBatchRecovery = finalizeCoverageAmbiguous
-        if needsBatchRecovery { lastFinalizeRequiresBufferedAudioRecovery = true }
-        let accumulatedSoFar = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         stateLock.unlock()
-        if closed || integrityFailed {
-            if closed { markStreamIntegrityFailed() }
-            tearDownSocket()
-            vlog("elevenlabs-stream: finalize short-circuit (socket/integrity), \(accumulatedSoFar.count) chars")
-            stateLock.lock()
-            resetTranscriptState()
-            stateLock.unlock()
-            return accumulatedSoFar
-        }
 
-        // A segment commit cannot establish session coverage in these cases.
-        // The coordinator must recover from the complete retained recording,
-        // so waiting for another provider commit cannot improve the result.
-        if needsBatchRecovery {
-            tearDownSocket()
-            stateLock.lock()
-            resetTranscriptState()
-            stateLock.unlock()
-            vlog("elevenlabs-stream: finalize skipped provider wait — buffered recovery required")
-            return accumulatedSoFar
+        if closed || integrityFailed || needsBatchRecovery {
+            if closed { markStreamIntegrityFailed() }
+            completeFinalize(generation: generation, requiresBufferedRecovery: true)
+            return
         }
 
         // Commits received while the sender backlog was draining are earlier
         // segment boundaries. Only events from the final boundary onward may
         // complete this finalize call.
         stateLock.lock()
+        guard finalizeGeneration == generation, !doneResolved else {
+            stateLock.unlock()
+            return
+        }
         finalizeCommitSeen = false
         finalizeCommitHadText = false
         stateLock.unlock()
-        if task != nil || injectedMessageSender != nil {
-            let commitFrame = Self.makeInputAudioChunkFrame(pcmData: Data(), commit: true)
+
+        let hasTerminalDestination = task != nil || injectedMessageSender != nil
+        if hasTerminalDestination {
             do {
+                let commitFrame = Self.makeInputAudioChunkFrame(pcmData: Data(), commit: true)
                 try await sendMessage(.string(commitFrame))
             } catch {
-                markStreamIntegrityFailed()
-                let text = accumulatedSoFar
-                tearDownSocket()
                 stateLock.lock()
-                lastFinalizeRequiresBufferedAudioRecovery = true
-                resetTranscriptState()
+                let stillActive = finalizeGeneration == generation && !doneResolved
                 stateLock.unlock()
-                return text
+                if stillActive {
+                    markStreamIntegrityFailed()
+                    completeFinalize(generation: generation, requiresBufferedRecovery: true)
+                }
+                return
             }
         }
+
         stateLock.lock()
+        guard finalizeGeneration == generation, !doneResolved else {
+            stateLock.unlock()
+            return
+        }
+        if hasTerminalDestination {
+            finalizeTerminalSentAt = Date()
+        }
         finalizeDrainArmed = true
-        if finalizeCommitSeen, !doneResolved {
+        if finalizeCommitSeen {
             scheduleDoneAfterCommittedQuietPeriodLocked()
         }
         stateLock.unlock()
+    }
 
-        let waitSeconds = min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
-        let waitNs = UInt64(waitSeconds * 1_000_000_000)
-
-        let result = await withTaskGroup(of: String?.self) { group -> String in
-            group.addTask { [weak self] in
-                guard let self else { return nil }
-                return await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
-                    self.stateLock.lock()
-                    if self.doneResolved {
-                        let text = self.finalizeResultLocked()
-                        self.stateLock.unlock()
-                        continuation.resume(returning: text)
-                        return
-                    }
-                    self.doneContinuation = continuation
-                    self.stateLock.unlock()
-                }
-            }
-            group.addTask { [weak self] in
-                try? await Task.sleep(nanoseconds: waitNs)
-                guard let self else { return nil }
-                self.stateLock.lock()
-                if self.doneResolved {
-                    self.stateLock.unlock()
-                    return nil
-                }
-                let pending = self.doneContinuation
-                self.lastFinalizeRequiresBufferedAudioRecovery = true
-                if self.finalizeCommitHadText,
-                   !self.latestPartial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.lastFinalizeRequiresBufferedAudioRecovery = true
-                }
-                let text = self.finalizeResultLocked()
-                self.doneResolved = true
-                self.doneContinuation = nil
-                self.stateLock.unlock()
-                pending?.resume(returning: text)
-                return text
-            }
-            for await value in group {
-                if let value {
-                    group.cancelAll()
-                    return value
-                }
-            }
-            return ""
-        }
-
-        tearDownSocket()
-
-        vlog("elevenlabs-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (wait=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
+    private func completeFinalize(generation: UInt64, requiresBufferedRecovery: Bool) {
         stateLock.lock()
-        resetTranscriptState()
+        guard finalizeGeneration == generation, !doneResolved else {
+            stateLock.unlock()
+            return
+        }
+        if requiresBufferedRecovery {
+            lastFinalizeRequiresBufferedAudioRecovery = true
+        }
+        let continuation = doneContinuation
+        let text = finalizeResultLocked()
+        doneResolved = true
+        doneContinuation = nil
         stateLock.unlock()
-        return result
+        continuation?.resume(returning: text)
+    }
+
+    private static func elapsedDescription(_ date: Date?, since start: Date?) -> String {
+        guard let date, let start else { return "none" }
+        return String(format: "%.3f", date.timeIntervalSince(start))
     }
 
     /// Hard stop, no read-back. Cancels the socket and sender.
@@ -505,6 +543,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         receiveLoopTask = nil
         senderTask?.cancel()
         senderTask = nil
+        finalizeWorkerTask?.cancel()
+        finalizeWorkerTask = nil
+        finalizeDeadlineTask?.cancel()
+        finalizeDeadlineTask = nil
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -587,6 +629,13 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// Package-visible for unit tests (`@testable`) — production receive loop only.
     func handleServerEvent(_ text: String) {
+        stateLock.lock()
+        if tornDown && doneResolved {
+            stateLock.unlock()
+            return
+        }
+        stateLock.unlock()
+
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let messageType = json["message_type"] as? String
@@ -595,6 +644,16 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             vlog("elevenlabs-stream: received unparseable event")
             return
         }
+
+        stateLock.lock()
+        if tornDown && doneResolved {
+            stateLock.unlock()
+            return
+        }
+        if finalizeRequested, finalizeFirstEventAt == nil {
+            finalizeFirstEventAt = Date()
+        }
+        stateLock.unlock()
 
         switch messageType {
         case "session_started":
@@ -609,6 +668,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         case "partial_transcript":
             let partialText = (json["text"] as? String) ?? ""
             stateLock.lock()
+            guard !(tornDown && doneResolved) else {
+                stateLock.unlock()
+                return
+            }
             // Empty/whitespace partial must not wipe a prior non-empty
             // latestPartial (mirrors empty committed_transcript retain).
             let trimmedPartial = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -626,6 +689,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         case "committed_transcript":
             let committedText = (json["text"] as? String) ?? ""
             stateLock.lock()
+            guard !(tornDown && doneResolved) else {
+                stateLock.unlock()
+                return
+            }
             let trimmed = committedText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 committedSegments.append(trimmed)
@@ -651,6 +718,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             // it as receive activity so finalize does not close between the
             // paired events.
             stateLock.lock()
+            guard !(tornDown && doneResolved) else {
+                stateLock.unlock()
+                return
+            }
             let shouldDrain = finalizeRequested && finalizeDrainArmed && !doneResolved
             if shouldDrain { scheduleDoneAfterCommittedQuietPeriodLocked() }
             stateLock.unlock()

@@ -68,6 +68,34 @@ final class TerminalPunctuationTests: XCTestCase {
         }
     }
 
+    func testProviderTrailingNewlineDoesNotSuppressReportedPhraseThroughProductionPreprocessingSeam() {
+        let phrase = "When you're done and all committed, PR'd, and merged, give me a little marketing card for the update as well. You should be able to find the template from the King Lollipop repo"
+        let preprocessed = TranscriptionPipeline.preprocessForCleanup(phrase + "\n", codeAware: false)
+
+        XCTAssertFalse(preprocessed.hadExplicitTrailingNewline)
+        XCTAssertEqual(
+            prepare(TranscriptionPipeline.normalizeTranscriptForInjection(preprocessed.text)),
+            phrase + "."
+        )
+    }
+
+    func testSpokenTrailingNewlineRetainsFormattingOptOutThroughProductionPreprocessingSeam() {
+        let preprocessed = TranscriptionPipeline.preprocessForCleanup(
+            "This ordinary line has a spoken new line",
+            codeAware: true
+        )
+
+        XCTAssertTrue(preprocessed.hadExplicitTrailingNewline)
+        XCTAssertEqual(
+            prepare(
+                TranscriptionPipeline.normalizeTranscriptForInjection(preprocessed.text),
+                codeAware: true,
+                trailingNewline: preprocessed.hadExplicitTrailingNewline
+            ),
+            "This ordinary line has a spoken"
+        )
+    }
+
     func testUnknownAXAndKnownEndOfFieldUseTheSameSharedPolicy() {
         let text = "This ordinary shared pipeline output needs a period"
         XCTAssertEqual(prepare(text), text + ".")

@@ -9,6 +9,13 @@ import os.log
 /// completion work here so the selector stays focused on engine selection.
 final class TranscriptionPipeline {
 
+    /// The transcript plus only the formatting provenance needed after edge
+    /// whitespace normalization. It deliberately retains no raw provider text.
+    struct PreprocessedTranscript {
+        let text: String
+        let hadExplicitTrailingNewline: Bool
+    }
+
     /// Tri-state handed to HUD after inject — not a Bool collapse of success/fail.
     enum InjectPipelineResult: Equatable {
         case inserted
@@ -314,9 +321,10 @@ final class TranscriptionPipeline {
                         language: selector.selectedLanguage
                     )
                     let cleaned = await self.applyCleanup(text)
-                    let transformed = await self.applyAutoTransform(cleaned)
+                    let transformed = await self.applyAutoTransform(cleaned.text)
                     self.finishTranscription(
                         text: transformed,
+                        hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
                         engineID: engineTag,
                         audioPath: audioPath,
                         replaceHistoryEntryID: replaceID,
@@ -374,9 +382,10 @@ final class TranscriptionPipeline {
             )
         Task {
             let cleaned = await self.applyCleanup(text)
-            let transformed = await self.applyAutoTransform(cleaned)
+            let transformed = await self.applyAutoTransform(cleaned.text)
             self.finishTranscription(
                 text: transformed,
+                hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
                 engineID: engineID,
                 audioPath: Self.streamedAudioPath(retainedAudioURL),
                 replaceHistoryEntryID: nil,
@@ -432,9 +441,10 @@ final class TranscriptionPipeline {
             do {
                 let text = try await engine.transcribe(audioURL: audioURL)
                 let cleaned = await self.applyCleanup(text)
-                let transformed = await self.applyAutoTransform(cleaned)
+                let transformed = await self.applyAutoTransform(cleaned.text)
                 self.finishTranscription(
                     text: transformed,
+                    hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
                     engineID: engine.id,
                     audioPath: audioPath,
                     replaceHistoryEntryID: replaceHistoryEntryID,
@@ -486,11 +496,11 @@ final class TranscriptionPipeline {
         )
     }
 
-    private func applyCleanup(_ text: String) async -> String {
-        let preprocessed = Self.preprocessBeforeCleanup(text, codeAware: codeAware)
-        guard cleanupEnabled, let svc = cleanupService, !preprocessed.isEmpty else { return preprocessed }
+    private func applyCleanup(_ text: String) async -> PreprocessedTranscript {
+        let preprocessed = Self.preprocessForCleanup(text, codeAware: codeAware)
+        guard cleanupEnabled, let svc = cleanupService, !preprocessed.text.isEmpty else { return preprocessed }
 
-        let wordCount = preprocessed.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).count
+        let wordCount = preprocessed.text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).count
         guard wordCount > 3 else {
             vlog("cleanup skipped — short input (\(wordCount) words)")
             return preprocessed
@@ -498,11 +508,11 @@ final class TranscriptionPipeline {
 
         let cleanupStart = Date()
         do {
-            let cleaned = try await svc.cleanup(preprocessed, codeAware: codeAware, styleInstruction: styleInstruction)
+            let cleaned = try await svc.cleanup(preprocessed.text, codeAware: codeAware, styleInstruction: styleInstruction)
             vlog("cleanup \(String(format: "%.2f", Date().timeIntervalSince(cleanupStart)))s")
             let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return preprocessed }
-            guard Self.cleanupLooksSane(input: preprocessed, output: trimmed) else {
+            guard Self.cleanupLooksSane(input: preprocessed.text, output: trimmed) else {
                 vlog("cleanup rejected — output diverged from input (likely answered); using raw")
                 return preprocessed
             }
@@ -510,11 +520,34 @@ final class TranscriptionPipeline {
             // `conduct dot mdc`) and cleanupLooksSane accepts that. Re-run the
             // deterministic pass so spoken punctuation wins last.
             // Post-SP only on successful cleanup; Caps does not re-run here.
-            return SpokenPunctuation.apply(trimmed, codeAware: codeAware)
+            return PreprocessedTranscript(
+                text: SpokenPunctuation.apply(trimmed, codeAware: codeAware),
+                hadExplicitTrailingNewline: preprocessed.hadExplicitTrailingNewline
+            )
         } catch {
             vlog("cleanup failed: \(error.localizedDescription) — using raw")
             return preprocessed
         }
+    }
+
+    /// Records only whether preprocessing created a terminal newline after
+    /// provider edge whitespace was removed. That distinguishes a spoken
+    /// `new line` command from an incidental provider trailing newline without
+    /// retaining the raw provider response beyond this stage.
+    static func preprocessForCleanup(_ text: String, codeAware: Bool) -> PreprocessedTranscript {
+        let preprocessed = preprocessBeforeCleanup(text, codeAware: codeAware)
+        let providerEdgeNormalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formattingProbe = preprocessBeforeCleanup(providerEdgeNormalized, codeAware: codeAware)
+        return PreprocessedTranscript(
+            text: preprocessed,
+            hadExplicitTrailingNewline: formattingProbe.last?.isNewline == true
+        )
+    }
+
+    /// Shared finish-stage normalization for ordinary provider edge whitespace.
+    /// Formatting intent has already been reduced to `hadExplicitTrailingNewline`.
+    static func normalizeTranscriptForInjection(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func applyAutoTransform(_ text: String) async -> String {
@@ -552,6 +585,7 @@ final class TranscriptionPipeline {
 
     private func finishTranscription(
         text: String,
+        hadExplicitTrailingNewline: Bool,
         engineID: String,
         audioPath: String?,
         replaceHistoryEntryID: UUID?,
@@ -560,13 +594,7 @@ final class TranscriptionPipeline {
         sessionHeldFrontmostPID: pid_t?,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
-        // `trimmed` below deliberately normalizes usual ASR edge whitespace,
-        // but an explicit spoken newline is formatting and must opt out before
-        // that normalization hides it from terminal-period eligibility.
-        let hadExplicitTrailingNewline = text.reversed().first(where: {
-            !($0.isWhitespace && !$0.isNewline)
-        })?.isNewline == true
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.normalizeTranscriptForInjection(text)
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 

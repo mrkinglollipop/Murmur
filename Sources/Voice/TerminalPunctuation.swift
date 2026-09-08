@@ -14,13 +14,25 @@ enum TerminalPunctuation {
         snippetExpansionOccurred: Bool,
         hadExplicitTrailingNewline: Bool
     ) -> String {
-        guard !codeAware, !hasExplicitCustomTransform, !snippetExpansionOccurred,
-              !hadExplicitTrailingNewline else {
+        if codeAware { vlog("terminal punctuation skipped: code-aware"); return text }
+        if hasExplicitCustomTransform { vlog("terminal punctuation skipped: custom-transform"); return text }
+        if snippetExpansionOccurred { vlog("terminal punctuation skipped: snippet-expansion"); return text }
+        // This flag comes from preprocessing a provider-whitespace-normalized
+        // transcript, so it represents a spoken formatting command rather
+        // than an ASR service's incidental trailing line break.
+        guard !hadExplicitTrailingNewline else {
+            vlog("terminal punctuation skipped: explicit-spoken-trailing-newline")
             return text
         }
-        guard isOrdinaryProse(text), insertionEndsFieldOrParagraph(snapshot) else {
+        guard isOrdinaryProse(text) else {
+            vlog("terminal punctuation skipped: prose-ineligible")
             return text
         }
+        guard insertionEndsFieldOrParagraph(snapshot) else {
+            vlog("terminal punctuation skipped: insertion-context")
+            return text
+        }
+        vlog("terminal punctuation added")
         return text + "."
     }
 

@@ -179,6 +179,85 @@ final class StreamIntegrityTests: XCTestCase {
         }
     }
 
+    func testElevenLabsFinalizeBudgetFallsBackOnceWithExactRetainedAudio() async {
+        let buffer = Self.audioBuffer(seconds: 4)
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        })
+        session.handleServerEvent(#"{"message_type":"partial_transcript","text":"plausible but incomplete prefix"}"#)
+        let coordinator = StreamingCoordinator(elevenLabsSession: session)
+        let fallback = expectation(description: "bounded full-audio recovery")
+        let lock = NSLock()
+        var successCount = 0
+        var fallbackCount = 0
+        var interimCount = 0
+        session.onInterim = { _ in
+            lock.lock()
+            interimCount += 1
+            lock.unlock()
+        }
+        let startedAt = Date()
+
+        XCTAssertTrue(coordinator.handleStopElevenLabs(
+            context: .init(duration: 4, hadSpeech: true, bufferedAudio: [buffer], streamTextEver: true),
+            onSilence: { XCTFail("unexpected silence") },
+            onStreamSuccess: { _ in
+                lock.lock()
+                successCount += 1
+                lock.unlock()
+            },
+            onBatchFallback: { buffers, duration in
+                lock.lock()
+                fallbackCount += 1
+                lock.unlock()
+                XCTAssertEqual(buffers.count, 1)
+                XCTAssertTrue(buffers.first === buffer)
+                XCTAssertEqual(buffers.first?.frameLength, buffer.frameLength)
+                XCTAssertEqual(duration, 4)
+                fallback.fulfill()
+            }
+        ))
+
+        await fulfillment(of: [fallback], timeout: 2.5)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 2.2)
+
+        // A provider event arriving after the deadline must not revive the
+        // abandoned stream or produce a second delivery.
+        session.handleServerEvent(#"{"message_type":"committed_transcript","text":"late authority"}"#)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        lock.lock()
+        let counts = (successCount, fallbackCount, interimCount)
+        lock.unlock()
+        XCTAssertEqual(counts.0, 0)
+        XCTAssertEqual(counts.1, 1)
+        XCTAssertEqual(counts.2, 0)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "")
+    }
+
+    func testElevenLabsPromptFinalCommitKeepsStreamingResult() async {
+        let buffer = Self.audioBuffer(seconds: 4)
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        let coordinator = StreamingCoordinator(elevenLabsSession: session)
+        let success = expectation(description: "prompt committed stream result")
+        var fallbackCount = 0
+
+        XCTAssertTrue(coordinator.handleStopElevenLabs(
+            context: .init(duration: 4, hadSpeech: true, bufferedAudio: [buffer], streamTextEver: true),
+            onSilence: { XCTFail("unexpected silence") },
+            onStreamSuccess: { text in
+                XCTAssertEqual(text, "complete short result")
+                success.fulfill()
+            },
+            onBatchFallback: { _, _ in fallbackCount += 1 }
+        ))
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        session.handleServerEvent(#"{"message_type":"committed_transcript","text":"complete short result"}"#)
+        await fulfillment(of: [success], timeout: 1)
+        XCTAssertEqual(fallbackCount, 0)
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+    }
+
     func testElevenLabsLongSessionCannotTreatFirstRacedCommitAsSessionFinal() async {
         let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
         let finalizer = Task { await session.finalize(recordingDuration: 40) }
