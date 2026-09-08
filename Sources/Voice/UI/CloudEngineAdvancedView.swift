@@ -63,7 +63,7 @@ struct CloudEngineAdvancedView: View {
             .font(Theme.body(12))
             .foregroundColor(Theme.textPrimary)
 
-        Text("Scribe ignores other speakers and room noise on the server. Separate from Focus on my voice (local speaker match).")
+        Text("Filters other voices, but can also omit quieter parts of your own speech. Leave off to preserve your words.")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
 

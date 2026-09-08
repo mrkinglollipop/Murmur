@@ -1274,8 +1274,9 @@ final class AudioRecorder {
     /// Pushes live speaker-gating settings from `SettingsStore`. Active only
     /// when `enabled` is true AND a profile exists on disk.
     func updateSpeakerGating(enabled: Bool, sensitivity: VoiceGateSensitivity) {
-        let hasProfile = voiceGateProfileStore.load() != nil
-        if enabled, hasProfile {
+        let profile = voiceGateProfileStore.load()
+        if enabled, profile?.modelId == FluidAudioEmbeddingProvider.modelId {
+            voiceGateEmbeddingProvider.retryLoadingIfNeeded()
             if voiceGateProcessor == nil {
                 let gate = VoiceGate(
                     profileStore: voiceGateProfileStore,
@@ -2686,7 +2687,7 @@ final class AudioRecorder {
         switch result {
         case .inserted:
             hud.showSuccessThenHide()
-        case .deduped, .failed:
+        case .savedToHistory, .deduped, .failed:
             if hud.isProcessing {
                 hud.hide()
             }

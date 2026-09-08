@@ -68,6 +68,11 @@ final class HotkeyController {
             // A collision with another app's ⌃⌥⌘T lands here, and a log-only
             // failure left the user with a hotkey that silently does nothing.
             logger.error("RegisterEventHotKey failed: \(regStatus)")
+            if let ref { UnregisterEventHotKey(ref) }
+            if let handler = eventHandler {
+                RemoveEventHandler(handler)
+                eventHandler = nil
+            }
             report(.failed("Transform hotkey ⌃⌥⌘T unavailable — already in use"))
             return
         }

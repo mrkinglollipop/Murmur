@@ -34,6 +34,7 @@ stderr is captured separately and forwarded to os_log on the Swift side.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,14 @@ MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v3"
 
 
 def main() -> None:
+    # Own a process group before launching afconvert or ML helpers. The Swift
+    # parent verifies this group id before signalling it, so cancellation can
+    # terminate descendants without ever targeting unrelated processes.
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass  # Parent may already have established the same owned group.
+
     if len(sys.argv) < 2:
         _error_exit("Usage: parakeet_transcribe.py <audio_file_path>")
 
@@ -100,8 +109,6 @@ def _transcode_caf_to_wav(caf_path: Path) -> Path:
     rather than risk an unsupported-format failure inside the model.
     """
     fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="parakeet_")
-    import os
-
     os.close(fd)
     wav_path = Path(tmp_name)
 

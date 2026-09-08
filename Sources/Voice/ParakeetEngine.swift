@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os.log
 
@@ -96,121 +97,313 @@ final class ParakeetEngine: ASREngine {
 
         let python = Self.resolvedPythonExecutable()
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            let stdout = Pipe()
-            let stderr = Pipe()
+        let text = try await ParakeetProcessRunner.run(
+            executableURL: python.executable,
+            arguments: python.argumentsPrefix + [scriptURL.path, audioURL.path],
+            interpreterDescription: interpreterDescription
+        )
+        logger.info("Parakeet: got \(text.count) chars of transcript")
+        return text
+    }
+}
 
-            process.executableURL = python.executable
-            process.arguments = python.argumentsPrefix + [scriptURL.path, audioURL.path]
-            process.standardOutput = stdout
-            process.standardError = stderr
+// MARK: - Owned subprocess runner
 
-            // Accumulate stdout/stderr incrementally via readabilityHandler
-            // instead of readDataToEndOfFile() inside terminationHandler.
-            // readDataToEndOfFile() blocks until EOF, but the pipe's kernel
-            // buffer is only ~64KB — if the child writes more than that before
-            // the parent starts draining, the child blocks on write() and the
-            // process never terminates, so terminationHandler never fires
-            // (deadlock). Draining continuously as data arrives avoids this.
-            let outBuffer = NSMutableData()
-            let errBuffer = NSMutableData()
-            let bufferLock = NSLock()
-            var resumed = false
+enum ParakeetProcessRunner {
+    static func run(
+        executableURL: URL,
+        arguments: [String],
+        interpreterDescription: String,
+        timeoutSeconds: TimeInterval = 120,
+        terminationGraceSeconds: TimeInterval = 0.35
+    ) async throws -> String {
+        let invocation = ParakeetProcessInvocation(
+            executableURL: executableURL,
+            arguments: arguments,
+            interpreterDescription: interpreterDescription,
+            timeoutSeconds: timeoutSeconds,
+            terminationGraceSeconds: terminationGraceSeconds
+        )
+        return try await withTaskCancellationHandler {
+            try await invocation.run()
+        } onCancel: {
+            invocation.cancel()
+        }
+    }
+}
 
-            func resumeOnce(_ result: Result<String, Error>) {
-                bufferLock.lock()
-                defer { bufferLock.unlock() }
-                guard !resumed else { return }
-                resumed = true
-                continuation.resume(with: result)
+private final class ParakeetProcessInvocation: @unchecked Sendable {
+    private enum StopReason {
+        case cancelled
+        case timedOut
+    }
+
+    private let process = Process()
+    private let stdout = Pipe()
+    private let stderr = Pipe()
+    private let interpreterDescription: String
+    private let timeoutSeconds: TimeInterval
+    private let terminationGraceSeconds: TimeInterval
+    private let stateLock = NSLock()
+    private let outputLock = NSLock()
+
+    private var continuation: CheckedContinuation<String, Error>?
+    private var completed = false
+    private var launched = false
+    private var terminated = false
+    private var shutdownStarted = false
+    private var stopReason: StopReason?
+    private var timeoutWorkItem: DispatchWorkItem?
+    private var stdoutData = Data()
+    private var stderrData = Data()
+    private var pipesClosed = false
+
+    init(
+        executableURL: URL,
+        arguments: [String],
+        interpreterDescription: String,
+        timeoutSeconds: TimeInterval,
+        terminationGraceSeconds: TimeInterval
+    ) {
+        self.interpreterDescription = interpreterDescription
+        self.timeoutSeconds = timeoutSeconds
+        self.terminationGraceSeconds = terminationGraceSeconds
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = stderr
+    }
+
+    func run() async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            stateLock.lock()
+            self.continuation = continuation
+            let cancelledBeforeLaunch = stopReason != nil
+            stateLock.unlock()
+            guard !cancelledBeforeLaunch else {
+                finish(.failure(CancellationError()))
+                return
             }
 
-            stdout.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                bufferLock.lock()
-                outBuffer.append(data)
-                bufferLock.unlock()
-            }
-            stderr.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                bufferLock.lock()
-                errBuffer.append(data)
-                bufferLock.unlock()
-            }
-
-            // Capture self STRONGLY here: if self were weak and deallocated
-            // mid-process, the continuation would never resume (the checked
-            // continuation contract requires exactly one resume, and a nil
-            // self would silently skip it — a hang, not a crash).
-            process.terminationHandler = { proc in
-                // Tear down the readability handlers and do one final drain
-                // in case data arrived between the last callback and exit.
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-
-                let finalOut = stdout.fileHandleForReading.readDataToEndOfFile()
-                let finalErr = stderr.fileHandleForReading.readDataToEndOfFile()
-
-                bufferLock.lock()
-                if !finalOut.isEmpty { outBuffer.append(finalOut) }
-                if !finalErr.isEmpty { errBuffer.append(finalErr) }
-                let outData = Data(referencing: outBuffer)
-                let errData = Data(referencing: errBuffer)
-                bufferLock.unlock()
-
-                if proc.terminationStatus != 0 {
-                    let errMsg = String(data: errData, encoding: .utf8) ?? "unknown error"
-                    self.logger.error("Parakeet sidecar exited \(proc.terminationStatus): \(errMsg)")
-                    resumeOnce(.failure(ParakeetError.sidecarExitCode(
-                        proc.terminationStatus,
-                        errMsg,
-                        interpreterDescription: interpreterDescription
-                    )))
-                    return
-                }
-
-                do {
-                    guard let json = try JSONSerialization.jsonObject(with: outData) as? [String: Any],
-                          let text = json["text"] as? String else {
-                        resumeOnce(.failure(ParakeetError.invalidJSON))
-                        return
-                    }
-                    self.logger.info("Parakeet: got \(text.count) chars of transcript")
-                    resumeOnce(.success(text.trimmingCharacters(in: .whitespaces)))
-                } catch {
-                    resumeOnce(.failure(error))
-                }
-            }
-
-            // Wedge-breaker only — generous so cold model loads never trip it.
-            let timeoutSeconds: TimeInterval = 120
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
-                bufferLock.lock()
-                let already = resumed
-                bufferLock.unlock()
-                guard !already else { return }
-                self.logger.error("Parakeet sidecar timed out after \(Int(timeoutSeconds))s — terminating")
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                process.terminate()
-                resumeOnce(.failure(ParakeetError.sidecarExitCode(
-                    -1,
-                    "timed out after \(Int(timeoutSeconds))s",
-                    interpreterDescription: interpreterDescription
-                )))
+            installPipeReaders()
+            process.terminationHandler = { [weak self] process in
+                self?.processTerminated(process)
             }
 
             do {
                 try process.run()
+                // Process retains the duplicated child descriptors. The parent
+                // must close its write ends so EOF reflects child ownership.
+                try? stdout.fileHandleForWriting.close()
+                try? stderr.fileHandleForWriting.close()
             } catch {
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                resumeOnce(.failure(error))
+                closePipesAndSnapshot()
+                finish(.failure(error))
+                return
+            }
+
+            stateLock.lock()
+            launched = true
+            let shouldStop = stopReason != nil
+            stateLock.unlock()
+
+            let timeout = DispatchWorkItem { [weak self] in self?.timeOut() }
+            stateLock.lock()
+            if completed {
+                stateLock.unlock()
+                timeout.cancel()
+            } else {
+                timeoutWorkItem = timeout
+                stateLock.unlock()
+                DispatchQueue.global().asyncAfter(
+                    deadline: .now() + max(0, timeoutSeconds),
+                    execute: timeout
+                )
+            }
+
+            if shouldStop { beginShutdown() }
+        }
+    }
+
+    func cancel() {
+        requestStop(.cancelled)
+    }
+
+    private func timeOut() {
+        requestStop(.timedOut)
+    }
+
+    private func requestStop(_ reason: StopReason) {
+        stateLock.lock()
+        guard !completed else {
+            stateLock.unlock()
+            return
+        }
+        if stopReason == nil { stopReason = reason }
+        let shouldShutdown = launched
+        stateLock.unlock()
+        if shouldShutdown { beginShutdown() }
+    }
+
+    private func beginShutdown() {
+        stateLock.lock()
+        guard launched, !terminated, !shutdownStarted else {
+            stateLock.unlock()
+            return
+        }
+        shutdownStarted = true
+        stateLock.unlock()
+
+        DispatchQueue.global().async { [self] in
+            signalOwnedProcess(SIGTERM)
+            waitWhileRunning(for: terminationGraceSeconds)
+            if process.isRunning {
+                signalOwnedProcess(SIGKILL)
+                waitWhileRunning(for: 2.0)
+            }
+            // Never wait for pipe EOF here: a descendant may have inherited a
+            // writer. Closing our readers also releases a blocked writer.
+            if process.isRunning {
+                closePipesAndSnapshot()
+                finish(stopResult())
             }
         }
+    }
+
+    private func signalOwnedProcess(_ signal: Int32) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        guard pid > 0 else { return }
+        let processGroup = Darwin.getpgid(pid)
+        guard processGroup >= 0 else { return }
+        if processGroup == pid {
+            // Negative PID targets only the verified group owned by this child.
+            _ = Darwin.kill(-pid, signal)
+        } else {
+            _ = Darwin.kill(pid, signal)
+        }
+    }
+
+    private func waitWhileRunning(for seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(max(0, seconds))
+        while process.isRunning, Date() < deadline {
+            usleep(10_000)
+        }
+    }
+
+    private func processTerminated(_ process: Process) {
+        stateLock.lock()
+        terminated = true
+        let reason = stopReason
+        stateLock.unlock()
+
+        let (outData, errData) = closePipesAndSnapshot()
+        if reason != nil {
+            finish(stopResult())
+        } else if process.terminationStatus != 0 {
+            let message = String(data: errData, encoding: .utf8) ?? "unknown error"
+            finish(.failure(ParakeetError.sidecarExitCode(
+                process.terminationStatus,
+                message,
+                interpreterDescription: interpreterDescription
+            )))
+        } else {
+            do {
+                guard let json = try JSONSerialization.jsonObject(with: outData) as? [String: Any],
+                      let text = json["text"] as? String else {
+                    finish(.failure(ParakeetError.invalidJSON))
+                    return
+                }
+                finish(.success(text.trimmingCharacters(in: .whitespaces)))
+            } catch {
+                finish(.failure(error))
+            }
+        }
+    }
+
+    private func stopResult() -> Result<String, Error> {
+        stateLock.lock()
+        let reason = stopReason
+        stateLock.unlock()
+        switch reason {
+        case .cancelled:
+            return .failure(CancellationError())
+        case .timedOut, .none:
+            return .failure(ParakeetError.sidecarExitCode(
+                -1,
+                "timed out after \(timeoutSeconds)s",
+                interpreterDescription: interpreterDescription
+            ))
+        }
+    }
+
+    private func finish(_ result: Result<String, Error>) {
+        stateLock.lock()
+        guard !completed else {
+            stateLock.unlock()
+            return
+        }
+        completed = true
+        let continuation = continuation
+        self.continuation = nil
+        let timeout = timeoutWorkItem
+        timeoutWorkItem = nil
+        stateLock.unlock()
+
+        timeout?.cancel()
+        continuation?.resume(with: result)
+    }
+
+    private func installPipeReaders() {
+        makeNonblocking(stdout.fileHandleForReading.fileDescriptor)
+        makeNonblocking(stderr.fileHandleForReading.fileDescriptor)
+        stdout.fileHandleForReading.readabilityHandler = { [weak self] _ in
+            self?.drain(stdout: true)
+        }
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] _ in
+            self?.drain(stdout: false)
+        }
+    }
+
+    private func makeNonblocking(_ descriptor: Int32) {
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        if flags >= 0 { _ = Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) }
+    }
+
+    private func drain(stdout isStdout: Bool) {
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        guard !pipesClosed else { return }
+        let descriptor = isStdout
+            ? stdout.fileHandleForReading.fileDescriptor
+            : stderr.fileHandleForReading.fileDescriptor
+        var buffer = [UInt8](repeating: 0, count: 8_192)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            guard count > 0 else { break }
+            if isStdout {
+                stdoutData.append(contentsOf: buffer.prefix(count))
+            } else {
+                stderrData.append(contentsOf: buffer.prefix(count))
+            }
+        }
+    }
+
+    @discardableResult
+    private func closePipesAndSnapshot() -> (Data, Data) {
+        stdout.fileHandleForReading.readabilityHandler = nil
+        stderr.fileHandleForReading.readabilityHandler = nil
+        drain(stdout: true)
+        drain(stdout: false)
+        outputLock.lock()
+        if !pipesClosed {
+            pipesClosed = true
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+        }
+        let snapshot = (stdoutData, stderrData)
+        outputLock.unlock()
+        return snapshot
     }
 }
 

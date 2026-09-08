@@ -66,6 +66,48 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(chunks.map(\.count), [3, 3, 2])
     }
 
+    // MARK: - Safari atomic-paste routing
+
+    func testInjectionLanes_safariMultiChunkUsesOnePasteOnly() {
+        XCTAssertEqual(
+            TextInjector.injectionLanes(bundleIdentifier: "com.apple.Safari", chunkCount: 4),
+            [.pasteOnce]
+        )
+    }
+
+    func testInjectionLanes_safariSingleChunkKeepsUnicodeThenPasteFallback() {
+        XCTAssertEqual(
+            TextInjector.injectionLanes(bundleIdentifier: "com.apple.Safari", chunkCount: 1),
+            [.unicodeWithEvidence, .pasteOnce]
+        )
+    }
+
+    func testInjectionLanes_otherAppsKeepUnicodeThenPasteFallback() {
+        XCTAssertEqual(
+            TextInjector.injectionLanes(bundleIdentifier: "com.apple.TextEdit", chunkCount: 4),
+            [.unicodeWithEvidence, .pasteOnce]
+        )
+        XCTAssertEqual(
+            TextInjector.injectionLanes(bundleIdentifier: nil, chunkCount: 4),
+            [.unicodeWithEvidence, .pasteOnce]
+        )
+    }
+
+    func testSafariXRegression_exactChunkPermutationRoutesAwayFromUnicode() {
+        let expected = "Another bug fix, quality of life update for Murmur."
+        let observedCorruption = "Another bug fix, quality of lifeur. update for Murm"
+        let chunks = TextInjector.chunkUTF16Units(expected)
+
+        XCTAssertEqual(chunks.count, 4)
+        let swappedTail = chunks[0] + chunks[1] + chunks[3] + chunks[2]
+        XCTAssertEqual(String(decoding: swappedTail, as: UTF16.self), observedCorruption)
+        XCTAssertEqual(
+            TextInjector.injectionLanes(bundleIdentifier: "com.apple.Safari", chunkCount: chunks.count),
+            [.pasteOnce],
+            "Safari must receive this transcript as one paste payload, with no unicode lane after an ambiguous paste"
+        )
+    }
+
     // MARK: - Fallback ordering
 
     func testResolveOutcome_confirmedOnFirstAttempt() {

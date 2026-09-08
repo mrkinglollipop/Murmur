@@ -2,6 +2,100 @@ import Foundation
 import os.log
 import WhisperKit
 
+/// A one-shot race that can return after its deadline even when the operation
+/// is blocked in code that does not cooperate with task cancellation.
+enum AsyncDeadline {
+    static func run<Value: Sendable>(
+        seconds: TimeInterval,
+        timeoutError: @escaping @Sendable () -> Error,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let race = DeadlineRaceState<Value>()
+        let operationTask = Task<Void, Never> {
+            do {
+                race.resolve(.success(try await operation()))
+            } catch {
+                race.resolve(.failure(error))
+            }
+        }
+        let timeoutTask = Task<Void, Never> {
+            do {
+                try await Task.sleep(nanoseconds: Self.nanoseconds(for: seconds))
+            } catch {
+                return
+            }
+            if race.resolve(.failure(timeoutError())) {
+                operationTask.cancel()
+            }
+        }
+        race.installTimeoutTask(timeoutTask)
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                race.installContinuation(continuation)
+            }
+        } onCancel: {
+            if race.resolve(.failure(CancellationError())) {
+                operationTask.cancel()
+            }
+        }
+    }
+
+    private static func nanoseconds(for seconds: TimeInterval) -> UInt64 {
+        let clamped = max(0, min(seconds, TimeInterval(UInt64.max) / 1_000_000_000))
+        return UInt64(clamped * 1_000_000_000)
+    }
+}
+
+private final class DeadlineRaceState<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var result: Result<Value, Error>?
+    private var timeoutTask: Task<Void, Never>?
+
+    func installContinuation(_ newContinuation: CheckedContinuation<Value, Error>) {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            newContinuation.resume(with: result)
+        } else {
+            continuation = newContinuation
+            lock.unlock()
+        }
+    }
+
+    func installTimeoutTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        if result != nil {
+            lock.unlock()
+            task.cancel()
+        } else {
+            timeoutTask = task
+            lock.unlock()
+        }
+    }
+
+    @discardableResult
+    func resolve(_ newResult: Result<Value, Error>) -> Bool {
+        lock.lock()
+        guard result == nil else {
+            lock.unlock()
+            return false
+        }
+        result = newResult
+        let continuation = continuation
+        self.continuation = nil
+        let timeoutTask = timeoutTask
+        self.timeoutTask = nil
+        lock.unlock()
+
+        timeoutTask?.cancel()
+        continuation?.resume(with: newResult)
+        return true
+    }
+}
+
+
 // MARK: - WhisperKit ASR Engine
 
 /// On-device speech recognition using WhisperKit (argmaxinc/WhisperKit, MIT licence).
@@ -51,6 +145,7 @@ final class WhisperKitEngine: ASREngine {
     // WhisperKit instance — lazily initialised on first transcription.
     // We keep it alive to avoid reload cost on every recording.
     private var whisper: WhisperKit?
+    private let loadLock = NSLock()
 
     // In-flight model load, so two near-simultaneous transcription calls
     // can't race a double CoreML load — the second caller awaits the same
@@ -68,7 +163,7 @@ final class WhisperKitEngine: ASREngine {
     /// takes long.
     static let modelLoadTimeout: TimeInterval = 120
 
-    /// Races `operation` against a deadline. On timeout the group is cancelled
+    /// Races `operation` against a deadline. On timeout cancellation is requested
     /// and `timeoutError()` is thrown; an uncancellable operation may linger in
     /// the abandoned task, which is acceptable — the caller's path unblocks and
     /// a late completion just leaves the engine warm for the next attempt.
@@ -77,20 +172,17 @@ final class WhisperKitEngine: ASREngine {
         timeoutError: @escaping @Sendable () -> Error,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                throw timeoutError()
-            }
-            let first = try await group.next()!
-            group.cancelAll()
-            return first
-        }
+        try await AsyncDeadline.run(
+            seconds: seconds,
+            timeoutError: timeoutError,
+            operation: operation
+        )
     }
 
     func transcribe(audioURL: URL) async throws -> String {
+        loadLock.lock()
         let wasWarm = whisper != nil
+        loadLock.unlock()
         let loadStart = Date()
         vlog(wasWarm ? "whisperkit: model warm" : "whisperkit: cold load starting (\(modelID))")
         let wk = try await Self.withDeadline(
@@ -124,20 +216,10 @@ final class WhisperKitEngine: ASREngine {
         return WhisperKitEngine.stripSoundAnnotations(text)
     }
 
-    /// Whisper was trained on subtitles that annotate non-speech sounds
-    /// ("[Music]", "*dog barking*", "♪"). On ambiguous or non-speech audio it
-    /// emits these captions instead of words — never wanted in a dictation
-    /// tool. Strips the bracketed / asterisk-wrapped / musical-note forms; when
-    /// noise produces ONLY a caption this yields empty text and the empty-guard
-    /// downstream skips injection entirely. Parentheses are left intact (too
-    /// often a legitimately dictated aside).
+    /// Caption removal must not delete arbitrary brackets or Markdown emphasis:
+    /// those can contain real words, identifiers, and dictated code.
     static func stripSoundAnnotations(_ text: String) -> String {
-        var out = text
-        for pattern in ["\\[[^\\]]*\\]", "\\*[^*]*\\*", "♪[^♪]*♪", "♪"] {
-            out = out.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
-        }
-        return out
-            .replacingOccurrences(of: " +", with: " ", options: .regularExpression)
+        NonSpeechAnnotations.stripRecognizedTags(text)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -195,15 +277,21 @@ final class WhisperKitEngine: ASREngine {
     // MARK: - Private
 
     private func loadModelIfNeeded() async throws -> WhisperKit {
-        if let existing = whisper { return existing }
+        loadLock.lock()
+        if let existing = whisper {
+            loadLock.unlock()
+            return existing
+        }
 
         // A load is already in flight — await its result instead of
         // starting a second concurrent CoreML load.
         if let existingTask = loadTask {
+            loadLock.unlock()
             return try await existingTask.value
         }
 
         guard let folder = ModelManager.modelFolderURL(for: localModel) else {
+            loadLock.unlock()
             throw WhisperKitEngineError.noModelFolder(localModel.rawValue)
         }
 
@@ -224,16 +312,21 @@ final class WhisperKitEngine: ASREngine {
             return try await WhisperKit(config)
         }
         loadTask = task
+        loadLock.unlock()
 
         do {
             let wk = try await task.value
+            loadLock.lock()
             whisper = wk
             loadTask = nil
+            loadLock.unlock()
             logger.info("WhisperKit: model ready.")
             vlog("whisperkit: WhisperKit(config) init returned")
             return wk
         } catch {
+            loadLock.lock()
             loadTask = nil
+            loadLock.unlock()
             vlog("whisperkit: WhisperKit(config) init threw: \(error.localizedDescription)")
             throw error
         }

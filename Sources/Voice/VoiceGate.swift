@@ -265,7 +265,7 @@ final class VoiceGate {
             createdAt: Date(),
             modelId: modelId
         )
-        profileStore.save(profile)
+        guard profileStore.save(profile) else { return nil }
         return profile
     }
 

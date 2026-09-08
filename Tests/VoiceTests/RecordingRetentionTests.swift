@@ -184,4 +184,16 @@ final class RecordingRetentionTests: XCTestCase {
             XCTAssertEqual(error as? RecordingRetention.ExportError, .nothingToExport)
         }
     }
+
+    func testFailedZipPreservesExistingDestination() throws {
+        let destination = tempRoot.appendingPathComponent("previous.zip")
+        let previous = Data("previous export".utf8)
+        try previous.write(to: destination)
+        let entry = HistoryEntry(text: "Keep this transcript.", engine: "test", injected: true)
+        XCTAssertThrowsError(try RecordingRetention.exportZip(
+            to: destination, historyEntries: [entry],
+            zipExecutableURL: URL(fileURLWithPath: "/usr/bin/false")
+        ))
+        XCTAssertEqual(try Data(contentsOf: destination), previous)
+    }
 }

@@ -189,6 +189,28 @@ final class MicWatchdogTests: XCTestCase {
         }
     }
 
+    func testDeadlineReturnsWithoutJoiningAnOperationThatIgnoresCancellation() async {
+        let startedAt = Date()
+        do {
+            _ = try await WhisperKitEngine.withDeadline(
+                0.05,
+                timeoutError: { WhisperKitEngineError.modelLoadTimedOut("test-model", 0.05) },
+                operation: { () -> String in
+                    await withCheckedContinuation { continuation in
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.75) {
+                            continuation.resume(returning: "late")
+                        }
+                    }
+                }
+            )
+            XCTFail("expected modelLoadTimedOut")
+        } catch is WhisperKitEngineError {
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
+
     func testDeadFormatDetection() {
         XCTAssertTrue(AudioRecorder.inputFormatLooksDead(sampleRate: 0, channelCount: 1))
         XCTAssertTrue(AudioRecorder.inputFormatLooksDead(sampleRate: 48_000, channelCount: 0))
