@@ -111,12 +111,12 @@ final class ASREngineSelector {
     /// primary path when selected.
     var museStreamingEnabled: Bool = true
 
-    /// Sent as ElevenLabs' `no_verbatim` param (server-side filler-word /
-    /// disfluency removal). Set by `SettingsStore` from the persisted
-    /// `removeFillerWords` toggle; defaults `true` here to match that
-    /// setting's default (operator request, 2026-07-09) in case a session
-    /// ever constructs a stream before `SettingsStore.applyOnLaunch()` runs.
-    var removeFillerWordsEnabled: Bool = true
+    /// Local hesitation cleanup, also used by Gemini's existing smart mode.
+    /// ElevenLabs stays verbatim so deliberate spoken corrections survive.
+    var removeFillerWordsEnabled: Bool {
+        get { pipeline.removeFillerWordsEnabled }
+        set { pipeline.removeFillerWordsEnabled = newValue }
+    }
 
     /// Resolves the current keyterms vocabulary (canonical dictionary terms,
     /// already selected/capped/de-duped) for the ElevenLabs `keyterms` param.
@@ -338,7 +338,7 @@ final class ASREngineSelector {
         return ElevenLabsRealtimeTranscriber(
             apiKey: key,
             language: selectedLanguage,
-            noVerbatim: removeFillerWordsEnabled,
+            noVerbatim: false,
             keyterms: keytermsProvider?() ?? [],
             realtimeOptions: elevenLabsRealtimeOptions
         )

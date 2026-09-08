@@ -23,6 +23,65 @@ final class StorePersistenceTests: XCTestCase {
 
     // MARK: - HistoryStore
 
+    @MainActor
+    func testFailedRetryPreservesSuccessfulTranscriptAndProvenance() {
+        let store = HistoryStore(fileURL: tempFile("failed-retry"))
+        store.append(text: "Keep the original words.", engine: "original", injected: true)
+        let original = store.entries[0]
+        store.append(text: "", engine: "retry", injected: false, failed: true, replaceEntryID: original.id)
+        XCTAssertEqual(store.entries[0], original)
+    }
+
+    @MainActor
+    func testSuccessfulRetryPersistsHistoryOnlyStatus() {
+        let url = tempFile("successful-retry")
+        let store = HistoryStore(fileURL: url)
+        store.append(text: "Earlier words.", engine: "original", injected: true)
+        let id = store.entries[0].id
+        store.append(text: "Recovered final words.", engine: "retry", injected: false, replaceEntryID: id)
+        let entry = HistoryStore(fileURL: url).entries[0]
+        XCTAssertEqual(entry.id, id)
+        XCTAssertEqual(entry.text, "Recovered final words.")
+        XCTAssertFalse(entry.failed)
+        XCTAssertFalse(entry.injected)
+        XCTAssertTrue(entry.savedWithoutInsertion)
+    }
+
+    @MainActor
+    func testHistoryRetryCompletionSavesWithoutInsertionOrHeldContext() async {
+        let pipeline = TranscriptionPipeline()
+        let id = UUID()
+        let finished = expectation(description: "retry saved")
+        pipeline.onTextInserted = { _ in XCTFail("History retry must not type into a focused app") }
+        pipeline.onTranscriptionLogged = { text, engine, injected, audio, failed, replacement in
+            XCTAssertEqual(text, "Recover all the missing words.")
+            XCTAssertEqual(replacement, id)
+            XCTAssertFalse(injected)
+            XCTAssertFalse(failed)
+        }
+        pipeline.finishTranscription(
+            text: "Recover all the missing words", hadExplicitTrailingNewline: false,
+            engineID: "test", audioPath: nil, replaceHistoryEntryID: id,
+            sessionHeldToken: 0, sessionHeldSnapshot: nil, sessionHeldFrontmostPID: nil
+        ) { result in
+            XCTAssertEqual(result, .savedToHistory)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 2)
+    }
+
+    @MainActor
+    func testFailedAudioProtectionSnapshotUpdatesAfterRetry() {
+        let audio = tempFile("retained-audio")
+        try? Data([0]).write(to: audio)
+        let store = HistoryStore(fileURL: tempFile("protected-snapshot"))
+        store.append(text: "", engine: "test", injected: false, audioPath: audio.path, failed: true)
+        XCTAssertEqual(store.protectedAudioPathsSnapshot(), [audio.path])
+        store.append(text: "Recovered.", engine: "retry", injected: false,
+                     audioPath: audio.path, replaceEntryID: store.entries[0].id)
+        XCTAssertEqual(store.protectedAudioPathsSnapshot(), [])
+    }
+
     func testHistoryRoundTripAfterFlush() {
         let url = tempFile("history")
         let store = HistoryStore(fileURL: url)
@@ -123,6 +182,28 @@ final class StorePersistenceTests: XCTestCase {
         try? Data("garbage".utf8).write(to: url)
         let store = TransformsStore(fileURL: url)
         XCTAssertFalse(store.transforms.isEmpty, "corrupt file should seed defaults")
+    }
+
+    func testEditingSelectedTransformUpdatesTheLivePipelineBeforeSave() throws {
+        let key = "voice.settings.autoRunTransformID"
+        let previous = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        let url = tempFile("live-transform")
+        try Data("[]".utf8).write(to: url)
+        let store = TransformsStore(fileURL: url)
+        let selector = ASREngineSelector()
+        store.asrEngineSelector = selector
+        store.add(name: "Polish", prompt: "Old instruction")
+        var transform = try XCTUnwrap(store.transforms.first)
+        store.autoRunTransformID = transform.id
+        XCTAssertEqual(selector.autoRunTransform?.prompt, "Old instruction")
+        transform.prompt = "Updated instruction"
+        store.update(transform)
+        XCTAssertEqual(selector.autoRunTransform?.prompt, "Updated instruction")
+        store.flush()
     }
 
     // MARK: - DictionaryStore

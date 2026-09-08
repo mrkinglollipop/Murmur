@@ -20,7 +20,7 @@ enum NonSpeechAnnotations {
     ]
 
     private static let tagPattern = try! NSRegularExpression(
-        pattern: "\\(([^()\\r\\n]*)\\)|\\[([^\\[\\]\\r\\n]*)\\]"
+        pattern: "\\(([^()\\r\\n]*)\\)|\\[([^\\[\\]\\r\\n]*)\\]|\\*([^*\\r\\n]*)\\*"
     )
 
     /// Strip a recognized round- or square-bracketed audio-event label when
@@ -38,7 +38,8 @@ enum NonSpeechAnnotations {
         for match in matches {
             guard let range = Range(match.range, in: text),
                   let labelRange = Range(match.range(at: 1), in: text)
-                      ?? Range(match.range(at: 2), in: text),
+                      ?? Range(match.range(at: 2), in: text)
+                      ?? Range(match.range(at: 3), in: text),
                   isRecognizedLabel(String(text[labelRange])),
                   hasCaptionBoundaries(in: text, range: range),
                   !isInsideProtectedSpan(in: text, before: range.lowerBound)

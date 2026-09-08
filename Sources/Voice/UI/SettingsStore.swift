@@ -279,16 +279,9 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    /// When on, the ElevenLabs Scribe RT socket is asked to strip filler
-    /// words and disfluencies server-side (`no_verbatim`) — the same polish
-    /// the cleanup LLM round-trip does today, but free and at transcription
-    /// time (plan 014). Defaults **true** at the operator's explicit request
-    /// (2026-07-09) rather than the plan's original opt-in default — see the
-    /// "Why `no_verbatim` defaults ON" maintenance note in
-    /// `plans/014-elevenlabs-native-polish.md` for the spoken-correction risk
-    /// this accepts (disfluency-shaped speech like "um, actually, no —" used
-    /// as a deliberate correction could be swallowed). Only the ElevenLabs
-    /// provider reads this; shown in Settings only when it's selected.
+    /// Applies conservative local hesitation cleanup without a model request.
+    /// Gemini also uses its existing smart mode; ElevenLabs remains verbatim
+    /// because provider disfluency removal can swallow deliberate corrections.
     @Published var removeFillerWords: Bool {
         didSet {
             UserDefaults.standard.set(removeFillerWords, forKey: Keys.removeFillerWords)

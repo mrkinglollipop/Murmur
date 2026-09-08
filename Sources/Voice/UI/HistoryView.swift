@@ -232,7 +232,7 @@ struct HistoryView: View {
                         engineChip(entry.engine)
 
                         if !entry.injected && !entry.failed {
-                            clipboardChip
+                            clipboardChip(savedWithoutInsertion: entry.savedWithoutInsertion)
                         }
 
                         if entry.failed {
@@ -244,7 +244,7 @@ struct HistoryView: View {
                 Spacer()
 
                 Group {
-                    if entry.failed, entry.audioPath != nil, retryingID != entry.id {
+                    if entry.audioPath != nil, retryingID != entry.id {
                         Button {
                             retryEntry(entry)
                         } label: {
@@ -253,7 +253,7 @@ struct HistoryView: View {
                                 .foregroundColor(Theme.primary)
                         }
                         .buttonStyle(.plain)
-                        .help("Retry transcription")
+                        .help("Transcribe the recording again and save the result in History")
                     } else if retryingID == entry.id {
                         ProgressView()
                             .controlSize(.small)
@@ -349,7 +349,7 @@ struct HistoryView: View {
                         }
                     }
                 }
-                if entry.failed, entry.audioPath != nil {
+                if entry.audioPath != nil {
                     Button("Retry") { retryEntry(entry) }
                 }
                 Divider()
@@ -405,11 +405,11 @@ struct HistoryView: View {
         .clipShape(Capsule())
     }
 
-    private var clipboardChip: some View {
+    private func clipboardChip(savedWithoutInsertion: Bool) -> some View {
         HStack(spacing: 4) {
             Image(systemName: "clipboard")
                 .font(.system(size: 10))
-            Text("Left on clipboard")
+            Text(savedWithoutInsertion ? "Saved in History" : "Left on clipboard")
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundColor(Theme.amberText)

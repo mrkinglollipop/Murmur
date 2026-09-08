@@ -29,7 +29,14 @@ enum TerminalPunctuation {
             return text
         }
         guard insertionEndsFieldOrParagraph(snapshot) else {
-            vlog("terminal punctuation skipped: insertion-context")
+            let selection: String
+            switch snapshot.selectionLength {
+            case .readable(let length): selection = String(length)
+            case .unreadable: selection = "unreadable"
+            }
+            // Positions expose why the context guard fired without logging
+            // the focused field's contents or any surrounding user text.
+            vlog("terminal punctuation skipped: insertion-context fieldUTF16=\(snapshot.value.utf16.count) location=\(snapshot.location) selection=\(selection) unknown=\(snapshot.isUnknown)")
             return text
         }
         vlog("terminal punctuation added")
