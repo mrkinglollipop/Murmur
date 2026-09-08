@@ -68,6 +68,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// pause does not split the take. Settings Advanced can lower it.
     private let endpointingMs: Int
     private let injectedMessageSender: MessageSender?
+    private let finalizeBudgetOverride: TimeInterval?
 
     static let defaultEndpointingMs = 5000
     static let endpointingMsRange: ClosedRange<Int> = 500...5000
@@ -172,12 +173,14 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         apiKey: String,
         language: String = "en",
         endpointingMs: Int = XAIStreamingTranscriber.defaultEndpointingMs,
+        finalizeBudgetOverride: TimeInterval? = nil,
         messageSender: MessageSender? = nil
     ) {
         self.apiKey = apiKey
         self.language = language
         self.endpointingMs = Self.clampEndpointingMs(endpointingMs)
         self.injectedMessageSender = messageSender
+        self.finalizeBudgetOverride = finalizeBudgetOverride
         super.init()
     }
 
@@ -321,8 +324,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         continuation.yield(pcmData)
     }
 
-    /// Sends `{"type":"audio.done"}`, awaits `transcript.done` (timeout scales
-    /// with recording length), returns the final transcript trimmed. On
+    /// Drains buffered frames, sends `{"type":"audio.done"}`, and awaits
+    /// `transcript.done` within one duration-scaled budget. On
     /// timeout, returns the accumulated stitched text instead of losing the
     /// utterance. Tears the socket down either way.
     func finalize(recordingDuration: TimeInterval = 0) async -> String {
@@ -335,6 +338,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         tornDown = true
         stateLock.unlock()
         let finalizeStart = Date()
+        let waitSeconds = finalizeBudgetOverride
+            ?? min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
+        let finalizeDeadline = finalizeStart.addingTimeInterval(waitSeconds)
 
         // Stop accepting new frames, then WAIT for the sender to flush every
         // already-captured frame before signalling end-of-audio — otherwise
@@ -345,7 +351,22 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         frameContinuation = nil
         stateLock.unlock()
         framesToFinish?.finish()
-        await senderTask?.value
+        let senderToDrain = senderTask
+        do {
+            try await AsyncDeadline.run(
+                seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
+                timeoutError: { CloudTranscriptionError(provider: .xai, message: "Finalize deadline exceeded while draining audio") },
+                operation: { await senderToDrain?.value }
+            )
+        } catch {
+            markStreamIntegrityFailed()
+            tearDownSocket()
+            stateLock.lock()
+            let text = Self.postProcessTranscript(mergeConfirmedWithInterim())
+            resetTranscriptState()
+            stateLock.unlock()
+            return text
+        }
         senderTask = nil
 
         // If the socket already failed/closed, don't send audio.done or wait on
@@ -370,7 +391,11 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         if task != nil || injectedMessageSender != nil {
             let doneMessage = "{\"type\":\"audio.done\"}"
             do {
-                try await sendMessage(.string(doneMessage))
+                try await AsyncDeadline.run(
+                    seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
+                    timeoutError: { CloudTranscriptionError(provider: .xai, message: "Finalize deadline exceeded while ending audio") },
+                    operation: { [self] in try await sendMessage(.string(doneMessage)) }
+                )
             } catch {
                 markStreamIntegrityFailed()
                 tearDownSocket()
@@ -385,8 +410,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         // Long recordings need more time for the server to stitch the full
         // transcript after audio.done — a flat 3s timeout was returning early
         // with only the last chunk on multi-minute dictations.
-        let waitSeconds = min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
-        let waitNs = UInt64(waitSeconds * 1_000_000_000)
+        let remainingWait = max(0, finalizeDeadline.timeIntervalSinceNow)
+        let waitNs = UInt64(remainingWait * 1_000_000_000)
 
         let result = await withTaskGroup(of: String?.self) { group -> String in
             group.addTask { [weak self] in
@@ -438,7 +463,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         tearDownSocket()
 
-        vlog("xai-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (wait=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
+        vlog("xai-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (budget=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
         let processed = Self.postProcessTranscript(result)
         stateLock.lock()
         resetTranscriptState()

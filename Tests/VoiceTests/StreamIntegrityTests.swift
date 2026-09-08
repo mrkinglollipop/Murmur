@@ -5,6 +5,56 @@ import XCTest
 final class StreamIntegrityTests: XCTestCase {
     private enum InjectedFailure: Error { case send }
 
+    func testFinalizeDeadlineBoundsNonCooperativeTerminalSendForXAI() async {
+        let session = XAIStreamingTranscriber(
+            apiKey: "key",
+            finalizeBudgetOverride: 0.05,
+            messageSender: Self.nonCooperativeSender
+        )
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"xai prefix","is_final":false}"#)
+        let startedAt = Date()
+        let text = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        XCTAssertEqual(text, "xai prefix")
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+    }
+
+    func testFinalizeDeadlineBoundsNonCooperativeTerminalSendForGemini() async {
+        let session = GeminiLiveTranscriber(
+            apiKey: "key",
+            finalizeBudgetOverride: 0.05,
+            messageSender: Self.nonCooperativeSender
+        )
+        session.handleServerEvent(#"{"serverContent":{"inputTranscription":{"text":"gemini prefix"}}}"#)
+        let startedAt = Date()
+        let text = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        XCTAssertEqual(text, "gemini prefix")
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+    }
+
+    func testFinalizeDeadlineBoundsNonCooperativeTerminalSendForMuse() async {
+        let session = MuseLiveTranscriber(
+            apiKey: "key",
+            finalizeBudgetOverride: 0.05,
+            messageSender: Self.nonCooperativeSender
+        )
+        session.handleServerEvent(#"{"type":"transcript","transcript":"muse prefix","final":true}"#)
+        let startedAt = Date()
+        let text = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        XCTAssertEqual(text, "muse prefix")
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+    }
+
+    private static func nonCooperativeSender(_ message: URLSessionWebSocketTask.Message) async throws {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.75) {
+                continuation.resume()
+            }
+        }
+    }
+
     func testTerminalSendFailureLatchesRecoveryForEveryProvider() async {
         let eleven = ElevenLabsRealtimeTranscriber(apiKey: "key") { _ in throw InjectedFailure.send }
         eleven.handleServerEvent(#"{"message_type":"partial_transcript","text":"plausible eleven prefix"}"#)

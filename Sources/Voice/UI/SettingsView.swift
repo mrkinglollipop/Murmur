@@ -164,7 +164,7 @@ struct SettingsView: View {
                                 .font(Theme.body(12))
                                 .foregroundColor(Theme.textPrimary)
 
-                            Text("Strips filler words, false starts, and stuttering during transcription. May occasionally swallow a deliberate spoken correction (e.g. \"um, actually, no —\"). Turn off if that happens.")
+                            Text("Removes unquoted hesitation sounds like ‘um’ and ‘uh’ from prose. Keeps deliberate corrections and adds no AI cleanup delay.")
                                 .font(Theme.body(10))
                                 .foregroundColor(Theme.textSecondary)
 

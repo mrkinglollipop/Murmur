@@ -20,6 +20,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private let keywords: [String]
     private let sessionId: String
     private let injectedMessageSender: MessageSender?
+    private let finalizeBudgetOverride: TimeInterval?
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
@@ -82,6 +83,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         language: String = "en",
         keywords: [String] = [],
         sessionId: String = UUID().uuidString,
+        finalizeBudgetOverride: TimeInterval? = nil,
         messageSender: MessageSender? = nil
     ) {
         self.apiKey = apiKey
@@ -89,6 +91,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.keywords = keywords
         self.sessionId = sessionId
         self.injectedMessageSender = messageSender
+        self.finalizeBudgetOverride = finalizeBudgetOverride
         super.init()
     }
 
@@ -206,13 +209,31 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         finalizeSpeechCompleteSeen = false
         stateLock.unlock()
         let finalizeStart = Date()
+        let waitSeconds = finalizeBudgetOverride
+            ?? min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
+        let finalizeDeadline = finalizeStart.addingTimeInterval(waitSeconds)
 
         stateLock.lock()
         let framesToFinish = frameContinuation
         frameContinuation = nil
         stateLock.unlock()
         framesToFinish?.finish()
-        await senderTask?.value
+        let senderToDrain = senderTask
+        do {
+            try await AsyncDeadline.run(
+                seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
+                timeoutError: { CloudTranscriptionError(provider: .meta, message: "Finalize deadline exceeded while draining audio") },
+                operation: { await senderToDrain?.value }
+            )
+        } catch {
+            markStreamIntegrityFailed()
+            tearDownSocket()
+            stateLock.lock()
+            let text = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+            resetTranscriptState()
+            stateLock.unlock()
+            return text
+        }
         senderTask = nil
 
         stateLock.lock()
@@ -235,7 +256,11 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.unlock()
         if task != nil || injectedMessageSender != nil {
             do {
-                try await sendMessage(.string(Self.makeEndStreamJSON()))
+                try await AsyncDeadline.run(
+                    seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
+                    timeoutError: { CloudTranscriptionError(provider: .meta, message: "Finalize deadline exceeded while ending audio") },
+                    operation: { [self] in try await sendMessage(.string(Self.makeEndStreamJSON())) }
+                )
             } catch {
                 markStreamIntegrityFailed()
                 tearDownSocket()
@@ -258,8 +283,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.unlock()
         earlyContinuation?.resume(returning: earlyText)
 
-        let waitSeconds = min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
-        let waitNs = UInt64(waitSeconds * 1_000_000_000)
+        let remainingWait = max(0, finalizeDeadline.timeIntervalSinceNow)
+        let waitNs = UInt64(remainingWait * 1_000_000_000)
 
         let result = await withTaskGroup(of: String?.self) { group -> String in
             group.addTask { [weak self] in
@@ -311,7 +336,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         tearDownSocket()
 
-        vlog("muse-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (wait=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
+        vlog("muse-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (budget=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
         stateLock.lock()
         resetTranscriptState()
         stateLock.unlock()

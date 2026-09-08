@@ -18,6 +18,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private let vocabulary: [String]
     private let liveOptions: GeminiLiveOptions
     private let injectedMessageSender: MessageSender?
+    private let finalizeBudgetOverride: TimeInterval?
     private let now: () -> Date
 
     private var session: URLSession?
@@ -89,6 +90,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         smartMode: Bool = true,
         vocabulary: [String] = [],
         liveOptions: GeminiLiveOptions = .defaults,
+        finalizeBudgetOverride: TimeInterval? = nil,
         messageSender: MessageSender? = nil,
         now: @escaping () -> Date = Date.init
     ) {
@@ -98,6 +100,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.vocabulary = vocabulary
         self.liveOptions = liveOptions.clamped()
         self.injectedMessageSender = messageSender
+        self.finalizeBudgetOverride = finalizeBudgetOverride
         self.now = now
         super.init()
     }
@@ -243,13 +246,31 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         let capReached = sessionCapReached
         stateLock.unlock()
         let finalizeStart = Date()
+        let waitSeconds = finalizeBudgetOverride
+            ?? min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
+        let finalizeDeadline = finalizeStart.addingTimeInterval(waitSeconds)
 
         stateLock.lock()
         let framesToFinish = frameContinuation
         frameContinuation = nil
         stateLock.unlock()
         framesToFinish?.finish()
-        await senderTask?.value
+        let senderToDrain = senderTask
+        do {
+            try await AsyncDeadline.run(
+                seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
+                timeoutError: { CloudTranscriptionError(provider: .gemini, message: "Finalize deadline exceeded while draining audio") },
+                operation: { await senderToDrain?.value }
+            )
+        } catch {
+            markStreamIntegrityFailed()
+            tearDownSocket()
+            stateLock.lock()
+            let text = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+            resetTranscriptState()
+            stateLock.unlock()
+            return text
+        }
         senderTask = nil
 
         stateLock.lock()
@@ -294,7 +315,11 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 endFrame = GeminiLiveOptions.makeAudioStreamEndFrameJSON()
             }
             do {
-                try await sendMessage(.string(endFrame))
+                try await AsyncDeadline.run(
+                    seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
+                    timeoutError: { CloudTranscriptionError(provider: .gemini, message: "Finalize deadline exceeded while ending audio") },
+                    operation: { [self] in try await sendMessage(.string(endFrame)) }
+                )
             } catch {
                 markStreamIntegrityFailed()
                 tearDownSocket()
@@ -319,8 +344,8 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.unlock()
         earlyContinuation?.resume(returning: earlyText)
 
-        let waitSeconds = min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
-        let waitNs = UInt64(waitSeconds * 1_000_000_000)
+        let remainingWait = max(0, finalizeDeadline.timeIntervalSinceNow)
+        let waitNs = UInt64(remainingWait * 1_000_000_000)
 
         let result = await withTaskGroup(of: String?.self) { group -> String in
             group.addTask { [weak self] in
@@ -366,7 +391,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         tearDownSocket()
 
-        vlog("gemini-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (wait=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
+        vlog("gemini-stream: finalize took \(String(format: "%.3f", Date().timeIntervalSince(finalizeStart)))s (budget=\(String(format: "%.1f", waitSeconds))s), \(result.count) chars")
         stateLock.lock()
         resetTranscriptState()
         stateLock.unlock()

@@ -207,11 +207,7 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "Authorization") // raw key, no scheme
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "audio_url": audioURL,
-            "speech_model": "universal",
-            "language_code": language
-        ])
+        request.httpBody = try Self.makeTranscriptRequestBody(audioURL: audioURL, language: language)
 
         let (data, response) = try await HTTPClient.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -219,6 +215,18 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
             throw CloudTranscriptionError.httpStatus(status, provider: .assemblyAI, body: String(data: data, encoding: .utf8))
         }
         return try JSONDecoder().decode(CreateTranscriptResponse.self, from: data).id
+    }
+
+    /// Universal-3.5 Pro is the current pre-recorded model; Universal-2 is
+    /// the documented fallback for languages it does not support. AssemblyAI
+    /// deprecated the singular `speech_model` parameter in favor of this
+    /// priority-ordered `speech_models` array.
+    static func makeTranscriptRequestBody(audioURL: String, language: String) throws -> Data {
+        try JSONSerialization.data(withJSONObject: [
+            "audio_url": audioURL,
+            "speech_models": ["universal-3-5-pro", "universal-2"],
+            "language_code": language
+        ])
     }
 
     /// Step (c): poll every ~1.5s until `status == "completed"` (or

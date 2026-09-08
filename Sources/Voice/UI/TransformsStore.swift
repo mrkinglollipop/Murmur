@@ -151,6 +151,9 @@ final class TransformsStore: ObservableObject {
         let mutate = {
             guard let idx = self.transforms.firstIndex(where: { $0.id == transform.id }) else { return }
             self.transforms[idx] = transform
+            if self.autoRunTransformID == transform.id {
+                self.pushAutoRunTransform()
+            }
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
