@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Persists the enrolled speaker profile under Application Support/Voice.
 /// Injectable directory URL for tests — production default never touches temp
@@ -8,11 +9,13 @@ final class VoiceProfileStore {
     static let profileFileName = "voice-profile.json"
 
     private let directoryURL: URL
+    private let writeProfile: (Data, URL) throws -> Void
     private var profileFileURL: URL {
         directoryURL.appendingPathComponent(Self.profileFileName)
     }
 
-    init(directoryURL: URL? = nil) {
+    init(directoryURL: URL? = nil, writeProfile: @escaping (Data, URL) throws -> Void = VoiceProfileStore.writeAtomically) {
+        self.writeProfile = writeProfile
         if let directoryURL {
             self.directoryURL = directoryURL
         } else {
@@ -29,22 +32,27 @@ final class VoiceProfileStore {
         return try? JSONDecoder().decode(VoiceProfile.self, from: data)
     }
 
-    func save(_ profile: VoiceProfile) {
+    @discardableResult
+    func save(_ profile: VoiceProfile) -> Bool {
         do {
             let data = try JSONEncoder().encode(profile)
             let fileManager = FileManager.default
             try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-            let url = profileFileURL
-            if fileManager.fileExists(atPath: url.path) {
-                try fileManager.removeItem(at: url)
-            }
-            fileManager.createFile(
-                atPath: url.path,
-                contents: data,
-                attributes: [.posixPermissions: 0o600]
-            )
+            try writeProfile(data, profileFileURL)
+            return true
         } catch {
-            // Corrupt or full disk — enrollment fails silently; dictation stays live.
+            return false
+        }
+    }
+
+    static func writeAtomically(_ data: Data, to destination: URL) throws {
+        let staged = destination.deletingLastPathComponent().appendingPathComponent(".voice-profile-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        guard FileManager.default.createFile(atPath: staged.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        guard Darwin.rename(staged.path, destination.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 

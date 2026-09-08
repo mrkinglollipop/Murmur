@@ -77,7 +77,9 @@ enum ClipboardFingerprint {
     static func fingerprint(for snapshot: TextInjector.PasteboardSnapshot) -> String {
         var hasher = SHA256()
         for item in snapshot {
-            guard let payload = canonicalPayload(of: item) else { continue }
+            let payload = canonicalPayload(of: item) ?? Data()
+            var length = UInt64(payload.count).bigEndian
+            hasher.update(data: Data(bytes: &length, count: MemoryLayout<UInt64>.size))
             hasher.update(data: payload)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
@@ -241,7 +243,7 @@ final class ClipboardStore: ObservableObject {
     @Published private(set) var isKeyUnavailable = false
 
     /// Whether a capture can actually be sealed and stored right now.
-    var canCapture: Bool { isActivated && !isKeyUnavailable }
+    var canCapture: Bool { isActivated && !isKeyUnavailable && !isMetadataCorrupt }
 
     /// The most recent copy that was too large to store, until dismissed.
     ///
@@ -264,6 +266,7 @@ final class ClipboardStore: ObservableObject {
 
     private let directory: URL
     private let metadataURL: URL
+    private let metadataQuarantineMarkerURL: URL
     private let blobsDirectory: URL
     private let thumbsDirectory: URL
     /// Main-thread owned. Resolved by `activate()`, off the launch path.
@@ -279,6 +282,12 @@ final class ClipboardStore: ObservableObject {
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "clipboard-store")
     private let blobQueue = DispatchQueue(label: "com.matt.voice-dictation.clipboard-blobs")
     private var saveWorkItem: DispatchWorkItem?
+    /// Completed blob writes awaiting their main-thread metadata insert. This
+    /// is owned by `blobQueue` so `flush()` can include them before exit.
+    private var completedInsertions: [(ClipboardEntry, String)] = []
+    /// A corrupt metadata file cannot distinguish orphaned blobs from
+    /// recoverable history. Preserve files and refuse automatic writes.
+    @Published private(set) var isMetadataCorrupt = false
 
     /// Guards `activate()` against re-entry while its Keychain resolution is
     /// still in flight, when `isActivated` is not yet true.
@@ -306,6 +315,7 @@ final class ClipboardStore: ObservableObject {
         let root = directory ?? ClipboardStore.defaultDirectory()
         self.directory = root
         self.metadataURL = root.appendingPathComponent("clipboard.json")
+        self.metadataQuarantineMarkerURL = root.appendingPathComponent("clipboard.json.quarantine")
         self.blobsDirectory = root.appendingPathComponent("blobs", isDirectory: true)
         self.thumbsDirectory = root.appendingPathComponent("thumbs", isDirectory: true)
         self.maxBytes = maxBytes
@@ -417,6 +427,10 @@ final class ClipboardStore: ObservableObject {
     // MARK: - Load / save
 
     private func load() {
+        guard !FileManager.default.fileExists(atPath: metadataQuarantineMarkerURL.path) else {
+            isMetadataCorrupt = true
+            return
+        }
         guard FileManager.default.fileExists(atPath: metadataURL.path) else { return }
         guard let data = try? Data(contentsOf: metadataURL) else { return }
         let decoder = JSONDecoder()
@@ -440,9 +454,12 @@ final class ClipboardStore: ObservableObject {
             logger.error("Failed to quarantine corrupt clipboard.json: \(error.localizedDescription); original decode error: \(decodeError.localizedDescription)")
         }
         entries = []
+        isMetadataCorrupt = true
+        try? Data().write(to: metadataQuarantineMarkerURL, options: .atomic)
     }
 
     private func save() {
+        guard !isMetadataCorrupt else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(entries) else { return }
@@ -459,14 +476,31 @@ final class ClipboardStore: ObservableObject {
     /// Persists metadata immediately, after letting in-flight blob writes
     /// finish so the file describes what is actually on disk.
     ///
-    /// An entry whose main-thread insert is still queued behind this call is
-    /// not in the saved file; its blob becomes an orphan and the reconcile
-    /// pass on next launch collects it.
+    /// Completed blob writes are committed synchronously before the save, so
+    /// a quit cannot turn a just-written capture into an orphan.
     func flush() {
         blobQueue.sync {}
+        commitCompletedInsertions()
         saveWorkItem?.cancel()
         saveWorkItem = nil
         save()
+    }
+
+    /// Moves completed blob writes into the published metadata on the main
+    /// thread. `flush()` calls this after draining `blobQueue`, before saving.
+    private func commitCompletedInsertions() {
+        let completed = blobQueue.sync {
+            let completed = completedInsertions
+            completedInsertions.removeAll()
+            return completed
+        }
+        guard !completed.isEmpty else { return }
+        for (_, fingerprint) in completed {
+            inFlightFingerprints.remove(fingerprint)
+        }
+        entries.insert(contentsOf: completed.map { $0.0 }.reversed(), at: 0)
+        pruneToBudget()
+        scheduleSave()
     }
 
     // MARK: - Reconciliation
@@ -480,6 +514,10 @@ final class ClipboardStore: ObservableObject {
     /// those, and because the retention budget only counts bytes it knows
     /// about, they would accumulate invisibly and forever.
     private func reconcileBlobsWithMetadata() {
+        guard !isMetadataCorrupt else {
+            logger.error("Clipboard metadata is corrupt; preserving blobs without reconciliation")
+            return
+        }
         let known = Set(entries.map(\.id.uuidString))
         blobQueue.async { [weak self] in
             guard let self else { return }
@@ -580,7 +618,7 @@ final class ClipboardStore: ObservableObject {
     /// the disk write, and preview generation all happen off it, and the entry
     /// appears once the blob is safely on disk.
     func record(snapshot: TextInjector.PasteboardSnapshot, sourceBundleID: String?) {
-        guard let crypto else { return }
+        guard !isMetadataCorrupt, let crypto else { return }
         let types = Array(Set(snapshot.flatMap { $0.keys.map(\.rawValue) })).sorted()
         guard let fingerprint = captureFingerprint(snapshot: snapshot, types: types) else { return }
 
@@ -621,24 +659,20 @@ final class ClipboardStore: ObservableObject {
                 DispatchQueue.main.async { self.inFlightFingerprints.remove(fingerprint) }
                 return
             }
-            DispatchQueue.main.async {
-                self.inFlightFingerprints.remove(fingerprint)
-                self.entries.insert(
-                    ClipboardEntry(
-                        id: id,
-                        date: date,
-                        kind: kind,
-                        preview: preview,
-                        sourceBundleID: sourceBundleID,
-                        types: types,
-                        byteCount: written,
-                        fingerprint: fingerprint
-                    ),
-                    at: 0
-                )
-                self.pruneToBudget()
-                self.scheduleSave()
-            }
+            self.completedInsertions.append((
+                ClipboardEntry(
+                    id: id,
+                    date: date,
+                    kind: kind,
+                    preview: preview,
+                    sourceBundleID: sourceBundleID,
+                    types: types,
+                    byteCount: written,
+                    fingerprint: fingerprint
+                ),
+                fingerprint
+            ))
+            DispatchQueue.main.async { self.commitCompletedInsertions() }
         }
     }
 
@@ -722,11 +756,103 @@ final class ClipboardStore: ObservableObject {
 
     func clearAll() {
         let mutate = {
+            guard !self.isMetadataCorrupt else { return }
             let dropped = self.entries
             self.entries = []
             self.isLockedOut = false
             self.deleteBlobs(for: dropped)
             self.scheduleSave()
+        }
+        Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
+    }
+
+    /// Deletes the preserved files only after the user confirms recovery from
+    /// corrupt metadata. Until this runs successfully, the quarantine marker
+    /// keeps capture and reconciliation off so unknown blobs are never swept.
+    func discardCorruptHistory() {
+        let mutate = {
+            guard self.isMetadataCorrupt else { return }
+            self.saveWorkItem?.cancel()
+            self.saveWorkItem = nil
+
+            let root = self.directory
+            let metadata = self.metadataURL
+            let marker = self.metadataQuarantineMarkerURL
+            let blobs = self.blobsDirectory
+            let thumbs = self.thumbsDirectory
+            self.blobQueue.async { [weak self] in
+                guard let self else { return }
+                let fm = FileManager.default
+                var succeeded = true
+                for directory in [blobs, thumbs] {
+                    let files: [URL]
+                    do {
+                        files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                    } catch {
+                        // A positively absent directory is already empty. Any
+                        // other enumeration failure means deletion is unknown,
+                        // so retain quarantine mode and its marker.
+                        let fileError = error as NSError
+                        if fileError.domain == NSCocoaErrorDomain,
+                           [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(fileError.code) {
+                            files = []
+                        } else {
+                            succeeded = false
+                            self.logger.error("Failed to enumerate corrupt clipboard recovery files: \(error.localizedDescription)")
+                            continue
+                        }
+                    }
+                    for url in files {
+                        do {
+                            try fm.removeItem(at: url)
+                        } catch {
+                            succeeded = false
+                            self.logger.error("Failed to remove corrupt clipboard recovery file: \(error.localizedDescription)")
+                        }
+                    }
+                }
+                // The decoder moves the bad metadata here. Remove every
+                // quarantined generation only during this explicit recovery.
+                let prefix = metadata.lastPathComponent + ".corrupt."
+                let rootFiles: [URL]
+                do {
+                    rootFiles = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+                } catch {
+                    succeeded = false
+                    rootFiles = []
+                    self.logger.error("Failed to enumerate quarantined clipboard metadata: \(error.localizedDescription)")
+                }
+                for url in rootFiles where url.lastPathComponent.hasPrefix(prefix) {
+                    do {
+                        try fm.removeItem(at: url)
+                    } catch {
+                        succeeded = false
+                        self.logger.error("Failed to remove quarantined clipboard metadata: \(error.localizedDescription)")
+                    }
+                }
+                if fm.fileExists(atPath: metadata.path) {
+                    do {
+                        try fm.removeItem(at: metadata)
+                    } catch {
+                        succeeded = false
+                        self.logger.error("Failed to remove corrupt clipboard metadata: \(error.localizedDescription)")
+                    }
+                }
+                guard succeeded else { return }
+                do {
+                    try fm.removeItem(at: marker)
+                } catch {
+                    self.logger.error("Failed to finish corrupt clipboard recovery: \(error.localizedDescription)")
+                    return
+                }
+                DispatchQueue.main.async {
+                    guard self.isMetadataCorrupt else { return }
+                    self.isMetadataCorrupt = false
+                    self.isLockedOut = false
+                    self.entries = []
+                    self.save()
+                }
+            }
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }

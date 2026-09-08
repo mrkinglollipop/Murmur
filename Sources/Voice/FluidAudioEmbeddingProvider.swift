@@ -3,8 +3,8 @@ import Foundation
 import os.log
 
 /// Production `SpeakerEmbeddingProviding` backed by FluidAudio's WeSpeaker
-/// diarizer embeddings. Model download/init runs once on a background task;
-/// stays fail-open (`isReady == false`) forever on failure.
+/// diarizer embeddings. Model loading stays off-main and fails open;
+/// an explicit settings update can retry a failed load.
 final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
 
     static let modelId = "fluidaudio-wespeaker-0.15.6"
@@ -12,7 +12,9 @@ final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "voice-gate")
     private let stateLock = NSLock()
     private var _isReady = false
+    private var isLoading = false
     private var diarizer: DiarizerManager?
+    private let loader: () async throws -> DiarizerManager
 
     var isReady: Bool {
         stateLock.lock()
@@ -20,10 +22,27 @@ final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
         return _isReady
     }
 
-    init() {
-        Task {
-            await loadModels()
+    init(loader: @escaping () async throws -> DiarizerManager = {
+        let models = try await DiarizerModels.downloadIfNeeded()
+        let manager = DiarizerManager()
+        manager.initialize(models: models)
+        return manager
+    }) {
+        self.loader = loader
+        retryLoadingIfNeeded()
+    }
+
+    @discardableResult
+    func retryLoadingIfNeeded() -> Bool {
+        stateLock.lock()
+        guard !_isReady, !isLoading else {
+            stateLock.unlock()
+            return false
         }
+        isLoading = true
+        stateLock.unlock()
+        Task { await loadModels() }
+        return true
     }
 
     func embedding(for samples: [Float]) -> [Float]? {
@@ -42,15 +61,17 @@ final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
 
     private func loadModels() async {
         do {
-            let models = try await DiarizerModels.downloadIfNeeded()
-            let manager = DiarizerManager()
-            manager.initialize(models: models)
+            let manager = try await loader()
             stateLock.lock()
             diarizer = manager
             _isReady = true
+            isLoading = false
             stateLock.unlock()
             logger.info("FluidAudio speaker-embedding models ready.")
         } catch {
+            stateLock.lock()
+            isLoading = false
+            stateLock.unlock()
             logger.error("FluidAudio model load failed: \(error.localizedDescription)")
         }
     }

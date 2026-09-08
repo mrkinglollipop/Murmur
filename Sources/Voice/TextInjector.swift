@@ -8,7 +8,7 @@ import Foundation
 
 /// Inserts recognised text at the current cursor position in the focused app.
 ///
-/// Primary lane: CGEvent unicode typing with delivery confirmation, one retry,
+/// Default primary lane: CGEvent unicode typing with transport observation, one retry,
 /// and an F20 canary probe when the observation channel's own testimony is
 /// unprovable — **does not touch** `NSPasteboard.general` on any of those
 /// paths, so the user's prior copy survives a normal dictate. `postToPid` was
@@ -17,7 +17,10 @@ import Foundation
 /// duplication bug this file exists to prevent. Fallback: clipboard + single
 /// Cmd-V chord (Wispr-style) when unicode cannot confirm; that path snapshots
 /// + restores the prior pasteboard after `pasteboardRestoreDelay` so slow
-/// Electron/Cursor consumers still read the transcript before restore.
+/// Electron/Cursor consumers still read the transcript before restore. Safari
+/// receives multi-chunk text through one paste transaction: its web editor can
+/// accept separately-posted unicode chunks out of order even when the event tap
+/// observes every chunk in order.
 final class TextInjector {
 
     private static let dedupeLock = NSLock()
@@ -79,6 +82,23 @@ final class TextInjector {
     /// UTF-16 units per CGEvent. Apple's keyboardSetUnicodeString documents
     /// a practical ceiling around this size; chunk longer transcripts.
     private static let unicodeChunkSize = 16
+    private static let safariBundleIdentifier = "com.apple.Safari"
+
+    enum InjectionLane: Equatable {
+        case unicodeWithEvidence
+        case pasteOnce
+    }
+
+    /// Safari web editors can reorder separate multi-character unicode events.
+    /// A single paste is atomic from the editor's perspective. Keep the
+    /// pasteboard-free unicode lane everywhere else, and for one-chunk Safari
+    /// inserts where reordering is impossible.
+    static func injectionLanes(bundleIdentifier: String?, chunkCount: Int) -> [InjectionLane] {
+        if bundleIdentifier == safariBundleIdentifier, chunkCount > 1 {
+            return [.pasteOnce]
+        }
+        return [.unicodeWithEvidence, .pasteOnce]
+    }
 
     // Confirmation wait is progress-aware, not a flat timeout: a WindowServer
     // stall DELAYS CGEvent delivery to the observer tap, it does not DROP it.
@@ -143,7 +163,7 @@ final class TextInjector {
 
     enum SavedPasteboardRestoreDecision: Equatable {
         /// Immediate restore — safe when the pasteboard was not the delivery
-        /// channel (unicode typing confirmed).
+        /// channel (unicode transport observed).
         case restoreSaved
         /// Restore later so a slow Cmd-V consumer (Electron/Cursor) cannot
         /// read the pre-insert snapshot we just put back. Paste-lane only.
@@ -465,6 +485,13 @@ final class TextInjector {
         return result
     }
 
+    /// `insert` normally runs off-main. AppKit's frontmost-application state is
+    /// sampled on main at the actual insertion boundary, after pipeline work.
+    private static func frontmostBundleIdentifierAtInsert() -> String? {
+        let sample = { NSWorkspace.shared.frontmostApplication?.bundleIdentifier }
+        return Thread.isMainThread ? sample() : DispatchQueue.main.sync(execute: sample)
+    }
+
     @discardableResult
     func insert(_ text: String) -> InsertResult {
         let trimmed = Self.trimmingTrailingWhitespaceAndNewlines(text)
@@ -476,6 +503,10 @@ final class TextInjector {
             return .failed
         }
 
+        // Never synchronously hop to main while holding the dedupe lock: a
+        // main-thread insertion may already be waiting for that same lock.
+        let bundleIdentifier = Self.deliveryLaneForTesting == nil
+            ? Self.frontmostBundleIdentifierAtInsert() : nil
         Self.dedupeLock.lock()
         defer { Self.dedupeLock.unlock() }
 
@@ -495,7 +526,10 @@ final class TextInjector {
         if let deliveryLane = Self.deliveryLaneForTesting {
             result = deliveryLane(trimmed) ? .inserted(deliveredText: trimmed) : .failed
         } else {
-            result = performInsert(trimmed)
+            result = performInsert(
+                trimmed,
+                bundleIdentifier: bundleIdentifier
+            )
         }
 
         if case .inserted = result {
@@ -537,13 +571,13 @@ final class TextInjector {
             wentBlind: observer.wentBlind
         ) {
         case .confirmed:
-            Self.log("unicode typing confirmed\(attemptLabel) chars=\(trimmed.utf16.count) — pasteboard untouched")
+            Self.log("unicode transport observed\(attemptLabel) chars=\(trimmed.utf16.count) — target acceptance unverified, pasteboard untouched")
             return .confirmed
         case .confirmedByKeycode:
-            Self.log("delivered by keycode evidence (readback blind)\(attemptLabel) chunks=\(chunkTarget)")
+            Self.log("unicode transport observed by keycode (readback blind)\(attemptLabel) chunks=\(chunkTarget) — target acceptance unverified")
             return .confirmed
         case .acceptPartial:
-            Self.log("partial delivery observed=\(observed)/\(posted)\(attemptLabel) — accepting without retry (anti-double)")
+            Self.log("partial unicode transport observed=\(observed)/\(posted)\(attemptLabel) — accepting without retry (anti-double)")
             return .confirmed
         case .needsCanaryProbe:
             return .needsCanaryProbe
@@ -570,7 +604,7 @@ final class TextInjector {
         )
     }
 
-    private func performInsert(_ trimmed: String) -> InsertResult {
+    private func performInsert(_ trimmed: String, bundleIdentifier: String?) -> InsertResult {
         let utf16Count = trimmed.utf16.count
         // Snapshot before any lane that may write the pasteboard. Unicode-first
         // never writes on success; paste fallback needs this to put the user's
@@ -588,6 +622,31 @@ final class TextInjector {
         defer { observer.stop() }
 
         let chunkTarget = Self.chunkUTF16Units(trimmed).count
+        let lanes = Self.injectionLanes(
+            bundleIdentifier: bundleIdentifier,
+            chunkCount: chunkTarget
+        )
+
+        if lanes == [.pasteOnce] {
+            let pasteSucceeded = tryPasteLane(trimmed, observer: observer, retryOnAmbiguous: false)
+            if pasteSucceeded {
+                Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
+                Self.scheduleDeferredPasteboardRestore(
+                    injectedText: trimmed,
+                    savedPasteboard: savedPasteboard
+                )
+                Self.log("Safari atomic paste transport observed chars=\(utf16Count) — target acceptance unverified")
+                return .inserted(deliveredText: trimmed)
+            }
+
+            // A missing observer count cannot distinguish a dropped chord from
+            // a paste Safari already accepted. Never follow it with unicode or
+            // another Cmd-V: either could duplicate or corrupt the field.
+            leaveOnClipboard(trimmed)
+            Self.log("Safari atomic paste ambiguous — no retry; transcript left on clipboard chars=\(utf16Count)")
+            return .failed
+        }
+
         var confirmed = false
         var retryConfirmed = false
 
@@ -634,7 +693,7 @@ final class TextInjector {
 
         // Paste fallback (Wispr-style). Touches the pasteboard; restore prior
         // after pasteboardRestoreDelay so Electron/Cursor can still consume.
-        let pasteSucceeded = tryPasteLane(trimmed, observer: observer)
+        let pasteSucceeded = tryPasteLane(trimmed, observer: observer, retryOnAmbiguous: true)
         if pasteSucceeded {
             Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
             switch Self.resolveSavedPasteboardRestore(
@@ -704,7 +763,11 @@ final class TextInjector {
     /// Returns true when a Cmd-V chord is observed *and* the pasteboard still
     /// holds our transcript. Chord-only confirmation previously let Universal
     /// Clipboard win the race and paste stale iPhone copy.
-    private func tryPasteLane(_ text: String, observer: UnicodeDeliveryObserver) -> Bool {
+    private func tryPasteLane(
+        _ text: String,
+        observer: UnicodeDeliveryObserver,
+        retryOnAmbiguous: Bool
+    ) -> Bool {
         guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
             Self.log("paste lane aborted — could not stabilize pasteboard")
             return false
@@ -751,6 +814,7 @@ final class TextInjector {
             return true
         }
 
+        guard retryOnAmbiguous else { return false }
         Self.log("paste delivery drop detected — retrying")
         return attempt()
     }

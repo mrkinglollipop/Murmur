@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.1.50",
+    "build": "51",
+    "title": "What's New in 0.1.50",
+    "items": [
+      "Dictation in Safari now uses a single paste to prevent reordered text in web editors.",
+      "Optional filler cleanup removes standalone um and uh conservatively, preserving quoted text and code.",
+      "Stalled cloud streams and local transcription processes now exit through bounded recovery paths.",
+      "Retrying a recording saves the result in History without inserting it into the current app.",
+      "Voice-profile saves and recording exports preserve the previous file if replacement fails.",
+      "ElevenLabs advanced settings now explain that background-voice filtering can also omit quieter speech.",
+      "AssemblyAI dictation uses the current supported transcription models."
+    ]
+  },
+  {
     "version": "0.1.49",
     "build": "50",
     "title": "What's New in 0.1.49",

@@ -32,6 +32,7 @@ struct ClipboardView: View {
     @State private var pendingDeleteEntry: ClipboardEntry?
     @State private var showDeleteConfirmation = false
     @State private var showClearAllConfirmation = false
+    @State private var showCorruptRecoveryConfirmation = false
 
     @FocusState private var isSearchFocused: Bool
 
@@ -89,7 +90,16 @@ struct ClipboardView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if store.isKeyUnavailable {
+            if store.isMetadataCorrupt {
+                banner(
+                    icon: "exclamationmark.triangle.fill",
+                    tint: Theme.recordRed,
+                    title: "Clipboard history needs recovery",
+                    message: "Murmur found damaged history metadata. Your encrypted clipboard files are preserved and new copies are paused.",
+                    actionTitle: "Delete preserved history",
+                    action: { showCorruptRecoveryConfirmation = true }
+                )
+            } else if store.isKeyUnavailable {
                 banner(
                     icon: "exclamationmark.triangle.fill",
                     tint: Theme.recordRed,
@@ -159,6 +169,13 @@ struct ClipboardView: View {
             title: "Delete all clipboard history?",
             onConfirm: {
                 withAnimation(Theme.easeOutOrNil()) { store.clearAll() }
+            }
+        )
+        .confirmDelete(
+            isPresented: $showCorruptRecoveryConfirmation,
+            title: "Permanently delete preserved clipboard history?",
+            onConfirm: {
+                withAnimation(Theme.easeOutOrNil()) { store.discardCorruptHistory() }
             }
         )
     }

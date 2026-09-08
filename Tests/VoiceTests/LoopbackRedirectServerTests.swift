@@ -94,25 +94,30 @@ final class LoopbackRedirectServerTests: XCTestCase {
         XCTAssertEqual(received, .success("live-abc"))
     }
 
-    /// A second hit (browser prefetch, reload) must not re-deliver the code.
-    func testResultDeliversAtMostOnce() async throws {
-        var deliveries = 0
-        let first = expectation(description: "first delivery")
-        guard let server = LoopbackRedirectServer.start(onResult: { _ in
-            deliveries += 1
-            first.fulfill()
+    /// An unbound error must not consume the listener. The still-open browser
+    /// can subsequently deliver the current attempt's valid code on the exact
+    /// redirect port it was originally given.
+    func testListenerDeliversErrorThenCodeCandidates() async throws {
+        var received: [Result<String, SupabaseAuthClient.AuthError>] = []
+        let candidates = expectation(description: "both candidates delivered")
+        candidates.expectedFulfillmentCount = 2
+        guard let server = LoopbackRedirectServer.start(onResult: { result in
+            received.append(result)
+            candidates.fulfill()
         }) else {
             XCTFail("no loopback port available")
             return
         }
         defer { server.stop() }
 
-        let url = URL(string: "http://127.0.0.1:\(server.port)/auth-callback?code=once")!
-        _ = try await URLSession.shared.data(from: url)
-        await fulfillment(of: [first], timeout: 5)
-        _ = try await URLSession.shared.data(from: url)
-        // Give a wrongly-queued second delivery a beat to land before asserting.
-        try await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertEqual(deliveries, 1)
+        let base = "http://127.0.0.1:\(server.port)/auth-callback"
+        _ = try await URLSession.shared.data(from: URL(string: "\(base)?error=access_denied")!)
+        _ = try await URLSession.shared.data(from: URL(string: "\(base)?code=current")!)
+        await fulfillment(of: [candidates], timeout: 5)
+        XCTAssertEqual(received, [
+            .failure(.callbackCarriedError("access_denied")),
+            .success("current")
+        ])
     }
+
 }

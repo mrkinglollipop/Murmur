@@ -79,6 +79,8 @@ final class EntitlementStore: ObservableObject {
 
     private let defaults: UserDefaults
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "entitlement")
+    /// A sign-out or newer user refresh invalidates late server replies.
+    private var refreshGeneration = 0
 
     /// Injectable for tests; production default hits Supabase.
     var fetcher: (SupabaseAuthClient.Session) async throws -> Bool
@@ -107,24 +109,31 @@ final class EntitlementStore: ObservableObject {
     }
 
     func refresh(session: SupabaseAuthClient.Session) async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         isRefreshing = true
-        defer { isRefreshing = false }
 
         var fetched: Bool?
         do {
             fetched = try await fetcher(session)
-            defaults.set(fetched, forKey: Self.cacheKey(userID: session.userID))
         } catch {
             logger.error("entitlement fetch failed, using cache: \(error.localizedDescription)")
         }
+        guard generation == refreshGeneration else { return }
+        if let fetched {
+            defaults.set(fetched, forKey: Self.cacheKey(userID: session.userID))
+        }
         isPro = Self.resolve(fetched: fetched, cached: cachedAnswer(userID: session.userID))
+        isRefreshing = false
     }
 
     /// Sign-out. The per-user cache is kept — it only ever answers for the
     /// same userID after a fresh sign-in, and dropping it would strand a paid
     /// user who signs back in while offline.
     func clear() {
+        refreshGeneration &+= 1
         isPro = false
+        isRefreshing = false
     }
 }
 

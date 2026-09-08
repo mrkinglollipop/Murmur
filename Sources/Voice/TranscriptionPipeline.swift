@@ -19,6 +19,7 @@ final class TranscriptionPipeline {
     /// Tri-state handed to HUD after inject — not a Bool collapse of success/fail.
     enum InjectPipelineResult: Equatable {
         case inserted
+        case savedToHistory
         case deduped
         case failed
     }
@@ -30,6 +31,10 @@ final class TranscriptionPipeline {
 
     /// Master on/off for the AI cleanup pass.
     var cleanupEnabled: Bool = false
+
+    /// Existing provider-filler preference, reused for conservative local
+    /// hesitation removal before optional AI cleanup.
+    var removeFillerWordsEnabled: Bool = false
 
     /// Whether cleanup should use the code-aware prompt variant.
     var codeAware: Bool = false
@@ -488,16 +493,29 @@ final class TranscriptionPipeline {
     /// punctuation (full table if codeAware; sentence commands always), and
     /// DotCompound. Package-visible for pipeline-gate unit tests. This applies
     /// regardless of optional AI cleanup so every ASR path gets the same guard.
-    static func preprocessBeforeCleanup(_ text: String, codeAware: Bool) -> String {
+    static func preprocessBeforeCleanup(
+        _ text: String,
+        codeAware: Bool,
+        removeFillerWords: Bool = false
+    ) -> String {
         let withoutSoundTags = NonSpeechAnnotations.stripRecognizedTags(text)
         let capped = SpokenCapitalization.apply(withoutSoundTags)
-        return DotCompoundNumberNormalizer.apply(
+        let punctuated = DotCompoundNumberNormalizer.apply(
             SpokenPunctuation.apply(capped, codeAware: codeAware)
+        )
+        return HesitationNormalizer.normalize(
+            punctuated,
+            codeAware: codeAware,
+            enabled: removeFillerWords
         )
     }
 
     private func applyCleanup(_ text: String) async -> PreprocessedTranscript {
-        let preprocessed = Self.preprocessForCleanup(text, codeAware: codeAware)
+        let preprocessed = Self.preprocessForCleanup(
+            text,
+            codeAware: codeAware,
+            removeFillerWords: removeFillerWordsEnabled
+        )
         guard cleanupEnabled, let svc = cleanupService, !preprocessed.text.isEmpty else { return preprocessed }
 
         let wordCount = preprocessed.text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).count
@@ -534,10 +552,22 @@ final class TranscriptionPipeline {
     /// provider edge whitespace was removed. That distinguishes a spoken
     /// `new line` command from an incidental provider trailing newline without
     /// retaining the raw provider response beyond this stage.
-    static func preprocessForCleanup(_ text: String, codeAware: Bool) -> PreprocessedTranscript {
-        let preprocessed = preprocessBeforeCleanup(text, codeAware: codeAware)
+    static func preprocessForCleanup(
+        _ text: String,
+        codeAware: Bool,
+        removeFillerWords: Bool = false
+    ) -> PreprocessedTranscript {
+        let preprocessed = preprocessBeforeCleanup(
+            text,
+            codeAware: codeAware,
+            removeFillerWords: removeFillerWords
+        )
         let providerEdgeNormalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let formattingProbe = preprocessBeforeCleanup(providerEdgeNormalized, codeAware: codeAware)
+        let formattingProbe = preprocessBeforeCleanup(
+            providerEdgeNormalized,
+            codeAware: codeAware,
+            removeFillerWords: removeFillerWords
+        )
         return PreprocessedTranscript(
             text: preprocessed,
             hadExplicitTrailingNewline: formattingProbe.last?.isNewline == true
@@ -583,7 +613,7 @@ final class TranscriptionPipeline {
         return Double(newWords.count) / Double(outWords.count) <= 0.4
     }
 
-    private func finishTranscription(
+    func finishTranscription(
         text: String,
         hadExplicitTrailingNewline: Bool,
         engineID: String,
@@ -618,6 +648,21 @@ final class TranscriptionPipeline {
             let expanded = self.onSnippetExpand?(corrected) ?? corrected
             let snippetExpansionOccurred = expanded != corrected
             let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
+            if let retryID = replaceHistoryEntryID {
+                // Retrying a recording is a History operation. Focus may be on
+                // History's search field or an unrelated app by the time ASR ends.
+                let saved = Self.prepareResolvedSnapshotTextForInjection(
+                    expanded: expanded,
+                    snapshot: .unknown,
+                    codeAware: self.codeAware,
+                    hasExplicitCustomTransform: hasExplicitCustomTransform,
+                    snippetExpansionOccurred: snippetExpansionOccurred,
+                    hadExplicitTrailingNewline: hadExplicitTrailingNewline
+                )
+                self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, retryID)
+                completion?(.savedToHistory)
+                return
+            }
             let capitalizedTerms = self.engineSelector?.capitalizedDictionaryTermsProvider?() ?? []
             // Prefer the stop-time session snapshot when present. Token match
             // for clear still uses sessionHeldToken; live held is only a

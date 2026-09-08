@@ -3,6 +3,14 @@ import XCTest
 
 final class NonSpeechAnnotationsTests: XCTestCase {
 
+    func testWhisperCaptionCleanupPreservesContentAndCode() {
+        XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("Keep [chapter three] and *important words* intact."),
+                       "Keep [chapter three] and *important words* intact.")
+        XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("Use `items[coughing]` and `*sighs*` literally."),
+                       "Use `items[coughing]` and `*sighs*` literally.")
+        XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("*sighs* Keep these words [music]."), "Keep these words.")
+    }
+
     func testStripsRecognizedRoundAndSquareCaptions() {
         XCTAssertEqual(
             NonSpeechAnnotations.stripRecognizedTags("Please [sniffs] send (coughing) the report."),

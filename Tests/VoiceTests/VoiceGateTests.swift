@@ -265,6 +265,16 @@ final class VoiceGateTests: XCTestCase {
         XCTAssertEqual(loaded, profile)
     }
 
+    func testFailedProfileReplacementPreservesPreviousEnrollment() {
+        let dir = tempDirectory()
+        let store = VoiceProfileStore(directoryURL: dir)
+        let original = VoiceProfile(embedding: [1, 0], createdAt: Date(), modelId: "old")
+        XCTAssertTrue(store.save(original))
+        let failing = VoiceProfileStore(directoryURL: dir, writeProfile: { _, _ in throw CocoaError(.fileWriteOutOfSpace) })
+        XCTAssertFalse(failing.save(VoiceProfile(embedding: [0, 1], createdAt: Date(), modelId: "new")))
+        XCTAssertEqual(store.load(), original)
+    }
+
     func testProfileStoreMissingFileReturnsNil() {
         let dir = tempDirectory()
         let store = VoiceProfileStore(directoryURL: dir)

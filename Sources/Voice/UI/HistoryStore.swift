@@ -15,6 +15,8 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
     var audioPath: String?
     /// Transcription never produced usable text — audio may be retried.
     var failed: Bool
+    /// A retry was saved for review without typing into whichever app is focused.
+    var savedWithoutInsertion: Bool
 
     init(
         id: UUID = UUID(),
@@ -23,7 +25,8 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
         engine: String,
         injected: Bool,
         audioPath: String? = nil,
-        failed: Bool = false
+        failed: Bool = false,
+        savedWithoutInsertion: Bool = false
     ) {
         self.id = id
         self.date = date
@@ -32,6 +35,7 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
         self.injected = injected
         self.audioPath = audioPath
         self.failed = failed
+        self.savedWithoutInsertion = savedWithoutInsertion
     }
 
     init(from decoder: Decoder) throws {
@@ -43,6 +47,7 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
         injected = try container.decode(Bool.self, forKey: .injected)
         audioPath = try container.decodeIfPresent(String.self, forKey: .audioPath)
         failed = try container.decodeIfPresent(Bool.self, forKey: .failed) ?? false
+        savedWithoutInsertion = try container.decodeIfPresent(Bool.self, forKey: .savedWithoutInsertion) ?? false
     }
 }
 
@@ -53,7 +58,19 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
 /// pass transcript text to `vlog`, `os_log`, `print`, or any /tmp path.
 final class HistoryStore: ObservableObject {
 
-    @Published private(set) var entries: [HistoryEntry] = []
+    @Published private(set) var entries: [HistoryEntry] = [] {
+        didSet {
+            let paths = entries.compactMap { entry -> String? in
+                guard entry.failed, let path = entry.audioPath, !path.isEmpty else { return nil }
+                return path
+            }
+            protectedPathsLock.lock()
+            protectedPaths = paths
+            protectedPathsLock.unlock()
+        }
+    }
+    private let protectedPathsLock = NSLock()
+    private var protectedPaths: [String] = []
 
     /// Cap on retained entries — oldest are dropped past this count.
     private let maxEntries = 1000
@@ -183,14 +200,13 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    /// Re-transcribes a failed entry's retained audio via `asrSelector`.
-    /// On success, updates the existing row; on failure, leaves `failed = true`.
+    /// Re-transcribes retained audio and updates the row without inserting text.
+    /// A failed retry preserves any previous usable transcript.
     /// Passes `replaceEntryID` through the transcription pipeline so concurrent
     /// live dictation cannot steal the slot via a global pending flag.
     func retryTranscription(id: UUID, asrSelector: ASREngineSelector, completion: (() -> Void)? = nil) {
         func start() {
             guard let entry = self.entries.first(where: { $0.id == id }),
-                  entry.failed,
                   let path = entry.audioPath,
                   FileManager.default.fileExists(atPath: path) else {
                 completion?()
@@ -220,14 +236,14 @@ final class HistoryStore: ObservableObject {
     ) {
         guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
         if failed || text.isEmpty {
-            entries[idx].failed = true
-            entries[idx].engine = engine
+            if entries[idx].failed { entries[idx].engine = engine }
             if let audioPath { entries[idx].audioPath = audioPath }
         } else {
             entries[idx].text = text
             entries[idx].engine = engine
             entries[idx].injected = injected
             entries[idx].failed = false
+            entries[idx].savedWithoutInsertion = !injected
             entries[idx].audioPath = audioPath ?? entries[idx].audioPath
         }
         save()
@@ -247,10 +263,9 @@ final class HistoryStore: ObservableObject {
     /// clear. Safe from any thread; may include paths that no longer exist
     /// (harmless: prune simply never sees those files).
     func protectedAudioPathsSnapshot() -> [String] {
-        entries.compactMap { entry in
-            guard entry.failed, let path = entry.audioPath, !path.isEmpty else { return nil }
-            return path
-        }
+        protectedPathsLock.lock()
+        defer { protectedPathsLock.unlock() }
+        return protectedPaths
     }
 
     /// Clears `audioPath` on entries whose files no longer exist (after prune

@@ -6,6 +6,31 @@ import XCTest
 /// store takes an injected fetcher.
 final class ProEntitlementTests: XCTestCase {
 
+    private actor BoolGate {
+        private var continuation: CheckedContinuation<Bool, Error>?
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var started = false
+
+        func fetch() async throws -> Bool {
+            started = true
+            startWaiters.forEach { $0.resume() }
+            startWaiters.removeAll()
+            return try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { startWaiters.append($0) }
+        }
+
+        func succeed(_ value: Bool) {
+            continuation?.resume(returning: value)
+            continuation = nil
+        }
+    }
+
     private var defaults: UserDefaults!
     private var suiteName: String!
 
@@ -148,6 +173,41 @@ final class ProEntitlementTests: XCTestCase {
             store.cachedAnswer(userID: "user-1"), true,
             "cache survives sign-out so an offline re-sign-in still works"
         )
+    }
+
+    @MainActor
+    func testLateRefreshAfterClearCannotRestoreEntitlementOrCache() async {
+        let gate = BoolGate()
+        let store = EntitlementStore(defaults: defaults, fetcher: { _ in try await gate.fetch() })
+
+        let refresh = Task { await store.refresh(session: self.session(userID: "payer")) }
+        await gate.waitUntilStarted()
+        store.clear()
+        await gate.succeed(true)
+        await refresh.value
+
+        XCTAssertFalse(store.isPro)
+        XCTAssertFalse(store.isRefreshing)
+        XCTAssertNil(store.cachedAnswer(userID: "payer"))
+    }
+
+    @MainActor
+    func testLateRefreshCannotWritePreviousUsersCache() async {
+        let gate = BoolGate()
+        let store = EntitlementStore(defaults: defaults, fetcher: { session in
+            if session.userID == "payer" { return try await gate.fetch() }
+            return false
+        })
+
+        let oldRefresh = Task { await store.refresh(session: self.session(userID: "payer")) }
+        await gate.waitUntilStarted()
+        await store.refresh(session: session(userID: "new-user"))
+        await gate.succeed(true)
+        await oldRefresh.value
+
+        XCTAssertFalse(store.isPro)
+        XCTAssertNil(store.cachedAnswer(userID: "payer"))
+        XCTAssertEqual(store.cachedAnswer(userID: "new-user"), false)
     }
 
     // MARK: - Sidebar and pro marking

@@ -4,7 +4,7 @@
 import Foundation
 import Network
 
-/// One-shot loopback HTTP listener for the OAuth browser round trip.
+/// Loopback HTTP listener for the OAuth browser round trip.
 ///
 /// A browser cannot render a `murmur://` custom-scheme redirect — macOS hands
 /// the URL to the app, but the tab itself is left spinning forever. Binding a
@@ -67,11 +67,11 @@ final class LoopbackRedirectServer {
     private let queue = DispatchQueue(label: "com.matt.voice-dictation.loopback-auth")
     private var connections: [NWConnection] = []
     private var onResult: ((Result<String, SupabaseAuthClient.AuthError>) -> Void)?
-    private var hasDelivered = false
 
     /// Binds the first free allow-listed port, or nil when none is available.
-    /// `onResult` fires at most once, on an internal queue — hop to the main
-    /// actor before touching UI state.
+    /// `onResult` fires for each callback candidate, on an internal queue — hop
+    /// to the main actor before touching UI state. The controller keeps the
+    /// first code that successfully exchanges and then stops this listener.
     static func start(
         ports: [UInt16] = allowedPorts,
         onResult: @escaping (Result<String, SupabaseAuthClient.AuthError>) -> Void
@@ -85,7 +85,10 @@ final class LoopbackRedirectServer {
         return nil
     }
 
-    private init(port: UInt16, onResult: @escaping (Result<String, SupabaseAuthClient.AuthError>) -> Void) throws {
+    private init(
+        port: UInt16,
+        onResult: @escaping (Result<String, SupabaseAuthClient.AuthError>) -> Void
+    ) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { throw POSIXError(.EINVAL) }
         let params = NWParameters.tcp
         // Loopback only — never reachable from the network.
@@ -152,11 +155,7 @@ final class LoopbackRedirectServer {
         let success: Bool
         if case .success = result { success = true } else { success = false }
         send(connection, status: "200 OK", body: Self.responseHTML(success: success))
-        if !hasDelivered {
-            hasDelivered = true
-            onResult?(result)
-            onResult = nil
-        }
+        onResult?(result)
     }
 
     private func send(_ connection: NWConnection, status: String, body: String) {

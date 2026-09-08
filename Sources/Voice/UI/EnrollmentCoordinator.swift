@@ -179,7 +179,7 @@ final class EnrollmentCoordinator: ObservableObject, Identifiable {
                 flow.computingSucceeded()
                 onGatingShouldRefresh()
             } else {
-                flow.computingFailed("Could not build a voice profile from the recordings. Try again in a quieter room.")
+                flow.computingFailed("Could not build or save your voice profile. Check available storage and try recording again in a quieter room.")
             }
         }
     }

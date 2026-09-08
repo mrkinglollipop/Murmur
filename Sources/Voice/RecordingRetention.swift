@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Retains recent dictation recordings for future retry. Copies from the
 /// ephemeral `/tmp` capture path into Application Support and prunes by
@@ -124,10 +125,10 @@ enum RecordingRetention {
     static func exportZip(
         to destination: URL,
         historyEntries: [HistoryEntry],
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        zipExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/zip")
     ) throws -> Int {
         let recordings = (try? listedRecordings(in: recordingsDirectory)) ?? []
-        let audioByName = Dictionary(uniqueKeysWithValues: recordings.map { ($0.lastPathComponent, $0) })
 
         let hasAudio = !recordings.isEmpty
         let hasTranscripts = historyEntries.contains { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -149,11 +150,13 @@ enum RecordingRetention {
         }
 
         var packagedAudio = 0
+        var packagedNames = Set<String>()
         for url in recordings {
             let dest = recordingsDir.appendingPathComponent(url.lastPathComponent)
             do {
                 try fileManager.copyItem(at: url, to: dest)
                 packagedAudio += 1
+                packagedNames.insert(url.lastPathComponent)
             } catch {
                 // Skip unreadable files; still export what we can.
                 continue
@@ -182,14 +185,18 @@ enum RecordingRetention {
             if !trimmed.isEmpty {
                 let name = "\(dateString.replacingOccurrences(of: ":", with: "-"))_\(idString.prefix(8)).txt"
                 let url = transcriptsDir.appendingPathComponent(name)
-                try? trimmed.write(to: url, atomically: true, encoding: .utf8)
+                do {
+                    try trimmed.write(to: url, atomically: true, encoding: .utf8)
+                } catch {
+                    throw ExportError.stagingFailed(error.localizedDescription)
+                }
                 transcriptFile = name
             }
 
             var audioFile: String?
             if let path = entry.audioPath {
                 let name = URL(fileURLWithPath: path).lastPathComponent
-                if audioByName[name] != nil {
+                if packagedNames.contains(name) {
                     audioFile = name
                 }
             }
@@ -209,7 +216,7 @@ enum RecordingRetention {
 
         // Also list orphan recordings not referenced by history.
         let referencedNames = Set(manifest.compactMap(\.audioFile))
-        for url in recordings where !referencedNames.contains(url.lastPathComponent) {
+        for url in recordings where packagedNames.contains(url.lastPathComponent) && !referencedNames.contains(url.lastPathComponent) {
             manifest.append(
                 ManifestRow(
                     id: "orphan-\(url.lastPathComponent)",
@@ -233,13 +240,14 @@ enum RecordingRetention {
             throw ExportError.stagingFailed(error.localizedDescription)
         }
 
-        if fileManager.fileExists(atPath: destination.path) {
-            try? fileManager.removeItem(at: destination)
-        }
+        // Build beside the destination so replacement is an atomic rename on
+        // the same volume. A failed archive never removes a previous export.
+        let archive = destination.deletingLastPathComponent().appendingPathComponent(".murmur-export-\(UUID().uuidString).zip")
+        defer { try? fileManager.removeItem(at: archive) }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-        process.arguments = ["-r", "-q", destination.path, "."]
+        process.executableURL = zipExecutableURL
+        process.arguments = ["-r", "-q", archive.path, "."]
         process.currentDirectoryURL = staging
         let errPipe = Pipe()
         process.standardError = errPipe
@@ -252,10 +260,14 @@ enum RecordingRetention {
             throw ExportError.zipFailed(error.localizedDescription)
         }
 
-        guard process.terminationStatus == 0, fileManager.fileExists(atPath: destination.path) else {
+        guard process.terminationStatus == 0, fileManager.fileExists(atPath: archive.path) else {
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
             let errText = String(data: errData, encoding: .utf8) ?? "zip exit \(process.terminationStatus)"
             throw ExportError.zipFailed(errText)
+        }
+
+        guard Darwin.rename(archive.path, destination.path) == 0 else {
+            throw ExportError.zipFailed("Could not replace the destination; the previous export was preserved.")
         }
 
         return packagedAudio
