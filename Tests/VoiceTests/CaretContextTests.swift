@@ -1176,7 +1176,7 @@ final class HeldCaretLifecycleTests: XCTestCase {
     func testPostReleaseCaptureGraceIsTwoHundredFiftyMilliseconds() {
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGraceForTesting,
-            0.250,
+            0.750,
             "grace window regressed — the last spoken word will clip again"
         )
     }

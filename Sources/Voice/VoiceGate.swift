@@ -275,6 +275,11 @@ final class VoiceGate {
         guard let profile = profileStore.load() else {
             return VoiceGateEvaluation(decision: .pass, similarity: nil)
         }
+        // An embedding from another extractor version is not a meaningful
+        // comparator. Do not turn a stale enrollment into a rejection.
+        guard profile.modelId == modelId else {
+            return VoiceGateEvaluation(decision: .pass, similarity: nil)
+        }
         // 2. Provider not ready (loading / download failed / unavailable) → pass.
         guard embeddingProvider.isReady else {
             return VoiceGateEvaluation(decision: .pass, similarity: nil)

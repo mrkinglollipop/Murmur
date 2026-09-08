@@ -436,6 +436,7 @@ final class ASREngineSelector {
     func logStreamedTranscription(
         text: String,
         engineID: String,
+        retainedAudioURL: URL? = nil,
         sessionHeldToken: UInt64? = nil,
         sessionHeldSnapshot: CaretContext.Snapshot? = nil,
         sessionHeldFrontmostPID: pid_t? = nil,
@@ -444,6 +445,7 @@ final class ASREngineSelector {
         pipeline.logStreamedTranscription(
             text: text,
             engineID: engineID,
+            retainedAudioURL: retainedAudioURL,
             sessionHeldToken: sessionHeldToken,
             sessionHeldSnapshot: sessionHeldSnapshot,
             sessionHeldFrontmostPID: sessionHeldFrontmostPID,

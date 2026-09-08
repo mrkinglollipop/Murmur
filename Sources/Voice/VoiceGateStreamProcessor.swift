@@ -59,13 +59,16 @@ final class VoiceGateStreamProcessor {
         gate.updateSensitivity(sensitivity)
     }
 
-    /// Applies the latched gate decision to `buffer`, then feeds the embedding
-    /// path asynchronously. Call from the mic tap thread only.
+    /// Feeds unmodified microphone audio to the embedding path, then applies
+    /// the decision captured at entry to the downstream buffer. The snapshot
+    /// prevents an async evaluation from changing this buffer's treatment
+    /// halfway through processing.
     func processBuffer(_ buffer: AVAudioPCMBuffer) {
         guard isActive else { return }
 
-        applyCurrentDecision(to: buffer)
+        let decision = currentDecisionSnapshot()
         appendResampledSamples(from: buffer)
+        apply(decision, to: buffer)
     }
 
     /// Clears latch state and the embedding accumulator without discarding
@@ -122,10 +125,14 @@ final class VoiceGateStreamProcessor {
 
     // MARK: - Attenuation (sync, realtime thread)
 
-    private func applyCurrentDecision(to buffer: AVAudioPCMBuffer) {
+    private func currentDecisionSnapshot() -> VoiceGateDecision {
         decisionLock.lock()
         let decision = currentDecision
         decisionLock.unlock()
+        return decision
+    }
+
+    private func apply(_ decision: VoiceGateDecision, to buffer: AVAudioPCMBuffer) {
         guard decision == .attenuate else { return }
         guard let channelData = buffer.floatChannelData else { return }
 

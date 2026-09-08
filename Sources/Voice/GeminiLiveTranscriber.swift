@@ -8,6 +8,7 @@ import os.log
 /// `gemini-3.5-transcribe-live` BidiGenerateContent WebSocket.
 /// Structurally modeled on `ElevenLabsRealtimeTranscriber`.
 final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
+    typealias MessageSender = (URLSessionWebSocketTask.Message) async throws -> Void
 
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "gemini-streaming")
 
@@ -16,6 +17,8 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private let smartMode: Bool
     private let vocabulary: [String]
     private let liveOptions: GeminiLiveOptions
+    private let injectedMessageSender: MessageSender?
+    private let now: () -> Date
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
@@ -59,8 +62,14 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var doneResolved = false
 
     private var finalizeRequested = false
+    private var finalizeBoundaryArmed = false
+    private var finalizeCommittedEventSeen = false
+    private var finalizeTurnCompleteSeen = false
     private var tornDown = false
     private var socketClosed = false
+    private var streamIntegrityFailed = false
+    private var lastFinalizeRequiresBufferedAudioRecovery = false
+    private var intentionalSocketShutdown = false
 
     private var sessionStartTime: Date?
     private var sessionCapReached = false
@@ -68,18 +77,28 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     static let sessionCapSeconds: TimeInterval = 580
 
+    var requiresBufferedAudioRecovery: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lastFinalizeRequiresBufferedAudioRecovery || streamIntegrityFailed || sessionCapReached
+    }
+
     init(
         apiKey: String,
         language: String = "en",
         smartMode: Bool = true,
         vocabulary: [String] = [],
-        liveOptions: GeminiLiveOptions = .defaults
+        liveOptions: GeminiLiveOptions = .defaults,
+        messageSender: MessageSender? = nil,
+        now: @escaping () -> Date = Date.init
     ) {
         self.apiKey = apiKey
         self.language = language
         self.smartMode = smartMode
         self.vocabulary = vocabulary
         self.liveOptions = liveOptions.clamped()
+        self.injectedMessageSender = messageSender
+        self.now = now
         super.init()
     }
 
@@ -87,6 +106,11 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     func start() async throws {
         vlog("gemini-stream: starting session")
+        stateLock.lock()
+        streamIntegrityFailed = false
+        lastFinalizeRequiresBufferedAudioRecovery = false
+        intentionalSocketShutdown = false
+        stateLock.unlock()
         resetTranscriptState()
 
         guard let url = Self.buildSocketURL(apiKey: apiKey) else {
@@ -97,7 +121,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         let task = session.webSocketTask(with: url)
         self.session = session
         self.task = task
-        self.sessionStartTime = Date()
+        self.sessionStartTime = now()
 
         let stream = AsyncStream<String> { continuation in
             self.stateLock.lock()
@@ -158,16 +182,21 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             if self.liveOptions.vadMode == .manual, !self.activityStartSent {
                 if let task = self.task {
                     let startFrame = GeminiLiveOptions.makeActivityStartFrameJSON()
-                    try? await task.send(.string(startFrame))
-                    self.stateLock.lock()
-                    self.activityStartSent = true
-                    self.stateLock.unlock()
+                    do {
+                        try await self.sendMessage(.string(startFrame))
+                        self.stateLock.lock()
+                        self.activityStartSent = true
+                        self.stateLock.unlock()
+                    } catch {
+                        self.markStreamIntegrityFailed()
+                    }
                 }
             }
             for await frame in stream {
                 do {
                     try await task.send(.string(frame))
                 } catch {
+                    self.markStreamIntegrityFailed()
                     let ns = error as NSError
                     vlog("gemini-stream: send failed, stopping sender: \(ns.domain)#\(ns.code)")
                     break
@@ -182,16 +211,17 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let continuation = frameContinuation
         let capReached = sessionCapReached
-        if let start = sessionStartTime, !capReached {
-            if Date().timeIntervalSince(start) > Self.sessionCapSeconds {
-                sessionCapReached = true
-                vlog("gemini-stream: 10min cap")
-            }
+        let start = sessionStartTime
+        stateLock.unlock()
+        if let start, !capReached, Self.sessionCapExceeded(elapsed: now().timeIntervalSince(start)) {
+            recordSessionCapReached()
         }
+        stateLock.lock()
         let blocked = capReached || sessionCapReached
         stateLock.unlock()
         guard let continuation, !blocked else { return }
         guard let pcmData = convertToPCM16(buffer) else {
+            markStreamIntegrityFailed()
             vlog("gemini-stream: send — conversion produced no data, dropping buffer")
             return
         }
@@ -207,6 +237,9 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
         tornDown = true
         finalizeRequested = true
+        finalizeBoundaryArmed = false
+        finalizeCommittedEventSeen = false
+        finalizeTurnCompleteSeen = false
         let capReached = sessionCapReached
         stateLock.unlock()
         let finalizeStart = Date()
@@ -221,10 +254,12 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         stateLock.lock()
         let closed = socketClosed
+        let integrityFailed = streamIntegrityFailed
         let accumulatedSoFar = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         stateLock.unlock()
 
         if capReached {
+            markStreamIntegrityFailed()
             tearDownSocket()
             let capText = Self.capReachedFinalizeText(accumulatedSoFar: accumulatedSoFar)
             vlog("gemini-stream: finalize short-circuit (10min cap), \(capText.count) chars preserved")
@@ -234,27 +269,55 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             return capText
         }
 
-        if closed {
+        if closed || integrityFailed {
+            if closed { markStreamIntegrityFailed() }
             tearDownSocket()
-            vlog("gemini-stream: finalize short-circuit (socket closed), \(accumulatedSoFar.count) chars")
+            vlog("gemini-stream: finalize short-circuit (socket/integrity), \(accumulatedSoFar.count) chars")
             stateLock.lock()
             resetTranscriptState()
             stateLock.unlock()
             return accumulatedSoFar
         }
 
-        if let task {
+        stateLock.lock()
+        finalizeCommittedEventSeen = false
+        finalizeTurnCompleteSeen = false
+        stateLock.unlock()
+        if task != nil || injectedMessageSender != nil {
+            let endFrame: String
             switch liveOptions.vadMode {
             case .manual:
-                let endFrame = GeminiLiveOptions.makeActivityEndFrameJSON()
-                try? await task.send(.string(endFrame))
-            case .hybrid:
-                let endFrame = GeminiLiveOptions.makeAudioStreamEndFrameJSON()
-                try? await task.send(.string(endFrame))
-            case .automatic:
-                break
+                endFrame = GeminiLiveOptions.makeActivityEndFrameJSON()
+            case .hybrid, .automatic:
+                // Automatic previously sent nothing and relied on timeout /
+                // next transcription — that early-done path drops the tail.
+                endFrame = GeminiLiveOptions.makeAudioStreamEndFrameJSON()
+            }
+            do {
+                try await sendMessage(.string(endFrame))
+            } catch {
+                markStreamIntegrityFailed()
+                tearDownSocket()
+                stateLock.lock()
+                let text = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+                resetTranscriptState()
+                stateLock.unlock()
+                return text
             }
         }
+        stateLock.lock()
+        finalizeBoundaryArmed = true
+        let shouldResolveDone = finalizeCommittedEventSeen
+            && finalizeTurnCompleteSeen
+            && !doneResolved
+        let earlyContinuation = shouldResolveDone ? doneContinuation : nil
+        let earlyText = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+        if shouldResolveDone {
+            doneResolved = true
+            doneContinuation = nil
+        }
+        stateLock.unlock()
+        earlyContinuation?.resume(returning: earlyText)
 
         let waitSeconds = min(30.0, max(3.0, recordingDuration * 0.25 + 3.0))
         let waitNs = UInt64(waitSeconds * 1_000_000_000)
@@ -283,6 +346,8 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                     return nil
                 }
                 let pending = self.doneContinuation
+                self.lastFinalizeRequiresBufferedAudioRecovery = true
+                self.streamIntegrityFailed = true
                 let text = Self.joinedTranscript(segments: self.committedSegments, partial: self.latestPartial)
                 self.doneResolved = true
                 self.doneContinuation = nil
@@ -346,12 +411,18 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         latestPartial = ""
         everHadNonEmptyStreamText = false
         finalizeRequested = false
+        finalizeBoundaryArmed = false
+        finalizeCommittedEventSeen = false
+        finalizeTurnCompleteSeen = false
         activityStartSent = false
         sessionCapReached = false
         sessionStartTime = nil
     }
 
     private func tearDownSocket() {
+        stateLock.lock()
+        intentionalSocketShutdown = true
+        stateLock.unlock()
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
         senderTask?.cancel()
@@ -371,7 +442,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         vlog("gemini-stream: socket closed (code=\(closeCode.rawValue) reason=\(reasonStr))")
-        failReadyIfPending("closed code \(closeCode.rawValue)")
+        noteSocketClosed(closeCode: closeCode)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -381,6 +452,10 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         } else {
             vlog("gemini-stream: task completed httpStatus=\(status) error=none")
         }
+        stateLock.lock()
+        let intentional = intentionalSocketShutdown
+        stateLock.unlock()
+        if error != nil, !intentional { markStreamIntegrityFailed() }
         failReadyIfPending("task completed httpStatus=\(status)")
     }
 
@@ -415,6 +490,10 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 let ns = error as NSError
                 // Domain+code only — localizedDescription can include the WSS URL (`key=`).
                 vlog("gemini-stream: receive loop ended: \(ns.domain)#\(ns.code)")
+                stateLock.lock()
+                let intentional = intentionalSocketShutdown
+                stateLock.unlock()
+                if !intentional { markStreamIntegrityFailed() }
                 failReadyIfPending("receive: \(ns.domain)#\(ns.code)")
                 break
             }
@@ -430,6 +509,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 if let text = Self.utf8JSONText(fromWebSocketData: data) {
                     handleServerEvent(text)
                 } else {
+                    markStreamIntegrityFailed()
                     vlog("gemini-stream: received non-utf8 binary frame (\(data.count) bytes)")
                 }
             @unknown default:
@@ -442,6 +522,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
+            markStreamIntegrityFailed()
             vlog("gemini-stream: received unparseable event")
             return
         }
@@ -456,6 +537,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 message = "error"
             }
             vlog("gemini-stream: server error: \(CloudTranscriptionError.redactedBodyFragment(message))")
+            markStreamIntegrityFailed()
             failReadyIfPending("server error")
             return
         }
@@ -489,6 +571,11 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         ) {
             applyCommitted(committed)
         }
+
+        if (serverContent["turnComplete"] as? Bool) == true
+            || (serverContent["turn_complete"] as? Bool) == true {
+            noteTurnComplete()
+        }
     }
 
     private func transcriptionText(from serverContent: [String: Any], keys: [String]) -> String? {
@@ -519,10 +606,16 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         if !trimmed.isEmpty {
             committedSegments.append(trimmed)
             everHadNonEmptyStreamText = true
+            // Do not join new segment + stale partial (duplicates the head).
             latestPartial = ""
         }
         let running = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
-        let shouldResolveDone = finalizeRequested && !doneResolved
+        if finalizeRequested { finalizeCommittedEventSeen = true }
+        let shouldResolveDone = finalizeRequested
+            && finalizeBoundaryArmed
+            && finalizeCommittedEventSeen
+            && finalizeTurnCompleteSeen
+            && !doneResolved
         let continuation = shouldResolveDone ? doneContinuation : nil
         if shouldResolveDone {
             doneResolved = true
@@ -532,6 +625,63 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         continuation?.resume(returning: running)
         onInterim?(running)
         vlog("gemini-stream: inputTranscription (\(trimmed.count) chars) finalizeRequested=\(finalizeRequested)")
+    }
+
+    private func noteTurnComplete() {
+        stateLock.lock()
+        if finalizeRequested { finalizeTurnCompleteSeen = true }
+        let shouldResolveDone = finalizeRequested
+            && finalizeBoundaryArmed
+            && finalizeCommittedEventSeen
+            && finalizeTurnCompleteSeen
+            && !doneResolved
+        let continuation = shouldResolveDone ? doneContinuation : nil
+        let running = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
+        if shouldResolveDone {
+            doneResolved = true
+            doneContinuation = nil
+        }
+        stateLock.unlock()
+        continuation?.resume(returning: running)
+    }
+
+    private func sendMessage(_ message: URLSessionWebSocketTask.Message) async throws {
+        if let injectedMessageSender {
+            try await injectedMessageSender(message)
+            return
+        }
+        guard let task else {
+            throw CloudTranscriptionError(provider: .gemini, message: "stream socket unavailable")
+        }
+        try await task.send(message)
+    }
+
+    private func markStreamIntegrityFailed() {
+        stateLock.lock()
+        streamIntegrityFailed = true
+        lastFinalizeRequiresBufferedAudioRecovery = true
+        stateLock.unlock()
+    }
+
+    func recordSessionCapReached() {
+        stateLock.lock()
+        let newlyReached = !sessionCapReached
+        sessionCapReached = true
+        streamIntegrityFailed = true
+        lastFinalizeRequiresBufferedAudioRecovery = true
+        stateLock.unlock()
+        if newlyReached { vlog("gemini-stream: 10min cap") }
+    }
+
+    func noteSocketClosed(closeCode: URLSessionWebSocketTask.CloseCode) {
+        stateLock.lock()
+        socketClosed = true
+        let terminalComplete = doneResolved
+        let shouldFail = !intentionalSocketShutdown
+            && !(closeCode == .normalClosure && terminalComplete)
+        stateLock.unlock()
+        if shouldFail { markStreamIntegrityFailed() }
+        failReadyIfPending("closed code \(closeCode.rawValue)")
     }
 
     // MARK: - Static helpers (@testable)

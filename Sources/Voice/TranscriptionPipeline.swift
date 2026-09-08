@@ -9,6 +9,13 @@ import os.log
 /// completion work here so the selector stays focused on engine selection.
 final class TranscriptionPipeline {
 
+    /// The transcript plus only the formatting provenance needed after edge
+    /// whitespace normalization. It deliberately retains no raw provider text.
+    struct PreprocessedTranscript {
+        let text: String
+        let hadExplicitTrailingNewline: Bool
+    }
+
     /// Tri-state handed to HUD after inject — not a Bool collapse of success/fail.
     enum InjectPipelineResult: Equatable {
         case inserted
@@ -314,9 +321,10 @@ final class TranscriptionPipeline {
                         language: selector.selectedLanguage
                     )
                     let cleaned = await self.applyCleanup(text)
-                    let transformed = await self.applyAutoTransform(cleaned)
+                    let transformed = await self.applyAutoTransform(cleaned.text)
                     self.finishTranscription(
                         text: transformed,
+                        hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
                         engineID: engineTag,
                         audioPath: audioPath,
                         replaceHistoryEntryID: replaceID,
@@ -360,6 +368,7 @@ final class TranscriptionPipeline {
     func logStreamedTranscription(
         text: String,
         engineID: String,
+        retainedAudioURL: URL? = nil,
         sessionHeldToken providedToken: UInt64? = nil,
         sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
         sessionHeldFrontmostPID providedPID: pid_t? = nil,
@@ -373,11 +382,12 @@ final class TranscriptionPipeline {
             )
         Task {
             let cleaned = await self.applyCleanup(text)
-            let transformed = await self.applyAutoTransform(cleaned)
+            let transformed = await self.applyAutoTransform(cleaned.text)
             self.finishTranscription(
                 text: transformed,
+                hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
                 engineID: engineID,
-                audioPath: nil,
+                audioPath: Self.streamedAudioPath(retainedAudioURL),
                 replaceHistoryEntryID: nil,
                 sessionHeldToken: sessionHeldToken,
                 sessionHeldSnapshot: sessionHeldSnapshot,
@@ -385,6 +395,13 @@ final class TranscriptionPipeline {
                 completion: completion
             )
         }
+    }
+
+    /// The stream success path has no audio URL until `AudioRecorder` has
+    /// retained its raw snapshot. Keep nil explicit when retention failed so
+    /// a successful transcript never gets a fabricated history path.
+    static func streamedAudioPath(_ retainedAudioURL: URL?) -> String? {
+        retainedAudioURL?.path
     }
 
     /// Resolve provided stop-time hold, or sample `heldCaret*` once on main.
@@ -424,9 +441,10 @@ final class TranscriptionPipeline {
             do {
                 let text = try await engine.transcribe(audioURL: audioURL)
                 let cleaned = await self.applyCleanup(text)
-                let transformed = await self.applyAutoTransform(cleaned)
+                let transformed = await self.applyAutoTransform(cleaned.text)
                 self.finishTranscription(
                     text: transformed,
+                    hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
                     engineID: engine.id,
                     audioPath: audioPath,
                     replaceHistoryEntryID: replaceHistoryEntryID,
@@ -466,21 +484,23 @@ final class TranscriptionPipeline {
         }
     }
 
-    /// Caps always, then SpokenPunctuation (full table if codeAware; sentence
-    /// commands always), then DotCompound. Package-visible for pipeline-gate
-    /// unit tests. Caps is not gated on codeAware or cleanup.
+    /// Strips known provider audio-event captions, then applies caps, spoken
+    /// punctuation (full table if codeAware; sentence commands always), and
+    /// DotCompound. Package-visible for pipeline-gate unit tests. This applies
+    /// regardless of optional AI cleanup so every ASR path gets the same guard.
     static func preprocessBeforeCleanup(_ text: String, codeAware: Bool) -> String {
-        let capped = SpokenCapitalization.apply(text)
+        let withoutSoundTags = NonSpeechAnnotations.stripRecognizedTags(text)
+        let capped = SpokenCapitalization.apply(withoutSoundTags)
         return DotCompoundNumberNormalizer.apply(
             SpokenPunctuation.apply(capped, codeAware: codeAware)
         )
     }
 
-    private func applyCleanup(_ text: String) async -> String {
-        let preprocessed = Self.preprocessBeforeCleanup(text, codeAware: codeAware)
-        guard cleanupEnabled, let svc = cleanupService, !preprocessed.isEmpty else { return preprocessed }
+    private func applyCleanup(_ text: String) async -> PreprocessedTranscript {
+        let preprocessed = Self.preprocessForCleanup(text, codeAware: codeAware)
+        guard cleanupEnabled, let svc = cleanupService, !preprocessed.text.isEmpty else { return preprocessed }
 
-        let wordCount = preprocessed.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).count
+        let wordCount = preprocessed.text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).count
         guard wordCount > 3 else {
             vlog("cleanup skipped — short input (\(wordCount) words)")
             return preprocessed
@@ -488,11 +508,11 @@ final class TranscriptionPipeline {
 
         let cleanupStart = Date()
         do {
-            let cleaned = try await svc.cleanup(preprocessed, codeAware: codeAware, styleInstruction: styleInstruction)
+            let cleaned = try await svc.cleanup(preprocessed.text, codeAware: codeAware, styleInstruction: styleInstruction)
             vlog("cleanup \(String(format: "%.2f", Date().timeIntervalSince(cleanupStart)))s")
             let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return preprocessed }
-            guard Self.cleanupLooksSane(input: preprocessed, output: trimmed) else {
+            guard Self.cleanupLooksSane(input: preprocessed.text, output: trimmed) else {
                 vlog("cleanup rejected — output diverged from input (likely answered); using raw")
                 return preprocessed
             }
@@ -500,11 +520,34 @@ final class TranscriptionPipeline {
             // `conduct dot mdc`) and cleanupLooksSane accepts that. Re-run the
             // deterministic pass so spoken punctuation wins last.
             // Post-SP only on successful cleanup; Caps does not re-run here.
-            return SpokenPunctuation.apply(trimmed, codeAware: codeAware)
+            return PreprocessedTranscript(
+                text: SpokenPunctuation.apply(trimmed, codeAware: codeAware),
+                hadExplicitTrailingNewline: preprocessed.hadExplicitTrailingNewline
+            )
         } catch {
             vlog("cleanup failed: \(error.localizedDescription) — using raw")
             return preprocessed
         }
+    }
+
+    /// Records only whether preprocessing created a terminal newline after
+    /// provider edge whitespace was removed. That distinguishes a spoken
+    /// `new line` command from an incidental provider trailing newline without
+    /// retaining the raw provider response beyond this stage.
+    static func preprocessForCleanup(_ text: String, codeAware: Bool) -> PreprocessedTranscript {
+        let preprocessed = preprocessBeforeCleanup(text, codeAware: codeAware)
+        let providerEdgeNormalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formattingProbe = preprocessBeforeCleanup(providerEdgeNormalized, codeAware: codeAware)
+        return PreprocessedTranscript(
+            text: preprocessed,
+            hadExplicitTrailingNewline: formattingProbe.last?.isNewline == true
+        )
+    }
+
+    /// Shared finish-stage normalization for ordinary provider edge whitespace.
+    /// Formatting intent has already been reduced to `hadExplicitTrailingNewline`.
+    static func normalizeTranscriptForInjection(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func applyAutoTransform(_ text: String) async -> String {
@@ -542,6 +585,7 @@ final class TranscriptionPipeline {
 
     private func finishTranscription(
         text: String,
+        hadExplicitTrailingNewline: Bool,
         engineID: String,
         audioPath: String?,
         replaceHistoryEntryID: UUID?,
@@ -550,7 +594,7 @@ final class TranscriptionPipeline {
         sessionHeldFrontmostPID: pid_t?,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.normalizeTranscriptForInjection(text)
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 
@@ -572,6 +616,8 @@ final class TranscriptionPipeline {
             let (corrected, records) = self.onTranscription?(trimmed, engineID) ?? (trimmed, [])
             if !records.isEmpty { self.onCorrectionsRecorded?(records) }
             let expanded = self.onSnippetExpand?(corrected) ?? corrected
+            let snippetExpansionOccurred = expanded != corrected
+            let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
             let capitalizedTerms = self.engineSelector?.capitalizedDictionaryTermsProvider?() ?? []
             // Prefer the stop-time session snapshot when present. Token match
             // for clear still uses sessionHeldToken; live held is only a
@@ -642,7 +688,14 @@ final class TranscriptionPipeline {
                         IsSecureEventInputEnabled()
                     }
                     textToInject = Self.applyInjectTransforms(
-                        expanded: expanded,
+                        expanded: Self.prepareResolvedSnapshotTextForInjection(
+                            expanded: expanded,
+                            snapshot: resolved,
+                            codeAware: self.codeAware,
+                            hasExplicitCustomTransform: hasExplicitCustomTransform,
+                            snippetExpansionOccurred: snippetExpansionOccurred,
+                            hadExplicitTrailingNewline: hadExplicitTrailingNewline
+                        ),
                         snapshot: resolved,
                         secureInput: liveSecure,
                         smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
@@ -803,6 +856,27 @@ final class TranscriptionPipeline {
             transcriptFirstChar: text.first
         )
         return shouldPrepend ? " " + text : text
+    }
+
+    /// Preparation that runs after the final AX snapshot resolves, so it can
+    /// reject a period before visible text while remaining independent of AI
+    /// cleanup and provider selection.
+    static func prepareResolvedSnapshotTextForInjection(
+        expanded: String,
+        snapshot: CaretContext.Snapshot,
+        codeAware: Bool,
+        hasExplicitCustomTransform: Bool,
+        snippetExpansionOccurred: Bool,
+        hadExplicitTrailingNewline: Bool = false
+    ) -> String {
+        TerminalPunctuation.prepare(
+            expanded,
+            snapshot: snapshot,
+            codeAware: codeAware,
+            hasExplicitCustomTransform: hasExplicitCustomTransform,
+            snippetExpansionOccurred: snippetExpansionOccurred,
+            hadExplicitTrailingNewline: hadExplicitTrailingNewline
+        )
     }
 
     /// Pure decision seam for the secure-input / history-logging / HUD outcome

@@ -46,21 +46,19 @@ enum CloudAudioTranscoder {
             AVLinearPCMIsNonInterleaved: false
         ]
 
-        // Read entire input into memory (dictation clips are short).
-        let frameCount = AVAudioFrameCount(inputFile.length)
-        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount) else {
-            throw CloudAudioTranscoderError.bufferAllocationFailed
-        }
-        try inputFile.read(into: inputBuffer)
-
         let framesToWrite: AVAudioPCMBuffer
         if inputFormat.sampleRate == outputFormat.sampleRate,
            inputFormat.channelCount == outputFormat.channelCount,
            inputFormat.commonFormat == outputFormat.commonFormat {
+            let frameCount = AVAudioFrameCount(inputFile.length)
+            guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount) else {
+                throw CloudAudioTranscoderError.bufferAllocationFailed
+            }
+            try inputFile.read(into: inputBuffer)
             framesToWrite = inputBuffer
         } else {
             framesToWrite = try convertToOutputBuffer(
-                inputBuffer: inputBuffer,
+                inputFile: inputFile,
                 inputFormat: inputFormat,
                 outputFormat: outputFormat
             )
@@ -68,6 +66,17 @@ enum CloudAudioTranscoder {
 
         guard framesToWrite.frameLength > 0 else {
             throw CloudAudioTranscoderError.emptyOutput
+        }
+
+        let expectedOutputFrames = Int64(
+            (Double(inputFile.length) * outputFormat.sampleRate / inputFormat.sampleRate).rounded()
+        )
+        let actualOutputFrames = Int64(framesToWrite.frameLength)
+        guard abs(actualOutputFrames - expectedOutputFrames) <= 1 else {
+            throw CloudAudioTranscoderError.incompleteConversion(
+                expectedFrames: expectedOutputFrames,
+                actualFrames: actualOutputFrames
+            )
         }
 
         do {
@@ -91,7 +100,7 @@ enum CloudAudioTranscoder {
 
     /// Drains `AVAudioConverter` into one contiguous Int16 buffer (no per-packet writes).
     private static func convertToOutputBuffer(
-        inputBuffer: AVAudioPCMBuffer,
+        inputFile: AVAudioFile,
         inputFormat: AVAudioFormat,
         outputFormat: AVAudioFormat
     ) throws -> AVAudioPCMBuffer {
@@ -100,31 +109,62 @@ enum CloudAudioTranscoder {
         }
 
         let ratio = outputFormat.sampleRate / max(inputFormat.sampleRate, 1)
-        let outCapacity = max(AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio) + 32, 4096)
+        let outCapacity = max(AVAudioFrameCount(Double(inputFile.length) * ratio) + 32, 4096)
         guard let accumulated = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outCapacity) else {
             throw CloudAudioTranscoderError.bufferAllocationFailed
         }
-        guard let packetBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outCapacity) else {
+        guard let packetBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4096) else {
             throw CloudAudioTranscoderError.bufferAllocationFailed
         }
 
         var error: NSError?
-        var inputProvided = false
+        var inputReadError: Error?
+        var totalInputFrames: AVAudioFramePosition = 0
         var totalOutputFrames: AVAudioFrameCount = 0
 
         // Drain until endOfStream. Accumulate packets in memory; never write
         // partial packets to ExtAudioFile mid-loop (assertion on edge audio).
         conversionLoop: while true {
             packetBuffer.frameLength = 0
-            let status = converter.convert(to: packetBuffer, error: &error) { _, outStatus in
-                if inputProvided {
+            let status = converter.convert(to: packetBuffer, error: &error) { requestedPackets, outStatus in
+                guard totalInputFrames < inputFile.length else {
                     outStatus.pointee = .endOfStream
                     return nil
                 }
-                inputProvided = true
+
+                // AVAudioConverter may consume only the packet count it requested.
+                // Returning the entire recording and then end-of-stream silently
+                // discards the unconsumed suffix. Read exactly the requested slice
+                // and advance AVAudioFile's frame position on every callback.
+                let remaining = inputFile.length - totalInputFrames
+                let requestedFrames = min(AVAudioFramePosition(requestedPackets), remaining)
+                guard requestedFrames > 0,
+                      let inputChunk = AVAudioPCMBuffer(
+                          pcmFormat: inputFormat,
+                          frameCapacity: AVAudioFrameCount(requestedFrames)
+                      ) else {
+                    inputReadError = CloudAudioTranscoderError.bufferAllocationFailed
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+
+                do {
+                    try inputFile.read(into: inputChunk, frameCount: AVAudioFrameCount(requestedFrames))
+                } catch {
+                    inputReadError = error
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                guard inputChunk.frameLength > 0 else {
+                    inputReadError = CloudAudioTranscoderError.conversionFailed
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                totalInputFrames += AVAudioFramePosition(inputChunk.frameLength)
                 outStatus.pointee = .haveData
-                return inputBuffer
+                return inputChunk
             }
+            if inputReadError != nil { throw CloudAudioTranscoderError.conversionFailed }
             if error != nil { throw CloudAudioTranscoderError.conversionFailed }
 
             switch status {
@@ -154,6 +194,12 @@ enum CloudAudioTranscoder {
             }
         }
 
+        guard totalInputFrames == inputFile.length else {
+            throw CloudAudioTranscoderError.incompleteConversion(
+                expectedFrames: inputFile.length,
+                actualFrames: totalInputFrames
+            )
+        }
         accumulated.frameLength = totalOutputFrames
         return accumulated
     }
@@ -196,6 +242,7 @@ enum CloudAudioTranscoderError: Error, LocalizedError {
     case converterConstructionFailed
     case bufferAllocationFailed
     case conversionFailed
+    case incompleteConversion(expectedFrames: Int64, actualFrames: Int64)
     case writeFailed
 
     var errorDescription: String? {
@@ -212,6 +259,8 @@ enum CloudAudioTranscoderError: Error, LocalizedError {
             return "Cloud audio transcode: buffer allocation failed"
         case .conversionFailed:
             return "Cloud audio transcode: conversion failed"
+        case let .incompleteConversion(expectedFrames, actualFrames):
+            return "Cloud audio transcode: incomplete conversion (expected \(expectedFrames) frames, produced \(actualFrames))"
         case .writeFailed:
             return "Cloud audio transcode: failed to write WAV output"
         }
