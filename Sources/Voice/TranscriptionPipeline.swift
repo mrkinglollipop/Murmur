@@ -107,6 +107,34 @@ final class TranscriptionPipeline {
     var test_heldCaretSnapshot: CaretContext.Snapshot? { heldCaretSnapshot }
     var test_heldFrontmostPID: pid_t? { heldFrontmostPID }
 
+    /// Hold tokens whose processing HUD was already dismissed by the
+    /// recorder's watchdog. A late result for one of these is saved to History
+    /// only — typing it into whatever app is focused by then would be a
+    /// surprise. Main-thread only; capped so a never-arriving result cannot
+    /// grow it.
+    private var abandonedHoldTokens: Set<UInt64> = []
+    private static let abandonedHoldTokenCap = 8
+
+    /// Marks a live hold as abandoned (main thread).
+    func markHoldAbandoned(_ token: UInt64) {
+        assert(Thread.isMainThread, "markHoldAbandoned requires main thread")
+        abandonedHoldTokens.insert(token)
+        if abandonedHoldTokens.count > Self.abandonedHoldTokenCap,
+           let oldest = abandonedHoldTokens.min() {
+            abandonedHoldTokens.remove(oldest)
+        }
+    }
+
+    /// One-shot: true when `token` was abandoned, and forgets it. Retries
+    /// (`replaceHistoryEntryID != nil`) never consume — they already save
+    /// without insertion. Main thread only.
+    private func consumeAbandonedHold(token: UInt64, replaceHistoryEntryID: UUID?) -> Bool {
+        guard replaceHistoryEntryID == nil else { return false }
+        return abandonedHoldTokens.remove(token) != nil
+    }
+
+    var test_abandonedHoldTokens: Set<UInt64> { abandonedHoldTokens }
+
     /// Test hook: install a synthetic held snapshot (no AX) on the main thread.
     @discardableResult
     func test_holdSnapshot(_ snapshot: CaretContext.Snapshot, frontmostPID: pid_t? = nil) -> UInt64 {
@@ -480,10 +508,15 @@ final class TranscriptionPipeline {
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         DispatchQueue.main.async {
+            let abandoned = self.consumeAbandonedHold(
+                token: sessionHeldToken,
+                replaceHistoryEntryID: replaceHistoryEntryID
+            )
             if replaceHistoryEntryID == nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
-            self.onFailure?(.transcriptionFailed)
+            // The user already saw this hold dismissed; no late error pill.
+            if !abandoned { self.onFailure?(.transcriptionFailed) }
             self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
             completion?(.failed)
         }
@@ -634,10 +667,14 @@ final class TranscriptionPipeline {
 
         guard !trimmed.isEmpty else {
             DispatchQueue.main.async {
+                let abandoned = self.consumeAbandonedHold(
+                    token: sessionHeldToken,
+                    replaceHistoryEntryID: replaceHistoryEntryID
+                )
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                self.onFailure?(.transcriptionFailed)
+                if !abandoned { self.onFailure?(.transcriptionFailed) }
                 if let audioPath {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
@@ -652,9 +689,15 @@ final class TranscriptionPipeline {
             let expanded = self.onSnippetExpand?(corrected) ?? corrected
             let snippetExpansionOccurred = expanded != corrected
             let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
-            if let retryID = replaceHistoryEntryID {
+            let abandoned = self.consumeAbandonedHold(
+                token: sessionHeldToken,
+                replaceHistoryEntryID: replaceHistoryEntryID
+            )
+            if replaceHistoryEntryID != nil || abandoned {
                 // Retrying a recording is a History operation. Focus may be on
                 // History's search field or an unrelated app by the time ASR ends.
+                // An abandoned hold (HUD watchdog fired) is saved the same way:
+                // the user moved on, so nothing is typed into the focused app.
                 let saved = Self.prepareResolvedSnapshotTextForInjection(
                     expanded: expanded,
                     snapshot: .unknown,
@@ -663,7 +706,10 @@ final class TranscriptionPipeline {
                     snippetExpansionOccurred: snippetExpansionOccurred,
                     hadExplicitTrailingNewline: hadExplicitTrailingNewline
                 )
-                self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, retryID)
+                if abandoned {
+                    self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                }
+                self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, replaceHistoryEntryID)
                 completion?(.savedToHistory)
                 return
             }

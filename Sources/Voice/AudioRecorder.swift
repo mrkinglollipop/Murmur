@@ -755,6 +755,48 @@ final class AudioRecorder {
     /// the discard path can tell a dead mic from an accidental tap.
     private var lastHoldDuration: TimeInterval = 0
 
+    /// A press→release shorter than this with no stream text is an accidental
+    /// tap. Measured before the post-release capture grace, which would
+    /// otherwise inflate buffered audio past the silence guard's floor.
+    static let accidentalTapMaxHoldSeconds: TimeInterval = 0.3
+
+    /// Discard the hold outright (no transcription, no injection, no history
+    /// row). Unknown duration (mic never started) is left to the existing
+    /// failure paths.
+    static func shouldDiscardAccidentalTap(
+        holdDuration: TimeInterval?,
+        streamTextEver: Bool
+    ) -> Bool {
+        guard let holdDuration else { return false }
+        return holdDuration < accidentalTapMaxHoldSeconds && !streamTextEver
+    }
+
+    /// Slack past the recording's own length before the processing HUD is
+    /// force-dismissed. Covers finalize + batch upload retry + local fallback
+    /// on a healthy day; a stuck hold must not outlive it.
+    private static let processingHUDWatchdogBaseSeconds: TimeInterval = 20
+
+    static func processingHUDWatchdogBound(audioDuration: TimeInterval) -> TimeInterval {
+        processingHUDWatchdogBaseSeconds + (audioDuration.isFinite ? max(0, audioDuration) : 0)
+    }
+
+    /// Only the watchdog armed for the current hold may fire, and only while
+    /// the HUD is still showing processing.
+    static func shouldFireProcessingWatchdog(
+        generation: UInt64,
+        currentGeneration: UInt64,
+        hudIsProcessing: Bool
+    ) -> Bool {
+        generation == currentGeneration && hudIsProcessing
+    }
+
+    /// Bumped whenever a processing watchdog is armed or cancelled, so a
+    /// superseded timer callback no-ops instead of hiding a newer hold's HUD.
+    private var processingWatchdogGeneration: UInt64 = 0
+    /// Hold the armed watchdog belongs to, so a late finish for an older hold
+    /// cannot cancel a newer hold's timer.
+    private var processingWatchdogToken: UInt64?
+
     /// Tracks the most recent start/stop request. Guards against a stale
     /// permission-completion handler (fired after a later stopRecording())
     /// resurrecting a recording the caller already cancelled.
@@ -1236,6 +1278,13 @@ final class AudioRecorder {
 
     func startRecording(heldCaretToken: UInt64? = nil) {
         pendingHeldCaretToken = heldCaretToken
+        // A newer hold owns the HUD now; the previous hold's watchdog must
+        // not hide it. `startRecording` can arrive off-main.
+        if Thread.isMainThread {
+            cancelProcessingWatchdog()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.cancelProcessingWatchdog() }
+        }
         // Freeze hold immediately while this token still owns the pipeline
         // slot — a rapid re-press can steal the live slot before stop samples.
         cacheHoldForAssignedToken(heldCaretToken)
@@ -1938,6 +1987,7 @@ final class AudioRecorder {
             clearHeldCaretSnapshotMatchingSession(token)
         }
         DispatchQueue.main.async { [weak self] in
+            self?.cancelProcessingWatchdog()
             self?.hud.hide()
             self?.asrSelector.onFailure?(.secureInputBlocked)
         }
@@ -2005,9 +2055,48 @@ final class AudioRecorder {
         // gesture and must not drift to whatever app is frontmost 250ms
         // later.
         let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold())
-        let holdDuration = startTime.map { Date().timeIntervalSince($0) } ?? 0
+        let holdDuration = startTime.map { Date().timeIntervalSince($0) }
 
+        armProcessingWatchdog(sessionToken: sessionHold.token, audioDuration: holdDuration ?? 0)
         scheduleStopGrace(sessionHold: sessionHold, holdDuration: holdDuration)
+    }
+
+    /// Bounds how long the processing HUD can outlive release. On expiry the
+    /// HUD is hidden and the hold marked abandoned, so a late result is saved
+    /// to History instead of typed into whatever app is focused by then.
+    private func armProcessingWatchdog(sessionToken: UInt64?, audioDuration: TimeInterval) {
+        processingWatchdogGeneration &+= 1
+        let generation = processingWatchdogGeneration
+        processingWatchdogToken = sessionToken
+        let bound = Self.processingHUDWatchdogBound(audioDuration: audioDuration)
+        DispatchQueue.main.asyncAfter(deadline: .now() + bound) { [weak self] in
+            self?.fireProcessingWatchdog(generation: generation, sessionToken: sessionToken)
+        }
+    }
+
+    private func cancelProcessingWatchdog() {
+        processingWatchdogGeneration &+= 1
+    }
+
+    /// Cancels only when the finishing hold is the one the watchdog guards.
+    private func cancelProcessingWatchdog(forToken token: UInt64?) {
+        guard token == processingWatchdogToken else { return }
+        cancelProcessingWatchdog()
+    }
+
+    private func fireProcessingWatchdog(generation: UInt64, sessionToken: UInt64?) {
+        guard Self.shouldFireProcessingWatchdog(
+            generation: generation,
+            currentGeneration: processingWatchdogGeneration,
+            hudIsProcessing: hud.isProcessing
+        ) else { return }
+        processingWatchdogGeneration &+= 1
+        logger.warning("Processing HUD watchdog fired — abandoning hold.")
+        vlog("processing HUD watchdog fired — hold abandoned, late result goes to History only")
+        if let sessionToken {
+            asrSelector.pipeline.markHoldAbandoned(sessionToken)
+        }
+        hud.hide()
     }
 
     /// Schedules `finishStop` to run after `postReleaseCaptureGrace(forHoldDuration:)`,
@@ -2015,12 +2104,12 @@ final class AudioRecorder {
     /// trailing buffers keep landing in `pcmBuffers` and keep streaming to
     /// the active cloud transcriber. A fast re-press ends this early via
     /// `flushPendingStopGrace()` instead of waiting out the delay.
-    private func scheduleStopGrace(sessionHold: SessionHold, holdDuration: TimeInterval) {
+    private func scheduleStopGrace(sessionHold: SessionHold, holdDuration: TimeInterval?) {
         stopGraceGeneration &+= 1
         let generation = stopGraceGeneration
-        let grace = Self.postReleaseCaptureGrace(forHoldDuration: holdDuration)
+        let grace = Self.postReleaseCaptureGrace(forHoldDuration: holdDuration ?? 0)
         stopGraceFinalize = { [weak self] in
-            self?.finishStop(sessionHold: sessionHold)
+            self?.finishStop(sessionHold: sessionHold, holdDuration: holdDuration)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
             self?.runStopGraceIfCurrent(generation)
@@ -2065,7 +2154,7 @@ final class AudioRecorder {
     /// the tap installed in `startMicCapture` keeps firing — appending to
     /// `pcmBuffers` and calling `sendToXAI`/`sendToElevenLabs`/`sendToGemini`/
     /// `sendToMuse` — for every buffer that arrives before this runs.
-    private func finishStop(sessionHold: SessionHold) {
+    private func finishStop(sessionHold: SessionHold, holdDuration: TimeInterval?) {
         let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
         lastHoldDuration = elapsed
 
@@ -2088,6 +2177,14 @@ final class AudioRecorder {
             || (streamingCoordinator.elevenLabsSession?.hasEverHadNonEmptyStreamText ?? false)
             || (streamingCoordinator.geminiSession?.hasEverHadNonEmptyStreamText ?? false)
             || (streamingCoordinator.museSession?.hasEverHadNonEmptyStreamText ?? false)
+
+        if Self.shouldDiscardAccidentalTap(
+            holdDuration: holdDuration,
+            streamTextEver: streamTextEver
+        ) {
+            finishAccidentalTap(sessionHeldToken: sessionHold.token)
+            return
+        }
 
         let xaiContext = StreamingCoordinator.XAIStopContext(
             duration: elapsed,
@@ -2406,6 +2503,22 @@ final class AudioRecorder {
         )
     }
 
+    /// Drops a split-second tap: no transcription, no injection, no history
+    /// row (a tombstone per stray fn tap would only clutter History). Tears
+    /// down the mic and any open stream so nothing keeps running.
+    private func finishAccidentalTap(sessionHeldToken: UInt64?) {
+        vlog("accidental tap — hold under \(Self.accidentalTapMaxHoldSeconds)s with no stream text, discarding")
+        streamingCoordinator.cancelAll()
+        teardownMicEngine()
+        clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
+        clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.cancelProcessingWatchdog(forToken: sessionHeldToken)
+            self.hud.hide()
+        }
+    }
+
     /// Tombstone a hold that produced nothing injectable — failed history row
     /// via existing `onTranscriptionLogged` (no parallel HistoryStore write).
     /// Display-only (nil audioPath); does not play failure sound (avoids Basso
@@ -2429,6 +2542,7 @@ final class AudioRecorder {
         clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.cancelProcessingWatchdog(forToken: sessionHeldToken)
             self.asrSelector.onTranscriptionLogged?(
                 "",
                 engineID,
@@ -2757,6 +2871,7 @@ final class AudioRecorder {
         sessionHeldToken: UInt64?
     ) {
         clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        cancelProcessingWatchdog(forToken: sessionHeldToken)
         switch result {
         case .inserted:
             hud.showSuccessThenHide()
