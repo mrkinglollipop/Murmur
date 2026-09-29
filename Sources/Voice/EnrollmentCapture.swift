@@ -63,44 +63,70 @@ final class EnrollmentCapture {
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
 
-        inputNode.removeTap(onBus: 0)
-
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            guard let self else { return }
-
-            if let channelData = buffer.floatChannelData {
-                let frameCount = Int(buffer.frameLength)
-                if frameCount > 0 {
-                    var sum: Float = 0
-                    let samples = channelData[0]
-                    for index in 0 ..< frameCount {
-                        let sample = samples[index]
-                        sum += sample * sample
-                    }
-                    let rawRMS = sqrt(sum / Float(frameCount))
-                    let alpha: Float = rawRMS > self.smoothedLevel ? 0.6 : 0.3
-                    self.smoothedLevel = self.smoothedLevel + (rawRMS - self.smoothedLevel) * alpha
-                    let normalized = min(1.0, max(0, self.smoothedLevel - 0.003) * 50)
-                    DispatchQueue.main.async {
-                        levelCallback(normalized)
-                    }
-                }
-            }
-
-            if let resampled = self.resampleTo16kMonoFloat(buffer) {
-                self.accumulatedSamples.append(contentsOf: resampled)
-            }
+        // A ghost / mid-transition default input reports 0 Hz or 0 ch; the tap
+        // install (and start) on it raises an NSException that aborts the app.
+        guard Self.shouldAttemptTap(sampleRate: format.sampleRate, channelCount: format.channelCount) else {
+            completion(false)
+            return
         }
 
-        do {
-            try engine.start()
+        inputNode.removeTap(onBus: 0)
+
+        let tapResult = ObjCExceptionCatcher.run {
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+                guard let self else { return }
+
+                if let channelData = buffer.floatChannelData {
+                    let frameCount = Int(buffer.frameLength)
+                    if frameCount > 0 {
+                        var sum: Float = 0
+                        let samples = channelData[0]
+                        for index in 0 ..< frameCount {
+                            let sample = samples[index]
+                            sum += sample * sample
+                        }
+                        let rawRMS = sqrt(sum / Float(frameCount))
+                        let alpha: Float = rawRMS > self.smoothedLevel ? 0.6 : 0.3
+                        self.smoothedLevel = self.smoothedLevel + (rawRMS - self.smoothedLevel) * alpha
+                        let normalized = min(1.0, max(0, self.smoothedLevel - 0.003) * 50)
+                        DispatchQueue.main.async {
+                            levelCallback(normalized)
+                        }
+                    }
+                }
+
+                if let resampled = self.resampleTo16kMonoFloat(buffer) {
+                    self.accumulatedSamples.append(contentsOf: resampled)
+                }
+            }
+        }
+        guard case .success = tapResult else {
+            resetCaptureState()
+            completion(false)
+            return
+        }
+
+        var startError: Error?
+        let startResult = ObjCExceptionCatcher.run {
+            do {
+                try self.engine.start()
+            } catch {
+                startError = error
+            }
+        }
+        if case .success = startResult, startError == nil {
             isCapturing = true
             completion(true)
-        } catch {
-            inputNode.removeTap(onBus: 0)
+        } else {
+            _ = ObjCExceptionCatcher.run { inputNode.removeTap(onBus: 0) }
             resetCaptureState()
             completion(false)
         }
+    }
+
+    /// Whether the default input's format is live enough to tap.
+    static func shouldAttemptTap(sampleRate: Double, channelCount: UInt32) -> Bool {
+        !AudioRecorder.inputFormatLooksDead(sampleRate: sampleRate, channelCount: channelCount)
     }
 
     private func stopEngine() {

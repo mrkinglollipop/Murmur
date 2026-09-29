@@ -68,7 +68,7 @@ enum LocalModel: String, CaseIterable, Identifiable, Codable {
 // MARK: - Cloud ASR Model
 
 /// Cloud transcription providers shown in Settings. Selectable cases are
-/// xAI Grok STT, ElevenLabs Scribe v2 Realtime, and Gemini 3.5 Transcribe
+/// xAI Grok Voice Transcribe 2.0, ElevenLabs Scribe v2 Realtime, and Gemini 3.5 Transcribe
 /// Live; retired providers remain for Keychain/factory compatibility but are
 /// hidden from the picker. Batch uploads are wired via `CloudTranscriber`;
 /// streaming via `XAIStreamingTranscriber`, `ElevenLabsRealtimeTranscriber`,
@@ -119,7 +119,7 @@ enum CloudModel: String, CaseIterable, Identifiable, Codable {
         case .deepgramNova3:           return "Deepgram Nova-3"
         case .openAIGPT4oTranscribe:   return "OpenAI gpt-4o-transcribe"
         case .groqWhisperLargeV3Turbo: return "Groq whisper-large-v3-turbo"
-        case .xaiGrokSTT:              return "xAI Grok (grok-stt)"
+        case .xaiGrokSTT:              return "xAI Grok Voice Transcribe 2.0"
         case .elevenLabsScribeV2Realtime: return "ElevenLabs Scribe v2 Realtime"
         case .gemini35TranscribeLive:  return "Gemini 3.5 Transcribe"
         case .museVoiceTranscribeLive: return "Meta Muse Voice Transcribe"

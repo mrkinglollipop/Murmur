@@ -296,6 +296,18 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(verdict, .acceptUnverified)
     }
 
+    func testCanaryVerdict_lateChunksObservedForcesAcceptUnverified() {
+        for isSecondAttempt in [false, true] {
+            let verdict = TextInjector.canaryVerdict(
+                canaryObserved: true,
+                wentBlind: false,
+                isSecondAttempt: isSecondAttempt,
+                lateChunksObserved: true
+            )
+            XCTAssertEqual(verdict, .acceptUnverified, "isSecondAttempt=\(isSecondAttempt)")
+        }
+    }
+
     func testCanaryVerdict_allEightInputCombinations() {
         let expectations: [(
             canaryObserved: Bool,
@@ -560,6 +572,60 @@ final class TextInjectorTests: XCTestCase {
 
         secondWork?()
         XCTAssertEqual(testPasteboard.string(forType: .string), "first")
+    }
+
+    func testBackToBackPasteInserts_restoreOriginalClipboard() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("original", forType: .string)
+
+        var works: [() -> Void] = []
+        for transcript in ["first", "second"] {
+            let baseline = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
+            TextInjector.preparePasteboardForPaste(transcript, on: testPasteboard)
+            TextInjector.scheduleDeferredPasteboardRestore(
+                injectedText: transcript,
+                savedPasteboard: baseline,
+                on: testPasteboard,
+                delay: 2.0,
+                asyncAfter: { _, block in works.append(block) }
+            )
+        }
+
+        works[0]()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "second",
+                       "superseded restore must not clobber newer inject")
+        works[1]()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "original")
+        testPasteboard.clearContents()
+        testPasteboard.setString("later copy", forType: .string)
+        let next = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
+        XCTAssertEqual(next.first?[.string].flatMap { String(data: $0, encoding: .utf8) }, "later copy",
+                       "baseline is cleared once the restore ran")
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+    }
+
+    func testPasteboardBaseline_clearedWhenRestoreSkippedForExternalOverwrite() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("original", forType: .string)
+        let baseline = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
+        TextInjector.preparePasteboardForPaste("first", on: testPasteboard)
+
+        var work: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "first",
+            savedPasteboard: baseline,
+            on: testPasteboard,
+            delay: 2.0,
+            asyncAfter: { _, block in work = block }
+        )
+        testPasteboard.clearContents()
+        testPasteboard.setString("user copy", forType: .string)
+        work?()
+
+        let next = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
+        XCTAssertEqual(next.first?[.string].flatMap { String(data: $0, encoding: .utf8) }, "user copy")
     }
 
     // MARK: - Pasteboard helpers (named test pasteboard only)

@@ -57,6 +57,20 @@ final class StitchDedupeTests: XCTestCase {
         )
     }
 
+    func testDedupeKeepsShortGenuineRepetition() {
+        for text in ["I think so I think so", "no no no no", "yes yes yes yes yes yes yes yes"] {
+            XCTAssertEqual(XAIStreamingTranscriber.dedupeRepeatedContent(text), text)
+        }
+    }
+
+    func testDedupeCollapsesTwelveWordDoubledString() {
+        let twelve = "one two three four five six"
+        XCTAssertEqual(
+            XAIStreamingTranscriber.dedupeRepeatedContent(twelve + " " + twelve),
+            twelve
+        )
+    }
+
     func testDedupeIgnoresShortText() {
         let text = "hello hello"
         XCTAssertEqual(XAIStreamingTranscriber.dedupeRepeatedContent(text), text)

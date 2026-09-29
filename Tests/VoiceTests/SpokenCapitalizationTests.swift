@@ -94,6 +94,27 @@ final class SpokenCapitalizationTests: XCTestCase {
         )
     }
 
+    func testProseWithCapitalNounIsUnchanged() {
+        let sentence = "It went well in the capital, I think"
+        XCTAssertEqual(SpokenCapitalization.apply(sentence), sentence)
+    }
+
+    func testDistantTargetIsNotCapitalizedAndNewlineSurvives() {
+        let text = "Is this the state capital, I guess\nNew line here"
+        XCTAssertEqual(SpokenCapitalization.apply(text), text)
+    }
+
+    func testCommandKeepsFollowingCommaAndNewline() {
+        XCTAssertEqual(
+            SpokenCapitalization.apply("my name is john capital j, and I live here\nsecond line"),
+            "my name is John, and I live here\nsecond line"
+        )
+        XCTAssertEqual(
+            SpokenCapitalization.apply("client secret capital s\nnext"),
+            "client Secret\nnext"
+        )
+    }
+
     func testOAuthStyleCapitalCS() {
         XCTAssertEqual(
             SpokenCapitalization.apply("OAuth Client secret capital c capital s"),

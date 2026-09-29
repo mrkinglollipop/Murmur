@@ -109,6 +109,7 @@ enum PhoneticMatcher {
         "go", "see", "know", "think", "want", "need", "use", "make", "take",
         "look", "say", "said", "let", "may", "right", "left", "good", "new",
         "old", "long", "little", "first", "last", "next", "type",
+        "i", "us", "our", "your", "his", "her", "its", "them", "their",
     ]
 }
 

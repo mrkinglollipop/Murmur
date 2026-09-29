@@ -110,7 +110,7 @@ Manage models in **Settings → Local Model**. Model files live under `~/Library
 
 | Provider | Model | Notes |
 |----------|-------|-------|
-| xAI | Grok STT | Optional live WebSocket streaming |
+| xAI | Grok Voice Transcribe 2.0 | Optional live WebSocket streaming |
 | ElevenLabs | Scribe v2 Realtime | Always streams (batch only as fallback) |
 | Google Gemini | Gemini 3.5 Transcribe Live | Always streams (batch only as fallback); Preview |
 

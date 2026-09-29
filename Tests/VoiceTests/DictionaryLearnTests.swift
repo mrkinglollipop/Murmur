@@ -238,4 +238,17 @@ final class DictionaryLearnTests: XCTestCase {
         )
         XCTAssertTrue(learned.isEmpty)
     }
+
+    func testSingleLetterEditDoesNotLearnPronounVariant() {
+        let store = makeStore()
+        let learned = store.learn(from: "I think", to: "We think", userInitiated: true)
+        XCTAssertTrue(learned.isEmpty)
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testCommonPronounsAreProtectedHeardTokens() {
+        for word in ["i", "I", "us", "our", "your", "his", "her", "its", "them", "their", "me", "my", "we", "he", "she", "it"] {
+            XCTAssertTrue(PhoneticMatcher.isProtectedHeardToken(word), word)
+        }
+    }
 }

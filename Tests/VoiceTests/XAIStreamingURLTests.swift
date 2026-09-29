@@ -9,6 +9,12 @@ final class XAIStreamingURLTests: XCTestCase {
         XCTAssertEqual(items.first(where: { $0.name == "interim_results" })?.value, "true")
     }
 
+    func testBuildSocketURLPinsModel() {
+        let url = XAIStreamingTranscriber.buildSocketURL(language: "en")
+        let items = URLComponents(url: url!, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first(where: { $0.name == "model" })?.value, "grok-voice-transcribe-2.0")
+    }
+
     func testBuildSocketURLClampsEndpointingToRange() {
         let low = XAIStreamingTranscriber.buildSocketURL(language: "en", endpointingMs: 1)
         let high = XAIStreamingTranscriber.buildSocketURL(language: "en", endpointingMs: 99_000)

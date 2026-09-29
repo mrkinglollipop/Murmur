@@ -393,7 +393,7 @@ struct HistoryView: View {
         HStack(spacing: 4) {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 10))
-            Text("Transcription failed")
+            Text(HistoryEntry.failedPlaceholderText)
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundColor(Theme.recordRed.opacity(0.85))
@@ -481,8 +481,9 @@ struct HistoryView: View {
     }
 
     private func saveEdit(for entry: HistoryEntry) {
-        let originalText = entry.text
-        dictionaryStore.learn(from: originalText, to: draftText, userInitiated: true)
+        if entry.isLearnableEditSource {
+            dictionaryStore.learn(from: entry.text, to: draftText, userInitiated: true)
+        }
         store.updateText(id: entry.id, newText: draftText)
         editingID = nil
         focusedEditID = nil

@@ -308,7 +308,7 @@ final class ASREngineSelector {
     }
 
     /// Builds an xAI Grok streaming session if — and only if — the streaming
-    /// path is enabled AND the selected cloud model is xAI Grok STT AND a
+    /// path is enabled AND the selected cloud model is xAI Grok Voice Transcribe AND a
     /// non-empty key is stored for it. Returns `nil` otherwise, in which case
     /// the caller uses its normal (WhisperKit-streaming or file-based) path,
     /// and xAI (if selected) transcribes via the batch multipart POST. Checked
