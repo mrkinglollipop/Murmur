@@ -59,6 +59,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onReplayOnboarding: { [weak self] in self?.replayOnboarding() }
     )
 
+    /// AppKit's stock handler for the `quit` Apple event refuses (reply -128,
+    /// "User canceled") while an app-modal `NSAlert.runModal()` or an attached
+    /// sheet is up, so `osascript … to quit` (install-local.sh) could never
+    /// replace a running app. Own the event: dismiss modal state, then
+    /// terminate. Must be installed before `finishLaunching` completes.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard !Self.isQuitHandlerInstalled else { return }
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleQuitAppleEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEQuitApplication)
+        )
+        Self.isQuitHandlerInstalled = true
+    }
+
+    private static var isQuitHandlerInstalled = false
+
+    @objc private func handleQuitAppleEvent(
+        _ event: NSAppleEventDescriptor,
+        withReplyEvent reply: NSAppleEventDescriptor
+    ) {
+        QuitRequest.dismissBlockingUI()
+        // Deferred a turn so an aborted `runModal()` unwinds before terminate.
+        DispatchQueue.main.async { NSApp.terminate(nil) }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        .terminateNow
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         FontRegistrar.registerBundledFonts()
         VoicePaths.prepareApplicationSupportVoiceDirectory()
@@ -564,6 +595,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 accessibilityDescription: "Murmur"
             )
             button.image?.isTemplate = true
+        }
+    }
+}
+
+/// Ends whatever UI would make AppKit cancel a programmatic quit.
+enum QuitRequest {
+    @MainActor
+    static func dismissBlockingUI() {
+        for window in NSApp.windows {
+            if let sheet = window.attachedSheet {
+                window.endSheet(sheet, returnCode: .abort)
+            }
+        }
+        if NSApp.modalWindow != nil {
+            NSApp.abortModal()
         }
     }
 }
