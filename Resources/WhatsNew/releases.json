@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.1.53",
+    "build": "54",
+    "title": "What's New in 0.1.53",
+    "items": [
+      "An accidental tap of the dictation key is ignored instead of leaving Transcribing on screen.",
+      "The Transcribing panel can no longer stay up indefinitely; a late result is saved to History instead of being typed into another app.",
+      "ElevenLabs dictation avoids an unnecessary second transcription when the final text has already arrived.",
+      "Releasing the key before a live connection is ready recovers from the recording right away.",
+      "Emoji are typed intact, and a paste that already landed is never repeated.",
+      "Filler removal leaves the word um alone in languages other than English.",
+      "Saying forward slash now joins short words such as PP/shipped when code-aware mode is on.",
+      "Removing an API key asks for confirmation, and deleting a History entry also deletes its recording.",
+      "Saved data is protected from being overwritten when a file cannot be read at launch.",
+      "Murmur quits cleanly when asked to, even with a sheet open."
+    ]
+  },
+  {
     "version": "0.1.52",
     "build": "53",
     "title": "What's New in 0.1.52",

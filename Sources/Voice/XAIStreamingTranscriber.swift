@@ -145,6 +145,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// lock since both are set from the receive-loop task.
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var readyResolved = false
+    /// Set once `start()` has begun. With `readyResolved` still false, the
+    /// server has not sent `transcript.created`, so anything sent now would be wasted.
+    private var startInvoked = false
 
     /// Resolved exactly once by the receive loop when `transcript.done`
     /// arrives (or by `finalize()`'s own timeout, which also flips this so
@@ -206,6 +209,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     func start() async throws {
         vlog("xai-stream: starting session")
         stateLock.lock()
+        startInvoked = true
         streamIntegrityFailed = false
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
@@ -219,10 +223,24 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let task = session.webSocketTask(with: request)
-        self.session = session
-        self.task = task
+        // An injected message sender replaces the socket entirely (unit tests):
+        // no URLSession is created, so start() never touches the network.
+        let task: URLSessionWebSocketTask?
+        if injectedMessageSender == nil {
+            let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let socketTask = session.webSocketTask(with: request)
+            self.session = session
+            self.task = socketTask
+            task = socketTask
+        } else {
+            task = nil
+        }
+
+        // Production writes go straight to the captured task (unaffected by a
+        // later teardown clearing `self.task`); with no socket, the injected sender.
+        func sendFrame(_ message: URLSessionWebSocketTask.Message) async throws {
+            if let task { try await task.send(message) } else { try await sendMessage(message) }
+        }
 
         // Create the frame stream + continuation BEFORE resuming so frames
         // captured during the connection handshake are BUFFERED (AsyncStream's
@@ -242,7 +260,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             await self?.runReceiveLoop()
         }
 
-        task.resume()
+        task?.resume()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
@@ -296,7 +314,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         senderTask = Task {
             for await frame in stream {
                 do {
-                    try await task.send(.data(frame))
+                    try await sendFrame(.data(frame))
                 } catch {
                     self.markStreamIntegrityFailed()
                     vlog("xai-stream: send failed, stopping sender: \(error.localizedDescription)")
@@ -376,12 +394,15 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let closed = socketClosed
         let integrityFailed = streamIntegrityFailed
+        let notReady = startInvoked && !readyResolved
         let confirmedSoFar = mergeConfirmedWithInterim()
         stateLock.unlock()
-        if closed || integrityFailed {
-            if closed { markStreamIntegrityFailed() }
+        // Released before transcript.created: audio.done would reach the socket
+        // ahead of any audio, so skip it and recover from the buffered audio.
+        if closed || integrityFailed || notReady {
+            if closed || notReady { markStreamIntegrityFailed() }
             tearDownSocket()
-            vlog("xai-stream: finalize short-circuit (socket/integrity), \(confirmedSoFar.count) chars")
+            vlog("xai-stream: finalize short-circuit (socket/integrity/not-ready), \(confirmedSoFar.count) chars")
             let processed = Self.postProcessTranscript(confirmedSoFar)
             stateLock.lock()
             resetTranscriptState()

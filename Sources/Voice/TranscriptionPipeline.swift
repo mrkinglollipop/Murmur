@@ -70,6 +70,11 @@ final class TranscriptionPipeline {
     /// Sixth arg is optional history entry ID to replace (retry path).
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)?
 
+    /// History hook for a hold the HUD watchdog abandoned: text, engine id,
+    /// audio path. Separate from `onTranscriptionLogged` because the row must
+    /// read "Saved in History" — nothing was typed or left on the clipboard.
+    var onAbandonedHoldSaved: ((String, String, String?) -> Void)?
+
     /// Fired on the main thread after a confirmed insert with the delivered text
     /// (for inline correction watching). Not called for dedupe or failed inserts.
     var onTextInserted: ((String) -> Void)?
@@ -106,6 +111,34 @@ final class TranscriptionPipeline {
     var test_heldCaretToken: UInt64 { heldCaretToken }
     var test_heldCaretSnapshot: CaretContext.Snapshot? { heldCaretSnapshot }
     var test_heldFrontmostPID: pid_t? { heldFrontmostPID }
+
+    /// Hold tokens whose processing HUD was already dismissed by the
+    /// recorder's watchdog. A late result for one of these is saved to History
+    /// only — typing it into whatever app is focused by then would be a
+    /// surprise. Main-thread only; capped so a never-arriving result cannot
+    /// grow it.
+    private var abandonedHoldTokens: Set<UInt64> = []
+    private static let abandonedHoldTokenCap = 8
+
+    /// Marks a live hold as abandoned (main thread).
+    func markHoldAbandoned(_ token: UInt64) {
+        assert(Thread.isMainThread, "markHoldAbandoned requires main thread")
+        abandonedHoldTokens.insert(token)
+        if abandonedHoldTokens.count > Self.abandonedHoldTokenCap,
+           let oldest = abandonedHoldTokens.min() {
+            abandonedHoldTokens.remove(oldest)
+        }
+    }
+
+    /// One-shot: true when `token` was abandoned, and forgets it. Retries
+    /// (`replaceHistoryEntryID != nil`) never consume — they already save
+    /// without insertion. Main thread only.
+    private func consumeAbandonedHold(token: UInt64, replaceHistoryEntryID: UUID?) -> Bool {
+        guard replaceHistoryEntryID == nil else { return false }
+        return abandonedHoldTokens.remove(token) != nil
+    }
+
+    var test_abandonedHoldTokens: Set<UInt64> { abandonedHoldTokens }
 
     /// Test hook: install a synthetic held snapshot (no AX) on the main thread.
     @discardableResult
@@ -480,10 +513,15 @@ final class TranscriptionPipeline {
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         DispatchQueue.main.async {
+            let abandoned = self.consumeAbandonedHold(
+                token: sessionHeldToken,
+                replaceHistoryEntryID: replaceHistoryEntryID
+            )
             if replaceHistoryEntryID == nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
-            self.onFailure?(.transcriptionFailed)
+            // The user already saw this hold dismissed; no late error pill.
+            if !abandoned { self.onFailure?(.transcriptionFailed) }
             self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
             completion?(.failed)
         }
@@ -604,10 +642,14 @@ final class TranscriptionPipeline {
         }
         let inWords = Set(words(input))
         let outWords = words(output)
-        guard !outWords.isEmpty, !inWords.isEmpty else { return true }
+        // No words in the input leaves nothing to compare against.
+        guard !inWords.isEmpty else { return true }
 
         let ratio = Double(output.count) / Double(max(input.count, 1))
         if ratio > 2.0 || ratio < 0.4 { return false }
+
+        // A symbol-only reply ("…", an emoji) is not a cleanup of spoken words.
+        guard !outWords.isEmpty else { return false }
 
         let newWords = outWords.filter { !inWords.contains($0) }
         return Double(newWords.count) / Double(outWords.count) <= 0.4
@@ -630,10 +672,14 @@ final class TranscriptionPipeline {
 
         guard !trimmed.isEmpty else {
             DispatchQueue.main.async {
+                let abandoned = self.consumeAbandonedHold(
+                    token: sessionHeldToken,
+                    replaceHistoryEntryID: replaceHistoryEntryID
+                )
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                self.onFailure?(.transcriptionFailed)
+                if !abandoned { self.onFailure?(.transcriptionFailed) }
                 if let audioPath {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
@@ -648,9 +694,15 @@ final class TranscriptionPipeline {
             let expanded = self.onSnippetExpand?(corrected) ?? corrected
             let snippetExpansionOccurred = expanded != corrected
             let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
-            if let retryID = replaceHistoryEntryID {
+            let abandoned = self.consumeAbandonedHold(
+                token: sessionHeldToken,
+                replaceHistoryEntryID: replaceHistoryEntryID
+            )
+            if replaceHistoryEntryID != nil || abandoned {
                 // Retrying a recording is a History operation. Focus may be on
                 // History's search field or an unrelated app by the time ASR ends.
+                // An abandoned hold (HUD watchdog fired) is saved the same way:
+                // the user moved on, so nothing is typed into the focused app.
                 let saved = Self.prepareResolvedSnapshotTextForInjection(
                     expanded: expanded,
                     snapshot: .unknown,
@@ -659,7 +711,14 @@ final class TranscriptionPipeline {
                     snippetExpansionOccurred: snippetExpansionOccurred,
                     hadExplicitTrailingNewline: hadExplicitTrailingNewline
                 )
-                self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, retryID)
+                if abandoned {
+                    self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                }
+                if abandoned, let onAbandonedHoldSaved = self.onAbandonedHoldSaved {
+                    onAbandonedHoldSaved(saved, engineID, audioPath)
+                } else {
+                    self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, replaceHistoryEntryID)
+                }
                 completion?(.savedToHistory)
                 return
             }

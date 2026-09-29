@@ -65,6 +65,28 @@ final class HesitationNormalizerTests: XCTestCase {
         )
     }
 
+    func testPortugueseArticleUmIsKept() {
+        let text = "Eu tenho um carro muito bonito"
+        XCTAssertEqual(
+            HesitationNormalizer.normalize(text, codeAware: false, enabled: true, language: "pt"),
+            text
+        )
+    }
+
+    func testUmIsRemovedWhenLanguageIsEnglish() {
+        XCTAssertEqual(
+            HesitationNormalizer.normalize("as an, um, complete audit", codeAware: false, enabled: true, language: "en"),
+            "as an, complete audit"
+        )
+    }
+
+    func testUhIsStillRemovedInOtherLanguages() {
+        XCTAssertEqual(
+            HesitationNormalizer.normalize("eu tenho, uh, um carro bonito", codeAware: false, enabled: true, language: "pt"),
+            "eu tenho, um carro bonito"
+        )
+    }
+
     func testDisabledLeavesTextUntouched() {
         XCTAssertEqual(
             HesitationNormalizer.normalize("as an, uh, complete audit", codeAware: false, enabled: false),

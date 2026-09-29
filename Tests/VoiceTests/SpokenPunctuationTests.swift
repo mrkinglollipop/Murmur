@@ -122,6 +122,10 @@ final class SpokenPunctuationTests: XCTestCase {
         )
     }
 
+    func testForwardSlashJoinsTwoLetterLeftNeighbor() {
+        XCTAssertEqual(SpokenPunctuation.apply("PP forward slash shipped"), "PP/shipped")
+    }
+
     func testBackSlashBetweenWords() {
         XCTAssertEqual(
             SpokenPunctuation.apply("foo back slash bar"),

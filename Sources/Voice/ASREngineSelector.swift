@@ -238,6 +238,11 @@ final class ASREngineSelector {
         set { pipeline.onTranscriptionLogged = newValue }
     }
 
+    var onAbandonedHoldSaved: ((String, String, String?) -> Void)? {
+        get { pipeline.onAbandonedHoldSaved }
+        set { pipeline.onAbandonedHoldSaved = newValue }
+    }
+
     /// Confirmed insert delivered text — for inline correction watching.
     var onTextInserted: ((String) -> Void)? {
         get { pipeline.onTextInserted }
