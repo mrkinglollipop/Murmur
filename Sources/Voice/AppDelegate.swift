@@ -92,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FontRegistrar.registerBundledFonts()
+        RealWordLexicon.warmUp()
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         CorrectionsLog.liveInstance = correctionsLog
 

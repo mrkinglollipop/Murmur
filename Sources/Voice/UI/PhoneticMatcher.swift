@@ -140,6 +140,14 @@ struct RealWordLexicon {
         return RealWordLexicon { words.contains($0) }
     }()
 
+    /// Forces the one-time dictionary load off the main thread so the first
+    /// correction doesn't pay for it. `system` is a `static let`, so a caller
+    /// racing the warm-up blocks on the same initialization rather than
+    /// loading twice.
+    static func warmUp() {
+        DispatchQueue.global(qos: .utility).async { _ = system }
+    }
+
     private static func loadSystemWords() -> Set<String> {
         guard
             let contents = try? String(contentsOfFile: "/usr/share/dict/words", encoding: .utf8),
