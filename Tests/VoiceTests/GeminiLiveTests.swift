@@ -83,6 +83,29 @@ final class GeminiLiveTests: XCTestCase {
         XCTAssertEqual(joined, "hello world")
     }
 
+    func testStalledSetupSendTimesOutWithinReadinessWindow() async {
+        let transcriber = GeminiLiveTranscriber(
+            apiKey: "test-key",
+            readinessTimeoutSeconds: 0.3,
+            messageSender: { _ in
+                // Never returns and ignores cancellation — a stalled connect.
+                await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+            }
+        )
+        let started = Date()
+        do {
+            try await transcriber.start()
+            XCTFail("start() must not succeed while the setup send is stalled")
+        } catch {
+            XCTAssertTrue(error is CloudTranscriptionError)
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            3.0,
+            "a stalled setup send must be bounded by the readiness window"
+        )
+    }
+
     func testCommittedTranscriptReplacesLongerSpeculativePartial() {
         let session = GeminiLiveTranscriber(apiKey: "test-key")
         session.handleServerEvent("""
