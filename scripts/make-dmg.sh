@@ -15,11 +15,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-if [[ -z "${DEVELOPMENT_TEAM:-}" && -f Config/Team.xcconfig ]]; then
-  DEVELOPMENT_TEAM="$(grep -E '^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=' Config/Team.xcconfig \
-    | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d ' ')"
-fi
-TEAM="${DEVELOPMENT_TEAM:?Set DEVELOPMENT_TEAM or add DEVELOPMENT_TEAM to Config/Team.xcconfig (see Config/Team.xcconfig.example)}"
+# shellcheck source=release-lib.sh
+source "$ROOT/scripts/release-lib.sh"
+# Validates the id (^[A-Z0-9]{10}$) — the example file's YOUR_TEAM_ID fails here.
+TEAM="$(resolve_development_team "$ROOT/Config/Team.xcconfig")" || exit 1
 IDENTITY="${CODE_SIGN_IDENTITY:-Developer ID Application}"
 DERIVED="$ROOT/build/DerivedData"
 PRODUCT="$DERIVED/Build/Products/Release/Murmur.app"
@@ -70,8 +69,20 @@ codesign --force --options runtime --timestamp \
   --sign "$IDENTITY" \
   "$PRODUCT"
 codesign --verify --deep --strict "$PRODUCT"
-codesign -d --entitlements :- "$PRODUCT" 2>/dev/null | grep -q get-task-allow \
-  && { echo "error: get-task-allow still present after re-sign" >&2; exit 1; } || true
+# Capture first, then test: in a `codesign | grep -q … && … || true` pipeline
+# under pipefail, SIGPIPE (141) or a codesign failure silently skipped the check.
+if ! ENTITLEMENTS_OUT="$(codesign -d --entitlements :- "$PRODUCT" 2>/dev/null)"; then
+  echo "error: could not read entitlements from re-signed $PRODUCT" >&2
+  exit 1
+fi
+if [[ -z "$ENTITLEMENTS_OUT" ]]; then
+  echo "error: re-signed app reports no entitlements (expected Voice.entitlements)" >&2
+  exit 1
+fi
+if grep -q get-task-allow <<<"$ENTITLEMENTS_OUT"; then
+  echo "error: get-task-allow still present after re-sign" >&2
+  exit 1
+fi
 
 echo "==> Staging (Murmur.app + /Applications symlink)"
 rm -rf "$STAGE" "$DMG"
