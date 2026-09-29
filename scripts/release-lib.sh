@@ -135,6 +135,35 @@ newest_appcast_backup() {
 
 # --- Release assets --------------------------------------------------------
 
+# The URL curl_fresh actually requests: cache-busting nonce appended, respecting
+# an existing query string.
+cache_busted_url() {
+  local url="$1" nonce="$2" sep="?"
+  [[ "$url" == *\?* ]] && sep="&"
+  printf '%s%scb=%s\n' "$url" "$sep" "$nonce"
+}
+
+# Fresh GET -L of a URL with cache busting (query nonce + no-cache) into <out>.
+# Retries: a just-uploaded GitHub asset can 404 or serve stale bytes briefly.
+# Usage: curl_fresh <label> <url> <out>; return 1 after 5 failed attempts.
+curl_fresh() {
+  local label="$1" url="$2" out="$3"
+  local attempt=1 max=5
+  while true; do
+    if curl -sfL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        -o "$out" "$(cache_busted_url "$url" "$(date +%s)-${attempt}")" 2>/dev/null; then
+      return 0
+    fi
+    if (( attempt >= max )); then
+      echo "error: could not download ${label} after ${max} attempts: $url" >&2
+      return 1
+    fi
+    echo "  ${label}: download attempt ${attempt}/${max} failed; retrying…" >&2
+    sleep 3
+    attempt=$((attempt + 1))
+  done
+}
+
 # Reads asset names (one per line) on stdin. Returns 0 when any is a .dmg.
 assets_include_dmg() {
   grep -qiE '\.dmg$'
