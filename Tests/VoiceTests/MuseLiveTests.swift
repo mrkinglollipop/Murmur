@@ -48,7 +48,8 @@ final class MuseLiveTests: XCTestCase {
             apiKey: "test-key",
             readinessTimeoutSeconds: 0.3,
             messageSender: { _ in
-                // Never returns and ignores cancellation — a stalled connect.
+                // Never returns and ignores cancellation — a stalled connect. The
+                // injected sender replaces the socket, so start() stays off the network.
                 await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
             }
         )
@@ -63,6 +64,24 @@ final class MuseLiveTests: XCTestCase {
             Date().timeIntervalSince(started),
             3.0,
             "a stalled setup send must be bounded by the readiness window"
+        )
+    }
+
+    func testCumulativePartialAfterFinalDoesNotDoubleCommittedHead() {
+        let transcriber = MuseLiveTranscriber(apiKey: "key")
+        transcriber.handleServerEvent(#"{"type":"transcript","transcript":"send the report","final":true}"#)
+        transcriber.handleServerEvent(#"{"type":"transcript","transcript":"Send the report to Dana","final":false}"#)
+        XCTAssertEqual(transcriber.joinedTranscriptSnapshot(), "Send the report to Dana")
+    }
+
+    func testJoinedTranscriptStillAppendsUnrelatedPartialAndKeepsContainedOne() {
+        XCTAssertEqual(
+            MuseLiveTranscriber.joinedTranscript(segments: ["hello world"], partial: "second thought"),
+            "hello world second thought"
+        )
+        XCTAssertEqual(
+            MuseLiveTranscriber.joinedTranscript(segments: ["hello world again"], partial: "hello world"),
+            "hello world again"
         )
     }
 

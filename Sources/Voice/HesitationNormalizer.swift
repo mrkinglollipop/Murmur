@@ -5,20 +5,34 @@ import Foundation
 /// rewrite and never changes code-aware text or quoted speech.
 enum HesitationNormalizer {
 
-    static func normalize(_ text: String, codeAware: Bool, enabled: Bool) -> String {
+    /// `language` is the selected dictation language (ISO code). "um" is a real
+    /// word outside English (Portuguese/German article, "eu tenho um carro"),
+    /// so it is only a hesitation when the language is English. Nil resolves
+    /// the persisted language setting, defaulting to English when unset.
+    static func normalize(
+        _ text: String,
+        codeAware: Bool,
+        enabled: Bool,
+        language: String? = nil
+    ) -> String {
         guard enabled, !codeAware else { return text }
 
+        let hesitations = hesitationTokens(language: language ?? persistedLanguage())
         let tokens = wordTokens(in: text)
         let nonHesitationCount = tokens.filter { token in
-            let lower = String(text[token]).lowercased()
-            return lower != "uh" && lower != "um"
+            !hesitations.contains(String(text[token]).lowercased())
         }.count
         // A bare "uh", "um okay", and other short utterances may be
         // intentional. Require a real prose run around the hesitation.
         guard nonHesitationCount >= 3 else { return text }
 
         let quotedRanges = quotedRanges(in: text)
-        let candidates = removableCandidates(tokens: tokens, quotedRanges: quotedRanges, in: text)
+        let candidates = removableCandidates(
+            tokens: tokens,
+            quotedRanges: quotedRanges,
+            hesitations: hesitations,
+            in: text
+        )
         guard !candidates.isEmpty else { return text }
 
         let removals = merged(removals: candidates.map { removalRange(for: $0, in: text) })
@@ -41,16 +55,27 @@ enum HesitationNormalizer {
     private static func removableCandidates(
         tokens: [Range<String.Index>],
         quotedRanges: [Range<String.Index>],
+        hesitations: Set<String>,
         in text: String
     ) -> [Range<String.Index>] {
         tokens.enumerated().compactMap { index, token in
             let lower = String(text[token]).lowercased()
-            guard lower == "uh" || lower == "um" else { return nil }
+            guard hesitations.contains(lower) else { return nil }
             guard !quotedRanges.contains(where: { $0.contains(token.lowerBound) }) else { return nil }
             guard isStandalone(token, in: text) else { return nil }
             guard !isDeliberateLetterSpelling(token, prior: index > 0 ? tokens[index - 1] : nil, in: text) else { return nil }
             return token
         }
+    }
+
+    private static func hesitationTokens(language: String) -> Set<String> {
+        let iso = language.split(separator: "-").first.map { $0.lowercased() } ?? "en"
+        return iso == "en" ? ["uh", "um"] : ["uh"]
+    }
+
+    private static func persistedLanguage() -> String {
+        let stored = UserDefaults.standard.string(forKey: "voice.settings.selectedLanguage")
+        return (stored?.isEmpty == false ? stored : nil) ?? "en"
     }
 
     private static func wordTokens(in text: String) -> [Range<String.Index>] {

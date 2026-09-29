@@ -12,6 +12,40 @@ enum ModelDownloadState: Equatable {
     case failed(String)
 }
 
+// MARK: - Download ticket book
+
+/// Tags each download with an id so a task that was cancelled (or superseded
+/// by a newer download of the same model) can tell it no longer owns the
+/// model's state or folder. Without this, a cancelled task's late `catch`
+/// deletes the folder and sets `.failed` under a re-download started meanwhile.
+struct DownloadTicketBook {
+    private var current: [LocalModel: UUID] = [:]
+
+    /// Issues a fresh ticket for `model`, superseding any earlier one.
+    mutating func issue(for model: LocalModel) -> UUID {
+        let id = UUID()
+        current[model] = id
+        return id
+    }
+
+    func isCurrent(_ id: UUID, for model: LocalModel) -> Bool {
+        current[model] == id
+    }
+
+    /// Invalidates whatever ticket is outstanding for `model`.
+    mutating func revoke(for model: LocalModel) {
+        current[model] = nil
+    }
+
+    /// Clears `model`'s ticket only if `id` still owns it. True when it did.
+    @discardableResult
+    mutating func retire(_ id: UUID, for model: LocalModel) -> Bool {
+        guard current[model] == id else { return false }
+        current[model] = nil
+        return true
+    }
+}
+
 // MARK: - Model Manager
 
 /// Owns per-model on-disk storage management for the WhisperKit-backed
@@ -90,6 +124,7 @@ final class ModelManager: ObservableObject {
     /// call for the same model awaits the existing task instead of racing a
     /// second HubApi snapshot for the same files.
     private var downloadTasks: [LocalModel: Task<Void, Never>] = [:]
+    private var downloadTickets = DownloadTicketBook()
 
     init() {
         VoicePaths.prepareApplicationSupportVoiceDirectory()
@@ -388,6 +423,7 @@ final class ModelManager: ObservableObject {
 
         state[model] = .downloading
         downloadProgress[model] = 0
+        let ticket = downloadTickets.issue(for: model)
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -404,6 +440,7 @@ final class ModelManager: ObservableObject {
                     }
                 )
                 await MainActor.run {
+                    guard self.downloadTickets.retire(ticket, for: model) else { return }
                     self.state[model] = .idle
                     self.downloadProgress[model] = 1.0
                     self.downloadTasks[model] = nil
@@ -412,11 +449,14 @@ final class ModelManager: ObservableObject {
                 self.logger.info("ModelManager: download complete for \(model.rawValue, privacy: .public)")
             } catch {
                 self.logger.error("ModelManager: download failed for \(model.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                // Recovery: remove any partial/corrupt folder so the next
-                // attempt starts from a clean slate rather than resuming
-                // into (or being confused by) a truncated snapshot.
-                Self.cleanupPartialDownload(for: model)
                 await MainActor.run {
+                    // Cancelled or superseded: `delete` already owns the
+                    // folder and a newer download owns state — touch neither.
+                    guard self.downloadTickets.retire(ticket, for: model) else { return }
+                    // Recovery: remove any partial/corrupt folder so the next
+                    // attempt starts from a clean slate rather than resuming
+                    // into (or being confused by) a truncated snapshot.
+                    Self.cleanupPartialDownload(for: model)
                     self.state[model] = .failed(error.localizedDescription)
                     self.downloadProgress[model] = nil
                     self.downloadTasks[model] = nil
@@ -454,6 +494,7 @@ final class ModelManager: ObservableObject {
         // Don't delete out from under an in-flight download.
         downloadTasks[model]?.cancel()
         downloadTasks[model] = nil
+        downloadTickets.revoke(for: model)
         state[model] = .idle
         downloadProgress[model] = nil
 

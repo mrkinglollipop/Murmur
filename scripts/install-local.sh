@@ -6,11 +6,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-if [[ -z "${DEVELOPMENT_TEAM:-}" && -f Config/Team.xcconfig ]]; then
-  DEVELOPMENT_TEAM="$(grep -E '^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=' Config/Team.xcconfig \
-    | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d ' ')"
-fi
-TEAM="${DEVELOPMENT_TEAM:?Set DEVELOPMENT_TEAM or add DEVELOPMENT_TEAM to Config/Team.xcconfig (see Config/Team.xcconfig.example)}"
+# shellcheck source=release-lib.sh
+source "$ROOT/scripts/release-lib.sh"
+# Validates the id (^[A-Z0-9]{10}$) — the example file's YOUR_TEAM_ID fails here.
+TEAM="$(resolve_development_team "$ROOT/Config/Team.xcconfig")" || exit 1
 IDENTITY="${CODE_SIGN_IDENTITY:-Developer ID Application}"
 DERIVED="$ROOT/build/DerivedData"
 PRODUCT="$DERIVED/Build/Products/Release/Murmur.app"
@@ -73,7 +72,19 @@ for attempt in {1..100}; do
   sleep 0.1
 done
 if pgrep -x Murmur >/dev/null 2>&1; then
-  echo "error: Murmur did not quit. The installed app is unchanged; staged build: $STAGING" >&2
+  # Ignored the quit request. Fall back to SIGTERM (still runs
+  # applicationWillTerminate via the default handler) on the captured PIDs of
+  # the INSTALLED copy only — never another build that happens to be running.
+  echo "==> Murmur ignored the quit request; sending SIGTERM to the installed copy"
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    case "$(ps -o comm= -p "$pid" 2>/dev/null)" in
+      "$DEST"/*) sigterm_and_wait "$pid" 50 || true ;;
+    esac
+  done < <(pgrep -x Murmur 2>/dev/null || true)
+fi
+if pgrep -x Murmur >/dev/null 2>&1; then
+  echo "error: Murmur did not quit (survived SIGTERM, or is not the installed copy). The installed app is unchanged; staged build: $STAGING" >&2
   exit 1
 fi
 

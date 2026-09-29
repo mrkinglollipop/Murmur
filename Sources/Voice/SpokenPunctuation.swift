@@ -11,14 +11,19 @@ enum SpokenPunctuation {
         let separator: String
         /// Minimum length for left/right `\w` segments (avoids eating short English words).
         let minWordLength: Int
+        /// Overrides `minWordLength` for the left segment only. The right
+        /// side stays stricter because a short right word is usually prose
+        /// ("type forward slash at the start"), while a short left token is
+        /// usually an acronym or path root ("PP forward slash shipped").
+        var minLeadingWordLength: Int? = nil
     }
 
     /// "foo underscore bar" / "src forward slash lib" → joined identifiers.
     private static let wordJoiners: [WordJoiner] = [
         WordJoiner(spokenPattern: #"underscore|under\s+score"#, separator: "_", minWordLength: 1),
         WordJoiner(spokenPattern: #"dot|period"#, separator: ".", minWordLength: 1),
-        WordJoiner(spokenPattern: #"forward\s+slash"#, separator: "/", minWordLength: 3),
-        WordJoiner(spokenPattern: #"back\s+slash"#, separator: "\\", minWordLength: 3),
+        WordJoiner(spokenPattern: #"forward\s+slash"#, separator: "/", minWordLength: 3, minLeadingWordLength: 2),
+        WordJoiner(spokenPattern: #"back\s+slash"#, separator: "\\", minWordLength: 3, minLeadingWordLength: 2),
         WordJoiner(spokenPattern: "colon", separator: ":", minWordLength: 2),
     ]
 
@@ -312,8 +317,12 @@ enum SpokenPunctuation {
 
     private static let compiledWordJoiners: [(NSRegularExpression, String)] = {
         wordJoiners.compactMap { joiner in
-            let word = joiner.minWordLength <= 1 ? #"\w+"# : #"\w{\#(joiner.minWordLength),}"#
-            let pattern = "(\(word))\\s+(?:\(joiner.spokenPattern))\\s+(\(word))"
+            func word(_ minLength: Int) -> String {
+                minLength <= 1 ? #"\w+"# : #"\w{\#(minLength),}"#
+            }
+            let left = word(joiner.minLeadingWordLength ?? joiner.minWordLength)
+            let right = word(joiner.minWordLength)
+            let pattern = "(\(left))\\s+(?:\(joiner.spokenPattern))\\s+(\(right))"
             guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
                 return nil
             }
