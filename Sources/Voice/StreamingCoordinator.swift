@@ -20,22 +20,44 @@ final class StreamingCoordinator {
     /// Non-nil while a WhisperKit streaming session owns transcription.
     private(set) var whisperSession: StreamingTranscriber?
 
+    /// Guards the four cloud-session references below: the realtime audio-tap
+    /// thread reads them per buffer while main sets/clears them (start,
+    /// start-failure, stop, `cancelAll`). Each read returns one retained
+    /// snapshot, so a session cleared mid-buffer stays alive for that send.
+    private let sessionLock = NSLock()
+
     /// Non-nil while an xAI Grok streaming session is active. Read from the
     /// audio-tap thread to fork per-buffer sends; set/cleared on main.
-    private(set) var xaiSession: XAIStreamingTranscriber?
+    private(set) var xaiSession: XAIStreamingTranscriber? {
+        get { sessionLock.withLock { _xaiSession } }
+        set { sessionLock.withLock { _xaiSession = newValue } }
+    }
+    private var _xaiSession: XAIStreamingTranscriber?
 
     /// Non-nil while an ElevenLabs Scribe v2 Realtime streaming session is
     /// active. Read from the audio-tap thread to fork per-buffer sends;
     /// set/cleared on main. Mutually exclusive with `xaiSession` (both are
     /// gated on the same `cloudModel` selection, which is a single value).
-    private(set) var elevenLabsSession: ElevenLabsRealtimeTranscriber?
+    private(set) var elevenLabsSession: ElevenLabsRealtimeTranscriber? {
+        get { sessionLock.withLock { _elevenLabsSession } }
+        set { sessionLock.withLock { _elevenLabsSession = newValue } }
+    }
+    private var _elevenLabsSession: ElevenLabsRealtimeTranscriber?
 
     /// Non-nil while a Gemini 3.5 Transcribe Live streaming session is
     /// active. Mutually exclusive with the other cloud streaming sessions.
-    private(set) var geminiSession: GeminiLiveTranscriber?
+    private(set) var geminiSession: GeminiLiveTranscriber? {
+        get { sessionLock.withLock { _geminiSession } }
+        set { sessionLock.withLock { _geminiSession = newValue } }
+    }
+    private var _geminiSession: GeminiLiveTranscriber?
 
     /// Non-nil while a Meta Muse Voice Transcribe streaming session is active.
-    private(set) var museSession: MuseLiveTranscriber?
+    private(set) var museSession: MuseLiveTranscriber? {
+        get { sessionLock.withLock { _museSession } }
+        set { sessionLock.withLock { _museSession = newValue } }
+    }
+    private var _museSession: MuseLiveTranscriber?
 
     /// Coordinator-wide latch: any non-empty `onInterim` during the current
     /// hold. Survives async start-failure clearing the session reference so
@@ -48,10 +70,10 @@ final class StreamingCoordinator {
         geminiSession: GeminiLiveTranscriber? = nil,
         museSession: MuseLiveTranscriber? = nil
     ) {
-        self.xaiSession = xaiSession
-        self.elevenLabsSession = elevenLabsSession
-        self.geminiSession = geminiSession
-        self.museSession = museSession
+        _xaiSession = xaiSession
+        _elevenLabsSession = elevenLabsSession
+        _geminiSession = geminiSession
+        _museSession = museSession
     }
 #else
     init() {}
@@ -429,7 +451,7 @@ final class StreamingCoordinator {
             do {
                 try await session.start()
             } catch {
-                vlog("xai streaming: start failed (\(error.localizedDescription)) — continuing in file-buffer mode")
+                vlog("xai streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.xaiSession === session {
@@ -461,7 +483,7 @@ final class StreamingCoordinator {
             do {
                 try await session.start()
             } catch {
-                vlog("elevenlabs streaming: start failed (\(error.localizedDescription)) — continuing in file-buffer mode")
+                vlog("elevenlabs streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.elevenLabsSession === session {
@@ -492,7 +514,7 @@ final class StreamingCoordinator {
             do {
                 try await session.start()
             } catch {
-                vlog("gemini streaming: start failed (\(error.localizedDescription)) — continuing in file-buffer mode")
+                vlog("gemini streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.geminiSession === session {
@@ -523,7 +545,7 @@ final class StreamingCoordinator {
             do {
                 try await session.start()
             } catch {
-                vlog("muse streaming: start failed (\(error.localizedDescription)) — continuing in file-buffer mode")
+                vlog("muse streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.museSession === session {
@@ -571,36 +593,57 @@ final class StreamingCoordinator {
 
     /// Sends a captured buffer to the active xAI session, if any.
     func sendToXAI(_ buffer: AVAudioPCMBuffer) {
-        xaiSession?.send(buffer)
+        guard let session = xaiSession else { return }
+        session.send(buffer)
     }
 
     /// Sends a captured buffer to the active ElevenLabs session, if any.
     func sendToElevenLabs(_ buffer: AVAudioPCMBuffer) {
-        elevenLabsSession?.send(buffer)
+        guard let session = elevenLabsSession else { return }
+        session.send(buffer)
     }
 
     /// Sends a captured buffer to the active Gemini session, if any.
     func sendToGemini(_ buffer: AVAudioPCMBuffer) {
-        geminiSession?.send(buffer)
+        guard let session = geminiSession else { return }
+        session.send(buffer)
     }
 
     /// Sends a captured buffer to the active Meta Muse session, if any.
     func sendToMuse(_ buffer: AVAudioPCMBuffer) {
-        museSession?.send(buffer)
+        guard let session = museSession else { return }
+        session.send(buffer)
     }
 
     /// Aborts any in-flight streaming session and drops the reference without
     /// waiting for a final transcript — used when the capture is abandoned
     /// (secure input activated mid-hold) and the audio must not be used.
     func cancelAll() {
-        xaiSession?.cancel()
-        xaiSession = nil
-        elevenLabsSession?.cancel()
-        elevenLabsSession = nil
-        geminiSession?.cancel()
-        geminiSession = nil
-        museSession?.cancel()
-        museSession = nil
+        let sessions = sessionLock.withLock { () -> (
+            XAIStreamingTranscriber?, ElevenLabsRealtimeTranscriber?,
+            GeminiLiveTranscriber?, MuseLiveTranscriber?
+        ) in
+            defer {
+                _xaiSession = nil
+                _elevenLabsSession = nil
+                _geminiSession = nil
+                _museSession = nil
+            }
+            return (_xaiSession, _elevenLabsSession, _geminiSession, _museSession)
+        }
+        sessions.0?.cancel()
+        sessions.1?.cancel()
+        sessions.2?.cancel()
+        sessions.3?.cancel()
+    }
+
+    /// Start-failure log text. `URLSession` errors (Gemini's API key rides in
+    /// the WebSocket URL) can embed the URL in `localizedDescription`, so
+    /// anything that is not our own `CloudTranscriptionError` logs domain+code.
+    static func startFailureDescription(_ error: Error) -> String {
+        if let cloud = error as? CloudTranscriptionError { return cloud.errorDescription ?? "cloud error" }
+        let ns = error as NSError
+        return "\(ns.domain)#\(ns.code)"
     }
 
     // MARK: - Stop (xAI)

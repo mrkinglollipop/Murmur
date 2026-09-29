@@ -59,6 +59,9 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var readyResolved = false
+    /// Set once `start()` has begun. With `readyResolved` still false, the
+    /// socket has not yet accepted setup, so anything sent now would be wasted.
+    private var startInvoked = false
 
     private var doneContinuation: CheckedContinuation<String, Never>?
     private var doneResolved = false
@@ -113,6 +116,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     func start() async throws {
         vlog("gemini-stream: starting session")
         stateLock.lock()
+        startInvoked = true
         streamIntegrityFailed = false
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
@@ -123,10 +127,24 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             throw CloudTranscriptionError(provider: .gemini, message: "Failed to build streaming URL")
         }
 
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let task = session.webSocketTask(with: url)
-        self.session = session
-        self.task = task
+        // An injected message sender replaces the socket entirely (unit tests):
+        // no URLSession is created, so start() never touches the network.
+        let task: URLSessionWebSocketTask?
+        if injectedMessageSender == nil {
+            let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let socketTask = session.webSocketTask(with: url)
+            self.session = session
+            self.task = socketTask
+            task = socketTask
+        } else {
+            task = nil
+        }
+
+        // Production writes go straight to the captured task (unaffected by a
+        // later teardown clearing `self.task`); with no socket, the injected sender.
+        func sendFrame(_ message: URLSessionWebSocketTask.Message) async throws {
+            if let task { try await task.send(message) } else { try await sendMessage(message) }
+        }
         self.sessionStartTime = now()
 
         let stream = AsyncStream<String> { continuation in
@@ -139,7 +157,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             await self?.runReceiveLoop()
         }
 
-        task.resume()
+        task?.resume()
 
         let setupFrame = GeminiLiveOptions.makeSetupMessageJSON(
             language: language,
@@ -167,7 +185,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         senderTask = Task { [weak self] in
             guard let self else { return }
             if self.liveOptions.vadMode == .manual, !self.activityStartSent {
-                if let task = self.task {
+                if self.task != nil || self.injectedMessageSender != nil {
                     let startFrame = GeminiLiveOptions.makeActivityStartFrameJSON()
                     do {
                         try await self.sendMessage(.string(startFrame))
@@ -181,7 +199,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             }
             for await frame in stream {
                 do {
-                    try await task.send(.string(frame))
+                    try await sendFrame(.string(frame))
                 } catch {
                     self.markStreamIntegrityFailed()
                     let ns = error as NSError
@@ -288,6 +306,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let closed = socketClosed
         let integrityFailed = streamIntegrityFailed
+        let notReady = startInvoked && !readyResolved
         let accumulatedSoFar = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         stateLock.unlock()
 
@@ -302,10 +321,12 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             return capText
         }
 
-        if closed || integrityFailed {
-            if closed { markStreamIntegrityFailed() }
+        // Released before setupComplete: the end-of-stream frame would reach the
+        // socket ahead of any audio, so skip it and recover from the buffered audio.
+        if closed || integrityFailed || notReady {
+            if closed || notReady { markStreamIntegrityFailed() }
             tearDownSocket()
-            vlog("gemini-stream: finalize short-circuit (socket/integrity), \(accumulatedSoFar.count) chars")
+            vlog("gemini-stream: finalize short-circuit (socket/integrity/not-ready), \(accumulatedSoFar.count) chars")
             stateLock.lock()
             resetTranscriptState()
             stateLock.unlock()

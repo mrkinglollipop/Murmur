@@ -341,17 +341,23 @@ final class TextInjector {
         return .deferRestore
     }
 
-    /// Splits `text` into UTF-16 chunks sized for `keyboardSetUnicodeString`.
+    /// Splits `text` into UTF-16 chunks sized for `keyboardSetUnicodeString`,
+    /// never inside a grapheme cluster.
     static func chunkUTF16Units(_ text: String, maxChunkSize: Int = unicodeChunkSize) -> [[UInt16]] {
-        let units = Array(text.utf16)
-        guard !units.isEmpty else { return [] }
         var chunks: [[UInt16]] = []
-        var index = 0
-        while index < units.count {
-            let end = min(index + maxChunkSize, units.count)
-            chunks.append(Array(units[index..<end]))
-            index = end
+        var current: [UInt16] = []
+        // Grapheme boundaries only: a surrogate pair (emoji, ZWJ sequence)
+        // split across two events posts two lone surrogates. A single
+        // grapheme wider than the cap goes alone rather than being cut.
+        for character in text {
+            let units = Array(String(character).utf16)
+            if !current.isEmpty, current.count + units.count > maxChunkSize {
+                chunks.append(current)
+                current = []
+            }
+            current.append(contentsOf: units)
         }
+        if !current.isEmpty { chunks.append(current) }
         return chunks
     }
 
@@ -816,19 +822,19 @@ final class TextInjector {
             return false
         }
 
-        func attempt() -> Bool {
+        func attempt() -> (landed: Bool, chordObserved: Bool) {
             if !Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general) {
                 Self.log("pasteboard mismatch before chord — re-stabilizing")
                 guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
-                    return false
+                    return (false, false)
                 }
             }
             guard Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general) else {
-                return false
+                return (false, false)
             }
 
             observer.resetObservedCount()
-            guard postPasteChord() else { return false }
+            guard postPasteChord() else { return (false, false) }
             // Chord observation is binary (target 1) — a WindowServer stall
             // DELAYS the CGEvent reaching the observer tap, it does not drop
             // it. The original 0.4s window mistook "still in flight" for
@@ -849,17 +855,29 @@ final class TextInjector {
             // Chord observed proves WindowServer accepted our events; pasteboard
             // still holding the transcript proves Continuity did not overwrite
             // between prepare and paste. Neither checks target-app content.
-            return chordObserved
+            let landed = chordObserved
                 && Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general)
+            return (landed, chordObserved)
         }
 
-        if attempt() {
+        let first = attempt()
+        if first.landed {
             return true
         }
 
-        guard retryOnAmbiguous else { return false }
+        guard Self.shouldRetryPaste(
+            chordObserved: first.chordObserved,
+            retryOnAmbiguous: retryOnAmbiguous
+        ) else { return false }
         Self.log("paste delivery drop detected — retrying")
-        return attempt()
+        return attempt().landed
+    }
+
+    /// A second Cmd-V is only safe when the first chord was never observed
+    /// (dropped). An observed chord with the pasteboard overwritten afterwards
+    /// means the target already pasted — retrying would paste twice.
+    static func shouldRetryPaste(chordObserved: Bool, retryOnAmbiguous: Bool) -> Bool {
+        retryOnAmbiguous && !chordObserved
     }
 
     @discardableResult

@@ -60,6 +60,9 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var readyResolved = false
+    /// Set once `start()` has begun. With `readyResolved` still false, the
+    /// handshake has not been acked, so anything sent now would be wasted.
+    private var startInvoked = false
 
     private var doneContinuation: CheckedContinuation<String, Never>?
     private var doneResolved = false
@@ -103,6 +106,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     func start() async throws {
         vlog("muse-stream: starting session")
         stateLock.lock()
+        startInvoked = true
         streamIntegrityFailed = false
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
@@ -113,10 +117,24 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             throw CloudTranscriptionError(provider: .meta, message: "Failed to build streaming URL")
         }
 
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let task = session.webSocketTask(with: url)
-        self.session = session
-        self.task = task
+        // An injected message sender replaces the socket entirely (unit tests):
+        // no URLSession is created, so start() never touches the network.
+        let task: URLSessionWebSocketTask?
+        if injectedMessageSender == nil {
+            let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let socketTask = session.webSocketTask(with: url)
+            self.session = session
+            self.task = socketTask
+            task = socketTask
+        } else {
+            task = nil
+        }
+
+        // Production writes go straight to the captured task (unaffected by a
+        // later teardown clearing `self.task`); with no socket, the injected sender.
+        func sendFrame(_ message: URLSessionWebSocketTask.Message) async throws {
+            if let task { try await task.send(message) } else { try await sendMessage(message) }
+        }
 
         let stream = AsyncStream<Data> { continuation in
             self.stateLock.lock()
@@ -128,7 +146,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             await self?.runReceiveLoop()
         }
 
-        task.resume()
+        task?.resume()
 
         let handshake = Self.makeHandshakeJSON(
             apiKey: apiKey,
@@ -155,7 +173,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         senderTask = Task {
             for await pcmData in stream {
                 do {
-                    try await task.send(.data(pcmData))
+                    try await sendFrame(.data(pcmData))
                 } catch {
                     self.markStreamIntegrityFailed()
                     vlog("muse-stream: send failed, stopping sender: \(error.localizedDescription)")
@@ -251,12 +269,16 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let closed = socketClosed
         let integrityFailed = streamIntegrityFailed
+        let notReady = startInvoked && !readyResolved
         let accumulatedSoFar = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         stateLock.unlock()
-        if closed || integrityFailed {
-            if closed { markStreamIntegrityFailed() }
+        // Released before the handshake ack: the end-of-stream message would
+        // reach the socket ahead of any audio, so skip it and recover from the
+        // buffered audio.
+        if closed || integrityFailed || notReady {
+            if closed || notReady { markStreamIntegrityFailed() }
             tearDownSocket()
-            vlog("muse-stream: finalize short-circuit (socket/integrity), \(accumulatedSoFar.count) chars")
+            vlog("muse-stream: finalize short-circuit (socket/integrity/not-ready), \(accumulatedSoFar.count) chars")
             stateLock.lock()
             resetTranscriptState()
             stateLock.unlock()
@@ -661,6 +683,11 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard !trimmedPartial.isEmpty else { return committed }
         guard !committed.isEmpty else { return trimmedPartial }
         if committed.localizedCaseInsensitiveContains(trimmedPartial) { return committed }
+        // Cumulative partials restate the whole utterance, so one arriving after
+        // a final already begins with the committed text.
+        if trimmedPartial.range(of: committed, options: [.caseInsensitive, .anchored]) != nil {
+            return trimmedPartial
+        }
         return committed + " " + trimmedPartial
     }
 

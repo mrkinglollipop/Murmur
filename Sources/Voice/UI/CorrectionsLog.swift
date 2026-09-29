@@ -79,6 +79,11 @@ final class CorrectionsLog: ObservableObject {
 
     private static let maxRecords = 200
 
+    /// Set when corrections-log.json exists but could not be read or moved aside. Saving then
+    /// would overwrite recoverable user data, so writes stay off for the
+    /// rest of the session.
+    private var savesBlocked = false
+
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? CorrectionsLog.defaultFileURL()
         load()
@@ -91,7 +96,11 @@ final class CorrectionsLog: ObservableObject {
 
     private func load() {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            savesBlocked = true
+            logger.error("corrections-log.json exists but is unreadable — saves disabled this session")
+            return
+        }
         do {
             records = try JSONDecoder().decode([CorrectionRecord].self, from: data)
         } catch {
@@ -108,12 +117,14 @@ final class CorrectionsLog: ObservableObject {
             try FileManager.default.moveItem(at: fileURL, to: bak)
             logger.error("Quarantined corrupt corrections-log.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
+            savesBlocked = true
             logger.error("Failed to quarantine corrupt corrections-log.json: \(error.localizedDescription)")
         }
         records = []
     }
 
     private func save() {
+        guard !savesBlocked else { return }
         guard let data = try? JSONEncoder().encode(records) else { return }
         try? data.write(to: fileURL, options: .atomic)
     }

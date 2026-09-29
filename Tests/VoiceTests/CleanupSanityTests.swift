@@ -27,8 +27,23 @@ final class CleanupSanityTests: XCTestCase {
         XCTAssertFalse(ASREngineSelector.cleanupLooksSane(input: input, output: output))
     }
 
-    func testEmptyInputOrOutputAccepted() {
+    func testEmptyInputAccepted() {
         XCTAssertTrue(ASREngineSelector.cleanupLooksSane(input: "", output: "anything"))
-        XCTAssertTrue(ASREngineSelector.cleanupLooksSane(input: "hello", output: ""))
+        XCTAssertTrue(ASREngineSelector.cleanupLooksSane(input: "...", output: "anything"))
+    }
+
+    func testEmptyOutputRejected() {
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(input: "hello", output: ""))
+    }
+
+    /// An LLM reply with no letters or digits must not replace a dictation,
+    /// including when the length ratio alone would pass.
+    func testSymbolOnlyOutputRejected() {
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(input: "ok sure", output: "\u{1F44D}\u{1F44D}\u{1F44D}"))
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(input: "yes please do it", output: "..."))
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
+            input: "Please schedule a follow up meeting with the design team tomorrow morning.",
+            output: "\u{2026}"
+        ))
     }
 }

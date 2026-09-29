@@ -6,7 +6,8 @@
 #
 # Required:
 #   NOTARIZE=1   (or ALLOW_UNNOTARIZED=1)
-#   SPARKLE_PRIVATE_KEY=/path/to/sparkle_ed25519  (or Keychain via --account)
+#   SPARKLE_PRIVATE_KEY=/path/to/sparkle_ed25519  (signs; Keychain key, if
+#                readable via SPARKLE_ACCOUNT, must be the same key)
 #   Notarization credentials when NOTARIZE=1 (NOTARY_PROFILE / notarytool store)
 #
 # Optional:
@@ -16,9 +17,23 @@
 #   SKIP_VERSION_BUMP=1  (use versions already in project.yml)
 #
 # Flow matches plans/015: bump → xcodegen → DMG (notarized when NOTARIZE=1) →
-# sign_update + --verify → prepend-only appcast merge → asserts BEFORE appcast
-# --clobber → also clobber stable appcast/Murmur.dmg (marketing download alias)
-# → curl -sfL (feed + versioned DMG + stable alias).
+# sign_update + --verify → prepend-only appcast merge → staged-appcast asserts →
+# upload versioned DMG → download that DMG from its public URL and
+# sign_update --verify the DOWNLOADED bytes against the staged signature
+# (BEFORE the appcast goes live) → back up the live appcast to
+# build/appcast.backup.<UTC>.xml → appcast --clobber (a failed upload re-uploads
+# the backup and exits non-zero) → also clobber stable appcast/Murmur.dmg
+# (marketing download alias) → curl -sfL (feed + versioned DMG + stable alias)
+# → compare the live feed's newest item (version + edSignature) to the staged one.
+#
+# Fail-closed gates (no override unless named):
+#   - Config/Team.xcconfig (or DEVELOPMENT_TEAM) must be a real 10-char team id.
+#   - The app's SUPublicEDKey must equal the public half of SPARKLE_PRIVATE_KEY
+#     (the file that actually signs); a readable Keychain key must match too.
+#   - Release v<SHORT> must not already hold a DMG (the previous appcast item
+#     still points at it) unless ALLOW_REPUBLISH_VERSION=1.
+#   - SKIP_MAKE_DMG=1 + NOTARIZE=1 also needs stapler validate + codesign --strict.
+#   Feed missing but release 'appcast' exists? scripts/recover-appcast.sh.
 #
 # After AudioRecorder / HAL / engine.start / bind changes: VoiceTests is not
 # the product oracle. install-local + fn-hold + bash scripts/oracle-dictation-start.sh
@@ -27,6 +42,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=release-lib.sh
+source "$ROOT/scripts/release-lib.sh"
 
 if [[ "${NOTARIZE:-0}" != "1" && "${ALLOW_UNNOTARIZED:-0}" != "1" ]]; then
   echo "error: NOTARIZE=1 is required (or ALLOW_UNNOTARIZED=1 for local/Gatekeeper-prompt publishes)." >&2
@@ -58,6 +75,9 @@ if [[ ! -f "${SPARKLE_PRIVATE_KEY}" ]]; then
   echo "error: SPARKLE_PRIVATE_KEY does not point to a readable file." >&2
   exit 1
 fi
+# Preflight before ANY network call: a placeholder team id (the example file's
+# YOUR_TEAM_ID) would otherwise surface only after gh/curl work and a build.
+resolve_development_team "$ROOT/Config/Team.xcconfig" >/dev/null || exit 1
 
 resolve_sparkle_bin() {
   if [[ -n "${SPARKLE_BIN:-}" && -x "${SPARKLE_BIN}/sign_update" ]]; then
@@ -300,46 +320,48 @@ print("yes" if pa > pb else "no")
 PY
 }
 
-# Public key that matches the private key used for sign_update (Keychain or file).
-expected_public_ed_key() {
-  local raw pub
-  if [[ -x "$GENERATE_KEYS" ]]; then
-    raw="$("$GENERATE_KEYS" -p --account "$SPARKLE_ACCOUNT" 2>/dev/null || true)"
-    # generate_keys -p may print prose; take last base64-looking token
-    pub="$(echo "$raw" | python3 -c 'import re,sys; t=sys.stdin.read(); ms=re.findall(r"[A-Za-z0-9+/]{40,}={0,2}", t); print(ms[-1] if ms else "")')"
-    if [[ -n "$pub" ]]; then
-      echo "$pub"
-      return 0
-    fi
-  fi
-  if [[ -n "${SPARKLE_PRIVATE_KEY:-}" && -f "${SPARKLE_PRIVATE_KEY}" ]]; then
-    python3 - "$SPARKLE_PRIVATE_KEY" <<'PY'
-import base64, sys
-seed = base64.b64decode(open(sys.argv[1]).read().strip())
-if len(seed) != 32:
-    raise SystemExit(f"expected 32-byte Sparkle seed, got {len(seed)}")
-try:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives import serialization
-    pk = Ed25519PrivateKey.from_private_bytes(seed)
-    pub = pk.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-except Exception:
-    try:
-        from nacl.signing import SigningKey
-        pub = bytes(SigningKey(seed).verify_key)
-    except Exception as e:
-        raise SystemExit(
-            "cannot derive SUPublicEDKey from private key file "
-            f"(install cryptography or PyNaCl): {e}"
-        )
-print(base64.b64encode(pub).decode())
+# Key comparison lives in release-lib.sh (sparkle_public_key_from_seed_file,
+# sparkle_keychain_public_key, check_sparkle_keys) so it is unit-testable.
+
+# Newest-item fingerprint "<sparkle:version>|<edSignature>" of an appcast, with
+# comments/CDATA masked. Empty output = newest item unparseable (callers fail
+# closed). Used to compare the live feed against the staged appcast.
+appcast_newest_fingerprint() {
+  local file="$1"
+  python3 - "$file" <<PY
+import re, sys
+${mask_xml_noise_py}
+masked = mask_xml_noise(open(sys.argv[1]).read())
+for item_m in re.finditer(r"<item\b[^>]*>.*?</item>", masked, flags=re.DOTALL | re.IGNORECASE):
+    block = item_m.group(0)
+    v = item_sparkle_version(block)
+    m = re.search(r"sparkle:edSignature=\"([^\"]+)\"", block)
+    sig = m.group(1).strip() if m else ""
+    print(f"{v}|{sig}" if v and sig else "")
+    raise SystemExit(0)
+print("")
 PY
-    return 0
+}
+
+# Load the asset names of release <tag> into GH_RELEASE_ASSET_NAMES (one per
+# line). Direct call only (exit 1 must reach the main shell). Fail-closed on any
+# CLI/auth/network error — never read "gh failed" as "no assets".
+GH_RELEASE_ASSET_NAMES=""
+load_gh_release_asset_names() {
+  local tag="$1" err ec out
+  err="$(mktemp "${TMPDIR:-/tmp}/gh-assets.XXXXXX")"
+  set +e
+  out="$(gh release view "$tag" --repo "$UPDATES_REPO" --json assets --jq '.assets[].name' 2>"$err")"
+  ec=$?
+  set -e
+  if [[ $ec -ne 0 ]]; then
+    echo "error: gh release view ${tag} --json assets failed (exit $ec); refusing to publish." >&2
+    sed 's/^/  /' "$err" >&2 || true
+    rm -f "$err"
+    exit 1
   fi
-  return 1
+  rm -f "$err"
+  GH_RELEASE_ASSET_NAMES="$out"
 }
 
 # --- 1) Load / bump versions ---
@@ -398,6 +420,24 @@ if [[ "${SKIP_VERSION_BUMP:-0}" != "1" && "$HAS_PRIOR" == "1" ]]; then
   fi
 fi
 
+# A rebuild at the same short version would --clobber the DMG the previous
+# appcast item still points at (its edSignature would then no longer match the
+# bytes users download). Refuse before spending a build, unless overridden.
+if gh_release_exists "v${SHORT}" "version-collision check"; then
+  load_gh_release_asset_names "v${SHORT}"
+  if printf '%s\n' "$GH_RELEASE_ASSET_NAMES" | assets_include_dmg; then
+    if [[ "${ALLOW_REPUBLISH_VERSION:-0}" == "1" ]]; then
+      echo "warning: release v${SHORT} already has a DMG; ALLOW_REPUBLISH_VERSION=1 — it will be overwritten." >&2
+    else
+      echo "error: release v${SHORT} on $UPDATES_REPO already has a DMG asset." >&2
+      echo "  Publishing again would overwrite bytes the current appcast item is signed for." >&2
+      echo "  Bump CFBundleShortVersionString/CFBundleVersion in project.yml, or (deliberately," >&2
+      echo "  e.g. resuming a run that died before the appcast upload) set ALLOW_REPUBLISH_VERSION=1." >&2
+      exit 1
+    fi
+  fi
+fi
+
 echo "==> Publishing Murmur $SHORT (build $BUILD) → $UPDATES_REPO"
 
 echo "==> App icon oracle (test-app-icon-helpers.sh)"
@@ -422,8 +462,12 @@ elif [[ "${SKIP_MAKE_DMG:-0}" == "1" ]]; then
   echo "==> Reusing DMG: $DMG"
 else
   echo "==> make-dmg.sh (NOTARIZE=${NOTARIZE:-0})"
-  NOTARIZE="${NOTARIZE:-0}" NOTARY_PROFILE="$NOTARY_PROFILE" bash "$ROOT/scripts/make-dmg.sh"
+  # make-dmg.sh honors an exported DMG_PATH; this path publishes
+  # build/Murmur-$SHORT.dmg, so strip DMG_PATH (else the DMG lands elsewhere and
+  # a stale same-version build/ DMG gets published) and clear any stale file.
   DMG="$ROOT/build/Murmur-$SHORT.dmg"
+  rm -f "$DMG"
+  env -u DMG_PATH NOTARIZE="${NOTARIZE:-0}" NOTARY_PROFILE="$NOTARY_PROFILE" bash "$ROOT/scripts/make-dmg.sh"
 fi
 if [[ ! -f "$DMG" ]]; then
   echo "error: expected DMG at $DMG" >&2
@@ -462,21 +506,40 @@ if [[ "$APP_SHORT" != "$SHORT" || "$APP_BUILD" != "$BUILD" ]]; then
 fi
 if [[ "$SKIPPED_MAKE_DMG" == "1" ]]; then
   echo "==> DMG payload versions match project.yml ($APP_SHORT / $APP_BUILD)"
+  # A reused DMG never went through make-dmg.sh in this run, so a matching
+  # version proves nothing about notarization or signing. Check both while the
+  # image is still mounted.
+  if [[ "${NOTARIZE:-0}" == "1" ]]; then
+    echo "==> NOTARIZE=1: validating reused DMG (stapler + codesign --strict)"
+    if ! xcrun stapler validate "$DMG"; then
+      echo "error: reused DMG has no valid notarization ticket (xcrun stapler validate failed): $DMG" >&2
+      echo "  Refusing SKIP_MAKE_DMG with NOTARIZE=1. Re-run make-dmg.sh with NOTARIZE=1." >&2
+      exit 1
+    fi
+    if ! codesign --verify --deep --strict "$APP"; then
+      echo "error: Murmur.app inside the reused DMG fails codesign --verify --deep --strict." >&2
+      exit 1
+    fi
+    echo "  stapled ticket valid; app signature verified"
+  fi
   cleanup_dmg_mount
 fi
 
-EXPECTED_PUB="$(expected_public_ed_key || true)"
-if [[ -z "$EXPECTED_PUB" ]]; then
-  echo "error: could not resolve expected public EdDSA key (generate_keys -p --account $SPARKLE_ACCOUNT or derive from SPARKLE_PRIVATE_KEY)." >&2
+# Signing (sign_update below and --verify) uses the SPARKLE_PRIVATE_KEY FILE, so
+# that file's public half — not the Keychain's — is what installed apps must
+# trust. The app's SUPublicEDKey must equal it; a readable Keychain key must
+# agree too, otherwise abort here, before anything is uploaded.
+FILE_PUB="$(sparkle_public_key_from_seed_file "$SPARKLE_PRIVATE_KEY")" || {
+  echo "error: could not derive the public key from SPARKLE_PRIVATE_KEY ($SPARKLE_PRIVATE_KEY)." >&2
   exit 1
+}
+KEYCHAIN_PUB="$(sparkle_keychain_public_key "$GENERATE_KEYS" "$SPARKLE_ACCOUNT")"
+check_sparkle_keys "$APP_PUBKEY" "$FILE_PUB" "$KEYCHAIN_PUB" || exit 1
+if [[ -z "$KEYCHAIN_PUB" ]]; then
+  echo "==> SUPublicEDKey matches SPARKLE_PRIVATE_KEY file (Keychain key not readable; skipped)"
+else
+  echo "==> SUPublicEDKey matches SPARKLE_PRIVATE_KEY file and Keychain key"
 fi
-if [[ "$APP_PUBKEY" != "$EXPECTED_PUB" ]]; then
-  echo "error: app SUPublicEDKey does not match murmur signing key public half." >&2
-  echo "  app:      $APP_PUBKEY" >&2
-  echo "  expected: $EXPECTED_PUB" >&2
-  exit 1
-fi
-echo "==> SUPublicEDKey matches signing key"
 
 # --- 3) sign_update ---
 echo "==> sign_update"
@@ -715,6 +778,28 @@ else
   gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "$WHATSNEW_NOTES"
 fi
 
+# --- 6b) Verify the bytes users will actually download, BEFORE the appcast ---
+# points at them. The local sign_update --verify covered the local file; this
+# covers the uploaded asset (truncated/failed/stale upload, wrong file).
+echo "==> Downloading $ENCLOSURE_URL to verify the published DMG"
+VERIFY_DMG="$ROOT/build/verify-download-${SHORT}.dmg"
+rm -f "$VERIFY_DMG"
+if ! curl_fresh "enclosure DMG" "$ENCLOSURE_URL" "$VERIFY_DMG"; then
+  echo "error: published DMG not downloadable; appcast NOT updated (feed unchanged)." >&2
+  exit 1
+fi
+DL_LENGTH="$(wc -c < "$VERIFY_DMG" | tr -d '[:space:]')"
+if [[ "$DL_LENGTH" != "$LENGTH" ]]; then
+  echo "error: downloaded DMG is $DL_LENGTH bytes, staged appcast says length=$LENGTH; appcast NOT updated (feed unchanged)." >&2
+  exit 1
+fi
+if ! "$SIGN_UPDATE" --verify --ed-key-file "$SPARKLE_PRIVATE_KEY" "$VERIFY_DMG" "$ED_SIG"; then
+  echo "error: downloaded DMG fails sign_update --verify against the staged signature; appcast NOT updated (feed unchanged)." >&2
+  exit 1
+fi
+rm -f "$VERIFY_DMG"
+echo "  published DMG bytes verified against staged edSignature"
+
 # --- 7) Appcast release (only after asserts) ---
 if gh_release_exists appcast "appcast upload"; then
   :
@@ -723,8 +808,45 @@ else
   gh release create appcast --repo "$UPDATES_REPO" --title "Appcast" --notes "Stable Sparkle appcast feed (asset overwritten each publish)." --latest=false
 fi
 
+# --clobber deletes the old asset before the new one lands; a failed upload can
+# leave the feed missing for every installed copy. Keep a timestamped copy of
+# the appcast we are replacing so it can be put back (automatically below, or
+# via scripts/recover-appcast.sh).
+APPCAST_BACKUP=""
+if [[ "$HAS_PRIOR" == "1" && -s "$PREV_APPCAST" ]]; then
+  APPCAST_BACKUP="$ROOT/build/appcast.backup.$(date -u +%Y%m%dT%H%M%SZ).xml"
+  cp "$PREV_APPCAST" "$APPCAST_BACKUP"
+  echo "==> Prior appcast backed up: $APPCAST_BACKUP"
+fi
+
+# Re-upload a backup as appcast.xml (the asset name comes from the file name).
+restore_appcast_backup() {
+  local backup="$1" dir rc=0
+  if [[ -z "$backup" || ! -s "$backup" ]]; then
+    echo "  no prior appcast to restore (first publish); the feed asset may now be missing." >&2
+    return 1
+  fi
+  dir="$(mktemp -d "$ROOT/build/appcast-restore.XXXXXX")"
+  cp "$backup" "$dir/appcast.xml"
+  if gh release upload appcast "$dir/appcast.xml" --repo "$UPDATES_REPO" --clobber; then
+    echo "  restored prior appcast from $backup" >&2
+  else
+    echo "  RESTORE FAILED — the feed may be MISSING. Run: bash scripts/recover-appcast.sh" >&2
+    echo "  (backup: $backup)" >&2
+    rc=1
+  fi
+  rm -rf "$dir"
+  return $rc
+}
+
 echo "==> Uploading appcast.xml (--clobber)"
-gh release upload appcast "$STAGE_APPCAST" --repo "$UPDATES_REPO" --clobber
+if ! gh release upload appcast "$STAGE_APPCAST" --repo "$UPDATES_REPO" --clobber; then
+  echo "error: appcast upload failed; attempting to restore the prior appcast." >&2
+  restore_appcast_backup "$APPCAST_BACKUP" || true
+  echo "  The v${SHORT} DMG is uploaded but the feed does not advertise it. Verify with:" >&2
+  echo "    curl -sfL '$FEED_URL' | head" >&2
+  exit 1
+fi
 
 # Stable installer alias for marketing download links (kinglollipop.com/murmur/download).
 # Same bytes as the versioned DMG; overwritten every publish so the site never hardcodes a version.
@@ -739,6 +861,41 @@ echo "==> curl -sfL live URLs (up to 3 attempts each)"
 curl_assert_url "feed" "$FEED_URL"
 curl_assert_url "dmg" "$ENCLOSURE_URL"
 curl_assert_url "stable-dmg" "$STABLE_DMG_URL"
+
+# HTTP 200 does not prove the feed says what we staged (CDN staleness, a lost
+# race, a wrong file). Compare the live feed's newest item — version +
+# edSignature — with the staged appcast, cache-busted.
+echo "==> Comparing live feed newest item to the staged appcast"
+STAGED_FP="$(appcast_newest_fingerprint "$STAGE_APPCAST")"
+if [[ -z "$STAGED_FP" ]]; then
+  echo "error: staged appcast newest item has no version+edSignature fingerprint." >&2
+  exit 1
+fi
+LIVE_APPCAST="$ROOT/build/appcast.live.xml"
+LIVE_FP=""
+live_match=0
+for live_attempt in 1 2 3 4; do
+  rm -f "$LIVE_APPCAST"
+  if curl_fresh "live feed" "$FEED_URL" "$LIVE_APPCAST"; then
+    LIVE_FP="$(appcast_newest_fingerprint "$LIVE_APPCAST")"
+    if [[ "$LIVE_FP" == "$STAGED_FP" ]]; then
+      live_match=1
+      break
+    fi
+  fi
+  echo "  live feed newest item [${LIVE_FP:-unreadable}] != staged [$STAGED_FP] (attempt ${live_attempt}/4); retrying…" >&2
+  sleep 3
+done
+if [[ "$live_match" != "1" ]]; then
+  echo "error: live feed newest item does not match the staged appcast." >&2
+  echo "  staged: $STAGED_FP" >&2
+  echo "  live:   ${LIVE_FP:-<unreadable>}  (downloaded to $LIVE_APPCAST)" >&2
+  if [[ -n "$APPCAST_BACKUP" ]]; then
+    echo "  Prior appcast backup: $APPCAST_BACKUP (bash scripts/recover-appcast.sh restores the newest backup)." >&2
+  fi
+  exit 1
+fi
+echo "  live feed newest item matches staged ($STAGED_FP)"
 echo ""
 echo "==> Done"
 echo "  Feed:   $FEED_URL"

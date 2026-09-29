@@ -31,6 +31,9 @@ struct SettingsView: View {
     @State private var showModelDeleteConfirmation = false
 
     @State private var showDeleteProfileConfirmation = false
+    @State private var showAPIKeyRemoveConfirmation = false
+    @State private var pendingAPIKeyRemoval: CloudProvider?
+    @State private var showCleanupKeyRemoveConfirmation = false
 
     @State private var exportStatus: String?
 
@@ -677,9 +680,8 @@ struct SettingsView: View {
                     .disabled(apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     Button("Remove") {
-                        settingsStore.removeAPIKey(for: provider)
-                        apiKeyInput = ""
-                        apiKeySaveFailed = false
+                        pendingAPIKeyRemoval = provider
+                        showAPIKeyRemoveConfirmation = true
                     }
                     .buttonStyle(.glass)
                     .font(Theme.body(11, weight: .medium))
@@ -712,6 +714,17 @@ struct SettingsView: View {
                     .foregroundColor(Theme.amberText)
             }
         }
+        .confirmDelete(
+            isPresented: $showAPIKeyRemoveConfirmation,
+            title: "Remove \(pendingAPIKeyRemoval?.displayName ?? provider.displayName) API key?",
+            message: "The key is deleted from your Keychain. You'll need to paste it again to use this provider.",
+            onConfirm: {
+                settingsStore.removeAPIKey(for: pendingAPIKeyRemoval ?? provider)
+                pendingAPIKeyRemoval = nil
+                apiKeyInput = ""
+                apiKeySaveFailed = false
+            }
+        )
     }
 
     /// SecureField + Save/Remove + status line for the cleanup cloud
@@ -751,9 +764,7 @@ struct SettingsView: View {
                     .disabled(cleanupKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     Button("Remove") {
-                        settingsStore.removeCleanupKey()
-                        cleanupKeyInput = ""
-                        cleanupKeySaveFailed = false
+                        showCleanupKeyRemoveConfirmation = true
                     }
                     .buttonStyle(.glass)
                     .font(Theme.body(11, weight: .medium))
@@ -782,6 +793,16 @@ struct SettingsView: View {
                     .foregroundColor(Theme.amberText)
             }
         }
+        .confirmDelete(
+            isPresented: $showCleanupKeyRemoveConfirmation,
+            title: "Remove OpenAI API key?",
+            message: "The key is deleted from your Keychain. You'll need to paste it again to use cleanup.",
+            onConfirm: {
+                settingsStore.removeCleanupKey()
+                cleanupKeyInput = ""
+                cleanupKeySaveFailed = false
+            }
+        )
     }
 
     // MARK: - Murmur Pro (PRO ONLY)
