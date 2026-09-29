@@ -70,6 +70,11 @@ final class TranscriptionPipeline {
     /// Sixth arg is optional history entry ID to replace (retry path).
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)?
 
+    /// History hook for a hold the HUD watchdog abandoned: text, engine id,
+    /// audio path. Separate from `onTranscriptionLogged` because the row must
+    /// read "Saved in History" — nothing was typed or left on the clipboard.
+    var onAbandonedHoldSaved: ((String, String, String?) -> Void)?
+
     /// Fired on the main thread after a confirmed insert with the delivered text
     /// (for inline correction watching). Not called for dedupe or failed inserts.
     var onTextInserted: ((String) -> Void)?
@@ -709,7 +714,11 @@ final class TranscriptionPipeline {
                 if abandoned {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, replaceHistoryEntryID)
+                if abandoned, let onAbandonedHoldSaved = self.onAbandonedHoldSaved {
+                    onAbandonedHoldSaved(saved, engineID, audioPath)
+                } else {
+                    self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, replaceHistoryEntryID)
+                }
                 completion?(.savedToHistory)
                 return
             }

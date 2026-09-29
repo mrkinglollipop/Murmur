@@ -24,6 +24,14 @@ final class StorePersistenceTests: XCTestCase {
     // MARK: - HistoryStore
 
     @MainActor
+    func testAppendCanMarkNewRowSavedWithoutInsertion() {
+        let store = HistoryStore(fileURL: tempFile("abandoned-row"))
+        store.append(text: "late result", engine: "test", injected: false, savedWithoutInsertion: true)
+        XCTAssertEqual(store.entries.first?.savedWithoutInsertion, true)
+        store.append(text: "normal", engine: "test", injected: false)
+        XCTAssertEqual(store.entries.first?.savedWithoutInsertion, false)
+    }
+
     func testFailedRetryPreservesSuccessfulTranscriptAndProvenance() {
         let store = HistoryStore(fileURL: tempFile("failed-retry"))
         store.append(text: "Keep the original words.", engine: "original", injected: true)

@@ -261,6 +261,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 replaceEntryID: replaceEntryID
             )
         }
+        activationController?.audioRecorder.asrSelector.onAbandonedHoldSaved = { [weak self] text, engineID, audioPath in
+            self?.historyStore.append(
+                text: text,
+                engine: engineID,
+                injected: false,
+                audioPath: audioPath,
+                savedWithoutInsertion: true
+            )
+        }
 
         wireFailureReporting()
         wireHUDMenuBarSync()

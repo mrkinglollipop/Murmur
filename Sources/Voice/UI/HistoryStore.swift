@@ -182,7 +182,8 @@ final class HistoryStore: ObservableObject {
         injected: Bool,
         audioPath: String? = nil,
         failed: Bool = false,
-        replaceEntryID: UUID? = nil
+        replaceEntryID: UUID? = nil,
+        savedWithoutInsertion: Bool = false
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || failed else { return }
@@ -205,7 +206,8 @@ final class HistoryStore: ObservableObject {
                 engine: engine,
                 injected: injected,
                 audioPath: audioPath,
-                failed: failed
+                failed: failed,
+                savedWithoutInsertion: savedWithoutInsertion
             )
             self.entries.insert(entry, at: 0)
             if self.entries.count > self.maxEntries {

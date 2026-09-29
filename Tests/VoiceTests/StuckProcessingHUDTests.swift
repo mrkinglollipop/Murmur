@@ -114,6 +114,17 @@ final class StuckProcessingHUDTests: XCTestCase {
         XCTAssertTrue(pipeline.test_abandonedHoldTokens.isEmpty, "abandonment is one-shot")
     }
 
+    func testAbandonedHoldUsesDedicatedHistoryHookWhenWired() {
+        let pipeline = TranscriptionPipeline()
+        var saved: [(text: String, engine: String)] = []
+        pipeline.onAbandonedHoldSaved = { text, engine, _ in saved.append((text, engine)) }
+        pipeline.markHoldAbandoned(9)
+        let out = finish(pipeline: pipeline, text: "late result", token: 9)
+        XCTAssertEqual(out.result, .savedToHistory)
+        XCTAssertEqual(saved.map(\.text), ["late result"])
+        XCTAssertTrue(out.logged.isEmpty, "the generic hook would label the row as left on the clipboard")
+    }
+
     func testAbandonedHoldWithEmptyResultRaisesNoLateErrorPill() {
         let pipeline = TranscriptionPipeline()
         pipeline.markHoldAbandoned(7)
