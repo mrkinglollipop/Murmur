@@ -2334,7 +2334,10 @@ final class AudioRecorder {
         sessionHeldFrontmostPID: pid_t?,
         everHadStreamText: Bool = false
     ) {
-        guard isSetUp else {
+        pcmBuffersLock.lock()
+        let bufferCountAtStop = pcmBuffers.count
+        pcmBuffersLock.unlock()
+        guard !Self.shouldDiscardAsMicNotSetup(isSetUp: isSetUp, bufferCount: bufferCountAtStop) else {
             finishDiscardedHold(
                 reason: "mic-not-setup",
                 engineID: "file",
@@ -2481,6 +2484,85 @@ final class AudioRecorder {
 
     // MARK: - Write captured audio
 
+    /// Concatenates tap buffers into one buffer in the FIRST buffer's format.
+    /// A mid-hold device reroute reinstalls the tap in the new device's format
+    /// while `pcmBuffers` keeps the pre-reroute audio, so the list can mix
+    /// sample rates and channel counts; raw memcpy would play at the wrong
+    /// speed or read past a mono buffer's single channel. Non-conforming
+    /// buffers go through `AVAudioConverter`; one that cannot convert is
+    /// dropped rather than written as garbage. Nil when there is nothing
+    /// usable (empty input, non-float32 target, allocation failure).
+    static func combine(buffers: [AVAudioPCMBuffer]) -> AVAudioPCMBuffer? {
+        guard let first = buffers.first else { return nil }
+        let format = first.format
+        let rate = format.sampleRate
+        guard rate > 0, format.channelCount > 0, !format.isInterleaved,
+              format.commonFormat == .pcmFormatFloat32 else { return nil }
+
+        var converters: [AVAudioFormat: AVAudioConverter] = [:]
+        var segments: [AVAudioPCMBuffer] = []
+        var totalFrames: AVAudioFrameCount = 0
+        for buffer in buffers {
+            guard buffer.frameLength > 0 else { continue }
+            let segment: AVAudioPCMBuffer
+            if buffer.format == format {
+                segment = buffer
+            } else {
+                guard buffer.format.sampleRate > 0, buffer.format.channelCount > 0 else { continue }
+                let converter: AVAudioConverter
+                if let cached = converters[buffer.format] {
+                    converter = cached
+                } else if let made = AVAudioConverter(from: buffer.format, to: format) {
+                    converters[buffer.format] = made
+                    converter = made
+                } else {
+                    continue
+                }
+                let capacity = AVAudioFrameCount(
+                    (Double(buffer.frameLength) * rate / buffer.format.sampleRate).rounded(.up) + 64
+                )
+                guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { continue }
+                var supplied = false
+                var error: NSError?
+                let status = converter.convert(to: out, error: &error) { _, inputStatus in
+                    if supplied {
+                        inputStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    supplied = true
+                    inputStatus.pointee = .haveData
+                    return buffer
+                }
+                guard status != .error, error == nil, out.frameLength > 0 else { continue }
+                segment = out
+            }
+            segments.append(segment)
+            totalFrames += segment.frameLength
+        }
+        guard totalFrames > 0,
+              let combined = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames),
+              let dst = combined.floatChannelData else { return nil }
+        var offset = 0
+        for segment in segments {
+            guard let src = segment.floatChannelData else { continue }
+            let frames = Int(segment.frameLength)
+            for ch in 0 ..< Int(format.channelCount) {
+                memcpy(dst[ch].advanced(by: offset), src[ch], frames * MemoryLayout<Float>.size)
+            }
+            offset += frames
+        }
+        combined.frameLength = AVAudioFrameCount(offset)
+        return combined
+    }
+
+    /// The hold is a "mic never came up" discard only when there is also no
+    /// audio. A release racing a mid-hold restart's `engine.start()` tears the
+    /// engine down (`isSetUp` false) while `pcmBuffers` still holds the
+    /// pre-restart speech, which must be transcribed like a normal stop.
+    static func shouldDiscardAsMicNotSetup(isSetUp: Bool, bufferCount: Int) -> Bool {
+        !isSetUp && bufferCount == 0
+    }
+
     /// Persist the raw tap snapshot for a successful cloud stream. This uses
     /// the same retention budget as batch recordings, but never feeds a
     /// second ASR path or shares the filtered provider buffer.
@@ -2488,33 +2570,18 @@ final class AudioRecorder {
         buffers: [AVAudioPCMBuffer],
         completion: @escaping (URL?) -> Void
     ) {
-        guard let first = buffers.first else {
+        guard !buffers.isEmpty else {
             completion(nil)
             return
         }
-        let format = first.format
         let buffersCopy = buffers
         audioIOQueue.async { [weak self] in
             guard let self else { return }
-            let totalFrames = buffersCopy.reduce(0) { $0 + AVAudioFrameCount($1.frameLength) }
-            guard let combined = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames),
-                  let dst = combined.floatChannelData else {
+            guard let combined = Self.combine(buffers: buffersCopy) else {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            var offset: AVAudioFrameCount = 0
-            for buffer in buffersCopy {
-                guard let src = buffer.floatChannelData else { continue }
-                for channel in 0 ..< Int(format.channelCount) {
-                    memcpy(
-                        dst[channel].advanced(by: Int(offset)),
-                        src[channel],
-                        Int(buffer.frameLength) * MemoryLayout<Float>.size
-                    )
-                }
-                offset += buffer.frameLength
-            }
-            combined.frameLength = offset
+            let format = combined.format
             let temporaryURL = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("voice-\(UUID().uuidString).caf")
             defer { try? FileManager.default.removeItem(at: temporaryURL) }
@@ -2546,8 +2613,7 @@ final class AudioRecorder {
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?
     ) {
-        guard let first = buffers.first else { return }
-        let format = first.format
+        guard !buffers.isEmpty else { return }
         // Snapshot buffers for the IO queue — do not touch AVAudioFile / retain on main.
         let buffersCopy = buffers
         // Hold triple was sampled at stop (before this async IO). Token alone
@@ -2556,10 +2622,8 @@ final class AudioRecorder {
         audioIOQueue.async { [weak self] in
             guard let self = self else { return }
 
-            let totalFrames = buffersCopy.reduce(0) { $0 + AVAudioFrameCount($1.frameLength) }
-
-            guard let combined = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else {
-                self.logger.error("Failed to allocate combined buffer (\(totalFrames) frames)")
+            guard let combined = Self.combine(buffers: buffersCopy) else {
+                self.logger.error("Failed to combine \(buffersCopy.count) buffers")
                 DispatchQueue.main.async {
                     self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
                     self.asrSelector.onTranscriptionLogged?(
@@ -2575,25 +2639,7 @@ final class AudioRecorder {
                 }
                 return
             }
-            combined.frameLength = 0
-
-            // Concatenate
-            if let dst = combined.floatChannelData {
-                var offset = AVAudioFrameCount(0)
-                for buf in buffersCopy {
-                    if let src = buf.floatChannelData {
-                        for ch in 0 ..< Int(format.channelCount) {
-                            memcpy(
-                                dst[ch].advanced(by: Int(offset)),
-                                src[ch],
-                                Int(buf.frameLength) * MemoryLayout<Float>.size
-                            )
-                        }
-                    }
-                    offset += buf.frameLength
-                }
-                combined.frameLength = offset
-            }
+            let format = combined.format
 
             // Write to /tmp
             let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
