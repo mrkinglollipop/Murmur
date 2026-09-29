@@ -521,6 +521,219 @@ else
   fail "failed-download error hides curl's exit code"
 fi
 
+LIB="$ROOT/scripts/release-lib.sh"
+RECOVER="$ROOT/scripts/recover-appcast.sh"
+# shellcheck source=release-lib.sh
+source "$LIB"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/publish-sparkle-test.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+echo "==> bash -n release-lib.sh / recover-appcast.sh"
+if bash -n "$LIB" && bash -n "$RECOVER"; then pass "bash -n lib + recover"; else fail "bash -n lib/recover"; fi
+
+echo "==> Sparkle key check: file key is the source of truth (item: Keychain/file split)"
+# RFC 8032 test vector 1: seed -> public key. Proves the derivation, not just the compare.
+SEED_B64="$(python3 -c 'import base64;print(base64.b64encode(bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")).decode())')"
+PUB_B64="$(python3 -c 'import base64;print(base64.b64encode(bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")).decode())')"
+OTHER_PUB="$(python3 -c 'import base64;print(base64.b64encode(bytes(range(32))).decode())')"
+printf '%s\n' "$SEED_B64" > "$TMP/seed"
+if got="$(sparkle_public_key_from_seed_file "$TMP/seed" 2>"$TMP/derive.err")"; then
+  if [[ "$got" == "$PUB_B64" ]]; then pass "seed file -> RFC 8032 public key"; else fail "derived [$got] != [$PUB_B64]"; fi
+elif grep -q 'install cryptography or PyNaCl' "$TMP/derive.err"; then
+  pass "SKIP derivation (no cryptography/PyNaCl here); compare logic still tested below"
+else
+  fail "seed derivation failed: $(cat "$TMP/derive.err")"
+fi
+printf 'AAAA\n' > "$TMP/short"
+if sparkle_public_key_from_seed_file "$TMP/short" >/dev/null 2>&1; then fail "short seed accepted"; else pass "wrong-length seed rejected"; fi
+
+if check_sparkle_keys "$PUB_B64" "$PUB_B64" "" 2>/dev/null; then pass "app == file, no keychain key"; else fail "app==file, no keychain rejected"; fi
+if check_sparkle_keys "$PUB_B64" "$PUB_B64" "$PUB_B64" 2>/dev/null; then pass "app == file == keychain"; else fail "all-equal rejected"; fi
+if check_sparkle_keys "$OTHER_PUB" "$PUB_B64" "$PUB_B64" 2>/dev/null; then fail "app != file accepted"; else pass "app != file rejected"; fi
+# The historical bug: keychain agrees with the app, the signing file does not.
+if check_sparkle_keys "$OTHER_PUB" "$PUB_B64" "$OTHER_PUB" 2>/dev/null; then fail "keychain==app but file differs accepted (old bug)"; else pass "keychain==app but signing file differs rejected"; fi
+# Signing file agrees with the app but a readable Keychain key differs.
+if check_sparkle_keys "$PUB_B64" "$PUB_B64" "$OTHER_PUB" 2>/dev/null; then fail "keychain mismatch accepted"; else pass "readable keychain mismatch rejected"; fi
+if check_sparkle_keys "$PUB_B64" "" "" 2>/dev/null; then fail "empty file key accepted"; else pass "underivable file key rejected"; fi
+if check_sparkle_keys "" "$PUB_B64" "" 2>/dev/null; then fail "empty app key accepted"; else pass "missing app key rejected"; fi
+
+echo "==> key gate wired into publish-sparkle.sh"
+if grep -q 'expected_public_ed_key' "$SCRIPT"; then
+  fail "expected_public_ed_key (Keychain-preferring) still present"
+elif grep -q 'sparkle_public_key_from_seed_file "\$SPARKLE_PRIVATE_KEY"' "$SCRIPT" \
+  && grep -q 'check_sparkle_keys "\$APP_PUBKEY" "\$FILE_PUB" "\$KEYCHAIN_PUB"' "$SCRIPT"; then
+  pass "app key checked against the signing file (+ Keychain when readable)"
+else
+  fail "publish-sparkle.sh does not check the signing file's public key"
+fi
+
+echo "==> newest appcast backup selection"
+mkdir -p "$TMP/bk"
+if newest_appcast_backup "$TMP/bk" >/dev/null 2>&1; then fail "empty dir returned a backup"; else pass "no backups -> non-zero"; fi
+if newest_appcast_backup "$TMP/nope" >/dev/null 2>&1; then fail "missing dir returned a backup"; else pass "missing dir -> non-zero"; fi
+for n in appcast.backup.20260101T000000Z.xml appcast.backup.20260929T101500Z.xml \
+         appcast.backup.20260315T235959Z.xml appcast.prev.xml appcast.xml \
+         appcast.backup.99999999T999999Z.xml.bak appcast.backup.bad.xml; do
+  : > "$TMP/bk/$n"
+done
+got="$(newest_appcast_backup "$TMP/bk")"
+if [[ "$got" == "$TMP/bk/appcast.backup.20260929T101500Z.xml" ]]; then
+  pass "newest by timestamp; decoys ignored"
+else
+  fail "picked [$got]"
+fi
+
+echo "==> version-collision refusal (release already has a DMG)"
+if printf 'Murmur-0.1.52.dmg\n' | assets_include_dmg; then pass "DMG asset detected"; else fail "DMG asset missed"; fi
+if printf 'notes.txt\nMurmur.DMG\n' | assets_include_dmg; then pass "case-insensitive .dmg among others"; else fail ".DMG missed"; fi
+if printf '' | assets_include_dmg; then fail "empty asset list read as DMG"; else pass "no assets -> allowed"; fi
+if printf 'notes.txt\nappcast.xml\nMurmur.dmg.sig\n' | assets_include_dmg; then fail "non-dmg names matched"; else pass "non-dmg assets -> allowed"; fi
+if grep -q 'ALLOW_REPUBLISH_VERSION' "$SCRIPT" \
+  && grep -q 'load_gh_release_asset_names "v\${SHORT}"' "$SCRIPT"; then
+  pass "collision gate + explicit override wired"
+else
+  fail "publish-sparkle.sh lacks the v\$SHORT DMG-asset gate"
+fi
+
+echo "==> live-feed fingerprint (real function extracted from publish-sparkle.sh)"
+eval "$(sed -n "/^mask_xml_noise_py='/,/^'\$/p" "$SCRIPT")"
+eval "$(sed -n '/^appcast_newest_fingerprint() {/,/^}/p' "$SCRIPT")"
+cat > "$TMP/staged.xml" <<'XML'
+<rss><channel>
+  <item>
+    <sparkle:version>53</sparkle:version>
+    <enclosure url="u" sparkle:version="53" sparkle:edSignature="NEWSIG" length="9" />
+  </item>
+  <item>
+    <sparkle:version>52</sparkle:version>
+    <enclosure url="u" sparkle:version="52" sparkle:edSignature="OLDSIG" length="8" />
+  </item>
+</channel></rss>
+XML
+# CDN still serving the pre-publish feed.
+cat > "$TMP/stale.xml" <<'XML'
+<rss><channel>
+  <item>
+    <sparkle:version>52</sparkle:version>
+    <enclosure url="u" sparkle:version="52" sparkle:edSignature="OLDSIG" length="8" />
+  </item>
+</channel></rss>
+XML
+cat > "$TMP/wrongsig.xml" <<'XML'
+<rss><channel>
+  <item>
+    <sparkle:version>53</sparkle:version>
+    <enclosure url="u" sparkle:version="53" sparkle:edSignature="OTHERSIG" length="9" />
+  </item>
+</channel></rss>
+XML
+cat > "$TMP/commented.xml" <<'XML'
+<rss><channel>
+  <!-- <item><sparkle:version>99</sparkle:version><enclosure sparkle:edSignature="GHOST" /></item> -->
+  <item>
+    <sparkle:version>53</sparkle:version>
+    <enclosure url="u" sparkle:version="53" sparkle:edSignature="NEWSIG" length="9" />
+  </item>
+</channel></rss>
+XML
+printf '<rss><channel><item><sparkle:version>53</sparkle:version></item></channel></rss>' > "$TMP/nosig.xml"
+printf '<rss><channel></channel></rss>' > "$TMP/noitem.xml"
+STAGED_FP="$(appcast_newest_fingerprint "$TMP/staged.xml")"
+[[ "$STAGED_FP" == "53|NEWSIG" ]] && pass "staged fingerprint 53|NEWSIG" || fail "staged fp [$STAGED_FP]"
+[[ "$(appcast_newest_fingerprint "$TMP/commented.xml")" == "$STAGED_FP" ]] \
+  && pass "commented item ignored; identical newest item matches" || fail "comment masking"
+[[ "$(appcast_newest_fingerprint "$TMP/stale.xml")" != "$STAGED_FP" ]] \
+  && pass "stale feed (old newest) differs" || fail "stale feed matched"
+[[ "$(appcast_newest_fingerprint "$TMP/wrongsig.xml")" != "$STAGED_FP" ]] \
+  && pass "same version, different signature differs" || fail "signature ignored"
+[[ -z "$(appcast_newest_fingerprint "$TMP/nosig.xml")" ]] \
+  && pass "newest item without edSignature -> empty (fail closed)" || fail "nosig produced fp"
+[[ -z "$(appcast_newest_fingerprint "$TMP/noitem.xml")" ]] \
+  && pass "no <item> -> empty (fail closed)" || fail "noitem produced fp"
+
+echo "==> cache-busted URL"
+[[ "$(cache_busted_url 'https://h/p/appcast.xml' 7)" == 'https://h/p/appcast.xml?cb=7' ]] \
+  && pass "nonce appended with ?" || fail "plain url"
+[[ "$(cache_busted_url 'https://h/p?a=1' 7)" == 'https://h/p?a=1&cb=7' ]] \
+  && pass "nonce appended with & to an existing query" || fail "query url"
+
+echo "==> publish-sparkle.sh release-safety wiring"
+ln_of() { grep -n -m1 -- "$1" "$SCRIPT" | cut -d: -f1; }
+TEAM_LINE="$(ln_of '^resolve_development_team ')"
+FETCH_LINE="$(ln_of '^if fetch_prior_appcast')"
+if [[ -n "$TEAM_LINE" && -n "$FETCH_LINE" ]] && (( TEAM_LINE < FETCH_LINE )); then
+  pass "team-id preflight ($TEAM_LINE) precedes the first network call ($FETCH_LINE)"
+else
+  fail "team-id preflight missing or after fetch_prior_appcast (team=$TEAM_LINE fetch=$FETCH_LINE)"
+fi
+if grep -q 'env -u DMG_PATH' "$SCRIPT"; then pass "DMG_PATH unset for make-dmg.sh"; else fail "make-dmg.sh still inherits DMG_PATH"; fi
+if grep -q 'xcrun stapler validate "\$DMG"' "$SCRIPT" \
+  && grep -q 'codesign --verify --deep --strict "\$APP"' "$SCRIPT"; then
+  pass "SKIP_MAKE_DMG + NOTARIZE=1 runs stapler + codesign --strict"
+else
+  fail "SKIP_MAKE_DMG reuse lacks stapler/codesign checks"
+fi
+VERIFY_LINE="$(ln_of 'sign_update.*--verify.*VERIFY_DMG\|--verify --ed-key-file "\$SPARKLE_PRIVATE_KEY" "\$VERIFY_DMG"')"
+BACKUP_LINE="$(ln_of 'appcast.backup.\$(date')"
+UPLOAD_LINE="$(ln_of '^if ! gh release upload appcast "\$STAGE_APPCAST"')"
+DMGUP_LINE="$(ln_of 'gh release upload "\$TAG"')"
+if [[ -n "$VERIFY_LINE" && -n "$BACKUP_LINE" && -n "$UPLOAD_LINE" && -n "$DMGUP_LINE" ]] \
+  && (( DMGUP_LINE < VERIFY_LINE && VERIFY_LINE < BACKUP_LINE && BACKUP_LINE < UPLOAD_LINE )); then
+  pass "order: DMG upload ($DMGUP_LINE) → verify download ($VERIFY_LINE) → backup ($BACKUP_LINE) → appcast upload ($UPLOAD_LINE)"
+else
+  fail "release order wrong/missing (dmgup=$DMGUP_LINE verify=$VERIFY_LINE backup=$BACKUP_LINE upload=$UPLOAD_LINE)"
+fi
+if grep -q 'restore_appcast_backup "\$APPCAST_BACKUP"' "$SCRIPT"; then pass "failed appcast upload restores the backup"; else fail "no restore on failed appcast upload"; fi
+if grep -q 'gh release upload appcast "\$STAGE_APPCAST" --repo "\$UPDATES_REPO" --clobber$' "$SCRIPT"; then
+  fail "bare appcast --clobber (no failure handling) still present"
+else
+  pass "no unguarded appcast --clobber"
+fi
+if grep -q 'appcast_newest_fingerprint "\$LIVE_APPCAST"' "$SCRIPT" && grep -q 'curl_fresh "live feed"' "$SCRIPT"; then
+  pass "live feed compared to staged after upload"
+else
+  fail "no post-upload live-feed comparison"
+fi
+
+echo "==> restore_appcast_backup (real function extracted; gh stubbed)"
+eval "$(sed -n '/^restore_appcast_backup() {/,/^}/p' "$SCRIPT")"
+mkdir -p "$TMP/build"
+GH_LOG="$TMP/gh.log"
+gh() { echo "$*" >> "$GH_LOG"; [[ "$4" == *appcast.xml ]] && cp "$4" "$TMP/uploaded.xml"; [[ -z "${GH_FAIL:-}" ]]; }
+UPDATES_REPO="o/r"
+BK="$TMP/bk/appcast.backup.20260929T101500Z.xml"
+printf 'PRIOR-FEED-BYTES\n' > "$BK"
+: > "$GH_LOG"; rm -f "$TMP/uploaded.xml"
+if ROOT="$TMP" restore_appcast_backup "$BK" 2>/dev/null \
+  && grep -q '^release upload appcast .*/appcast.xml --repo o/r --clobber$' "$GH_LOG" \
+  && [[ "$(cat "$TMP/uploaded.xml")" == "PRIOR-FEED-BYTES" ]]; then
+  pass "restore re-uploads the backup bytes as appcast.xml"
+else
+  fail "restore did not upload backup as appcast.xml ($(cat "$GH_LOG"))"
+fi
+if GH_FAIL=1 ROOT="$TMP" restore_appcast_backup "$BK" 2>/dev/null; then
+  fail "failed restore reported success"
+else
+  pass "failed restore returns non-zero (caller still exits 1)"
+fi
+if ROOT="$TMP" restore_appcast_backup "" 2>/dev/null; then
+  fail "restore with no backup (bootstrap) reported success"
+else
+  pass "no backup (bootstrap) -> non-zero, no upload attempted"
+fi
+[[ -z "$(ls -A "$TMP/build")" ]] && pass "restore temp dirs cleaned up" || fail "restore left temp dirs: $(ls "$TMP/build")"
+unset -f gh
+
+echo "==> recover-appcast.sh guards"
+if grep -q 'newest_appcast_backup' "$RECOVER" \
+  && grep -q 'FORCE_RECOVER' "$RECOVER" \
+  && grep -q 'gh release view appcast' "$RECOVER" \
+  && grep -q 'DRY_RUN' "$RECOVER"; then
+  pass "recovers newest backup; refuses a live feed / unconfirmed release; dry-run"
+else
+  fail "recover-appcast.sh missing a guard"
+fi
+
 echo ""
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ORACLE FAILED"
