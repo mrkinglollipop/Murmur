@@ -762,10 +762,14 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
                 return
             }
             if self.finalizeCommitHadText,
-               !self.latestPartial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+               !self.latestPartial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !Self.partialIsCovered(byCommitted: self.committedSegments, partial: self.latestPartial) {
                 // A new hypothesis arrived after a committed segment. Wait for
                 // its authoritative commit; the global timeout will request
                 // buffered-audio recovery if that commit never arrives.
+                // A partial whose words are all already committed (a trailing
+                // re-emit) carries nothing a further commit could add — no audio
+                // follows the terminal frame — so it must not hold the wait.
                 self.doneDrainTask = nil
                 self.stateLock.unlock()
                 return
@@ -819,6 +823,24 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             partial: latestPartial,
             commitSeen: finalizeCommitHadText
         )
+    }
+
+    /// True when every word of `partial` already appears, in order and
+    /// contiguously, inside the committed text (case- and punctuation-
+    /// insensitive). Such a partial adds no words to the result.
+    static func partialIsCovered(byCommitted segments: [String], partial: String) -> Bool {
+        func words(_ text: String) -> [Substring] {
+            text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        }
+        let needle = words(partial)
+        guard !needle.isEmpty else { return true }
+        let haystack = words(segments.joined(separator: " "))
+        guard haystack.count >= needle.count else { return false }
+        for start in 0...(haystack.count - needle.count)
+            where haystack[start..<(start + needle.count)].elementsEqual(needle) {
+            return true
+        }
+        return false
     }
 
     static func finalizeTranscript(

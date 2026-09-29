@@ -308,6 +308,42 @@ final class StreamIntegrityTests: XCTestCase {
         XCTAssertFalse(session.requiresBufferedAudioRecovery)
     }
 
+    /// Replays the logged order: session ready -> finalize -> committed_transcript
+    /// 0.15 s in -> a trailing partial that only re-emits committed words.
+    func testElevenLabsTrailingDuplicatePartialDoesNotHoldFinalizeToDeadline() async {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        let finalizer = Task { await session.finalize(recordingDuration: 4) }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        session.handleServerEvent(#"{"message_type":"committed_transcript","text":"Send the report to Dana before noon today."}"#)
+        session.handleServerEvent(#"{"message_type":"partial_transcript","text":"send the report to dana before noon today"}"#)
+        let startedAt = Date()
+        let text = await finalizer.value
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.8)
+        XCTAssertEqual(text, "Send the report to Dana before noon today.")
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+    }
+
+    /// A post-commit partial that carries words the commit lacks still waits for
+    /// its authoritative commit and falls back to buffered audio if none arrives.
+    func testElevenLabsTrailingPartialWithNewWordsStillRequestsRecovery() async {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        let finalizer = Task { await session.finalize(recordingDuration: 4) }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        session.handleServerEvent(#"{"message_type":"committed_transcript","text":"Send the report"}"#)
+        session.handleServerEvent(#"{"message_type":"partial_transcript","text":"send the report to Dana"}"#)
+        _ = await finalizer.value
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+    }
+
+    func testElevenLabsPartialCoverageIsCaseAndPunctuationInsensitive() {
+        XCTAssertTrue(ElevenLabsRealtimeTranscriber.partialIsCovered(
+            byCommitted: ["Hello, world.", "Second one"], partial: "hello world second"))
+        XCTAssertFalse(ElevenLabsRealtimeTranscriber.partialIsCovered(
+            byCommitted: ["Hello, world."], partial: "hello there"))
+        XCTAssertFalse(ElevenLabsRealtimeTranscriber.partialIsCovered(
+            byCommitted: ["Hello"], partial: "hello world"))
+    }
+
     func testElevenLabsLongSessionCannotTreatFirstRacedCommitAsSessionFinal() async {
         let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
         let finalizer = Task { await session.finalize(recordingDuration: 40) }
