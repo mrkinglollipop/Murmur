@@ -66,6 +66,17 @@ struct SignInSheetView: View {
                 .font(.system(size: 10))
                 .foregroundColor(Theme.textSecondary)
                 .padding(.top, 6)
+
+            // The sheet is modal; without this the only way out of a failed
+            // sign-in is quitting the app.
+            Button("Not now") {
+                authFlow.cancelSignIn()
+                onDismiss()
+            }
+            .buttonStyle(.link)
+            .foregroundColor(Theme.textSecondary)
+            .keyboardShortcut(.cancelAction)
+            .padding(.top, 2)
         }
     }
 
@@ -82,6 +93,7 @@ struct SignInSheetView: View {
                 .multilineTextAlignment(.center)
                 .foregroundColor(Theme.textSecondary)
             Button("Cancel") { authFlow.cancelSignIn() }
+                .keyboardShortcut(.cancelAction)
                 .buttonStyle(.link)
                 .foregroundColor(Theme.primary)
                 .padding(.top, 4)

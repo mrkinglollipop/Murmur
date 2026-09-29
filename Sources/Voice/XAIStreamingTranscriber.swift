@@ -10,7 +10,7 @@ struct TranscriptWord: Equatable {
     let end: Double
 }
 
-// MARK: - Streaming transcription session (xAI Grok STT WebSocket)
+// MARK: - Streaming transcription session (xAI Grok Voice Transcribe WebSocket)
 
 /// Push-to-talk streaming speech-to-text client for xAI's Grok streaming STT
 /// WebSocket (`wss://api.x.ai/v1/stt`). Unlike `StreamingTranscriber` (which
@@ -22,7 +22,7 @@ struct TranscriptWord: Equatable {
 /// (`AudioRecorder`) regardless of which transcription backend is active.
 ///
 /// PROTOCOL (xAI docs, implemented verbatim):
-///   - Connect to `wss://api.x.ai/v1/stt?sample_rate=16000&encoding=pcm&interim_results=true&language=en&endpointing=5000`
+///   - Connect to `wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&sample_rate=16000&encoding=pcm&interim_results=true&language=en&endpointing=5000`
 ///     with `Authorization: Bearer <key>` as an HTTP header on the upgrade
 ///     request (NOT a query param).
 ///   - Wait for `{"type":"transcript.created"}` before sending any audio —
@@ -184,11 +184,12 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         super.init()
     }
 
-    /// Builds the Grok STT WebSocket URL. `endpointing` is clamped to
+    /// Builds the Grok Voice Transcribe WebSocket URL. `endpointing` is clamped to
     /// `endpointingMsRange`; default 5000 is the previous hardcoded value.
     static func buildSocketURL(language: String, endpointingMs: Int = defaultEndpointingMs) -> URL? {
         var components = URLComponents(string: "wss://api.x.ai/v1/stt")!
         components.queryItems = [
+            URLQueryItem(name: "model", value: XAITranscriptionService.modelID),
             URLQueryItem(name: "sample_rate", value: "16000"),
             URLQueryItem(name: "encoding", value: "pcm"),
             URLQueryItem(name: "interim_results", value: "true"),
@@ -1243,10 +1244,16 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// (common when cumulative chunk finals get appended onto stitched text).
     /// Requires word-boundary-aligned halves (split on whitespace, compare
     /// word arrays) so partial character matches don't false-positive.
+    ///
+    /// Each repeated half must be at least `minRepeatedHalfWords` long: shorter
+    /// repeats ("no no no no", "I think so I think so") are ordinary speech,
+    /// while a stitching artifact duplicates a whole chunk.
+    static let minRepeatedHalfWords = 6
+
     static func dedupeRepeatedContent(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let words = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        guard words.count >= 4 else { return trimmed }
+        guard words.count >= minRepeatedHalfWords * 2 else { return trimmed }
 
         let half = words.count / 2
         let firstHalf = Array(words.prefix(half))
@@ -1257,10 +1264,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             return firstHalf.joined(separator: " ")
         }
 
-        for splitCount in stride(from: words.count / 2, through: max(words.count / 4, 2), by: -1) {
+        for splitCount in stride(from: words.count / 2, through: max(words.count / 4, minRepeatedHalfWords), by: -1) {
             let prefix = Array(words.prefix(splitCount))
             let suffix = Array(words.suffix(words.count - splitCount))
-            guard prefix.count == suffix.count, prefix.count >= 2 else { continue }
+            guard prefix.count == suffix.count, prefix.count >= minRepeatedHalfWords else { continue }
             if prefix.map({ $0.lowercased() }) == suffix.map({ $0.lowercased() }),
                !Self.firstHalfEndsSentence(prefix) {
                 return prefix.joined(separator: " ")
