@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.1.52",
+    "build": "53",
+    "title": "What's New in 0.1.52",
+    "items": [
+      "Text that the system delivers late is no longer typed a second time.",
+      "Your clipboard is restored correctly when two dictations happen back to back.",
+      "Switching microphones mid-dictation no longer garbles the recording or discards it when you release during the switch.",
+      "Voice enrollment no longer crashes when the default microphone is unavailable.",
+      "Spoken capitalization commands no longer remove words or punctuation from ordinary sentences.",
+      "Editing a failed History entry or a pronoun no longer teaches the dictionary bad replacements.",
+      "xAI dictation keeps short phrases you intentionally repeat.",
+      "Gemini and Muse fall back quickly when their connection stalls instead of hanging."
+    ]
+  },
+  {
     "version": "0.1.51",
     "build": "52",
     "title": "What's New in 0.1.51",
