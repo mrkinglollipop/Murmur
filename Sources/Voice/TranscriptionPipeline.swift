@@ -604,10 +604,14 @@ final class TranscriptionPipeline {
         }
         let inWords = Set(words(input))
         let outWords = words(output)
-        guard !outWords.isEmpty, !inWords.isEmpty else { return true }
+        // No words in the input leaves nothing to compare against.
+        guard !inWords.isEmpty else { return true }
 
         let ratio = Double(output.count) / Double(max(input.count, 1))
         if ratio > 2.0 || ratio < 0.4 { return false }
+
+        // A symbol-only reply ("…", an emoji) is not a cleanup of spoken words.
+        guard !outWords.isEmpty else { return false }
 
         let newWords = outWords.filter { !inWords.contains($0) }
         return Double(newWords.count) / Double(outWords.count) <= 0.4
