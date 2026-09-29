@@ -70,6 +70,15 @@ final class AudioCaptureAuditTests: XCTestCase {
         XCTAssertFalse(AudioRecorder.shouldDiscardAsMicNotSetup(isSetUp: true, bufferCount: 5))
     }
 
+    func testStaleBuffersFromEarlierHoldNeverRescueAnInstantTap() {
+        XCTAssertTrue(AudioRecorder.shouldDiscardAsMicNotSetup(
+            isSetUp: false, bufferCount: 40, micCaptureBeganThisHold: false
+        ))
+        XCTAssertFalse(AudioRecorder.shouldDiscardAsMicNotSetup(
+            isSetUp: true, bufferCount: 40, micCaptureBeganThisHold: false
+        ))
+    }
+
     // MARK: - EnrollmentCapture.shouldAttemptTap
 
     func testEnrollmentRejectsDeadFormats() {

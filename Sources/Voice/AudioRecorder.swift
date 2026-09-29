@@ -19,6 +19,10 @@ final class AudioRecorder {
     private var engine = AVAudioEngine()
     private var pcmBuffers: [AVAudioPCMBuffer] = []
     private let pcmBuffersLock = NSLock()
+    /// Guarded by `pcmBuffersLock`. `pcmBuffers` is only cleared when a hold's
+    /// mic capture begins, so buffers seen at stop while this is false belong
+    /// to an earlier hold and must never be transcribed again.
+    private var micCaptureBeganThisHold = false
     private var startTime: Date?
     private var isSetUp = false
 
@@ -1238,6 +1242,9 @@ final class AudioRecorder {
         }
         wantsRecording = true
         isStopping = false
+        pcmBuffersLock.lock()
+        micCaptureBeganThisHold = false
+        pcmBuffersLock.unlock()
         vlog("AudioRecorder.startRecording — requesting mic permission")
         requestMicrophonePermissionIfNeeded { [weak self] granted in
             vlog("mic permission callback — granted=\(granted)")
@@ -1494,6 +1501,7 @@ final class AudioRecorder {
         if !isWatchdogRetry {
             pcmBuffersLock.lock()
             pcmBuffers.removeAll()
+            micCaptureBeganThisHold = true
             pcmBuffersLock.unlock()
 
             levelLock.lock()
@@ -2336,8 +2344,13 @@ final class AudioRecorder {
     ) {
         pcmBuffersLock.lock()
         let bufferCountAtStop = pcmBuffers.count
+        let captureBegan = micCaptureBeganThisHold
         pcmBuffersLock.unlock()
-        guard !Self.shouldDiscardAsMicNotSetup(isSetUp: isSetUp, bufferCount: bufferCountAtStop) else {
+        guard !Self.shouldDiscardAsMicNotSetup(
+            isSetUp: isSetUp,
+            bufferCount: bufferCountAtStop,
+            micCaptureBeganThisHold: captureBegan
+        ) else {
             finishDiscardedHold(
                 reason: "mic-not-setup",
                 engineID: "file",
@@ -2559,8 +2572,14 @@ final class AudioRecorder {
     /// audio. A release racing a mid-hold restart's `engine.start()` tears the
     /// engine down (`isSetUp` false) while `pcmBuffers` still holds the
     /// pre-restart speech, which must be transcribed like a normal stop.
-    static func shouldDiscardAsMicNotSetup(isSetUp: Bool, bufferCount: Int) -> Bool {
-        !isSetUp && bufferCount == 0
+    /// Buffers left from an earlier hold (this hold's capture never began)
+    /// are not this hold's audio and never rescue it.
+    static func shouldDiscardAsMicNotSetup(
+        isSetUp: Bool,
+        bufferCount: Int,
+        micCaptureBeganThisHold: Bool = true
+    ) -> Bool {
+        !isSetUp && (bufferCount == 0 || !micCaptureBeganThisHold)
     }
 
     /// Persist the raw tap snapshot for a successful cloud stream. This uses
