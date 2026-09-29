@@ -74,8 +74,8 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(chunks[0], Array(String(repeating: "a", count: 15).utf16))
         XCTAssertEqual(chunks[1], Array("😀b".utf16))
         for chunk in chunks {
-            XCTAssertNotNil(String(utf16CodeUnits: chunk, count: chunk.count) as String?)
-            XCTAssertEqual(String(decoding: chunk, as: UTF16.self).unicodeScalars.contains("\u{FFFD}"), false)
+            // A lone surrogate would decode to U+FFFD.
+            XCTAssertFalse(String(decoding: chunk, as: UTF16.self).unicodeScalars.contains("\u{FFFD}"))
         }
         XCTAssertEqual(chunks.flatMap { $0 }, Array(text.utf16))
     }
