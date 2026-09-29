@@ -229,11 +229,22 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
         ])
     }
 
+    /// The transcript id is server-supplied and lands in a URL path, so accept
+    /// only id-shaped characters (no `/`, `..`, `?`, whitespace).
+    static func pollURL(transcriptID: String) -> URL? {
+        guard !transcriptID.isEmpty,
+              transcriptID.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") })
+        else { return nil }
+        return URL(string: "https://api.assemblyai.com/v2/transcript/\(transcriptID)")
+    }
+
     /// Step (c): poll every ~1.5s until `status == "completed"` (or
     /// `"error"`), capped at ~120s total.
     private func poll(transcriptID: String, apiKey: String) async throws -> String {
         let deadline = Date().addingTimeInterval(120)
-        let url = URL(string: "https://api.assemblyai.com/v2/transcript/\(transcriptID)")!
+        guard let url = Self.pollURL(transcriptID: transcriptID) else {
+            throw CloudTranscriptionError(provider: .assemblyAI, message: "Invalid transcript id in response")
+        }
 
         while Date() < deadline {
             try Task.checkCancellation()
