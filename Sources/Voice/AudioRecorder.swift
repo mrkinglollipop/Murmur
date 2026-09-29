@@ -881,7 +881,14 @@ final class AudioRecorder {
 
     /// Speaker-gating stream processor — allocated only when gating is active
     /// (enabled setting + stored profile). Nil otherwise for zero overhead.
-    private var voiceGateProcessor: VoiceGateStreamProcessor?
+    /// Main sets/clears it (`updateSpeakerGating`) while the audio tap reads it,
+    /// so it is published through a lock; the tap takes one retained snapshot
+    /// per buffer rather than re-reading the property.
+    private let voiceGateProcessorRef = LockedReference<VoiceGateStreamProcessor>()
+    private var voiceGateProcessor: VoiceGateStreamProcessor? {
+        get { voiceGateProcessorRef.current }
+        set { voiceGateProcessorRef.current = newValue }
+    }
     private lazy var voiceGateEmbeddingProvider: FluidAudioEmbeddingProvider = FluidAudioEmbeddingProvider()
     private let voiceGateProfileStore = VoiceProfileStore()
     private let voiceGateRecordingSession = VoiceGateRecordingSession()
@@ -1628,7 +1635,8 @@ final class AudioRecorder {
                 // Gate only the buffer sent to the live provider. The stream
                 // processor evaluates the raw samples and snapshots its latch
                 // before any async evaluation can affect this buffer.
-                self.voiceGateProcessor?.processBuffer(buffer)
+                let gateProcessor = self.voiceGateProcessor
+                gateProcessor?.processBuffer(buffer)
 
                 // Streaming mode: ALSO convert + stream this buffer to the
                 // socket (the session consumes it synchronously). Only one of
@@ -2807,6 +2815,31 @@ final class AudioRecorder {
             completion(false)
         @unknown default:
             completion(false)
+        }
+    }
+}
+
+/// Lock-guarded optional class reference shared between main and a realtime
+/// thread. Readers get a retained snapshot, so a concurrent `nil` assignment
+/// cannot release the object out from under an in-flight callback.
+final class LockedReference<Value: AnyObject> {
+    private let lock = NSLock()
+    private var value: Value?
+
+    init(_ value: Value? = nil) {
+        self.value = value
+    }
+
+    var current: Value? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+        set {
+            lock.lock()
+            value = newValue
+            lock.unlock()
         }
     }
 }
