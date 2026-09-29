@@ -152,6 +152,12 @@ final class DictionaryStore: ObservableObject {
     private let fileURL: URL
     private let blocklistFileURL: URL
 
+    /// Set when dictionary.json / blocklist.json exists but could not be read
+    /// or moved aside. Saving then would overwrite recoverable user data, so
+    /// that file's writes stay off for the rest of the session.
+    private var dictionarySavesBlocked = false
+    private var blocklistSavesBlocked = false
+
     init(fileURL: URL? = nil, blocklistFileURL: URL? = nil) {
         self.fileURL = fileURL ?? DictionaryStore.defaultFileURL()
         self.blocklistFileURL = blocklistFileURL ?? DictionaryStore.defaultBlocklistFileURL()
@@ -176,7 +182,11 @@ final class DictionaryStore: ObservableObject {
 
     private func load() {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            dictionarySavesBlocked = true
+            logger.error("dictionary.json exists but is unreadable — saves disabled this session")
+            return
+        }
         do {
             let decoded = try JSONDecoder().decode([DictionaryEntry].self, from: data)
             let merged = Self.mergingDuplicateTerms(decoded)
@@ -185,7 +195,7 @@ final class DictionaryStore: ObservableObject {
                 save()
             }
         } catch {
-            quarantineCorruptFile(at: fileURL, label: "dictionary.json", error: error) {
+            quarantineCorruptFile(at: fileURL, label: "dictionary.json", error: error, blockSaves: { self.dictionarySavesBlocked = true }) {
                 self.entries = []
             }
         }
@@ -193,18 +203,22 @@ final class DictionaryStore: ObservableObject {
 
     private func loadBlocklist() {
         guard FileManager.default.fileExists(atPath: blocklistFileURL.path) else { return }
-        guard let data = try? Data(contentsOf: blocklistFileURL) else { return }
+        guard let data = try? Data(contentsOf: blocklistFileURL) else {
+            blocklistSavesBlocked = true
+            logger.error("blocklist.json exists but is unreadable — saves disabled this session")
+            return
+        }
         do {
             let pairs = try JSONDecoder().decode([BlockedPair].self, from: data)
             blocklist = Set(pairs)
         } catch {
-            quarantineCorruptFile(at: blocklistFileURL, label: "blocklist.json", error: error) {
+            quarantineCorruptFile(at: blocklistFileURL, label: "blocklist.json", error: error, blockSaves: { self.blocklistSavesBlocked = true }) {
                 self.blocklist = []
             }
         }
     }
 
-    private func quarantineCorruptFile(at url: URL, label: String, error: Error, reset: () -> Void) {
+    private func quarantineCorruptFile(at url: URL, label: String, error: Error, blockSaves: () -> Void, reset: () -> Void) {
         let bak = URL(fileURLWithPath: url.path + ".corrupt.\(Int(Date().timeIntervalSince1970))")
         do {
             if FileManager.default.fileExists(atPath: bak.path) {
@@ -213,6 +227,7 @@ final class DictionaryStore: ObservableObject {
             try FileManager.default.moveItem(at: url, to: bak)
             logger.error("Quarantined corrupt \(label) → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
+            blockSaves()
             logger.error("Failed to quarantine corrupt \(label): \(error.localizedDescription)")
         }
         reset()
@@ -220,11 +235,13 @@ final class DictionaryStore: ObservableObject {
 
     private func save() {
         rebuildRegexCache()
+        guard !dictionarySavesBlocked else { return }
         guard let data = try? JSONEncoder().encode(entries) else { return }
         try? data.write(to: fileURL, options: .atomic)
     }
 
     private func saveBlocklist() {
+        guard !blocklistSavesBlocked else { return }
         let pairs = Array(blocklist)
         guard let data = try? JSONEncoder().encode(pairs) else { return }
         try? data.write(to: blocklistFileURL, options: .atomic)
