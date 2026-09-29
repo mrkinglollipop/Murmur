@@ -843,8 +843,9 @@ final class DictionaryStore: ObservableObject {
     }
 
     private func isLearnableVariant(_ stripped: String) -> Bool {
-        guard !stripped.isEmpty else { return false }
-        guard stripped.count > 1 || stripped.rangeOfCharacter(from: .punctuationCharacters) == nil else { return false }
+        // A one-letter variant ("I") would rewrite every occurrence of that
+        // letter/pronoun from a single edit.
+        guard stripped.count > 1 else { return false }
         guard stripped.rangeOfCharacter(from: .decimalDigits.inverted) != nil else { return false }
         return true
     }

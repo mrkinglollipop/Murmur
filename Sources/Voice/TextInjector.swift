@@ -48,6 +48,7 @@ final class TextInjector {
     /// Leaves transcript on the general pasteboard for manual paste (PID-mismatch
     /// / failed inject). Package-visible for `TranscriptionPipeline`.
     static func leaveTranscriptOnClipboard(_ text: String) {
+        clearPendingRestoreBaseline()
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         log("left on clipboard for manual paste")
@@ -138,6 +139,12 @@ final class TextInjector {
     /// callback cannot clobber a newer dictation's pasteboard state.
     private static let restoreGenerationLock = NSLock()
     private static var restoreGeneration: UInt64 = 0
+    /// The user's pre-dictation clipboard while a deferred restore is pending.
+    /// Guarded by `restoreGenerationLock`. A paste-lane insert inside the
+    /// restore window would otherwise snapshot the pasteboard while it holds
+    /// the previous transcript, then supersede the pending restore — losing
+    /// the user's original clipboard for good.
+    private static var pendingRestoreBaseline: PasteboardSnapshot?
 
     static let concealedPasteboardType = NSPasteboard.PasteboardType(
         rawValue: "org.nspasteboard.ConcealedType"
@@ -280,12 +287,17 @@ final class TextInjector {
     /// once set (its credibility is shot for this insert), so it forces the
     /// anti-double-safe outcome even if this particular canary check reports
     /// observed==true.
+    ///
+    /// `lateChunksObserved` covers the delayed-not-dropped case: the WindowServer
+    /// stall that made the unicode wait read 0 can release our chunks while the
+    /// canary wait runs. Text that arrived late must never be re-typed.
     static func canaryVerdict(
         canaryObserved: Bool,
         wentBlind: Bool,
-        isSecondAttempt: Bool
+        isSecondAttempt: Bool,
+        lateChunksObserved: Bool = false
     ) -> CanaryVerdict {
-        guard canaryObserved, !wentBlind else {
+        guard canaryObserved, !wentBlind, !lateChunksObserved else {
             return .acceptUnverified
         }
         return isSecondAttempt ? .escalateToPaste : .retypeOnce
@@ -346,6 +358,21 @@ final class TextInjector {
     /// One captured pasteboard item: every representation type it carried,
     /// with its bytes. A whole pasteboard is an ordered list of these.
     typealias PasteboardSnapshot = [[NSPasteboard.PasteboardType: Data]]
+
+    /// Baseline for an insert about to run: the original clipboard captured by a
+    /// still-pending deferred restore, else the live pasteboard.
+    static func pasteboardBaselineSnapshot(from pasteboard: NSPasteboard) -> PasteboardSnapshot {
+        restoreGenerationLock.lock()
+        let pending = pendingRestoreBaseline
+        restoreGenerationLock.unlock()
+        return pending ?? pasteboardSnapshot(from: pasteboard)
+    }
+
+    private static func clearPendingRestoreBaseline() {
+        restoreGenerationLock.lock()
+        pendingRestoreBaseline = nil
+        restoreGenerationLock.unlock()
+    }
 
     /// Captures every item and every representation currently on `pasteboard`.
     ///
@@ -433,11 +460,15 @@ final class TextInjector {
         restoreGenerationLock.lock()
         restoreGeneration &+= 1
         let generation = restoreGeneration
+        pendingRestoreBaseline = savedPasteboard
         restoreGenerationLock.unlock()
 
         asyncAfter(delay) {
             restoreGenerationLock.lock()
             let current = restoreGeneration
+            if generation == current {
+                pendingRestoreBaseline = nil
+            }
             restoreGenerationLock.unlock()
             guard generation == current else {
                 log("skip deferred pasteboard restore — superseded")
@@ -456,6 +487,7 @@ final class TextInjector {
     static func resetDeferredRestoreGenerationForTesting() {
         restoreGenerationLock.lock()
         restoreGeneration = 0
+        pendingRestoreBaseline = nil
         restoreGenerationLock.unlock()
     }
 
@@ -586,8 +618,11 @@ final class TextInjector {
 
     /// Posts the F20 canary, waits a flat window, and folds the result
     /// through `canaryVerdict`.
+    ///
+    /// Only the canary counter is cleared: the unicode counters must survive
+    /// the wait so chunks delivered late (delayed, not dropped) are noticed.
     private func probeCanary(observer: UnicodeDeliveryObserver, isSecondAttempt: Bool) -> CanaryVerdict {
-        observer.resetObservedCount()
+        observer.resetCanaryCount()
         _ = postCanary()
         let observedCanary = waitForConfirmation(
             observer: observer,
@@ -597,10 +632,16 @@ final class TextInjector {
             progressExtension: 0,
             maxWait: Self.canaryConfirmationWindow
         )
+        let lateChunksObserved = observer.observedUTF16Units > 0
+            || observer.keycodeZeroKeyDownCount > 0
+        if lateChunksObserved {
+            Self.log("unicode chunks arrived during canary wait — accepting unverified (anti-double)")
+        }
         return Self.canaryVerdict(
             canaryObserved: observedCanary >= 1,
             wentBlind: observer.wentBlind,
-            isSecondAttempt: isSecondAttempt
+            isSecondAttempt: isSecondAttempt,
+            lateChunksObserved: lateChunksObserved
         )
     }
 
@@ -609,7 +650,9 @@ final class TextInjector {
         // Snapshot before any lane that may write the pasteboard. Unicode-first
         // never writes on success; paste fallback needs this to put the user's
         // prior copy back after Cmd-V.
-        let savedPasteboard = Self.pasteboardSnapshot(from: NSPasteboard.general)
+        // While a prior deferred restore is pending the live pasteboard holds
+        // that transcript, so the baseline is the original the restore owns.
+        let savedPasteboard = Self.pasteboardBaselineSnapshot(from: NSPasteboard.general)
 
         guard let observer = UnicodeDeliveryObserver.create() else {
             // Paste-blind is unconfirmed — fail closed for watch / InsertResult.
@@ -1075,6 +1118,12 @@ private final class UnicodeDeliveryObserver {
         observedUTF16UnitsStorage = 0
         observedPasteChordCountStorage = 0
         keycodeZeroKeyDownCountStorage = 0
+        canaryObservedCountStorage = 0
+        lock.unlock()
+    }
+
+    func resetCanaryCount() {
+        lock.lock()
         canaryObservedCountStorage = 0
         lock.unlock()
     }

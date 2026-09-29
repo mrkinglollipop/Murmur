@@ -1244,10 +1244,16 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// (common when cumulative chunk finals get appended onto stitched text).
     /// Requires word-boundary-aligned halves (split on whitespace, compare
     /// word arrays) so partial character matches don't false-positive.
+    ///
+    /// Each repeated half must be at least `minRepeatedHalfWords` long: shorter
+    /// repeats ("no no no no", "I think so I think so") are ordinary speech,
+    /// while a stitching artifact duplicates a whole chunk.
+    static let minRepeatedHalfWords = 6
+
     static func dedupeRepeatedContent(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let words = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        guard words.count >= 4 else { return trimmed }
+        guard words.count >= minRepeatedHalfWords * 2 else { return trimmed }
 
         let half = words.count / 2
         let firstHalf = Array(words.prefix(half))
@@ -1258,10 +1264,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             return firstHalf.joined(separator: " ")
         }
 
-        for splitCount in stride(from: words.count / 2, through: max(words.count / 4, 2), by: -1) {
+        for splitCount in stride(from: words.count / 2, through: max(words.count / 4, minRepeatedHalfWords), by: -1) {
             let prefix = Array(words.prefix(splitCount))
             let suffix = Array(words.suffix(words.count - splitCount))
-            guard prefix.count == suffix.count, prefix.count >= 2 else { continue }
+            guard prefix.count == suffix.count, prefix.count >= minRepeatedHalfWords else { continue }
             if prefix.map({ $0.lowercased() }) == suffix.map({ $0.lowercased() }),
                !Self.firstHalfEndsSentence(prefix) {
                 return prefix.joined(separator: " ")

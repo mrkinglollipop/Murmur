@@ -22,19 +22,28 @@ enum SpokenCapitalization {
 
     private struct Token {
         var text: String
+        /// Where the token sits in the original string, so output can be
+        /// rebuilt from the source and keep its punctuation and newlines.
+        let range: Range<String.Index>
         /// True when this token was used as a capitalization target (kept in output).
         var usedAsTarget: Bool = false
         /// True when this token is part of a consumed `capital X` command (dropped).
         var isCommand: Bool = false
     }
 
-    static func apply(_ text: String) -> String {
-        let raw = tokenize(text)
-        guard !raw.isEmpty else { return text }
+    /// Word-start targets ("capital J" → John) must be at most this many
+    /// non-command tokens before the verb; farther is a coincidence, not intent.
+    private static let wordTargetWindow = 3
+    /// A lone spoken letter ("x ... capital x") is unambiguous, so it may sit
+    /// farther back than a word-start match.
+    private static let letterTargetWindow = 6
+    /// Shorter words ("in", "is") are too likely to be stray matches for the
+    /// pronoun "I" or other common letters.
+    private static let minWordTargetLength = 3
 
-        var tokens = raw.map { Token(text: $0) }
-        /// Trailing punct peeled from consumed letter tokens (e.g. `S.` → `.`).
-        var salvagedTrailingPunctuation = ""
+    static func apply(_ text: String) -> String {
+        var tokens = tokenize(text)
+        guard !tokens.isEmpty else { return text }
 
         // Collect command spans (verbIndex, letterIndex) left-to-right, apply RTL.
         var commands: [(verb: Int, letter: Int)] = []
@@ -49,6 +58,14 @@ enum SpokenCapitalization {
             }
         }
 
+        // Command phrases never count as targets or toward the target window.
+        var commandPhraseIndices = Set<Int>()
+        for cmd in commands {
+            commandPhraseIndices.insert(cmd.verb)
+            commandPhraseIndices.insert(cmd.letter)
+        }
+
+        var consumed: [(verb: Int, letter: Int)] = []
         for cmd in commands.reversed() {
             guard let targetLetter = letterFromCommandWord(tokens[cmd.letter].text) else {
                 continue
@@ -56,7 +73,8 @@ enum SpokenCapitalization {
             guard let targetIndex = findTarget(
                 in: tokens,
                 before: cmd.verb,
-                letter: targetLetter
+                letter: targetLetter,
+                skipping: commandPhraseIndices
             ) else {
                 // Fail-soft: leave the command phrase in the text.
                 continue
@@ -69,30 +87,75 @@ enum SpokenCapitalization {
             tokens[targetIndex].usedAsTarget = true
             tokens[cmd.verb].isCommand = true
             tokens[cmd.letter].isCommand = true
-            // Keep sentence-final / glued punct that ASR stuck on the letter (`S.`).
-            let peeled = peelEdgePunctuation(tokens[cmd.letter].text)
-            salvagedTrailingPunctuation = peeled.trailing + salvagedTrailingPunctuation
+            consumed.append(cmd)
         }
 
         // Identity when nothing applied: preserve commas, newlines, spacing.
-        guard tokens.contains(where: \.isCommand) else {
+        guard !consumed.isEmpty else {
             return text
         }
 
-        var result = tokens.filter { !$0.isCommand }.map(\.text).joined(separator: " ")
-        if !salvagedTrailingPunctuation.isEmpty {
-            result += salvagedTrailingPunctuation
+        // Rebuild from the original string: only capitalized targets change
+        // and consumed command phrases are cut, so everything else (commas,
+        // newlines, spacing) survives.
+        var edits: [(range: Range<String.Index>, replacement: String)] = []
+        for token in tokens where token.usedAsTarget {
+            edits.append((token.range, token.text))
         }
+        var runs: [(first: Int, last: Int, trailing: String)] = []
+        for cmd in consumed.sorted(by: { $0.verb < $1.verb }) {
+            // Keep sentence-final / glued punct that ASR stuck on the letter (`S.`).
+            let trailing = peelEdgePunctuation(tokens[cmd.letter].text).trailing
+            if let previous = runs.last, previous.last + 1 == cmd.verb {
+                runs[runs.count - 1] = (previous.first, cmd.letter, previous.trailing + trailing)
+            } else {
+                runs.append((cmd.verb, cmd.letter, trailing))
+            }
+        }
+        for run in runs {
+            var lower = tokens[run.first].range.lowerBound
+            while lower > text.startIndex {
+                let before = text.index(before: lower)
+                let ch = text[before]
+                guard ch == "," || (ch.isWhitespace && !ch.isNewline) else { break }
+                lower = before
+            }
+            edits.append((lower..<tokens[run.last].range.upperBound, run.trailing))
+        }
+
+        var result = ""
+        var cursor = text.startIndex
+        for edit in edits.sorted(by: { $0.range.lowerBound < $1.range.lowerBound }) {
+            result += text[cursor..<edit.range.lowerBound]
+            result += edit.replacement
+            cursor = edit.range.upperBound
+        }
+        result += text[cursor...]
         return result
     }
 
     /// Split for command parsing; commas are optional separators ≡ whitespace.
-    /// Only used when scanning/applying commands — identity path skips rebuild.
-    private static func tokenize(_ text: String) -> [String] {
-        text
-            .replacingOccurrences(of: ",", with: " ")
-            .split(whereSeparator: { $0.isWhitespace })
-            .map(String.init)
+    /// Tokens keep their source ranges so output can be rebuilt from `text`.
+    private static func tokenize(_ text: String) -> [Token] {
+        var tokens: [Token] = []
+        var start: String.Index?
+        var index = text.startIndex
+        func isSeparator(_ ch: Character) -> Bool { ch == "," || ch.isWhitespace }
+        while index < text.endIndex {
+            if isSeparator(text[index]) {
+                if let begin = start {
+                    tokens.append(Token(text: String(text[begin..<index]), range: begin..<index))
+                    start = nil
+                }
+            } else if start == nil {
+                start = index
+            }
+            index = text.index(after: index)
+        }
+        if let begin = start {
+            tokens.append(Token(text: String(text[begin...]), range: begin..<text.endIndex))
+        }
+        return tokens
     }
 
     private static func isCommandVerb(_ word: String) -> Bool {
@@ -128,41 +191,41 @@ enum SpokenCapitalization {
     }
 
     /// Nearest preceding unused match: prefer exact single-letter token, else
-    /// word whose first letter matches (case-insensitive). Skip used targets.
+    /// word whose first letter matches (case-insensitive). Skip used targets
+    /// and other command phrases; both passes are bounded (see the windows).
     private static func findTarget(
         in tokens: [Token],
         before verbIndex: Int,
-        letter: Character
+        letter: Character,
+        skipping commandPhraseIndices: Set<Int>
     ) -> Int? {
         let needle = Character(letter.lowercased())
 
-        // Pass 1: exact single-letter token.
-        var index = verbIndex - 1
-        while index >= 0 {
-            let token = tokens[index]
-            if !token.usedAsTarget && !token.isCommand {
-                let lower = token.text.lowercased()
-                if lower.count == 1, lower.first == needle {
-                    return index
+        func search(window: Int, matches: (String) -> Bool) -> Int? {
+            var seen = 0
+            var index = verbIndex - 1
+            while index >= 0, seen < window {
+                if !commandPhraseIndices.contains(index) {
+                    seen += 1
+                    let token = tokens[index]
+                    if !token.usedAsTarget, matches(token.text.lowercased()) {
+                        return index
+                    }
                 }
+                index -= 1
             }
-            index -= 1
+            return nil
+        }
+
+        // Pass 1: exact single-letter token.
+        if let hit = search(window: letterTargetWindow, matches: { $0.count == 1 && $0.first == needle }) {
+            return hit
         }
 
         // Pass 2: first letter of a longer word.
-        index = verbIndex - 1
-        while index >= 0 {
-            let token = tokens[index]
-            if !token.usedAsTarget && !token.isCommand {
-                let lower = token.text.lowercased()
-                if lower.count >= 1, lower.first == needle {
-                    return index
-                }
-            }
-            index -= 1
-        }
-
-        return nil
+        return search(window: wordTargetWindow, matches: {
+            $0.count >= minWordTargetLength && $0.first == needle
+        })
     }
 
     /// Single-letter → uppercase letter; longer word → first letter uppercased.
