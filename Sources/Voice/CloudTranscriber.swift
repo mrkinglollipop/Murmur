@@ -263,6 +263,10 @@ final class AssemblyAITranscriptionService: CloudTranscriptionService {
 // MARK: - xAI (Grok)
 
 final class XAITranscriptionService: CloudTranscriptionService {
+    /// Shared by batch and `XAIStreamingTranscriber`. Pinned explicitly because
+    /// xAI changes which model serves requests that omit `model`.
+    static let modelID = "grok-voice-transcribe-2.0"
+
     private struct Response: Decodable { let text: String }
 
     func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String {
@@ -279,7 +283,7 @@ final class XAITranscriptionService: CloudTranscriptionService {
             fileName: payload.fileName,
             mimeType: payload.mimeType,
             fields: [
-                "model": "grok-stt",
+                "model": Self.modelID,
                 "format": "json",
                 "language": language
             ]

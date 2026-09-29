@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.1.51",
+    "build": "52",
+    "title": "What's New in 0.1.51",
+    "items": [
+      "xAI dictation now uses Grok Voice Transcribe 2.0, xAI's newest and most accurate speech-to-text model, for both live streaming and recorded audio."
+    ]
+  },
+  {
     "version": "0.1.50",
     "build": "51",
     "title": "What's New in 0.1.50",
