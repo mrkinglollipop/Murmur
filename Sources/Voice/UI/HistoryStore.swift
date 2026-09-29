@@ -18,6 +18,16 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
     /// A retry was saved for review without typing into whichever app is focused.
     var savedWithoutInsertion: Bool
 
+    /// Stand-in text for a failed row with no transcript. Not something the
+    /// engine heard, so it must never seed dictionary learning.
+    static let failedPlaceholderText = "Transcription failed"
+
+    /// Whether `text` is real recognizer output a user edit can teach the
+    /// dictionary from.
+    var isLearnableEditSource: Bool {
+        !failed && text != Self.failedPlaceholderText
+    }
+
     init(
         id: UUID = UUID(),
         date: Date = Date(),
@@ -180,7 +190,7 @@ final class HistoryStore: ObservableObject {
             }
 
             let entry = HistoryEntry(
-                text: failed && trimmed.isEmpty ? "Transcription failed" : trimmed,
+                text: failed && trimmed.isEmpty ? HistoryEntry.failedPlaceholderText : trimmed,
                 engine: engine,
                 injected: injected,
                 audioPath: audioPath,
