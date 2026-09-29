@@ -88,7 +88,8 @@ final class GeminiLiveTests: XCTestCase {
             apiKey: "test-key",
             readinessTimeoutSeconds: 0.3,
             messageSender: { _ in
-                // Never returns and ignores cancellation — a stalled connect.
+                // Never returns and ignores cancellation — a stalled connect. The
+                // injected sender replaces the socket, so start() stays off the network.
                 await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
             }
         )
