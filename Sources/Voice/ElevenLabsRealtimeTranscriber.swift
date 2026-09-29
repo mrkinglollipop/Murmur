@@ -127,6 +127,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// Resolved exactly once by the receive loop when `session_started` arrives.
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var readyResolved = false
+    /// Set once `start()` has begun. With `readyResolved` still false, the
+    /// server has not sent `session_started`, so the commit frame would reach
+    /// the socket ahead of any audio.
+    private var startInvoked = false
 
     /// Resolved exactly once after committed events become briefly quiet
     /// following `finalize()`'s `commit:true` frame.
@@ -199,6 +203,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     func start() async throws {
         vlog("elevenlabs-stream: starting session")
         stateLock.lock()
+        startInvoked = true
         streamIntegrityFailed = false
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
@@ -217,10 +222,24 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key") // NOT bearer
 
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let task = session.webSocketTask(with: request)
-        self.session = session
-        self.task = task
+        // An injected message sender replaces the socket entirely (unit tests):
+        // no URLSession is created, so start() never touches the network.
+        let task: URLSessionWebSocketTask?
+        if injectedMessageSender == nil {
+            let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let socketTask = session.webSocketTask(with: request)
+            self.session = session
+            self.task = socketTask
+            task = socketTask
+        } else {
+            task = nil
+        }
+
+        // Production writes go straight to the captured task (unaffected by a
+        // later teardown clearing `self.task`); with no socket, the injected sender.
+        func sendFrame(_ message: URLSessionWebSocketTask.Message) async throws {
+            if let task { try await task.send(message) } else { try await sendMessage(message) }
+        }
 
         // Buffer frames captured during the handshake (unbounded AsyncStream)
         // so the leading audio of the utterance survives socket-open latency;
@@ -235,7 +254,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             await self?.runReceiveLoop()
         }
 
-        task.resume()
+        task?.resume()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
@@ -276,7 +295,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         senderTask = Task {
             for await frame in stream {
                 do {
-                    try await task.send(.string(frame))
+                    try await sendFrame(.string(frame))
                 } catch {
                     self.markStreamIntegrityFailed()
                     vlog("elevenlabs-stream: send failed, stopping sender: \(error.localizedDescription)")
@@ -406,7 +425,8 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         finalizeCoverageAmbiguous = recordingDuration >= 30
             || realtimeOptions.commitStrategy == .vad
             || !committedSegments.isEmpty
-        let needsBatchRecovery = finalizeCoverageAmbiguous
+        let notReady = startInvoked && !readyResolved
+        let needsBatchRecovery = finalizeCoverageAmbiguous || notReady
         stateLock.unlock()
 
         if closed || integrityFailed || needsBatchRecovery {

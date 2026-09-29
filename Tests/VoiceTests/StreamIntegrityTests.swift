@@ -335,6 +335,125 @@ final class StreamIntegrityTests: XCTestCase {
         XCTAssertTrue(session.requiresBufferedAudioRecovery)
     }
 
+    // MARK: - Release before the socket is ready
+
+    /// Records every message a session writes so a test can assert that no
+    /// end-of-stream/commit frame went out ahead of the (never-sent) audio.
+    private final class SentLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [String] = []
+        func record(_ message: URLSessionWebSocketTask.Message) {
+            lock.lock()
+            defer { lock.unlock() }
+            switch message {
+            case .string(let text): items.append(text)
+            case .data(let data): items.append("<\(data.count) bytes>")
+            @unknown default: break
+            }
+        }
+        var all: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return items
+        }
+    }
+
+    private static let endMarkers = ["audio.done", "endStream", "activityEnd", "audioStreamEnd", "\"commit\":true"]
+
+    private func assertNoEndFrame(_ log: SentLog, file: StaticString = #filePath, line: UInt = #line) {
+        for frame in log.all {
+            for marker in Self.endMarkers {
+                XCTAssertFalse(frame.contains(marker), "end frame sent before readiness: \(marker)", file: file, line: line)
+            }
+        }
+    }
+
+    func testGeminiReleaseBeforeSetupCompleteSkipsSocketAndRecovers() async {
+        let log = SentLog()
+        let session = GeminiLiveTranscriber(apiKey: "key", readinessTimeoutSeconds: 1, messageSender: { log.record($0) })
+        let starting = Task { try? await session.start() }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let startedAt = Date()
+        _ = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        assertNoEndFrame(log)
+        _ = await starting.value
+    }
+
+    func testMuseReleaseBeforeHandshakeAckSkipsSocketAndRecovers() async {
+        let log = SentLog()
+        let session = MuseLiveTranscriber(apiKey: "key", readinessTimeoutSeconds: 1, messageSender: { log.record($0) })
+        let starting = Task { try? await session.start() }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let startedAt = Date()
+        _ = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        assertNoEndFrame(log)
+        _ = await starting.value
+    }
+
+    func testXAIReleaseBeforeTranscriptCreatedSkipsSocketAndRecovers() async {
+        let log = SentLog()
+        let session = XAIStreamingTranscriber(apiKey: "key", messageSender: { log.record($0) })
+        _ = Task { try? await session.start() }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let startedAt = Date()
+        _ = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        assertNoEndFrame(log)
+    }
+
+    func testElevenLabsReleaseBeforeSessionStartedSkipsSocketAndRecovers() async {
+        let log = SentLog()
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { log.record($0) })
+        _ = Task { try? await session.start() }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let startedAt = Date()
+        _ = await session.finalize(recordingDuration: 4)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        assertNoEndFrame(log)
+    }
+
+    func testAssemblyAIPollURLRejectsNonIDShapedTranscriptIDs() {
+        XCTAssertEqual(
+            AssemblyAITranscriptionService.pollURL(transcriptID: "abc-123_DEF")?.absoluteString,
+            "https://api.assemblyai.com/v2/transcript/abc-123_DEF"
+        )
+        for bad in ["", "../v2/upload", "a/b", "a?b=c", "has space", "id\n"] {
+            XCTAssertNil(AssemblyAITranscriptionService.pollURL(transcriptID: bad), bad)
+        }
+    }
+
+    func testStartFailureLogOmitsURLSessionErrorDescription() {
+        let leaky = NSError(
+            domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost,
+            userInfo: [NSLocalizedDescriptionKey: "wss://host/ws?key=SECRETKEY0123456789 refused"]
+        )
+        let text = StreamingCoordinator.startFailureDescription(leaky)
+        XCTAssertEqual(text, "\(NSURLErrorDomain)#\(NSURLErrorCannotConnectToHost)")
+        XCTAssertFalse(text.contains("SECRET"))
+        XCTAssertTrue(StreamingCoordinator.startFailureDescription(
+            CloudTranscriptionError(provider: .gemini, message: "Timed out")).contains("Timed out"))
+    }
+
+    func testCancelAllClearsEverySessionReference() {
+        let coordinator = StreamingCoordinator(
+            xaiSession: XAIStreamingTranscriber(apiKey: "key"),
+            elevenLabsSession: ElevenLabsRealtimeTranscriber(apiKey: "key"),
+            geminiSession: GeminiLiveTranscriber(apiKey: "key"),
+            museSession: MuseLiveTranscriber(apiKey: "key")
+        )
+        coordinator.cancelAll()
+        XCTAssertNil(coordinator.xaiSession)
+        XCTAssertNil(coordinator.elevenLabsSession)
+        XCTAssertNil(coordinator.geminiSession)
+        XCTAssertNil(coordinator.museSession)
+    }
+
     func testElevenLabsPartialCoverageIsCaseAndPunctuationInsensitive() {
         XCTAssertTrue(ElevenLabsRealtimeTranscriber.partialIsCovered(
             byCommitted: ["Hello, world.", "Second one"], partial: "hello world second"))
