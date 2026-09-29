@@ -20,6 +20,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private let keywords: [String]
     private let sessionId: String
     private let injectedMessageSender: MessageSender?
+    private let readinessTimeoutSeconds: TimeInterval
     private let finalizeBudgetOverride: TimeInterval?
 
     private var session: URLSession?
@@ -84,6 +85,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         keywords: [String] = [],
         sessionId: String = UUID().uuidString,
         finalizeBudgetOverride: TimeInterval? = nil,
+        readinessTimeoutSeconds: TimeInterval = 5,
         messageSender: MessageSender? = nil
     ) {
         self.apiKey = apiKey
@@ -91,6 +93,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.keywords = keywords
         self.sessionId = sessionId
         self.injectedMessageSender = messageSender
+        self.readinessTimeoutSeconds = readinessTimeoutSeconds
         self.finalizeBudgetOverride = finalizeBudgetOverride
         super.init()
     }
@@ -132,40 +135,21 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             language: language,
             keywords: keywords
         )
-        try await task.send(.string(handshake))
-
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    self.stateLock.lock()
-                    if self.readyResolved {
-                        self.stateLock.unlock()
-                        continuation.resume()
-                        return
-                    }
-                    self.readyContinuation = continuation
-                    self.stateLock.unlock()
+        // The setup send shares the readiness deadline: a stalled connect must
+        // not block start() (and the finalize budget behind it) on a send that
+        // never returns.
+        do {
+            try await AsyncDeadline.run(
+                seconds: readinessTimeoutSeconds,
+                timeoutError: { CloudTranscriptionError(provider: .meta, message: "Timed out waiting for handshake ack") },
+                operation: { [self] in
+                    try await sendMessage(.string(handshake))
+                    try await awaitReady()
                 }
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 5_000_000_000)
-                throw CloudTranscriptionError(provider: .meta, message: "Timed out waiting for handshake ack")
-            }
-            do {
-                try await group.next()
-                group.cancelAll()
-            } catch {
-                stateLock.lock()
-                let pending = readyResolved ? nil : readyContinuation
-                if !readyResolved {
-                    readyResolved = true
-                    readyContinuation = nil
-                }
-                stateLock.unlock()
-                pending?.resume(throwing: error)
-                group.cancelAll()
-                throw error
-            }
+            )
+        } catch {
+            failPendingReady(error)
+            throw error
         }
 
         senderTask = Task {
@@ -181,6 +165,34 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
 
         vlog("muse-stream: session ready")
+    }
+
+    /// Suspends until the ready signal resolves (or returns immediately when it
+    /// already did before this call registered).
+    private func awaitReady() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            stateLock.lock()
+            if readyResolved {
+                stateLock.unlock()
+                continuation.resume()
+                return
+            }
+            readyContinuation = continuation
+            stateLock.unlock()
+        }
+    }
+
+    /// Fails a still-registered ready waiter so a timed-out start() does not
+    /// leave its continuation suspended forever.
+    private func failPendingReady(_ error: Error) {
+        stateLock.lock()
+        let pending = readyResolved ? nil : readyContinuation
+        if !readyResolved {
+            readyResolved = true
+            readyContinuation = nil
+        }
+        stateLock.unlock()
+        pending?.resume(throwing: error)
     }
 
     func send(_ buffer: AVAudioPCMBuffer) {

@@ -43,6 +43,29 @@ final class MuseLiveTests: XCTestCase {
         XCTAssertEqual(selected.first, "term59")
     }
 
+    func testStalledSetupSendTimesOutWithinReadinessWindow() async {
+        let transcriber = MuseLiveTranscriber(
+            apiKey: "test-key",
+            readinessTimeoutSeconds: 0.3,
+            messageSender: { _ in
+                // Never returns and ignores cancellation — a stalled connect.
+                await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+            }
+        )
+        let started = Date()
+        do {
+            try await transcriber.start()
+            XCTFail("start() must not succeed while the setup send is stalled")
+        } catch {
+            XCTAssertTrue(error is CloudTranscriptionError)
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            3.0,
+            "a stalled setup send must be bounded by the readiness window"
+        )
+    }
+
     func testTranscriptEventPartial() {
         let transcriber = MuseLiveTranscriber(apiKey: "key")
         transcriber.handleServerEvent("""
