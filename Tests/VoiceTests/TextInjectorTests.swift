@@ -66,6 +66,40 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertEqual(chunks.map(\.count), [3, 3, 2])
     }
 
+    func testChunkUTF16Units_emojiStraddlingBoundaryStaysWhole() {
+        // 15 units then a surrogate pair: a fixed 16-unit split would cut it.
+        let text = String(repeating: "a", count: 15) + "😀" + "b"
+        let chunks = TextInjector.chunkUTF16Units(text)
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertEqual(chunks[0], Array(String(repeating: "a", count: 15).utf16))
+        XCTAssertEqual(chunks[1], Array("😀b".utf16))
+        for chunk in chunks {
+            XCTAssertNotNil(String(utf16CodeUnits: chunk, count: chunk.count) as String?)
+            XCTAssertEqual(String(decoding: chunk, as: UTF16.self).unicodeScalars.contains("\u{FFFD}"), false)
+        }
+        XCTAssertEqual(chunks.flatMap { $0 }, Array(text.utf16))
+    }
+
+    func testChunkUTF16Units_graphemeLongerThanCapGoesAlone() {
+        let family = "👨‍👩‍👧‍👦" // 11 UTF-16 units
+        let text = "abcdefgh" + family + family
+        let chunks = TextInjector.chunkUTF16Units(text, maxChunkSize: 8)
+        XCTAssertEqual(chunks.map(\.count), [8, 11, 11])
+        XCTAssertEqual(chunks.flatMap { $0 }, Array(text.utf16))
+    }
+
+    // MARK: - Paste retry gate
+
+    func testShouldRetryPaste_neverRetriesAfterObservedChord() {
+        XCTAssertFalse(TextInjector.shouldRetryPaste(chordObserved: true, retryOnAmbiguous: true))
+        XCTAssertFalse(TextInjector.shouldRetryPaste(chordObserved: true, retryOnAmbiguous: false))
+    }
+
+    func testShouldRetryPaste_retriesDroppedChordOnlyWhenAllowed() {
+        XCTAssertTrue(TextInjector.shouldRetryPaste(chordObserved: false, retryOnAmbiguous: true))
+        XCTAssertFalse(TextInjector.shouldRetryPaste(chordObserved: false, retryOnAmbiguous: false))
+    }
+
     // MARK: - Safari atomic-paste routing
 
     func testInjectionLanes_safariMultiChunkUsesOnePasteOnly() {
