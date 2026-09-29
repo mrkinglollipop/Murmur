@@ -30,6 +30,11 @@ final class ScratchpadStore: ObservableObject {
     private var saveWorkItem: DispatchWorkItem?
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "scratchpad-store")
 
+    /// Set when scratchpad.json exists but could not be read or moved aside. Saving then
+    /// would overwrite recoverable user data, so writes stay off for the
+    /// rest of the session.
+    private var savesBlocked = false
+
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? ScratchpadStore.defaultFileURL()
         load()
@@ -46,7 +51,11 @@ final class ScratchpadStore: ObservableObject {
 
     private func load() {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            savesBlocked = true
+            logger.error("scratchpad.json exists but is unreadable — saves disabled this session")
+            return
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         do {
@@ -65,12 +74,14 @@ final class ScratchpadStore: ObservableObject {
             try FileManager.default.moveItem(at: fileURL, to: bak)
             logger.error("Quarantined corrupt scratchpad.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
+            savesBlocked = true
             logger.error("Failed to quarantine corrupt scratchpad.json: \(error.localizedDescription)")
         }
         notes = []
     }
 
     private func save() {
+        guard !savesBlocked else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(notes) else { return }

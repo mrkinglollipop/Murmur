@@ -31,6 +31,11 @@ final class SnippetsStore: ObservableObject {
     private var triggerRegexCache: [String: NSRegularExpression] = [:]
     private var saveWorkItem: DispatchWorkItem?
 
+    /// Set when snippets.json exists but could not be read or moved aside. Saving then
+    /// would overwrite recoverable user data, so writes stay off for the
+    /// rest of the session.
+    private var savesBlocked = false
+
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? SnippetsStore.defaultFileURL()
         load()
@@ -48,7 +53,11 @@ final class SnippetsStore: ObservableObject {
 
     private func load() {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            savesBlocked = true
+            logger.error("snippets.json exists but is unreadable — saves disabled this session")
+            return
+        }
         do {
             snippets = try JSONDecoder().decode([Snippet].self, from: data)
         } catch {
@@ -65,12 +74,14 @@ final class SnippetsStore: ObservableObject {
             try FileManager.default.moveItem(at: fileURL, to: bak)
             logger.error("Quarantined corrupt snippets.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
+            savesBlocked = true
             logger.error("Failed to quarantine corrupt snippets.json: \(error.localizedDescription)")
         }
         snippets = []
     }
 
     private func save() {
+        guard !savesBlocked else { return }
         rebuildRegexCache()
         guard let data = try? JSONEncoder().encode(snippets) else { return }
         try? data.write(to: fileURL, options: .atomic)

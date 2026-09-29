@@ -46,6 +46,11 @@ final class TransformsStore: ObservableObject {
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "transforms-store")
     private var saveWorkItem: DispatchWorkItem?
 
+    /// Set when transforms.json exists but could not be read or quarantined.
+    /// Saving then would overwrite recoverable user data, so writes stay off
+    /// for the rest of the session.
+    private var savesBlocked = false
+
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? TransformsStore.defaultFileURL()
         if let raw = UserDefaults.standard.string(forKey: Keys.autoRunTransformID),
@@ -70,14 +75,14 @@ final class TransformsStore: ObservableObject {
             return
         }
         guard let data = try? Data(contentsOf: fileURL) else {
-            seedDefaults()
+            savesBlocked = true
+            logger.error("transforms.json exists but is unreadable — saves disabled this session")
             return
         }
         do {
             transforms = try JSONDecoder().decode([Transform].self, from: data)
         } catch {
             quarantineCorruptFile(error: error)
-            seedDefaults()
         }
         pushAutoRunTransform()
     }
@@ -91,12 +96,14 @@ final class TransformsStore: ObservableObject {
             try FileManager.default.moveItem(at: fileURL, to: bak)
             logger.error("Quarantined corrupt transforms.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
+            savesBlocked = true
             logger.error("Failed to quarantine corrupt transforms.json: \(error.localizedDescription)")
         }
     }
 
-    /// Seeds "Polish" and "Prompt Engineer" on first run (no persisted file
-    /// yet, or a corrupt one) so the list isn't empty on first launch.
+    /// Seeds "Polish" and "Prompt Engineer" on first run only (no file on
+    /// disk). Never after a read or quarantine failure — the seed's save would
+    /// overwrite the user's data.
     private func seedDefaults() {
         transforms = [
             Transform(
@@ -114,6 +121,7 @@ final class TransformsStore: ObservableObject {
     }
 
     private func save() {
+        guard !savesBlocked else { return }
         guard let data = try? JSONEncoder().encode(transforms) else { return }
         try? data.write(to: fileURL, options: .atomic)
     }

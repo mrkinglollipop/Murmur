@@ -90,6 +90,11 @@ final class HistoryStore: ObservableObject {
 
     private var saveWorkItem: DispatchWorkItem?
 
+    /// Set when history.json exists but could not be read or quarantined.
+    /// Saving then would overwrite recoverable user data with an empty list,
+    /// so writes stay off for the rest of the session.
+    private var savesBlocked = false
+
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? HistoryStore.defaultFileURL()
         load()
@@ -106,7 +111,11 @@ final class HistoryStore: ObservableObject {
 
     private func load() {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            savesBlocked = true
+            logger.error("history.json exists but is unreadable — saves disabled this session")
+            return
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         do {
@@ -131,12 +140,14 @@ final class HistoryStore: ObservableObject {
             // `decodeError` is deliberately named: an unqualified `error` here
             // binds to the move failure and shadows the decode failure, which is
             // the one that explains why history was quarantined at all.
+            savesBlocked = true
             logger.error("Failed to quarantine corrupt history.json: \(error.localizedDescription); original decode error: \(decodeError.localizedDescription)")
         }
         entries = []
     }
 
     private func save() {
+        guard !savesBlocked else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(entries) else { return }
@@ -322,11 +333,18 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    /// Removes the entry with the given `id`. No undo — the view gates this
-    /// behind a confirmation dialog.
+    /// Removes the entry with the given `id` and its retained audio file. No
+    /// undo — the view gates this behind a confirmation dialog.
     func delete(id: UUID) {
         func mutate() {
+            let audioPaths = self.entries
+                .filter { $0.id == id }
+                .compactMap(\.audioPath)
+                .filter { !$0.isEmpty }
             self.entries.removeAll { $0.id == id }
+            for path in audioPaths {
+                try? FileManager.default.removeItem(atPath: path)
+            }
             self.scheduleSave()
         }
         if Thread.isMainThread {

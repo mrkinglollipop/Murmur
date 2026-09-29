@@ -177,11 +177,82 @@ final class StorePersistenceTests: XCTestCase {
         XCTAssertTrue(after.transforms.contains { $0.name == "A" })
     }
 
-    func testTransformsCorruptFileSeedsDefaults() {
+    func testTransformsMissingFileSeedsDefaults() {
+        let store = TransformsStore(fileURL: tempFile("transforms-missing"))
+        XCTAssertFalse(store.transforms.isEmpty, "first run should seed defaults")
+    }
+
+    func testTransformsCorruptFileIsQuarantinedNotSeeded() throws {
         let url = tempFile("transforms-corrupt")
-        try? Data("garbage".utf8).write(to: url)
+        try Data("garbage".utf8).write(to: url)
         let store = TransformsStore(fileURL: url)
-        XCTAssertFalse(store.transforms.isEmpty, "corrupt file should seed defaults")
+        XCTAssertTrue(store.transforms.isEmpty, "corrupt file must not be replaced by seed data")
+        let quarantined = try FileManager.default
+            .contentsOfDirectory(atPath: url.deletingLastPathComponent().path)
+            .filter { $0.hasPrefix(url.lastPathComponent + ".corrupt.") }
+        XCTAssertEqual(quarantined.count, 1)
+        for name in quarantined {
+            tempURLs.append(url.deletingLastPathComponent().appendingPathComponent(name))
+        }
+    }
+
+    /// Unreadable-but-present file: the store must not overwrite it.
+    func testTransformsUnreadableFileIsNeverOverwritten() throws {
+        let url = tempFile("transforms-unreadable")
+        let original = Data(#"[{"id":"\#(UUID().uuidString)","name":"Mine","prompt":"keep"}]"#.utf8)
+        try original.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+        try XCTSkipIf((try? Data(contentsOf: url)) != nil, "file readable despite 0o000 (root?)")
+
+        let store = TransformsStore(fileURL: url)
+        XCTAssertTrue(store.transforms.isEmpty)
+        store.add(name: "New", prompt: "x")
+        store.flush()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path)
+        XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
+    func testHistoryUnreadableFileIsNeverOverwritten() throws {
+        let url = tempFile("history-unreadable")
+        let seed = HistoryStore(fileURL: url)
+        seed.append(text: "precious", engine: "test", injected: true)
+        seed.flush()
+        let original = try Data(contentsOf: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+        try XCTSkipIf((try? Data(contentsOf: url)) != nil, "file readable despite 0o000 (root?)")
+
+        let store = HistoryStore(fileURL: url)
+        XCTAssertTrue(store.entries.isEmpty)
+        store.append(text: "new", engine: "test", injected: true)
+        store.flush()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path)
+        XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
+    func testHistoryDeleteRemovesRetainedAudioFile() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("murmur-test-audio-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        tempURLs.append(dir)
+        let audio = dir.appendingPathComponent("clip.wav")
+        let other = dir.appendingPathComponent("other.wav")
+        try Data([0]).write(to: audio)
+        try Data([0]).write(to: other)
+
+        let store = HistoryStore(fileURL: dir.appendingPathComponent("history.json"))
+        store.append(text: "one", engine: "test", injected: true, audioPath: audio.path)
+        store.append(text: "two", engine: "test", injected: true, audioPath: other.path)
+        let id = try XCTUnwrap(store.entries.first { $0.audioPath == audio.path }?.id)
+
+        store.delete(id: id)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: other.path))
+        XCTAssertEqual(store.entries.count, 1)
     }
 
     func testEditingSelectedTransformUpdatesTheLivePipelineBeforeSave() throws {
