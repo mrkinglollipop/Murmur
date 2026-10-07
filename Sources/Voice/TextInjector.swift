@@ -128,6 +128,30 @@ final class TextInjector {
     static let pasteboardRestoreDelay: TimeInterval = 2.0
     private static let pasteChordTarget = 1
     private static let virtualKeyV: CGKeyCode = 9 // kVK_ANSI_V
+    private static let virtualKeyCommand: CGKeyCode = 55 // kVK_Command
+    /// Modifiers stripped from unicode chunks and the canary. Events built from
+    /// a `.combinedSessionState` source inherit that state's flags, and the
+    /// paste chord's `.maskCommand` sticks there until a Cmd release is posted;
+    /// our chunks use virtualKey 0 (kVK_ANSI_A), so an inherited Cmd turns a
+    /// dictation into Select All instead of text.
+    static let syntheticTypingModifierMask: CGEventFlags = [
+        .maskAlphaShift, .maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn,
+    ]
+
+    static func syntheticTypingFlags(inherited: CGEventFlags) -> CGEventFlags {
+        inherited.subtracting(syntheticTypingModifierMask)
+    }
+
+    /// Skip the synthetic Cmd release while the user physically holds Cmd.
+    static func shouldReleaseCommandAfterPasteChord(hidFlags: CGEventFlags) -> Bool {
+        !hidFlags.contains(.maskCommand)
+    }
+
+    /// Only Cmd is dropped — a real fn or Option hold stays in the flags.
+    static func commandReleaseFlags(inherited: CGEventFlags) -> CGEventFlags {
+        inherited.subtracting(.maskCommand)
+    }
+
     /// F20 — a no-op key in effectively every app — used as a canary to prove
     /// the post→WindowServer→tap pipe is live without mutating the document.
     private static let virtualKeyF20: CGKeyCode = 90 // kVK_F20
@@ -909,6 +933,20 @@ final class TextInjector {
         }
         keyUp.flags = .maskCommand
         keyUp.post(tap: .cgSessionEventTap)
+
+        // Without this release the combined session state keeps Cmd down, and
+        // every later event built from it (ours or another app's) is a Cmd chord.
+        if Self.shouldReleaseCommandAfterPasteChord(
+            hidFlags: CGEventSource.flagsState(.hidSystemState)
+        ), let commandUp = CGEvent(
+            keyboardEventSource: source,
+            virtualKey: Self.virtualKeyCommand,
+            keyDown: false
+        ) {
+            commandUp.type = .flagsChanged
+            commandUp.flags = Self.commandReleaseFlags(inherited: commandUp.flags)
+            commandUp.post(tap: .cgSessionEventTap)
+        }
         return true
     }
 
@@ -932,6 +970,7 @@ final class TextInjector {
             Self.log("failed to create canary keyDown")
             return false
         }
+        keyDown.flags = Self.syntheticTypingFlags(inherited: keyDown.flags)
         keyDown.post(tap: .cgSessionEventTap)
 
         guard let keyUp = CGEvent(
@@ -942,6 +981,7 @@ final class TextInjector {
             Self.log("failed to create canary keyUp")
             return false
         }
+        keyUp.flags = Self.syntheticTypingFlags(inherited: keyUp.flags)
         keyUp.post(tap: .cgSessionEventTap)
         return true
     }
@@ -970,6 +1010,7 @@ final class TextInjector {
                 return 0
             }
             keyDown.keyboardSetUnicodeString(stringLength: mutableChunk.count, unicodeString: &mutableChunk)
+            keyDown.flags = Self.syntheticTypingFlags(inherited: keyDown.flags)
             keyDown.post(tap: .cgSessionEventTap)
 
             if let keyUp = CGEvent(
@@ -977,6 +1018,7 @@ final class TextInjector {
                 virtualKey: 0,
                 keyDown: false
             ) {
+                keyUp.flags = Self.syntheticTypingFlags(inherited: keyUp.flags)
                 keyUp.post(tap: .cgSessionEventTap)
             }
         }
