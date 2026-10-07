@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.1.54",
+    "build": "55",
+    "title": "What's New in 0.1.54",
+    "items": [
+      "A dictation no longer disappears and highlights everything in the text field, which let the next dictation replace your text.",
+      "Holding Command, Option, or Control while a dictation is being typed no longer turns it into a keyboard shortcut."
+    ]
+  },
+  {
     "version": "0.1.53",
     "build": "54",
     "title": "What's New in 0.1.53",
