@@ -915,4 +915,35 @@ final class TextInjectorTests: XCTestCase {
 
         XCTAssertEqual(deliveryCount, 1)
     }
+
+    // MARK: - Synthetic modifier flags
+
+    func testSyntheticTypingFlags_stripsInheritedCommand() {
+        // The stuck-Cmd case: keycode-0 chunk + Cmd = Select All.
+        let inherited: CGEventFlags = [.maskCommand, .maskNonCoalesced]
+        let flags = TextInjector.syntheticTypingFlags(inherited: inherited)
+        XCTAssertFalse(flags.contains(.maskCommand))
+        XCTAssertTrue(flags.contains(.maskNonCoalesced))
+    }
+
+    func testSyntheticTypingFlags_stripsEveryUserModifier() {
+        let inherited: CGEventFlags = [
+            .maskAlphaShift, .maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn,
+        ]
+        XCTAssertTrue(TextInjector.syntheticTypingFlags(inherited: inherited).isEmpty)
+    }
+
+    func testShouldReleaseCommandAfterPasteChord_onlyWhenCmdNotPhysicallyHeld() {
+        XCTAssertTrue(TextInjector.shouldReleaseCommandAfterPasteChord(hidFlags: []))
+        XCTAssertTrue(TextInjector.shouldReleaseCommandAfterPasteChord(hidFlags: .maskSecondaryFn))
+        XCTAssertFalse(TextInjector.shouldReleaseCommandAfterPasteChord(hidFlags: .maskCommand))
+    }
+
+    func testCommandReleaseFlags_keepsHeldFnAndOption() {
+        let inherited: CGEventFlags = [.maskCommand, .maskSecondaryFn, .maskAlternate]
+        let flags = TextInjector.commandReleaseFlags(inherited: inherited)
+        XCTAssertFalse(flags.contains(.maskCommand))
+        XCTAssertTrue(flags.contains(.maskSecondaryFn))
+        XCTAssertTrue(flags.contains(.maskAlternate))
+    }
 }
