@@ -13,7 +13,7 @@ xcodebuild -project MurmurIOS.xcodeproj -scheme MurmurIOS \
   -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
 ```
 
-**Signing (2026-08-11):** App IDs `com.matt.murmur.ios` + `com.matt.murmur.ios.keyboard` are registered on team `XGLHMG3629`. Manual profiles: `Murmur iOS Development` / `Murmur Keyboard Development`.
+**Signing (2026-08-11):** App IDs `com.matt.murmur.ios` + `com.matt.murmur.ios.keyboard` use the configured `$DEVELOPMENT_TEAM`. Manual profiles: `Murmur iOS Development` / `Murmur Keyboard Development`.
 
 **Signed compile (verified 2026-08-11):** App Group `group.com.matt.murmur.ios` is on both App IDs; profiles regenerated. `xcodegen` + signed `xcodebuild` **BUILD SUCCEEDED**.
 
@@ -22,7 +22,7 @@ cd ios
 xcodegen generate
 xcodebuild -project MurmurIOS.xcodeproj -scheme MurmurIOS \
   -destination 'generic/platform=iOS' -configuration Debug \
-  DEVELOPMENT_TEAM=XGLHMG3629 -derivedDataPath build build
+  DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" -derivedDataPath build build
 
 # Autocorrect unit tests (iOS 27 simulator)
 xcodebuild test -project MurmurIOS.xcodeproj -scheme MurmurKeyboardTests \

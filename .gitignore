@@ -3,6 +3,8 @@
 xcuserdata/
 DerivedData/
 .build/
+# XcodeGen's project-local package resolution is generated; package versions
+# are pinned in project.yml instead.
 *.resolved
 __pycache__/
 
@@ -16,6 +18,11 @@ Config/Team.xcconfig
 *.ed25519
 sparkle_private*
 sparkle_ed25519
+*.p8
+*.p12
+*.cer
+*.mobileprovision
+*.dmg
 
 
 # Iterate / harness local state
@@ -26,7 +33,6 @@ sparkle_ed25519
 # to nowhere that breaks every fresh clone.
 .claude/
 
-# Public-cut fragment (Phase 5) — merge into .gitignore when cutting the public repo.
 # Voice.xcodeproj is generated from project.yml; contributors run xcodegen generate.
 Voice.xcodeproj
 ios/*.xcodeproj
