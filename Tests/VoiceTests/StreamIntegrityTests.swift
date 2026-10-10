@@ -585,3 +585,155 @@ final class StreamIntegrityTests: XCTestCase {
         return buffer
     }
 }
+
+/// Exercises the real sender and finalize paths with no socket or provider.
+final class StreamingSenderOrderingTests: XCTestCase {
+    private enum TerminalSent: Error { case stop }
+
+    private actor Barrier {
+        private var opened = false
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            if opened { return }
+            await withCheckedContinuation { waiter = $0 }
+        }
+
+        func open() {
+            opened = true
+            waiter?.resume()
+            waiter = nil
+        }
+    }
+
+    private final class Frames: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frames: [String] = []
+
+        var all: [String] { lock.withLock { frames } }
+
+        func send(_ message: URLSessionWebSocketTask.Message) throws {
+            let kind: String
+            switch message {
+            case .data:
+                kind = "audio"
+            case .string(let text):
+                let json = try JSONSerialization.jsonObject(with: Data(text.utf8)) as! [String: Any]
+                if json["commit"] as? Bool == true || json["type"] as? String == "audio.done"
+                    || json["type"] as? String == "endStream" {
+                    kind = "terminal"
+                } else if let realtime = json["realtimeInput"] as? [String: Any] {
+                    if realtime["activityEnd"] != nil || realtime["audioStreamEnd"] != nil {
+                        kind = "terminal"
+                    } else if realtime["activityStart"] != nil {
+                        kind = "activityStart"
+                    } else {
+                        kind = "audio"
+                    }
+                } else if json["audio_base_64"] != nil {
+                    kind = "audio"
+                } else {
+                    kind = "setup"
+                }
+            @unknown default:
+                kind = "unknown"
+            }
+            lock.withLock { frames.append(kind) }
+            // End the test's finalize immediately; ordering is independent of
+            // provider transcript responses and the production timeout budget.
+            if kind == "terminal" { throw TerminalSent.stop }
+        }
+    }
+
+    func testElevenLabsFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        let frames = Frames()
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"message_type":"session_started"}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames
+        )
+    }
+
+    func testXAIFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        let frames = Frames()
+        let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"type":"transcript.created"}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames
+        )
+    }
+
+    func testGeminiFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        try await assertGeminiOrdering(manual: false)
+    }
+
+    func testGeminiManualFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        try await assertGeminiOrdering(manual: true)
+    }
+
+    private func assertGeminiOrdering(manual: Bool) async throws {
+        let frames = Frames()
+        var options = GeminiLiveOptions.defaults
+        options.vadMode = manual ? .manual : .automatic
+        let session = GeminiLiveTranscriber(apiKey: "offline", liveOptions: options,
+                                           messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"setupComplete":{}}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames,
+            prefix: manual ? ["setup", "activityStart"] : ["setup"]
+        )
+    }
+
+    func testMuseFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        let frames = Frames()
+        let session = MuseLiveTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"sessionId":"offline"}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames, prefix: ["setup"]
+        )
+    }
+
+    private typealias Start = (@escaping () -> Void, @escaping () async -> Void) async throws -> Void
+
+    private func assertOrdering(
+        start: @escaping Start,
+        send: @escaping (AVAudioPCMBuffer) -> Void,
+        ready: @escaping () -> Void,
+        finalize: () async -> Void,
+        frames: Frames,
+        prefix: [String] = [],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let paused = expectation(description: "start paused after handshake")
+        let barrier = Barrier()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!
+        buffer.frameLength = 160
+        for index in 0..<160 { buffer.floatChannelData![0][index] = 0.1 }
+        let starting = Task {
+            try await start({
+                send(buffer)
+                send(buffer)
+                XCTAssertFalse(frames.all.contains("audio"), "audio escaped before readiness", file: file, line: line)
+                ready()
+            }, {
+                paused.fulfill()
+                await barrier.wait()
+            })
+        }
+        await fulfillment(of: [paused], timeout: 5)
+        await finalize()
+        XCTAssertEqual(frames.all, prefix + ["audio", "audio", "terminal"], file: file, line: line)
+        await barrier.open()
+        try await starting.value
+    }
+}

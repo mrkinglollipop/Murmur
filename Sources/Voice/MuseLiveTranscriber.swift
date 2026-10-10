@@ -27,6 +27,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var receiveLoopTask: Task<Void, Never>?
     private var senderTask: Task<Void, Never>?
+    /// Opens only on a successful handshake; finishing without a value aborts sending.
+    private var senderReadyContinuation: AsyncStream<Void>.Continuation?
 
     private var frameContinuation: AsyncStream<Data>.Continuation?
 
@@ -103,7 +105,11 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Lifecycle
 
-    func start() async throws {
+    // Lifecycle hooks let offline tests hold start at the readiness boundary.
+    func start(
+        beforeReadiness: (() -> Void)? = nil,
+        afterReadiness: (() async -> Void)? = nil
+    ) async throws {
         vlog("muse-stream: starting session")
         stateLock.lock()
         startInvoked = true
@@ -136,11 +142,32 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             if let task { try await task.send(message) } else { try await sendMessage(message) }
         }
 
-        let stream = AsyncStream<Data> { continuation in
-            self.stateLock.lock()
-            self.frameContinuation = continuation
-            self.stateLock.unlock()
+        let (stream, frames) = AsyncStream<Data>.makeStream()
+        let (readiness, readySignal) = AsyncStream<Void>.makeStream()
+        // Publish the buffer and its gated consumer atomically: finalize must
+        // always have a sender to drain, even before start resumes from readiness.
+        stateLock.lock()
+        guard !tornDown else {
+            stateLock.unlock()
+            tearDownSocket()
+            throw CancellationError()
         }
+        frameContinuation = frames
+        senderReadyContinuation = readySignal
+        senderTask = Task {
+            var readyIterator = readiness.makeAsyncIterator()
+            guard await readyIterator.next() != nil, !Task.isCancelled else { return }
+            for await pcmData in stream {
+                do {
+                    try await sendFrame(.data(pcmData))
+                } catch {
+                    self.markStreamIntegrityFailed()
+                    vlog("muse-stream: send failed, stopping sender: \(error.localizedDescription)")
+                    break
+                }
+            }
+        }
+        stateLock.unlock()
 
         receiveLoopTask = Task { [weak self] in
             await self?.runReceiveLoop()
@@ -162,6 +189,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
                 timeoutError: { CloudTranscriptionError(provider: .meta, message: "Timed out waiting for handshake ack") },
                 operation: { [self] in
                     try await sendMessage(.string(handshake))
+                    beforeReadiness?()
                     try await awaitReady()
                 }
             )
@@ -170,17 +198,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             throw error
         }
 
-        senderTask = Task {
-            for await pcmData in stream {
-                do {
-                    try await sendFrame(.data(pcmData))
-                } catch {
-                    self.markStreamIntegrityFailed()
-                    vlog("muse-stream: send failed, stopping sender: \(error.localizedDescription)")
-                    break
-                }
-            }
-        }
+        await afterReadiness?()
 
         vlog("muse-stream: session ready")
     }
@@ -206,6 +224,9 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let pending = readyResolved ? nil : readyContinuation
         if !readyResolved {
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
             readyResolved = true
             readyContinuation = nil
         }
@@ -246,9 +267,14 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let framesToFinish = frameContinuation
         frameContinuation = nil
+        let senderToDrain = senderTask
+        if startInvoked && !readyResolved {
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+        }
         stateLock.unlock()
         framesToFinish?.finish()
-        let senderToDrain = senderTask
         do {
             try await AsyncDeadline.run(
                 seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
@@ -264,7 +290,9 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             stateLock.unlock()
             return text
         }
+        stateLock.lock()
         senderTask = nil
+        stateLock.unlock()
 
         stateLock.lock()
         let closed = socketClosed
@@ -394,6 +422,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let pendingReady = readyResolved ? nil : readyContinuation
         if !readyResolved {
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
             readyResolved = true
             readyContinuation = nil
         }
@@ -422,11 +452,14 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private func tearDownSocket() {
         stateLock.lock()
         intentionalSocketShutdown = true
+        let senderToCancel = senderTask
+        senderTask = nil
+        senderReadyContinuation?.finish()
+        senderReadyContinuation = nil
         stateLock.unlock()
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
-        senderTask?.cancel()
-        senderTask = nil
+        senderToCancel?.cancel()
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -464,6 +497,9 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         socketClosed = true
         let cont = readyResolved ? nil : readyContinuation
         if !readyResolved {
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
             readyResolved = true
             readyContinuation = nil
         }
@@ -533,6 +569,11 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         if json["sessionId"] != nil {
             stateLock.lock()
             let continuation = readyResolved ? nil : readyContinuation
+            if !readyResolved {
+                senderReadyContinuation?.yield(())
+            }
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
             readyResolved = true
             readyContinuation = nil
             stateLock.unlock()
