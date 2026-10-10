@@ -243,6 +243,43 @@ final class ClipboardWatcherTests: XCTestCase {
         XCTAssertTrue(store.entries.isEmpty)
     }
 
+    func testSecureInputCopyIsSkippedEvenAfterSecureInputEnds() {
+        let pasteboard = makePasteboard()
+        let store = makeStore()
+        var secure = true
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, secureInputEnabled: { secure })
+        pasteboard.clearContents()
+        pasteboard.setString("protected secret", forType: .string)
+        watcher.tick()
+        settle()
+        XCTAssertTrue(store.entries.isEmpty)
+        secure = false
+        watcher.tick()
+        settle()
+        XCTAssertTrue(store.entries.isEmpty, "protected content must not be captured on the next unlocked tick")
+        pasteboard.clearContents()
+        pasteboard.setString("ordinary copy", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        XCTAssertEqual(store.entries.first?.preview, "ordinary copy")
+    }
+
+    func testSecureInputCopyDuringActivationIsNotCapturedAfterUnlock() {
+        let pasteboard = makePasteboard()
+        let store = makeStore(activate: false)
+        var secure = true
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, secureInputEnabled: { secure })
+        pasteboard.clearContents()
+        pasteboard.setString("startup secret", forType: .string)
+        watcher.tick()
+        secure = false
+        store.activate()
+        XCTAssertTrue(waitUntil { store.isActivated })
+        watcher.tick()
+        settle()
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
     // MARK: - Lifecycle
 
     func testStartAndStopToggleRunningState() {

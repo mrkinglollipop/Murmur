@@ -3,6 +3,7 @@
 // entitlement check. See the "Clipboard manager" section of CLAUDE.md.
 
 import AppKit
+import Carbon
 import Foundation
 import os.log
 
@@ -23,6 +24,7 @@ final class ClipboardWatcher {
     private let store: ClipboardStore
     private let pasteboard: NSPasteboard
     private let interval: TimeInterval
+    private let secureInputEnabled: () -> Bool
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "clipboard-watcher")
 
     private var timer: Timer?
@@ -34,11 +36,13 @@ final class ClipboardWatcher {
     init(
         store: ClipboardStore,
         pasteboard: NSPasteboard = .general,
-        interval: TimeInterval = 0.5
+        interval: TimeInterval = 0.5,
+        secureInputEnabled: @escaping () -> Bool = { IsSecureEventInputEnabled() }
     ) {
         self.store = store
         self.pasteboard = pasteboard
         self.interval = interval
+        self.secureInputEnabled = secureInputEnabled
     }
 
     var isRunning: Bool { timer != nil }
@@ -64,15 +68,14 @@ final class ClipboardWatcher {
     /// One poll. Cheap when nothing changed, which is the overwhelming majority
     /// of ticks.
     func tick() {
-        // Before the store has its key, a capture would be dropped silently.
-        // Returning without consuming `changeCount` means content copied during
-        // activation is captured on the next tick instead of being lost — the
-        // guard must stay above the changeCount read for that to hold. It also
-        // covers the store having no key at all, where consuming changeCounts
-        // would discard every copy in silence.
-        guard store.canCapture else { return }
-
+        // Unprotected copies remain eligible while activation is pending.
         let current = pasteboard.changeCount
+        // Consume protected copies so they cannot be captured after unlock.
+        guard !secureInputEnabled() else {
+            lastChangeCount = current
+            return
+        }
+        guard store.canCapture else { return }
         guard current != lastChangeCount else { return }
         lastChangeCount = current
 

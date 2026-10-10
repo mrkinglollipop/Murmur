@@ -45,6 +45,48 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     var fingerprint: String
 }
 
+/// The disk record accepts the old preview only for migration; writes seal it.
+private struct StoredClipboardEntry: Codable {
+    let id: UUID
+    let date: Date
+    let kind: ClipboardKind
+    let preview: String?
+    let sealedPreview: Data?
+    let sourceBundleID: String?
+    let types: [String]
+    let byteCount: Int
+    let fingerprint: String
+
+    var entry: ClipboardEntry {
+        ClipboardEntry(
+            id: id, date: date, kind: kind, preview: preview ?? "",
+            sourceBundleID: sourceBundleID, types: types,
+            byteCount: byteCount, fingerprint: fingerprint
+        )
+    }
+
+    init(entry: ClipboardEntry, crypto: ClipboardCrypto) throws {
+        id = entry.id
+        date = entry.date
+        kind = entry.kind
+        preview = nil
+        sealedPreview = try crypto.seal(Data(entry.preview.utf8))
+        sourceBundleID = entry.sourceBundleID
+        types = entry.types
+        byteCount = entry.byteCount
+        fingerprint = entry.fingerprint
+    }
+}
+
+struct ClipboardFileOperations {
+    var read: (URL) throws -> Data = { try Data(contentsOf: $0) }
+    var write: (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }
+    var contents: (URL) throws -> [URL] = {
+        try FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)
+    }
+    var remove: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
+}
+
 /// Content identity for dedupe, computed over a *canonical* payload rather
 /// than the full type map.
 ///
@@ -212,14 +254,7 @@ final class ClipboardStore: ObservableObject {
 
     @Published private(set) var entries: [ClipboardEntry] = []
 
-    /// Set when the key on hand cannot open the blobs already on disk.
-    ///
-    /// Determined by actually attempting a decrypt at load, not by inferring
-    /// it from a missing Keychain item: a missing item causes a *fresh key to
-    /// be minted*, so the store would otherwise hold a perfectly valid key,
-    /// believe everything is fine, and present a full history in which every
-    /// single item silently fails to open. "Unreadable" and "absent" must
-    /// never look the same to the user.
+    /// Set when the key on hand cannot open the stored history.
     @Published private(set) var isLockedOut = false
 
     /// Total encrypted bytes retained before the oldest entries are dropped.
@@ -229,12 +264,12 @@ final class ClipboardStore: ObservableObject {
     /// Items larger than this are not captured at all.
     private let maxItemBytes: Int
 
-    /// True once `activate()` has resolved a key and checked the stored blobs.
-    /// Nothing is captured before this — `record` has no key to seal with.
+    /// True once an activation attempt has finished, including failures.
+    /// `canCapture` also requires a usable key and healthy storage.
     @Published private(set) var isActivated = false
 
     /// Set when activation could not obtain a key at all — the Keychain
-    /// refused both the read and the write. Distinct from `isLockedOut`, which
+    /// refused a read or a first-use write. Distinct from `isLockedOut`, which
     /// means a key exists but does not open what is stored.
     ///
     /// Without this the two failure modes are indistinguishable from success
@@ -243,7 +278,7 @@ final class ClipboardStore: ObservableObject {
     @Published private(set) var isKeyUnavailable = false
 
     /// Whether a capture can actually be sealed and stored right now.
-    var canCapture: Bool { isActivated && !isKeyUnavailable && !isMetadataCorrupt }
+    var canCapture: Bool { isActivated && !isActivating && !isKeyUnavailable && !isLockedOut && !isMetadataCorrupt }
 
     /// The most recent copy that was too large to store, until dismissed.
     ///
@@ -264,6 +299,9 @@ final class ClipboardStore: ObservableObject {
         lastOversizedSkip = nil
     }
 
+    private let fileOperations: ClipboardFileOperations
+    private var storedEntries: [StoredClipboardEntry] = []
+    private var captureWorkItems: [UUID: DispatchWorkItem] = [:]
     private let directory: URL
     private let metadataURL: URL
     private let metadataQuarantineMarkerURL: URL
@@ -304,6 +342,7 @@ final class ClipboardStore: ObservableObject {
         directory: URL? = nil,
         crypto: ClipboardCrypto? = nil,
         cryptoProvider: (() -> ClipboardCrypto?)? = nil,
+        fileOperations: ClipboardFileOperations = ClipboardFileOperations(),
         maxBytes: Int = 1_000_000_000,
         maxEntries: Int = 2000,
         // 128 MB: a full-screen 6K grab carries ~81 MB of uncompressed TIFF
@@ -312,6 +351,7 @@ final class ClipboardStore: ObservableObject {
         maxItemBytes: Int = 128_000_000
     ) {
         self.cryptoProvider = cryptoProvider
+        self.fileOperations = fileOperations
         let root = directory ?? ClipboardStore.defaultDirectory()
         self.directory = root
         self.metadataURL = root.appendingPathComponent("clipboard.json")
@@ -323,8 +363,6 @@ final class ClipboardStore: ObservableObject {
         self.maxItemBytes = maxItemBytes
         self.injectedCrypto = crypto
 
-        try? FileManager.default.createDirectory(at: blobsDirectory, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: thumbsDirectory, withIntermediateDirectories: true)
         load()
     }
 
@@ -337,11 +375,10 @@ final class ClipboardStore: ObservableObject {
     /// hang caused by doing Keychain work on the main thread at startup — a
     /// locked login keychain can block on a system prompt. Probing a blob adds
     /// a disk read and a decrypt on top of that.
-    /// Call on the main thread. Repeat calls are ignored, including while the
-    /// first is still in flight — otherwise a second call would mean a second
-    /// Keychain resolution and a second reconciliation pass.
+    /// Call on the main thread. Successful activation is idempotent; an
+    /// unavailable key can be retried later, without concurrent resolutions.
     func activate() {
-        guard !isActivated, !isActivating else { return }
+        guard (!isActivated || isKeyUnavailable), !isActivating else { return }
         isActivating = true
         let probeOrder = entries.sorted { $0.byteCount < $1.byteCount }.map(\.id)
         let injected = injectedCrypto
@@ -368,9 +405,41 @@ final class ClipboardStore: ObservableObject {
                 self.crypto = resolved
                 self.isKeyUnavailable = resolved == nil
                 self.isLockedOut = locked
-                self.isActivated = true
-                self.pruneToBudget()
-                self.reconcileBlobsWithMetadata()
+                guard let resolved, !locked, !self.isMetadataCorrupt else {
+                    self.isActivating = false
+                    self.isActivated = true
+                    return
+                }
+                do {
+                    try FileManager.default.createDirectory(at: self.blobsDirectory, withIntermediateDirectories: true)
+                    try FileManager.default.createDirectory(at: self.thumbsDirectory, withIntermediateDirectories: true)
+                    let needsMigration = self.storedEntries.contains { $0.preview != nil }
+                    self.entries = try self.storedEntries.map { stored in
+                        var entry = stored.entry
+                        if let sealed = stored.sealedPreview {
+                            let data = try resolved.open(sealed)
+                            guard let preview = String(data: data, encoding: .utf8) else {
+                                throw ClipboardCryptoError.keyUnavailable
+                            }
+                            entry.preview = preview
+                        }
+                        return entry
+                    }
+                    if needsMigration { self.save() }
+                } catch {
+                    self.isLockedOut = true
+                    self.logger.error("Clipboard history unlock failed: \(error.localizedDescription)")
+                }
+                guard !self.isLockedOut, !self.isMetadataCorrupt else {
+                    self.isActivating = false
+                    self.isActivated = true
+                    return
+                }
+                self.reconcileBlobsWithMetadata {
+                    self.pruneToBudget()
+                    self.isActivating = false
+                    self.isActivated = true
+                }
             }
         }
     }
@@ -395,14 +464,17 @@ final class ClipboardStore: ObservableObject {
             assertionFailure("ClipboardStore must not resolve a real Keychain key under test")
             return nil
         }
-        let keychain = KeychainStore(service: ClipboardKeyStore.service)
-        if let key = ClipboardKeyStore.loadKey(keychain: keychain) {
+        return resolveCrypto(keychain: KeychainStore(service: ClipboardKeyStore.service))
+    }
+
+    static func resolveCrypto(keychain: KeychainStore) -> ClipboardCrypto? {
+        do {
+            let key = try ClipboardKeyStore.loadKey(keychain: keychain)
+                ?? ClipboardKeyStore.createKey(keychain: keychain)
             return ClipboardCrypto(key: key)
-        }
-        guard let key = try? ClipboardKeyStore.createKey(keychain: keychain) else {
+        } catch {
             return nil
         }
-        return ClipboardCrypto(key: key)
     }
 
     /// Ground-truth check that `candidate` opens what is already stored.
@@ -431,14 +503,41 @@ final class ClipboardStore: ObservableObject {
             isMetadataCorrupt = true
             return
         }
-        guard FileManager.default.fileExists(atPath: metadataURL.path) else { return }
-        guard let data = try? Data(contentsOf: metadataURL) else { return }
+        let data: Data
+        do {
+            data = try fileOperations.read(metadataURL)
+        } catch {
+            if !Self.isMissingFile(error) { metadataFailure(error) }
+            return
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         do {
-            entries = try decoder.decode([ClipboardEntry].self, from: data)
+            storedEntries = try decoder.decode([StoredClipboardEntry].self, from: data)
+            guard storedEntries.allSatisfy({ $0.preview != nil || $0.sealedPreview != nil }) else {
+                throw ClipboardCryptoError.keyUnavailable
+            }
+            entries = storedEntries.map(\.entry)
         } catch {
             quarantineCorruptFile(error: error)
+        }
+    }
+
+    private static func isMissingFile(_ error: Error) -> Bool {
+        let error = error as NSError
+        return error.domain == NSCocoaErrorDomain
+            && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code)
+    }
+
+    private func metadataFailure(_ error: Error) {
+        isMetadataCorrupt = true
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        logger.error("Clipboard storage unavailable: \(error.localizedDescription)")
+        do {
+            try fileOperations.write(Data(), metadataQuarantineMarkerURL)
+        } catch {
+            logger.error("Clipboard quarantine marker write failed: \(error.localizedDescription)")
         }
     }
 
@@ -455,15 +554,19 @@ final class ClipboardStore: ObservableObject {
         }
         entries = []
         isMetadataCorrupt = true
-        try? Data().write(to: metadataQuarantineMarkerURL, options: .atomic)
+        metadataFailure(decodeError)
     }
 
     private func save() {
-        guard !isMetadataCorrupt else { return }
+        guard !isMetadataCorrupt, !isLockedOut, let crypto else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(entries) else { return }
-        try? data.write(to: metadataURL, options: .atomic)
+        do {
+            let stored = try entries.map { try StoredClipboardEntry(entry: $0, crypto: crypto) }
+            try fileOperations.write(try encoder.encode(stored), metadataURL)
+        } catch {
+            metadataFailure(error)
+        }
     }
 
     private func scheduleSave() {
@@ -495,8 +598,9 @@ final class ClipboardStore: ObservableObject {
             return completed
         }
         guard !completed.isEmpty else { return }
-        for (_, fingerprint) in completed {
+        for (entry, fingerprint) in completed {
             inFlightFingerprints.remove(fingerprint)
+            captureWorkItems.removeValue(forKey: entry.id)
         }
         entries.insert(contentsOf: completed.map { $0.0 }.reversed(), at: 0)
         pruneToBudget()
@@ -513,47 +617,35 @@ final class ClipboardStore: ObservableObject {
     /// a quit or crash in between leaves an orphan. Nothing else ever collects
     /// those, and because the retention budget only counts bytes it knows
     /// about, they would accumulate invisibly and forever.
-    private func reconcileBlobsWithMetadata() {
-        guard !isMetadataCorrupt else {
-            logger.error("Clipboard metadata is corrupt; preserving blobs without reconciliation")
+    private func reconcileBlobsWithMetadata(completion: @escaping () -> Void) {
+        guard !isMetadataCorrupt, !isKeyUnavailable, !isLockedOut else {
+            completion()
             return
         }
         let known = Set(entries.map(\.id.uuidString))
         blobQueue.async { [weak self] in
             guard let self else { return }
-            let fm = FileManager.default
-            let files = (try? fm.contentsOfDirectory(
-                at: self.blobsDirectory,
-                includingPropertiesForKeys: nil
-            )) ?? []
-
-            var present: Set<String> = []
-            for url in files {
-                let name = url.lastPathComponent
-                if known.contains(name) {
-                    present.insert(name)
-                } else {
-                    try? fm.removeItem(at: url)
-                    self.logger.info("Removed orphaned clipboard blob")
+            do {
+                // Both enumerations must succeed before deleting anything.
+                let files = try self.fileOperations.contents(self.blobsDirectory)
+                let thumbs = try self.fileOperations.contents(self.thumbsDirectory)
+                let present = Set(files.map(\.lastPathComponent)).intersection(known)
+                for url in files + thumbs where !known.contains(url.lastPathComponent) {
+                    try self.fileOperations.remove(url)
                 }
-            }
-
-            // Thumbnails are derived data: an orphan is collected, but a
-            // missing one never invalidates its entry.
-            let thumbs = (try? fm.contentsOfDirectory(
-                at: self.thumbsDirectory,
-                includingPropertiesForKeys: nil
-            )) ?? []
-            for url in thumbs where !known.contains(url.lastPathComponent) {
-                try? fm.removeItem(at: url)
-            }
-
-            let missing = known.subtracting(present)
-            guard !missing.isEmpty else { return }
-            DispatchQueue.main.async {
-                self.entries.removeAll { missing.contains($0.id.uuidString) }
-                self.scheduleSave()
-                self.logger.info("Dropped \(missing.count) clipboard entries with no blob on disk")
+                let missing = known.subtracting(present)
+                DispatchQueue.main.async {
+                    if !missing.isEmpty {
+                        self.entries.removeAll { missing.contains($0.id.uuidString) }
+                        self.scheduleSave()
+                    }
+                    completion()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.metadataFailure(error)
+                    completion()
+                }
             }
         }
     }
@@ -618,7 +710,7 @@ final class ClipboardStore: ObservableObject {
     /// the disk write, and preview generation all happen off it, and the entry
     /// appears once the blob is safely on disk.
     func record(snapshot: TextInjector.PasteboardSnapshot, sourceBundleID: String?) {
-        guard !isMetadataCorrupt, let crypto else { return }
+        guard canCapture, let crypto else { return }
         let types = Array(Set(snapshot.flatMap { $0.keys.map(\.rawValue) })).sorted()
         guard let fingerprint = captureFingerprint(snapshot: snapshot, types: types) else { return }
 
@@ -628,7 +720,7 @@ final class ClipboardStore: ObservableObject {
         let url = blobURL(for: id)
         inFlightFingerprints.insert(fingerprint)
 
-        blobQueue.async { [weak self] in
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             let written: Int
             let preview: String
@@ -639,7 +731,7 @@ final class ClipboardStore: ObservableObject {
                 let encoder = PropertyListEncoder()
                 encoder.outputFormat = .binary
                 let sealed = try crypto.seal(try encoder.encode(plist))
-                try sealed.write(to: url, options: .atomic)
+                try self.fileOperations.write(sealed, url)
                 written = sealed.count
 
                 // Best-effort: a missing thumbnail costs the row its preview
@@ -656,7 +748,11 @@ final class ClipboardStore: ObservableObject {
                 preview = ClipboardCapture.preview(kind: kind, snapshot: snapshot, types: types)
             } catch {
                 self.logger.error("Clipboard blob write failed: \(error.localizedDescription)")
-                DispatchQueue.main.async { self.inFlightFingerprints.remove(fingerprint) }
+                DispatchQueue.main.async {
+                    self.inFlightFingerprints.remove(fingerprint)
+                    self.captureWorkItems.removeValue(forKey: id)
+                    self.metadataFailure(error)
+                }
                 return
             }
             self.completedInsertions.append((
@@ -674,11 +770,14 @@ final class ClipboardStore: ObservableObject {
             ))
             DispatchQueue.main.async { self.commitCompletedInsertions() }
         }
+        captureWorkItems[id] = work
+        blobQueue.async(execute: work)
     }
 
     /// Drops the oldest entries until both the byte budget and the count cap
     /// are satisfied, deleting their blobs.
     private func pruneToBudget() {
+        guard !isMetadataCorrupt, !isLockedOut, !isKeyUnavailable else { return }
         var running = 0
         var keep: [ClipboardEntry] = []
         var drop: [ClipboardEntry] = []
@@ -691,16 +790,29 @@ final class ClipboardStore: ObservableObject {
             }
         }
         guard !drop.isEmpty else { return }
+        guard deleteBlobs(for: drop.map(\.id)) else { return }
         entries = keep
-        deleteBlobs(for: drop)
+        scheduleSave()
     }
 
-    private func deleteBlobs(for dropped: [ClipboardEntry]) {
-        let urls = dropped.flatMap { [blobURL(for: $0.id), thumbURL(for: $0.id)] }
-        blobQueue.async {
-            for url in urls {
-                try? FileManager.default.removeItem(at: url)
+    @discardableResult
+    private func deleteBlobs(for ids: [UUID]) -> Bool {
+        do {
+            try blobQueue.sync {
+                for id in ids {
+                    for url in [blobURL(for: id), thumbURL(for: id)] {
+                        do {
+                            try fileOperations.remove(url)
+                        } catch {
+                            if !Self.isMissingFile(error) { throw error }
+                        }
+                    }
+                }
             }
+            return true
+        } catch {
+            metadataFailure(error)
+            return false
         }
     }
 
@@ -747,8 +859,9 @@ final class ClipboardStore: ObservableObject {
 
     func delete(_ entry: ClipboardEntry) {
         let mutate = {
+            guard !self.isMetadataCorrupt,
+                  self.deleteBlobs(for: [entry.id]) else { return }
             self.entries.removeAll { $0.id == entry.id }
-            self.deleteBlobs(for: [entry])
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
@@ -757,10 +870,17 @@ final class ClipboardStore: ObservableObject {
     func clearAll() {
         let mutate = {
             guard !self.isMetadataCorrupt else { return }
-            let dropped = self.entries
+            self.saveWorkItem?.cancel()
+            self.saveWorkItem = nil
+            let pendingIDs = Array(self.captureWorkItems.keys)
+            for work in self.captureWorkItems.values { work.cancel() }
+            self.blobQueue.sync { self.completedInsertions.removeAll() }
+            self.captureWorkItems.removeAll()
+            self.inFlightFingerprints.removeAll()
+            let ids = Array(Set(self.entries.map(\.id) + pendingIDs))
+            guard self.deleteBlobs(for: ids) else { return }
             self.entries = []
             self.isLockedOut = false
-            self.deleteBlobs(for: dropped)
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
