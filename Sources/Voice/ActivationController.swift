@@ -63,6 +63,10 @@ enum ActivationKey {
 
 final class ActivationController {
 
+    static func shouldProcessActivationEvent(isPaused: Bool, hasActiveRecording: Bool) -> Bool {
+        !isPaused || hasActiveRecording
+    }
+
     /// Pure guard for scheduled hold-timer work items — rejects stale/cancelled
     /// timers and fires after `stop()` tears down the event tap.
     static func shouldFireHoldTimer(
@@ -88,6 +92,25 @@ final class ActivationController {
     /// Set to `false` to revert to listen-only behaviour; you must then set
     /// System Settings → Keyboard → "Press 🌐 key to: Do Nothing" manually.
     var consumeFnEvents: Bool = true
+
+    // Paused input passes through; active recordings may receive their release.
+    var isPaused = false {
+        didSet {
+            if isPaused {
+                holdTimer?.cancel()
+                holdTimer = nil
+                FnActivationLogic.prepareForPause(state: &fnLogicState)
+            } else if case .fnGlobe = activationKey {
+                let flags = CGEventSource.flagsState(.combinedSessionState)
+                    .subtracting(.maskNonCoalesced)
+                lastFlags = flags
+                FnActivationLogic.reconcilePhysicalDownAfterRestart(
+                    state: &fnLogicState,
+                    fnHeld: flags.contains(.maskSecondaryFn)
+                )
+            }
+        }
+    }
 
     // MARK: - Private state
 
@@ -386,6 +409,12 @@ final class ActivationController {
             return Unmanaged.passUnretained(event)
         }
 
+        // Paused input passes through; an active recording may still receive its release.
+        let hasActiveRecording = fnLogicState.isRecording || rightOptionRecording
+        guard Self.shouldProcessActivationEvent(isPaused: isPaused, hasActiveRecording: hasActiveRecording) else {
+            return Unmanaged.passUnretained(event)
+        }
+
         let flags = event.flags
 
         switch activationKey {
@@ -427,7 +456,9 @@ final class ActivationController {
             applyFnEffects(effects)
 
             let normalizedCurrent = flags.subtracting(.maskNonCoalesced)
-            let result = consumeFnIfNeeded(event: event, normalizedCurrent: normalizedCurrent)
+            let result = isPaused
+                ? Unmanaged.passUnretained(event)
+                : consumeFnIfNeeded(event: event, normalizedCurrent: normalizedCurrent)
             lastFlags = normalizedCurrent
             return result
 

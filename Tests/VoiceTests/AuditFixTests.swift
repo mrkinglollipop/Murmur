@@ -126,6 +126,104 @@ final class AuditFixTests: XCTestCase {
             .failed("boom")
         )
     }
+
+    // MARK: - Review 030 UI helpers
+
+    func testReview030SettingsSectionMembershipIsExclusiveAndComplete() {
+        let expected: [SettingsSection: Set<String>] = [
+            .general: ["Activation", "System", "Voice"],
+            .engine: ["Transcription Engine", "Language", "Local Model", "Cloud Model"],
+            .text: ["Cleanup", "Dictation text"],
+            .storage: ["Storage"],
+            .permissions: ["Permissions"],
+            .about: ["What's New", "Acknowledgements"],
+        ]
+        for (section, cards) in expected {
+            for card in cards { XCTAssertTrue(SettingsSection.contains(card, in: section)) }
+        }
+        XCTAssertFalse(SettingsSection.contains("Cloud Model", in: .general))
+        XCTAssertFalse(SettingsSection.contains("Voice", in: .about))
+    }
+
+    func testReview030StorageSummaryPluralAndFullCap() {
+        XCTAssertEqual(SettingsView.storageSummary(fileCount: 1, usageBytes: 10_000_000, budgetMB: 200), "Retained audio: 1 file · 10 MB of 200 MB")
+        XCTAssertEqual(SettingsView.storageSummary(fileCount: 114, usageBytes: 209_500_000, budgetMB: 200), "Retained audio: 114 files · 200 MB, full")
+    }
+
+    func testReview030PermissionSnapshotOnlyCompletesWhenAllThreeGranted() {
+        for microphone in [false, true] {
+            for accessibility in [false, true] {
+                for inputMonitoring in [false, true] {
+                    let snapshot = PermissionSnapshot(microphone: microphone, accessibility: accessibility, inputMonitoring: inputMonitoring)
+                    XCTAssertEqual(snapshot.allGranted, microphone && accessibility && inputMonitoring)
+                }
+            }
+        }
+    }
+
+    func testReview030InsightsStreakExpiresWhenLatestEntryIsOlderThanYesterday() {
+        let calendar = Calendar(identifier: .gregorian)
+        let today = calendar.startOfDay(for: Date())
+        let twoDaysAgo = calendar.date(byAdding: .day, value: -2, to: today)!
+        XCTAssertEqual(InsightsView.dayStreak(activeDays: [twoDaysAgo], today: today, calendar: calendar), 0)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: today)!
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: today)!
+        XCTAssertEqual(InsightsView.dayStreak(activeDays: [today], today: today, calendar: calendar), 1)
+        XCTAssertEqual(InsightsView.dayStreak(activeDays: [yesterday], today: today, calendar: calendar), 1)
+        XCTAssertEqual(InsightsView.dayStreak(activeDays: [tomorrow], today: today, calendar: calendar), 0)
+    }
+
+    func testReview030InsightsQuantilesHaveFourPositiveStepsAndLocaleGrouping() {
+        let counts = [1, 10, 100, 1_000]
+        XCTAssertEqual(counts.map { InsightsView.heatmapIntensity(for: $0, positiveWordCounts: counts) }, [1, 2, 3, 4])
+        XCTAssertEqual(InsightsView.heatmapIntensity(for: 0, positiveWordCounts: counts), 0)
+        XCTAssertEqual(InsightsView.heatmapIntensity(for: 10, positiveWordCounts: [10, 10, 10, 10]), 1)
+        XCTAssertEqual(InsightsView.heatmapIntensity(for: 10, positiveWordCounts: []), 1)
+        XCTAssertEqual(InsightsView.groupedInteger(25_281, locale: Locale(identifier: "en_US")), "25,281")
+        XCTAssertEqual(InsightsView.groupedInteger(25_281, locale: Locale(identifier: "de_DE")), "25.281")
+    }
+
+    func testReview030PausedHotkeyAndActivationPassThrough() {
+        XCTAssertTrue(HotkeyController.shouldRegisterHotkey(isPaused: false))
+        XCTAssertFalse(HotkeyController.shouldRegisterHotkey(isPaused: true))
+        XCTAssertTrue(ActivationController.shouldProcessActivationEvent(isPaused: false, hasActiveRecording: false))
+        XCTAssertFalse(ActivationController.shouldProcessActivationEvent(isPaused: true, hasActiveRecording: false))
+        XCTAssertTrue(ActivationController.shouldProcessActivationEvent(isPaused: true, hasActiveRecording: true))
+    }
+
+    func testReview030PauseClearsPendingFnStateButPreservesRecording() {
+        var pending = FnActivationLogic.State(
+            isRecording: false,
+            isToggleLocked: false,
+            firstTapAnchor: Date(),
+            fnPhysicallyDown: true,
+            holdDeadline: Date().addingTimeInterval(FnActivationLogic.holdThreshold)
+        )
+        FnActivationLogic.prepareForPause(state: &pending)
+        XCTAssertNil(pending.firstTapAnchor)
+        XCTAssertNil(pending.holdDeadline)
+        XCTAssertFalse(pending.fnPhysicallyDown)
+
+        var recording = FnActivationLogic.State(isRecording: true, fnPhysicallyDown: true)
+        FnActivationLogic.prepareForPause(state: &recording)
+        XCTAssertTrue(recording.isRecording)
+        XCTAssertTrue(recording.fnPhysicallyDown)
+    }
+
+    @MainActor
+    func testReview030StatusMenuBuildsRequiredTitlesKeysEnabledStateAndPauseToggle() {
+        let menu = AppDelegate.makeStatusMenu(versionTitle: "Murmur 9.9.9", isPaused: false, updateTitle: "Check for Updates…", updatesEnabled: false, target: nil, updater: nil)
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+        XCTAssertEqual(titles, ["Murmur 9.9.9", "Open Murmur", "Settings…", "Pause dictation", "Check for Updates…", "Quit Murmur"])
+        XCTAssertEqual(menu.item(withTitle: "Settings…")?.keyEquivalent, ",")
+        XCTAssertEqual(menu.item(withTitle: "Settings…")?.keyEquivalentModifierMask, .command)
+        XCTAssertFalse(menu.item(withTitle: "Check for Updates…")?.isEnabled ?? true)
+        XCTAssertEqual(menu.item(withTitle: "Quit Murmur")?.keyEquivalent, "q")
+        let resumed = AppDelegate.makeStatusMenu(versionTitle: "Murmur", isPaused: true, updateTitle: "Check for Updates…", updatesEnabled: true, target: nil, updater: nil)
+        XCTAssertNotNil(resumed.item(withTitle: "Resume dictation"))
+        XCTAssertTrue(resumed.item(withTitle: "Check for Updates…")?.isEnabled ?? false)
+    }
+
 }
 
 /// Minimal `Bundle` stand-in for the version-title seam — subclassing `Bundle`
