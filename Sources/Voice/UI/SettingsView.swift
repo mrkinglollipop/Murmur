@@ -452,6 +452,7 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             settingsRail
+                .onAppear { settingsStore.refreshKeyPresence() }
             Divider().overlay(Theme.hairline)
             ScrollView {
                 sectionContent

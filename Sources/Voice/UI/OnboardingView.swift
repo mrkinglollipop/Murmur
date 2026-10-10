@@ -312,7 +312,7 @@ struct OnboardingView: View {
     }
 
     private func completeOnboarding() {
-        UserDefaults.standard.set(true, forKey: OnboardingStore.completeKey)
+        VoiceDefaults.shared.set(true, forKey: OnboardingStore.completeKey)
         onComplete()
     }
 }
@@ -333,7 +333,7 @@ enum OnboardingStore {
     static let completeKey = "voice.onboardingComplete"
 
     static var isComplete: Bool {
-        UserDefaults.standard.bool(forKey: completeKey)
+        VoiceDefaults.shared.bool(forKey: completeKey)
     }
 }
 
