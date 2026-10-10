@@ -54,6 +54,17 @@ enum CloudProvider: String, CaseIterable, Identifiable {
 struct CloudTranscriptionError: LocalizedError {
     let provider: CloudProvider
     let message: String
+    let heardNothing: Bool
+
+    init(provider: CloudProvider, message: String, heardNothing: Bool = false) {
+        self.provider = provider
+        self.message = message
+        self.heardNothing = heardNothing
+    }
+
+    static func emptyTranscript(provider: CloudProvider) -> CloudTranscriptionError {
+        CloudTranscriptionError(provider: provider, message: "No transcript in response", heardNothing: true)
+    }
 
     var errorDescription: String? {
         "\(provider.displayName): \(message)"
