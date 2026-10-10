@@ -170,4 +170,66 @@ final class LoopbackRedirectServerTests: XCTestCase {
         ])
     }
 
+    private final class MemoryConnection: LoopbackHTTPConnection {
+        var cancelled = false
+        var read: ((Data?, Bool, Error?) -> Void)?
+        var responses: [Data] = []
+        func start(queue: DispatchQueue) {}
+        func readHeadChunk(_ completion: @escaping (Data?, Bool, Error?) -> Void) { read = completion }
+        func writeResponse(_ data: Data, completion: @escaping () -> Void) {
+            responses.append(data)
+            completion()
+        }
+        func cancel() {
+            cancelled = true
+            read = nil
+        }
+        func receive(_ text: String) { read?(Data(text.utf8), false, nil) }
+    }
+
+    func testStalledHeaderDeadlineFreesAllEightSlotsForCallback() {
+        var deadlines: [DispatchWorkItem] = []
+        var results: [Result<String, SupabaseAuthClient.AuthError>] = []
+        let server = LoopbackRedirectServer(scheduleHeaderTimeout: { deadlines.append($0) }, onResult: { results.append($0) })
+        let stalled = (0..<8).map { _ in MemoryConnection() }
+        for connection in stalled {
+            server.accept(connection)
+            connection.receive("GET /auth-callback HTTP/1.1\r\nHost: ")
+        }
+        let rejected = MemoryConnection()
+        server.accept(rejected)
+        XCTAssertTrue(rejected.cancelled)
+        // Advancing the injected clock exercises expiry with no wall-clock wait.
+        deadlines.forEach { $0.perform() }
+        XCTAssertTrue(stalled.allSatisfy(\.cancelled))
+        let browser = MemoryConnection()
+        server.accept(browser)
+        browser.receive("GET /auth-callback?code=current HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        XCTAssertEqual(results, [.success("current")])
+        XCTAssertEqual(browser.responses.count, 1)
+    }
+
+    func testPartialHeadersKeepOriginalDeadlineAndLateCompletionsAreIgnored() {
+        var deadlines: [DispatchWorkItem] = []
+        var results: [Result<String, SupabaseAuthClient.AuthError>] = []
+        let server = LoopbackRedirectServer(scheduleHeaderTimeout: { deadlines.append($0) }, onResult: { results.append($0) })
+        let stalled = MemoryConnection()
+        server.accept(stalled)
+        stalled.receive("GET /auth-callback?code=late HTTP/1.1\r\n")
+        stalled.receive("Host: localhost\r\n")
+        XCTAssertEqual(deadlines.count, 1, "dripping bytes must not extend the header deadline")
+        let lateCompletion = stalled.read
+        deadlines.first?.perform()
+        XCTAssertTrue(stalled.cancelled)
+        lateCompletion?(Data("\r\n".utf8), false, nil)
+        XCTAssertTrue(results.isEmpty)
+
+        let valid = MemoryConnection()
+        server.accept(valid)
+        valid.receive("GET /auth-callback?code=current HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        XCTAssertEqual(results, [.success("current")])
+        deadlines.forEach { $0.perform() }
+        XCTAssertEqual(results, [.success("current")])
+    }
+
 }

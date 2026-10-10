@@ -54,6 +54,8 @@ final class AuthFlowController: ObservableObject {
     private var browserTimeoutTask: Task<Void, Never>?
     private var inFlightRefresh: RefreshAttempt?
     private var nextRefreshGeneration = 0
+    private var pendingStoredToken: String?
+    private var shouldRetryRestore = false
     private let browserTimeoutInterval: TimeInterval
     private let waitForBrowserTimeout: () async -> Void
 
@@ -138,6 +140,8 @@ final class AuthFlowController: ObservableObject {
     // MARK: - Flow
 
     func beginSignIn(provider: SupabaseAuthClient.Provider) {
+        shouldRetryRestore = false
+        pendingStoredToken = nil
         sessionGeneration &+= 1
         let generation = sessionGeneration
         let verifier = SupabaseAuthClient.makeCodeVerifier()
@@ -158,6 +162,7 @@ final class AuthFlowController: ObservableObject {
     }
 
     func cancelSignIn() {
+        shouldRetryRestore = false
         sessionGeneration &+= 1
         endBrowserAttempt()
         state = .signedOut
@@ -293,6 +298,9 @@ final class AuthFlowController: ObservableObject {
     /// auth-state observer cannot rotate the refresh token independently.
     func authenticatedSession() async -> SupabaseAuthClient.Session? {
         guard case .signedIn(let session) = state else { return nil }
+        if pendingStoredToken == session.refreshToken {
+            persistRenewedToken(session.refreshToken)
+        }
         guard session.expiresAt.timeIntervalSinceNow <= Self.refreshMargin else { return session }
 
         let attempt: RefreshAttempt
@@ -327,6 +335,13 @@ final class AuthFlowController: ObservableObject {
         return await attempt.task.value
     }
 
+    /// Foreground preflight shared with AppDelegate's entitlement refresh.
+    func sessionForForegroundActivation() async -> SupabaseAuthClient.Session? {
+        if shouldRetryRestore { await restoreSessionIfAvailable() }
+        guard case .signedIn(let session) = state else { return nil }
+        return session
+    }
+
     static let refreshMargin: TimeInterval = 60
 
     private func finishRefresh(
@@ -345,11 +360,7 @@ final class AuthFlowController: ObservableObject {
         switch result {
         case .success(let refreshed):
             state = .signedIn(refreshed)
-            if writeStoredToken(refreshed.refreshToken) {
-                lastError = nil
-            } else {
-                lastError = "Murmur couldn't save the renewed sign-in."
-            }
+            persistRenewedToken(refreshed.refreshToken)
             return refreshed
         case .failure(let error as SupabaseAuthClient.AuthError) where error == .invalidRefreshToken:
             endSessionAfterInvalidRefresh()
@@ -360,7 +371,19 @@ final class AuthFlowController: ObservableObject {
         }
     }
 
+    private func persistRenewedToken(_ token: String) {
+        if writeStoredToken(token) {
+            pendingStoredToken = nil
+            lastError = nil
+        } else {
+            pendingStoredToken = token
+            lastError = "Murmur couldn't save the renewed sign-in."
+        }
+    }
+
     private func endSessionAfterInvalidRefresh() {
+        shouldRetryRestore = false
+        pendingStoredToken = nil
         sessionGeneration &+= 1
         endBrowserAttempt()
         inFlightRefresh?.task.cancel()
@@ -378,30 +401,30 @@ final class AuthFlowController: ObservableObject {
         // launch-time restore race it, but let repeated restores supersede
         // one another so an older rotated token cannot win.
         guard case .signedOut = state else { return }
+        shouldRetryRestore = false
         guard let token = readStoredToken() else { return }
         sessionGeneration &+= 1
         let generation = sessionGeneration
         do {
             let session = try await refreshToken(token)
             guard generation == sessionGeneration else { return }
-            guard writeStoredToken(session.refreshToken) else {
-                state = .failed("Murmur couldn't save your renewed sign-in. Try again.")
-                return
-            }
             state = .signedIn(session)
-            lastError = nil
+            persistRenewedToken(session.refreshToken)
             vlog("auth: session restored from stored refresh token")
         } catch let error as SupabaseAuthClient.AuthError where error == .invalidRefreshToken {
             guard generation == sessionGeneration else { return }
             endSessionAfterInvalidRefresh()
         } catch {
-            // Expired/revoked token: stay signed out quietly; the user
-            // re-authenticates the next time they touch a Pro feature.
-            vlog("auth: stored refresh token no longer valid")
+            guard generation == sessionGeneration else { return }
+            shouldRetryRestore = true
+            lastError = "Murmur can't reach the server. Your saved sign-in will be retried when the app becomes active."
+            vlog("auth: session restore temporarily unavailable")
         }
     }
 
     func signOut() {
+        shouldRetryRestore = false
+        pendingStoredToken = nil
         sessionGeneration &+= 1
         endBrowserAttempt()
         inFlightRefresh?.task.cancel()

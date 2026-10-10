@@ -595,4 +595,152 @@ final class ProAuthTests: XCTestCase {
         XCTAssertEqual(controller.state, .signedIn(newer))
     }
 
+    @MainActor
+    func testRestorePersistenceFailurePreservesSessionAndRetriesRotatedToken() async {
+        let restored = session(refreshToken: "renewed")
+        var writes: [String] = []
+        var canPersist = false
+        var refreshes = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in refreshes += 1; return restored },
+            openBrowser: { _ in }, readStoredToken: { "saved" },
+            persistStoredToken: { writes.append($0); return canPersist },
+            removeStoredToken: { true }
+        )
+        await controller.restoreSessionIfAvailable()
+        XCTAssertEqual(controller.state, .signedIn(restored))
+        XCTAssertNotNil(controller.lastError)
+        canPersist = true
+        let available = await controller.authenticatedSession()
+        XCTAssertEqual(available, restored)
+        XCTAssertEqual(writes, ["renewed", "renewed"])
+        XCTAssertEqual(refreshes, 1)
+        XCTAssertNil(controller.lastError)
+    }
+
+    @MainActor
+    func testForegroundRetriesTransientRestoreFailure() async {
+        let restored = session()
+        var attempts = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in
+                attempts += 1
+                if attempts == 1 { throw SupabaseAuthClient.AuthError.badResponse(503) }
+                return restored
+            },
+            openBrowser: { _ in }, readStoredToken: { "saved" },
+            persistStoredToken: { _ in true }, removeStoredToken: { true }
+        )
+        await controller.restoreSessionIfAvailable()
+        XCTAssertEqual(controller.state, .signedOut)
+        let available = await controller.sessionForForegroundActivation()
+        XCTAssertEqual(available, restored)
+        XCTAssertEqual(controller.state, .signedIn(restored))
+        XCTAssertEqual(attempts, 2)
+    }
+
+    @MainActor
+    func testExplicitSignOutSuppressesPendingRestoreRetryEvenIfDeletionFails() async {
+        var attempts = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in attempts += 1; throw URLError(.notConnectedToInternet) },
+            openBrowser: { _ in }, readStoredToken: { "saved" },
+            persistStoredToken: { _ in true }, removeStoredToken: { false }
+        )
+        await controller.restoreSessionIfAvailable()
+        controller.signOut()
+        let available = await controller.sessionForForegroundActivation()
+        XCTAssertNil(available)
+        XCTAssertEqual(attempts, 1)
+    }
+
+    @MainActor
+    func testForegroundRecoveryUnlocksCachedPaidAccount() async throws {
+        let suiteName = "murmur-pro-restore-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let restored = session()
+        let entitlement = EntitlementStore(defaults: defaults, fetcher: { _ in true })
+        await entitlement.refresh(session: restored)
+        entitlement.clear()
+        entitlement.fetcher = { _ in throw URLError(.notConnectedToInternet) }
+        var attempts = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in
+                attempts += 1
+                if attempts == 1 { throw URLError(.notConnectedToInternet) }
+                return restored
+            },
+            readStoredToken: { "saved" }, persistStoredToken: { _ in true }, removeStoredToken: { true }
+        )
+        await controller.restoreSessionIfAvailable()
+        XCTAssertFalse(entitlement.isPro)
+        if let available = await controller.sessionForForegroundActivation() {
+            await entitlement.refresh(session: available) { await controller.authenticatedSession() }
+        }
+        XCTAssertTrue(entitlement.isPro)
+        XCTAssertEqual(attempts, 2)
+    }
+
+    @MainActor
+    func testInvalidRestoreNeverRetriesOnForeground() async {
+        var attempts = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in attempts += 1; throw SupabaseAuthClient.AuthError.invalidRefreshToken },
+            readStoredToken: { "revoked" }, persistStoredToken: { _ in true }, removeStoredToken: { false }
+        )
+        await controller.restoreSessionIfAvailable()
+        let available = await controller.sessionForForegroundActivation()
+        XCTAssertNil(available)
+        XCTAssertEqual(attempts, 1)
+    }
+
+    @MainActor
+    func testLateRestoreFailureCannotRetryAfterSignOut() async {
+        let gate = SessionGate()
+        var attempts = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in
+                attempts += 1
+                if attempts == 1 { return try await gate.fetch() }
+                throw URLError(.notConnectedToInternet)
+            },
+            readStoredToken: { "saved" }, persistStoredToken: { _ in true }, removeStoredToken: { true }
+        )
+        let restore = Task { await controller.restoreSessionIfAvailable() }
+        await gate.waitUntilStarted()
+        controller.signOut()
+        await gate.fail()
+        await restore.value
+        let available = await controller.sessionForForegroundActivation()
+        XCTAssertNil(available)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertNil(controller.lastError)
+    }
+
+    @MainActor
+    func testConcurrentForegroundNotificationsShareRestoreRetry() async {
+        let gate = SessionGate()
+        let restored = session()
+        var attempts = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in
+                attempts += 1
+                if attempts == 1 { throw URLError(.notConnectedToInternet) }
+                if attempts == 2 { return try await gate.fetch() }
+                return restored
+            },
+            readStoredToken: { "saved" }, persistStoredToken: { _ in true }, removeStoredToken: { true }
+        )
+        await controller.restoreSessionIfAvailable()
+        let first = Task { await controller.sessionForForegroundActivation() }
+        await gate.waitUntilStarted()
+        let second = await controller.sessionForForegroundActivation()
+        XCTAssertNil(second)
+        XCTAssertEqual(attempts, 2)
+        await gate.succeed(restored)
+        let available = await first.value
+        XCTAssertEqual(available, restored)
+    }
+
 }

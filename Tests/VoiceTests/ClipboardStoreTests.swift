@@ -1379,7 +1379,7 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertTrue(waitForEntries(relaunched, count: 2))
     }
 
-    func testMigrationCreatesWriteOnceOwnerOnlyBackup() throws {
+    func testFailedMigrationKeepsWriteOnceOwnerOnlyBackup() throws {
         let directory = tempDirectory()
         let key = SymmetricKey(size: .bits256)
         let crypto = ClipboardCrypto(key: key)
@@ -1393,7 +1393,10 @@ final class ClipboardStoreTests: XCTestCase {
         let legacy = try encoder.encode(original.entries)
         try legacy.write(to: metadata)
 
-        _ = activated(ClipboardStore(directory: directory, crypto: crypto))
+        var operations = ClipboardFileOperations()
+        operations.write = { _, _ in throw CocoaError(.fileWriteNoPermission) }
+
+        _ = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
         let backup = directory.appendingPathComponent("clipboard.json.pre-migration-backup")
         XCTAssertEqual(try Data(contentsOf: backup), legacy)
         let permissions = try FileManager.default.attributesOfItem(atPath: backup.path)[.posixPermissions] as? NSNumber
@@ -1402,7 +1405,7 @@ final class ClipboardStoreTests: XCTestCase {
         var laterLegacy = original.entries
         laterLegacy[0].preview = "LATER_LEGACY_MIGRATION"
         try encoder.encode(laterLegacy).write(to: metadata)
-        _ = activated(ClipboardStore(directory: directory, crypto: crypto))
+        _ = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
         XCTAssertEqual(try Data(contentsOf: backup), preserved)
     }
 
@@ -1437,7 +1440,7 @@ final class ClipboardStoreTests: XCTestCase {
         let recovered = activated(ClipboardStore(directory: directory, crypto: crypto))
         XCTAssertFalse(recovered.isMetadataCorrupt)
         XCTAssertEqual(recovered.entries.first?.preview, "legacy under marker")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json.pre-migration-backup").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json.pre-migration-backup").path))
     }
 
     func testDowngradeMarkerRestoresNewestCurrentFormatQuarantineWithoutOverwritingMetadata() throws {
@@ -1795,4 +1798,124 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertTrue(ClipboardTypeFilter.shouldIgnore(types: ["com.agilebits.onepassword"]))
         XCTAssertFalse(ClipboardTypeFilter.shouldIgnore(types: ["public.utf8-plain-text"]))
     }
+
+    private func legacyPreviewFixture() throws -> (URL, ClipboardCrypto, ClipboardEntry) {
+        let directory = tempDirectory()
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        let entry = ClipboardEntry(
+            id: UUID(), date: Date(timeIntervalSince1970: 1_700_000_000), kind: .text,
+            preview: "PRIVATE_LEGACY_PREVIEW", sourceBundleID: nil,
+            types: [NSPasteboard.PasteboardType.string.rawValue], byteCount: 100,
+            fingerprint: "fixture"
+        )
+        let blobs = directory.appendingPathComponent("blobs")
+        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        try crypto.seal(Data("fixture payload".utf8)).write(to: blobs.appendingPathComponent(entry.id.uuidString))
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode([entry]).write(to: directory.appendingPathComponent("clipboard.json"))
+        return (directory, crypto, entry)
+    }
+
+    func testClearAllWithoutKeyPersistsEmptyMetadata() throws {
+        let (directory, _, entry) = try legacyPreviewFixture()
+        let store = activated(ClipboardStore(directory: directory, cryptoProvider: { nil }))
+        XCTAssertEqual(store.entries, [entry])
+        store.clearAll()
+        store.flush()
+        let data = try Data(contentsOf: directory.appendingPathComponent("clipboard.json"))
+        XCTAssertNil(data.range(of: Data(entry.preview.utf8)))
+        XCTAssertEqual(try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [Any]).count, 0)
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testClearAllWithoutKeyReportsMetadataWriteFailure() throws {
+        let (directory, _, _) = try legacyPreviewFixture()
+        var failWrites = true
+        var operations = ClipboardFileOperations()
+        operations.write = { data, url in
+            if failWrites { throw CocoaError(.fileWriteNoPermission) }
+            try data.write(to: url, options: .atomic)
+        }
+        let store = activated(ClipboardStore(directory: directory, cryptoProvider: { nil }, fileOperations: operations))
+        store.clearAll()
+        store.flush()
+        XCTAssertTrue(store.isStorageUnavailable)
+        failWrites = false
+        store.flush()
+        XCTAssertFalse(store.isStorageUnavailable)
+        let data = try Data(contentsOf: directory.appendingPathComponent("clipboard.json"))
+        XCTAssertEqual(try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [Any]).count, 0)
+    }
+
+    func testVerifiedMigrationRemovesPlaintextBackup() throws {
+        let (directory, crypto, entry) = try legacyPreviewFixture()
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertEqual(store.entries, [entry])
+        let data = try Data(contentsOf: directory.appendingPathComponent("clipboard.json"))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        let sealed = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(rows.first?["sealedPreview"] as? String)))
+        XCTAssertEqual(try crypto.open(sealed), Data(entry.preview.utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json.pre-migration-backup").path))
+    }
+
+    func testFailedClearDoesNotEraseSubsequentCapture() throws {
+        let (directory, crypto, _) = try legacyPreviewFixture()
+        var failWrites = false
+        var operations = ClipboardFileOperations()
+        operations.write = { data, url in
+            if failWrites { throw CocoaError(.fileWriteNoPermission) }
+            try data.write(to: url, options: .atomic)
+        }
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
+        failWrites = true
+        store.clearAll()
+        XCTAssertTrue(store.isStorageUnavailable)
+        failWrites = false
+        store.record(snapshot: textSnapshot("after recovered clear"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        store.flush()
+        let reopened = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertEqual(reopened.entries.map(\.preview), ["after recovered clear"])
+    }
+
+    func testMigrationRequiresSuccessfulReadbackBeforeRemovingBackup() throws {
+        for unreadable in [false, true] {
+            let (directory, crypto, _) = try legacyPreviewFixture()
+            let metadata = directory.appendingPathComponent("clipboard.json")
+            let legacy = try Data(contentsOf: metadata)
+            var wrote = false
+            var operations = ClipboardFileOperations()
+            operations.write = { data, url in
+                if unreadable { try data.write(to: url, options: .atomic) }
+                // A successful return alone is not proof of persisted ciphertext.
+                wrote = true
+            }
+            operations.read = { url in
+                if unreadable && wrote && url == metadata { throw CocoaError(.fileReadNoPermission) }
+                return try Data(contentsOf: url)
+            }
+            let store = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
+            XCTAssertTrue(store.isStorageUnavailable)
+            XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("clipboard.json.pre-migration-backup")), legacy)
+        }
+    }
+
+    func testVerifiedMigrationBackupCleanupRetriesAfterRemovalFailure() throws {
+        let (directory, crypto, entry) = try legacyPreviewFixture()
+        let backup = directory.appendingPathComponent("clipboard.json.pre-migration-backup")
+        var operations = ClipboardFileOperations()
+        operations.remove = { url in
+            if url == backup { throw CocoaError(.fileWriteNoPermission) }
+            try FileManager.default.removeItem(at: url)
+        }
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
+        XCTAssertTrue(store.isStorageUnavailable)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+        let reopened = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertEqual(reopened.entries, [entry])
+        XCTAssertFalse(reopened.isStorageUnavailable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+    }
+
 }
