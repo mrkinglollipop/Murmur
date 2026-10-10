@@ -67,6 +67,10 @@ final class ActivationController {
         !isPaused || hasActiveRecording
     }
 
+    static func isShiftHeld(_ flags: CGEventFlags) -> Bool {
+        flags.contains(.maskShift)
+    }
+
     /// Pure guard for scheduled hold-timer work items — rejects stale/cancelled
     /// timers and fires after `stop()` tears down the event tap.
     static func shouldFireHoldTimer(
@@ -126,6 +130,13 @@ final class ActivationController {
 
     /// Read fresh from Settings — enables double-tap fn toggle-lock mode.
     var useToggleLockProvider: (() -> Bool)?
+
+    /// Read fresh at hold start so changing the setting applies to the next hold.
+    var voiceEditEnabledProvider: (() -> Bool)?
+
+    /// Captured from the activation edge that began the hold. The delayed Fn
+    /// hold timer must not perform a second event-state read for this modifier.
+    private var shiftHeldAtActivation = false
 
     private var holdTimer: DispatchWorkItem?
 
@@ -286,10 +297,16 @@ final class ActivationController {
 
     // MARK: - Fn consumption + recording hooks
 
-    private func onRecordingWillStart() -> UInt64 {
+    private func onRecordingWillStart(shiftHeld: Bool) -> UInt64 {
         let hop: () -> UInt64 = { [weak self] in
             guard let self else { return 0 }
-            let token = self.recorder.asrSelector.holdCaretSnapshotFromRecordingWillStart()
+            let token = self.recorder.asrSelector.holdCaretSnapshotFromRecordingWillStart(
+                voiceEditEnabled: self.voiceEditEnabledProvider?() ?? true,
+                shiftHeld: shiftHeld
+            )
+            self.recorder.hud.prepareForRecording(
+                editingSelection: self.recorder.asrSelector.isVoiceEditHold(token)
+            )
             self.recorder.asrSelector.onRecordingStart?()
             return token
         }
@@ -304,7 +321,7 @@ final class ActivationController {
         for effect in effects {
             switch effect {
             case .startRecording:
-                let heldToken = onRecordingWillStart()
+                let heldToken = onRecordingWillStart(shiftHeld: shiftHeldAtActivation)
                 recorder.startRecording(heldCaretToken: heldToken)
             case .stopRecording:
                 recorder.stopRecording()
@@ -421,6 +438,9 @@ final class ActivationController {
 
         case .fnGlobe:
             let fnDown = flags.contains(.maskSecondaryFn)
+            if fnDown && !fnLogicState.fnPhysicallyDown {
+                shiftHeldAtActivation = Self.isShiftHeld(flags)
+            }
             let useToggleLock = useToggleLockProvider?() ?? false
             let now = Date()
             let effects = FnActivationLogic.handle(
@@ -470,10 +490,11 @@ final class ActivationController {
             }
             let keyDown = flags.contains(.maskAlternate)
             if keyDown && !rightOptionRecording {
+                shiftHeldAtActivation = Self.isShiftHeld(flags)
                 rightOptionRecording = true
                 logger.info("Push-to-talk: Right Option DOWN → starting recording")
                 vlog("rightOption DOWN → startRecording()")
-                let heldToken = onRecordingWillStart()
+                let heldToken = onRecordingWillStart(shiftHeld: shiftHeldAtActivation)
                 recorder.startRecording(heldCaretToken: heldToken)
             } else if !keyDown && rightOptionRecording {
                 rightOptionRecording = false

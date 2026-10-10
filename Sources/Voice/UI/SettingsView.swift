@@ -366,6 +366,17 @@ struct SettingsView: View {
 
                 section(title: "Dictation text") {
                     VStack(alignment: .leading, spacing: 12) {
+                        Toggle("Edit selected text by voice", isOn: $settingsStore.voiceEditSelectedText)
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("Hold ⇧ with the dictation key to dictate over a selection instead.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+
+                        Divider().overlay(Theme.hairline)
+
                         Toggle("Code-aware mode (for coding)", isOn: $settingsStore.codeAwareMode)
                             .toggleStyle(.switch)
                             .font(Theme.body(12))

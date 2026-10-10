@@ -2,12 +2,20 @@ import Foundation
 import AppKit
 import os.log
 
-/// A single logged dictation.
+/// A completed dictation or voice edit.
 struct HistoryEntry: Codable, Identifiable, Equatable {
+    enum Kind: String, Codable {
+        case dictation = "Dictation"
+        case edit = "Edit"
+    }
+
     let id: UUID
     let date: Date
     var text: String
     var engine: String
+    var kind: Kind
+    /// The spoken instruction for an edit. The selected source text is never persisted.
+    var instruction: String?
     /// Whether the text was successfully injected into a focused app.
     /// `false` means it was left on the clipboard for manual paste.
     var injected: Bool
@@ -36,12 +44,16 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
         injected: Bool,
         audioPath: String? = nil,
         failed: Bool = false,
-        savedWithoutInsertion: Bool = false
+        savedWithoutInsertion: Bool = false,
+        kind: Kind = .dictation,
+        instruction: String? = nil
     ) {
         self.id = id
         self.date = date
         self.text = text
         self.engine = engine
+        self.kind = kind
+        self.instruction = instruction
         self.injected = injected
         self.audioPath = audioPath
         self.failed = failed
@@ -54,6 +66,8 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
         date = try container.decode(Date.self, forKey: .date)
         text = try container.decode(String.self, forKey: .text)
         engine = try container.decode(String.self, forKey: .engine)
+        instruction = try container.decodeIfPresent(String.self, forKey: .instruction)
+        kind = try container.decodeIfPresent(Kind.self, forKey: .kind) ?? (instruction == nil ? .dictation : .edit)
         injected = try container.decode(Bool.self, forKey: .injected)
         audioPath = try container.decodeIfPresent(String.self, forKey: .audioPath)
         failed = try container.decodeIfPresent(Bool.self, forKey: .failed) ?? false
@@ -199,7 +213,9 @@ final class HistoryStore: ObservableObject {
         audioPath: String? = nil,
         failed: Bool = false,
         replaceEntryID: UUID? = nil,
-        savedWithoutInsertion: Bool = false
+        savedWithoutInsertion: Bool = false,
+        kind: HistoryEntry.Kind = .dictation,
+        instruction: String? = nil
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || failed else { return }
@@ -223,7 +239,9 @@ final class HistoryStore: ObservableObject {
                 injected: injected,
                 audioPath: audioPath,
                 failed: failed,
-                savedWithoutInsertion: savedWithoutInsertion
+                savedWithoutInsertion: savedWithoutInsertion,
+                kind: kind,
+                instruction: instruction
             )
             self.entries.insert(entry, at: 0)
             if self.entries.count > self.maxEntries {

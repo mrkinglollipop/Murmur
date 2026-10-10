@@ -183,6 +183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activationController?.useToggleLockProvider = { [weak self] in
             self?.settingsStore.useToggleLock ?? false
         }
+        activationController?.voiceEditEnabledProvider = { [weak self] in
+            self?.settingsStore.voiceEditSelectedText ?? true
+        }
         activationController?.start()
 
         hotkeyController = HotkeyController()
@@ -331,6 +334,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 audioPath: audioPath,
                 failed: failed,
                 replaceEntryID: replaceEntryID
+            )
+        }
+        activationController?.audioRecorder.asrSelector.onVoiceEditLogged = { [weak self] result, instruction, engineID, injected, savedWithoutInsertion in
+            self?.historyStore.append(
+                text: result,
+                engine: engineID,
+                injected: injected,
+                savedWithoutInsertion: savedWithoutInsertion,
+                kind: .edit,
+                instruction: instruction
             )
         }
         activationController?.audioRecorder.asrSelector.onAbandonedHoldSaved = { [weak self] text, engineID, audioPath in
@@ -687,7 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
         switch state {
-        case .listening, .microphoneNoAudio:
+        case .listening, .editingSelection, .microphoneNoAudio:
             setMenuBarIcon(.listening)
         case .processing:
             setMenuBarIcon(.processing)

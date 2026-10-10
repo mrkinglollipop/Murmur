@@ -36,6 +36,7 @@ final class RecordingHUD {
 
     enum State: Equatable {
         case listening
+        case editingSelection
         case processing
         case success
         case clipboardFlash
@@ -45,12 +46,18 @@ final class RecordingHUD {
         var accessibilityAnnouncement: String {
             switch self {
             case .listening: return "Listening"
+            case .editingSelection: return "Editing selection"
             case .processing: return "Transcribing"
             case .success: return "Dictation complete"
             case .clipboardFlash: return "Text copied to clipboard"
             case .microphoneNoAudio(let device): return "No microphone audio from \(device)"
             case .error(let message): return "Dictation failed. \(message)"
             }
+        }
+
+        var visibleLabel: String? {
+            if case .editingSelection = self { return "Editing selection" }
+            return nil
         }
     }
 
@@ -104,6 +111,8 @@ final class RecordingHUD {
     private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     private var accessibilityObserver: NSObjectProtocol?
     private var isHiding = false
+    private var shouldShowEditingSelection = false
+    private var recordingIsVoiceEdit = false
 
     /// Short label for the push-to-talk key chip (e.g. "fn", "⌥").
     private(set) var activationKeyLabel: String = "fn"
@@ -176,7 +185,9 @@ final class RecordingHUD {
     func show() {
         _ = beginTransition()
         clearInterimText()
-        applyState(.listening)
+        let initialState: State = shouldShowEditingSelection ? .editingSelection : .listening
+        shouldShowEditingSelection = false
+        applyState(initialState)
         resizePanel(forInterim: false)
         positionOnMainScreen(offsetBelowFinal: 8)
         panel.orderFrontRegardless()
@@ -194,6 +205,14 @@ final class RecordingHUD {
             guard let self, self.isVisible else { return }
             self.notifyLayoutChange()
         })
+    }
+
+    /// Sets the next recording HUD appearance from the captured hold intent.
+    /// Every hold calls this so a failed preflight cannot label the next normal
+    /// recording as an edit.
+    func prepareForRecording(editingSelection: Bool) {
+        shouldShowEditingSelection = editingSelection
+        recordingIsVoiceEdit = editingSelection
     }
 
     /// Switches to `.processing` state (indeterminate pulse) without
@@ -260,7 +279,7 @@ final class RecordingHUD {
     /// the waveform or changing focus.
     func clearMicrophoneNoAudio() {
         guard case .microphoneNoAudio = currentState else { return }
-        applyState(.listening)
+        applyState(recordingIsVoiceEdit ? .editingSelection : .listening)
         resizePanel(forInterim: false)
         positionOnMainScreen(offsetBelowFinal: 8)
         notifyLayoutChange()
@@ -415,11 +434,11 @@ final class RecordingHUD {
     }
 
     private var currentPillSize: NSSize {
-        NSSize(width: pillWidth, height: waveformView.hasInterimText || waveformView.hasProcessingLabel || waveformView.hasMicrophoneWarning ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight)
+        NSSize(width: pillWidth, height: waveformView.hasInterimText || waveformView.hasProcessingLabel || waveformView.hasEditingSelectionLabel || waveformView.hasMicrophoneWarning ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight)
     }
 
     private func resizePanel(forInterim: Bool, animatedShrink: Bool = false) {
-        let expanded = forInterim || waveformView.hasProcessingLabel || waveformView.hasMicrophoneWarning
+        let expanded = forInterim || waveformView.hasProcessingLabel || waveformView.hasEditingSelectionLabel || waveformView.hasMicrophoneWarning
         let targetHeight = expanded ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight
         if panel.frame.height == targetHeight { return }
         var frame = panel.frame
@@ -484,6 +503,7 @@ private final class WaveformView: NSView {
 
     private(set) var hasInterimText = false
     private(set) var hasProcessingLabel = false
+    private(set) var hasEditingSelectionLabel = false
     private(set) var hasMicrophoneWarning = false
     private(set) var correctionCount: Int = 0
 
@@ -659,7 +679,7 @@ private final class WaveformView: NSView {
         }
         clipboardIcon.frame = CGRect(x: bounds.midX - 12, y: midY - 12, width: 24, height: 24)
 
-        if hasInterimText || hasProcessingLabel || hasMicrophoneWarning {
+        if hasInterimText || hasProcessingLabel || hasEditingSelectionLabel || hasMicrophoneWarning {
             interimLabel.isHidden = false
             interimLabel.frame = CGRect(x: 12, y: 4, width: bounds.width - 24, height: bounds.height - waveformBandHeight - 4)
         } else {
@@ -678,6 +698,9 @@ private final class WaveformView: NSView {
 
         if case .processing = previous, !isProcessingState(newState) {
             setProcessingLabel(false)
+        }
+        if case .editingSelection = previous, newState != .editingSelection {
+            hasEditingSelectionLabel = false
         }
 
         switch newState {
@@ -746,6 +769,19 @@ private final class WaveformView: NSView {
             interimLabel.isHidden = true
             layer?.backgroundColor = NSColor(calibratedRed: 0.22, green: 0.08, blue: 0.08, alpha: 0.98).cgColor
             layer?.borderColor = NSColor(calibratedRed: 0.85, green: 0.25, blue: 0.25, alpha: 0.55).cgColor
+        case .editingSelection:
+            hasMicrophoneWarning = false
+            errorLabel.isHidden = true
+            successIcon.isHidden = true
+            clipboardIcon.isHidden = true
+            fnChipBackground.isHidden = false
+            fnLabel.isHidden = false
+            for barLayer in barLayers { barLayer.isHidden = false }
+            hasEditingSelectionLabel = true
+            interimLabel.stringValue = newState.visibleLabel ?? ""
+            interimLabel.isHidden = false
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
+            layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         case .listening:
             hasMicrophoneWarning = false
             errorLabel.isHidden = true
@@ -754,6 +790,7 @@ private final class WaveformView: NSView {
             fnChipBackground.isHidden = false
             fnLabel.isHidden = false
             for barLayer in barLayers { barLayer.isHidden = false }
+            hasEditingSelectionLabel = false
             interimLabel.isHidden = !hasInterimText && !hasProcessingLabel
             layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
             layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
@@ -779,7 +816,10 @@ private final class WaveformView: NSView {
             interimLabel.isHidden = state != .listening
         } else {
             hasInterimText = false
-            if !hasProcessingLabel {
+            if hasEditingSelectionLabel {
+                interimLabel.stringValue = RecordingHUD.State.editingSelection.visibleLabel ?? ""
+                interimLabel.isHidden = false
+            } else if !hasProcessingLabel {
                 interimLabel.stringValue = ""
                 interimLabel.isHidden = true
             }
@@ -884,7 +924,7 @@ private final class WaveformView: NSView {
 
     private func tick() {
         switch state {
-        case .listening, .microphoneNoAudio:
+        case .listening, .editingSelection, .microphoneNoAudio:
             tickListening()
         case .processing:
             tickProcessing()
