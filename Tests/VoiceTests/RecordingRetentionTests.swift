@@ -200,10 +200,15 @@ final class RecordingRetentionTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
         }
         wait(for: [finished], timeout: 2)
-        let entry = try XCTUnwrap(history.entries.first)
-        XCTAssertNil(entry.audioPath)
-        XCTAssertEqual(entry.failed, failed)
-        XCTAssertEqual(entry.text, failed ? HistoryEntry.failedPlaceholderText : "Recovered all the words.")
+        if failed {
+            // A failed take with no retained audio has nothing to retry, so no row.
+            XCTAssertTrue(history.entries.isEmpty)
+        } else {
+            let entry = try XCTUnwrap(history.entries.first)
+            XCTAssertNil(entry.audioPath)
+            XCTAssertFalse(entry.failed)
+            XCTAssertEqual(entry.text, "Recovered all the words.")
+        }
         if let protectedURL { XCTAssertTrue(FileManager.default.fileExists(atPath: protectedURL.path)) }
     }
 

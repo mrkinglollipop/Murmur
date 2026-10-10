@@ -685,7 +685,9 @@ final class TranscriptionPipeline {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
                 if !abandoned { self.onFailure?(.transcriptionFailed) }
-                self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
+                if let audioPath {
+                    self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
+                }
                 completion?(.failed)
             }
             return
@@ -917,7 +919,10 @@ final class TranscriptionPipeline {
                             replaceID
                         )
                     }
-                    Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog)
+                    // A retry's audio still belongs to the row being retried.
+                    if replaceID == nil {
+                        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog)
+                    }
                     if let failure = outcome.failure {
                         self.onFailure?(failure)
                     }
