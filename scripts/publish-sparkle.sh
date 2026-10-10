@@ -791,10 +791,10 @@ PY
 # --- 6) Upload DMG release ---
 TAG="v${SHORT}"
 echo "==> GitHub release $TAG on $UPDATES_REPO"
-WHATSNEW_NOTES="$(python3 - "$SHORT" "$BUILD" "$RELEASE_SHA" <<'PY'
+WHATSNEW_NOTES="$(python3 - "$SHORT" "$BUILD" <<'PY'
 import json, sys
 from pathlib import Path
-short, build, release_sha = sys.argv[1], sys.argv[2], sys.argv[3]
+short, build = sys.argv[1], sys.argv[2]
 path = Path("Resources/WhatsNew/releases.json")
 data = json.loads(path.read_text(encoding="utf-8"))
 entry = next((e for e in data if str(e.get("build", "")) == build), None)
@@ -809,7 +809,6 @@ else:
         item = str(item).strip()
         if item:
             print(f"- {item}")
-print(f"\nBuilt from commit {release_sha}.")
 PY
 )"
 if gh_release_exists "$TAG" "DMG upload"; then

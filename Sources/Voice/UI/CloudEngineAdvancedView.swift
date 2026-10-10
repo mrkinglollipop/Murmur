@@ -69,11 +69,11 @@ struct CloudEngineAdvancedView: View {
 
         Divider().overlay(Theme.hairline)
 
-        Text("When to finalize")
+        Text("When text is finished")
             .font(Theme.body(11, weight: .medium))
             .foregroundColor(Theme.textSecondary)
 
-        Picker("Commit", selection: $settingsStore.elevenLabsCommitStrategy) {
+        Picker("When text is finished", selection: $settingsStore.elevenLabsCommitStrategy) {
             ForEach(ElevenLabsCommitStrategy.allCases) { strategy in
                 Text(strategy.displayName).tag(strategy)
             }
@@ -81,7 +81,7 @@ struct CloudEngineAdvancedView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
 
-        Text("On key release: transcript locks when you let go of fn. Voice activity: Scribe locks when it hears silence — can split a long hold.")
+        Text("On key release: text is finalized when you let go of fn. Voice activity: text is finalized when you pause. A long recording can be split into parts.")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
 
@@ -89,7 +89,7 @@ struct CloudEngineAdvancedView: View {
             Divider().overlay(Theme.hairline)
 
             sliderRow(
-                title: "Speech loudness gate",
+                title: "Speech loudness",
                 value: $settingsStore.elevenLabsVadThreshold,
                 range: ElevenLabsRealtimeOptions.vadThresholdRange,
                 step: 0.05,
@@ -101,14 +101,14 @@ struct CloudEngineAdvancedView: View {
                 .foregroundColor(Theme.textSecondary)
 
             sliderRow(
-                title: "Quiet time to finalize",
+                title: "Pause before finishing",
                 value: $settingsStore.elevenLabsVadSilenceThresholdSecs,
                 range: ElevenLabsRealtimeOptions.vadSilenceRange,
                 step: 0.1,
                 format: { String(format: "%.1fs", $0) }
             )
 
-            Text("How long Scribe must hear silence before it commits the utterance.")
+            Text("How long you need to pause before your text is finalized.")
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
 
@@ -148,7 +148,7 @@ struct CloudEngineAdvancedView: View {
             .font(Theme.body(11, weight: .medium))
             .foregroundColor(Theme.textSecondary)
 
-        Picker("VAD mode", selection: $settingsStore.geminiVadMode) {
+        Picker("Who decides you’re done talking", selection: $settingsStore.geminiVadMode) {
             ForEach(GeminiVadMode.allCases) { mode in
                 Text(mode.displayName).tag(mode)
             }
@@ -156,7 +156,7 @@ struct CloudEngineAdvancedView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
 
-        Text("On key release: you control start/stop with fn (default). Voice activity: Gemini ends the utterance on silence. Hybrid: both — silence can end it, and releasing fn always flushes.")
+        Text("On key release: use fn to start and stop (default). Voice activity: text is finalized when you pause. Hybrid: either pausing or releasing fn finalizes the text.")
             .font(Theme.body(10))
             .foregroundColor(Theme.textSecondary)
 
@@ -244,6 +244,8 @@ struct CloudEngineAdvancedView: View {
                     .monospacedDigit()
             }
             Slider(value: value, in: range, step: step)
+                .accessibilityLabel(title)
+                .accessibilityValue(format(value.wrappedValue))
         }
     }
 }

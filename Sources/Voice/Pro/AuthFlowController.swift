@@ -12,6 +12,16 @@ import Foundation
 @MainActor
 final class AuthFlowController: ObservableObject {
 
+    private final class RefreshAttempt {
+        let generation: Int
+        let task: Task<SupabaseAuthClient.Session?, Never>
+
+        init(generation: Int, task: Task<SupabaseAuthClient.Session?, Never>) {
+            self.generation = generation
+            self.task = task
+        }
+    }
+
     enum State: Equatable {
         case signedOut
         case waitingForBrowser(provider: SupabaseAuthClient.Provider, startedAt: Date)
@@ -21,14 +31,17 @@ final class AuthFlowController: ObservableObject {
     }
 
     @Published private(set) var state: State = .signedOut
+    /// A non-terminal error preserves an existing signed-in session, so the
+    /// caller can retry rather than being unexpectedly signed out offline.
+    @Published private(set) var lastError: String?
 
     /// Refresh token survives relaunches in the same Keychain service as the
     /// BYO API keys (legacy login keychain — see KeychainStore's warning
     /// about the Data Protection store before "improving" this).
     static let keychainAccount = "supabase-refresh-token"
     private let readStoredToken: () -> String?
-    private let writeStoredToken: (String) -> Void
-    private let deleteStoredToken: () -> Void
+    private let writeStoredToken: (String) -> Bool
+    private let deleteStoredToken: () -> Bool
     private let exchangeCode: (String, String) async throws -> SupabaseAuthClient.Session
     private let refreshToken: (String) async throws -> SupabaseAuthClient.Session
     private let openBrowser: (URL) -> Void
@@ -38,6 +51,11 @@ final class AuthFlowController: ObservableObject {
     /// Loopback listener for the browser redirect; nil while not signing in
     /// or when every allow-listed port was taken (deep-link fallback).
     private var loopbackServer: LoopbackRedirectServer?
+    private var browserTimeoutTask: Task<Void, Never>?
+    private var inFlightRefresh: RefreshAttempt?
+    private var nextRefreshGeneration = 0
+    private let browserTimeoutInterval: TimeInterval
+    private let waitForBrowserTimeout: () async -> Void
 
     static let browserTimeout: TimeInterval = 300
 
@@ -48,16 +66,44 @@ final class AuthFlowController: ObservableObject {
         openBrowser: @escaping (URL) -> Void = { _ = NSWorkspace.shared.open($0) },
         readStoredToken: (() -> String?)? = nil,
         writeStoredToken: ((String) -> Void)? = nil,
-        deleteStoredToken: (() -> Void)? = nil
+        deleteStoredToken: (() -> Void)? = nil,
+        persistStoredToken: ((String) -> Bool)? = nil,
+        removeStoredToken: (() -> Bool)? = nil,
+        browserTimeout: TimeInterval = AuthFlowController.browserTimeout,
+        waitForBrowserTimeout: (() async -> Void)? = nil
     ) {
         self.readStoredToken = readStoredToken ?? { keychain.key(for: Self.keychainAccount) }
-        self.writeStoredToken = writeStoredToken ?? { value in
-            _ = keychain.setKey(value, for: Self.keychainAccount)
+        self.writeStoredToken = persistStoredToken ?? { value in
+            if let writeStoredToken {
+                writeStoredToken(value)
+                return true
+            }
+            return keychain.setKey(value, for: Self.keychainAccount)
         }
-        self.deleteStoredToken = deleteStoredToken ?? { keychain.deleteKey(for: Self.keychainAccount) }
+        self.deleteStoredToken = removeStoredToken ?? {
+            if let deleteStoredToken {
+                deleteStoredToken()
+                return true
+            }
+            keychain.deleteKey(for: Self.keychainAccount)
+            do {
+                return try keychain.readKey(for: Self.keychainAccount) == nil
+            } catch {
+                return false
+            }
+        }
         self.exchangeCode = exchangeCode
         self.refreshToken = refreshToken
         self.openBrowser = openBrowser
+        self.browserTimeoutInterval = browserTimeout
+        if let waitForBrowserTimeout {
+            self.waitForBrowserTimeout = waitForBrowserTimeout
+        } else {
+            let timeoutNanoseconds = UInt64(browserTimeout * 1_000_000_000)
+            self.waitForBrowserTimeout = {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            }
+        }
     }
 
     // MARK: - Pure seams
@@ -69,10 +115,14 @@ final class AuthFlowController: ObservableObject {
         return false
     }
 
-    /// Waiting-state expiry check — the sheet polls this on a timer.
-    nonisolated static func waitingHasExpired(state: State, now: Date) -> Bool {
+    /// Waiting-state expiry check, owned and scheduled by the controller.
+    nonisolated static func waitingHasExpired(
+        state: State,
+        now: Date,
+        timeout: TimeInterval = browserTimeout
+    ) -> Bool {
         guard case .waitingForBrowser(_, let startedAt) = state else { return false }
-        return now.timeIntervalSince(startedAt) > browserTimeout
+        return now.timeIntervalSince(startedAt) > timeout
     }
 
     /// A loopback listener belongs to one browser attempt. A stopped listener
@@ -93,11 +143,13 @@ final class AuthFlowController: ObservableObject {
         let verifier = SupabaseAuthClient.makeCodeVerifier()
         pendingVerifier = verifier
         state = .waitingForBrowser(provider: provider, startedAt: Date())
+        lastError = nil
 
         // Prefer a loopback redirect so the browser tab gets a real
         // "you can close this tab" page instead of spinning on murmur://.
         stopLoopbackServer()
         startLoopbackServer(generation: generation)
+        scheduleBrowserTimeout(generation: generation)
         let redirect = loopbackServer?.redirectURI ?? SupabaseAuthClient.redirectURI
 
         let url = SupabaseAuthClient.authorizeURL(provider: provider, verifier: verifier, redirectTo: redirect)
@@ -107,18 +159,33 @@ final class AuthFlowController: ObservableObject {
 
     func cancelSignIn() {
         sessionGeneration &+= 1
-        stopLoopbackServer()
-        pendingVerifier = nil
+        endBrowserAttempt()
         state = .signedOut
+        lastError = nil
     }
 
     func expireIfTimedOut(now: Date = Date()) {
-        if Self.waitingHasExpired(state: state, now: now) {
+        if Self.waitingHasExpired(state: state, now: now, timeout: browserTimeoutInterval) {
             sessionGeneration &+= 1
-            stopLoopbackServer()
-            pendingVerifier = nil
+            endBrowserAttempt()
             state = .failed("That took too long — try again.")
         }
+    }
+
+    private func scheduleBrowserTimeout(generation: Int) {
+        browserTimeoutTask?.cancel()
+        browserTimeoutTask = Task { [weak self] in
+            await self?.waitForBrowserTimeout()
+            guard !Task.isCancelled, let self, generation == self.sessionGeneration else { return }
+            self.expireIfTimedOut()
+        }
+    }
+
+    private func endBrowserAttempt() {
+        browserTimeoutTask?.cancel()
+        browserTimeoutTask = nil
+        stopLoopbackServer()
+        pendingVerifier = nil
     }
 
     private func stopLoopbackServer() {
@@ -149,8 +216,9 @@ final class AuthFlowController: ObservableObject {
         }
         switch result {
         case .failure:
-            // A provider error on an unbound redirect cannot be attributed to
-            // this browser attempt. Preserve the listener and bounded wait.
+            // Error-only callbacks have no app nonce to associate them with
+            // this browser attempt. Keep the listener and timeout alive so a
+            // still-open provider page can send the current code.
             vlog("auth: ignoring unbound loopback callback error")
         case .success(let code):
             submitExchange(code: code, verifier: verifier, generation: generation)
@@ -168,9 +236,8 @@ final class AuthFlowController: ObservableObject {
         }
         switch SupabaseAuthClient.parseCallback(url) {
         case .failure:
-            // With fixed Supabase redirect URLs there is no supported app
-            // nonce to correlate an error-only callback. Treat it as stray
-            // while the active browser still has time to finish.
+            // As above, a provider error cannot be safely correlated to this
+            // attempt with the fixed redirect configuration.
             vlog("auth: ignoring unbound callback error")
         case .success(let code):
             submitExchange(code: code, verifier: verifier, generation: sessionGeneration)
@@ -204,9 +271,11 @@ final class AuthFlowController: ObservableObject {
             guard generation == sessionGeneration,
                   Self.shouldHandleCallback(state: state),
                   pendingVerifier != nil else { return }
-            stopLoopbackServer()
-            pendingVerifier = nil
-            writeStoredToken(session.refreshToken)
+            endBrowserAttempt()
+            guard writeStoredToken(session.refreshToken) else {
+                state = .failed("Murmur couldn't save your sign-in. Try again.")
+                return
+            }
             state = .signedIn(session)
         } catch {
             guard generation == sessionGeneration,
@@ -217,6 +286,90 @@ final class AuthFlowController: ObservableObject {
             // attempt and its original loopback port alive until timeout
             // instead of letting an old rejected code consume the verifier.
         }
+    }
+
+    /// Returns a token that is safe for an authenticated request. Calls within
+    /// the refresh margin share one refresh task, so a foreground event and an
+    /// auth-state observer cannot rotate the refresh token independently.
+    func authenticatedSession() async -> SupabaseAuthClient.Session? {
+        guard case .signedIn(let session) = state else { return nil }
+        guard session.expiresAt.timeIntervalSinceNow <= Self.refreshMargin else { return session }
+
+        let attempt: RefreshAttempt
+        if let inFlightRefresh {
+            attempt = inFlightRefresh
+        } else {
+            nextRefreshGeneration &+= 1
+            let generation = nextRefreshGeneration
+            let sourceGeneration = sessionGeneration
+            let token = session.refreshToken
+            let task = Task { [weak self, refreshToken] in
+                do {
+                    let refreshed = try await refreshToken(token)
+                    return self?.finishRefresh(
+                        .success(refreshed),
+                        generation: generation,
+                        sourceGeneration: sourceGeneration,
+                        sourceToken: token
+                    )
+                } catch {
+                    return self?.finishRefresh(
+                        .failure(error),
+                        generation: generation,
+                        sourceGeneration: sourceGeneration,
+                        sourceToken: token
+                    )
+                }
+            }
+            attempt = RefreshAttempt(generation: generation, task: task)
+            inFlightRefresh = attempt
+        }
+        return await attempt.task.value
+    }
+
+    static let refreshMargin: TimeInterval = 60
+
+    private func finishRefresh(
+        _ result: Result<SupabaseAuthClient.Session, Error>,
+        generation: Int,
+        sourceGeneration: Int,
+        sourceToken: String
+    ) -> SupabaseAuthClient.Session? {
+        defer {
+            if inFlightRefresh?.generation == generation { inFlightRefresh = nil }
+        }
+        guard inFlightRefresh?.generation == generation,
+              sessionGeneration == sourceGeneration,
+              case .signedIn(let current) = state,
+              current.refreshToken == sourceToken else { return nil }
+        switch result {
+        case .success(let refreshed):
+            state = .signedIn(refreshed)
+            if writeStoredToken(refreshed.refreshToken) {
+                lastError = nil
+            } else {
+                lastError = "Murmur couldn't save the renewed sign-in."
+            }
+            return refreshed
+        case .failure(let error as SupabaseAuthClient.AuthError) where error == .invalidRefreshToken:
+            endSessionAfterInvalidRefresh()
+            return nil
+        case .failure:
+            lastError = "Murmur can't reach the server. Your sign-in is still available; try again shortly."
+            return nil
+        }
+    }
+
+    private func endSessionAfterInvalidRefresh() {
+        sessionGeneration &+= 1
+        endBrowserAttempt()
+        inFlightRefresh?.task.cancel()
+        inFlightRefresh = nil
+        let deleted = deleteStoredToken()
+        state = .signedOut
+        lastError = deleted
+            ? "Your sign-in expired. Please sign in again."
+            : "Your sign-in expired, but Murmur couldn't remove its saved sign-in."
     }
 
     /// Relaunch path: a stored refresh token becomes a live session silently.
@@ -231,9 +384,16 @@ final class AuthFlowController: ObservableObject {
         do {
             let session = try await refreshToken(token)
             guard generation == sessionGeneration else { return }
-            writeStoredToken(session.refreshToken)
+            guard writeStoredToken(session.refreshToken) else {
+                state = .failed("Murmur couldn't save your renewed sign-in. Try again.")
+                return
+            }
             state = .signedIn(session)
+            lastError = nil
             vlog("auth: session restored from stored refresh token")
+        } catch let error as SupabaseAuthClient.AuthError where error == .invalidRefreshToken {
+            guard generation == sessionGeneration else { return }
+            endSessionAfterInvalidRefresh()
         } catch {
             // Expired/revoked token: stay signed out quietly; the user
             // re-authenticates the next time they touch a Pro feature.
@@ -243,16 +403,22 @@ final class AuthFlowController: ObservableObject {
 
     func signOut() {
         sessionGeneration &+= 1
-        deleteStoredToken()
-        stopLoopbackServer()
-        pendingVerifier = nil
+        endBrowserAttempt()
+        inFlightRefresh?.task.cancel()
+        inFlightRefresh = nil
+        guard deleteStoredToken() else {
+            lastError = "Murmur couldn't remove your saved sign-in."
+            return
+        }
         state = .signedOut
+        lastError = nil
     }
 
     nonisolated static func userMessage(for error: SupabaseAuthClient.AuthError) -> String {
         switch error {
         case .callbackCarriedError(let message): return message
         case .callbackMissingCode: return "The browser didn't finish sign-in — try again."
+        case .invalidRefreshToken: return "Your sign-in expired. Please sign in again."
         case .badResponse, .malformedSession: return "Sign-in didn't complete — try again."
         }
     }

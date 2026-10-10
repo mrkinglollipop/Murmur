@@ -116,6 +116,38 @@ final class ProEntitlementTests: XCTestCase {
         XCTAssertEqual(store.cachedAnswer(userID: "user-1"), true)
     }
 
+    @MainActor
+    func testRefreshUsesInjectedAuthenticatedSessionBeforeBearerFetch() async {
+        let fresh = session()
+        var fetchedAccessToken: String?
+        let store = EntitlementStore(defaults: defaults, fetcher: { session in
+            fetchedAccessToken = session.accessToken
+            return true
+        })
+        let stale = SupabaseAuthClient.Session(
+            accessToken: "expired", refreshToken: "refresh-abc",
+            expiresAt: Date().addingTimeInterval(-1), userID: "user-1", email: nil
+        )
+
+        await store.refresh(session: stale, authenticatedSession: { fresh })
+        XCTAssertEqual(fetchedAccessToken, fresh.accessToken)
+    }
+
+    @MainActor
+    func testUnavailablePreflightKeepsExistingCacheResolution() async {
+        defaults.set(true, forKey: "murmur.pro.entitlement.user-1")
+        let store = EntitlementStore(defaults: defaults, fetcher: { _ in
+            XCTFail("expired token must not reach the bearer fetch")
+            return false
+        })
+        await store.refresh(session: session(), authenticatedSession: { nil })
+        XCTAssertTrue(store.isPro)
+
+        defaults.removeObject(forKey: "murmur.pro.entitlement.user-1")
+        await store.refresh(session: session(), authenticatedSession: { nil })
+        XCTAssertFalse(store.isPro)
+    }
+
     /// The offline path: paid user, server unreachable → cache keeps Pro on.
     @MainActor
     func testFetchFailureFallsBackToCache() async {

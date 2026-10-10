@@ -42,6 +42,15 @@ final class AudioRecorder {
     /// exclude a ghost on the one allowed rebuild so we do not re-pick it.
     private var lastBoundInputDeviceID: AudioDeviceID?
 
+    /// User-facing name for the last successful binding. Kept alongside the
+    /// ephemeral ID so the no-audio hint can name the device without persisting
+    /// that ID across launches.
+    private var lastBoundInputDeviceName = "Microphone"
+
+    /// Avoid repeating the unavailable-preference diagnostic on every
+    /// recovery bind in the same hold.
+    private var loggedUnavailablePreferredUID: String?
+
     /// Device to exclude on the *next* `startMicCapture` bind/rebuild.
     /// Timeout, in-flight abandon, and fail-closed paths record a known ghost
     /// here because `doStart` calls `startMicCapture()` with `excluding: nil`.
@@ -211,14 +220,52 @@ final class AudioRecorder {
         let defaultID = Self.halDefaultInputDeviceID()
         let defaultAlive = defaultID.map(Self.isAudioDeviceAlive) ?? false
         let defaultFormatDead = defaultID.map(Self.audioDeviceInputFormatLooksDead) ?? true
-        let candidates = Self.halInputDeviceCandidates()
+        let configuredExcludedUIDs = excludedInputDeviceUIDsProvider?() ?? []
+        let allCandidates = Self.halInputDeviceCandidates()
+        // Filter before calculating last-resort IDs or running any picker
+        // branch. A device in Never use may not become a fallback later.
+        let allowedUIDs = Set(MicHealth.availableDevices(
+            allCandidates.map { MicrophoneDevice(uid: $0.uid, name: $0.name) },
+            excluding: configuredExcludedUIDs
+        ).map(\.uid))
+        let candidates = allCandidates.filter { allowedUIDs.contains($0.uid) }
         let lastResortIDs = Set(candidates.filter(\.isLastResort).map(\.id))
         var excluded = Set<AudioDeviceID>()
         if let failedDeviceID {
             excluded.insert(failedDeviceID)
         }
+        if let defaultID,
+           configuredExcludedUIDs.contains(Self.audioDeviceCFString(defaultID, kAudioDevicePropertyDeviceUID)) {
+            // The built-in/default ghost fallback below can exist outside the
+            // enumerated candidates. Its UID must still respect Never use.
+            excluded.insert(defaultID)
+        }
+        let preferredUID = preferredInputDeviceUIDProvider?()
+        let activePreferredUID = MicHealth.activePreferredUID(
+            preferredUID,
+            availableDevices: candidates.map { MicrophoneDevice(uid: $0.uid, name: $0.name) },
+            excluding: configuredExcludedUIDs
+        )
+        let preferredCandidate = activePreferredUID.flatMap { uid in
+            candidates.first { $0.uid == uid }
+        }
+        if let preferredUID, loggedUnavailablePreferredUID != preferredUID {
+            let isAvailable = preferredCandidate.map { $0.isAlive && !$0.formatLooksDead } ?? false
+            if !isAvailable {
+                logger.warning("Configured microphone unavailable for this hold; using Automatic")
+                vlog("configured microphone UID unavailable or excluded — using Automatic")
+                loggedUnavailablePreferredUID = preferredUID
+            }
+        }
         while true {
-            let picked = Self.pickAliveInputDevice(
+            let preferredID = preferredCandidate.flatMap { candidate -> AudioDeviceID? in
+                candidate.isAlive && !candidate.formatLooksDead && !excluded.contains(candidate.id)
+                    ? candidate.id
+                    : nil
+            }
+            // An explicit choice may be Continuity or virtual even when the
+            // automatic last-resort fallback remains off. Exclusions always win.
+            let picked = preferredID ?? Self.pickAliveInputDevice(
                 defaultID: defaultID,
                 defaultIsAlive: defaultAlive,
                 defaultFormatLooksDead: defaultFormatDead,
@@ -245,6 +292,9 @@ final class AudioRecorder {
             let bound = bindInputNode(to: picked)
             if bound {
                 lastBoundInputDeviceID = picked
+                let name = candidates.first(where: { $0.id == picked })?.name
+                    ?? Self.audioDeviceCFString(picked, kAudioObjectPropertyName)
+                lastBoundInputDeviceName = name.isEmpty ? "Microphone" : name
                 return picked
             }
             logger.error("bindInputNode failed for \(picked) — excluding and replacing engine")
@@ -372,7 +422,9 @@ final class AudioRecorder {
         isAlive: Bool,
         isBuiltIn: Bool,
         formatLooksDead: Bool,
-        isLastResort: Bool
+        isLastResort: Bool,
+        uid: String,
+        name: String
     )] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
@@ -395,7 +447,9 @@ final class AudioRecorder {
             isAlive: Bool,
             isBuiltIn: Bool,
             formatLooksDead: Bool,
-            isLastResort: Bool
+            isLastResort: Bool,
+            uid: String,
+            name: String
         )? in
             guard Self.audioDeviceHasInputStreams(id) else { return nil }
             return (
@@ -403,7 +457,22 @@ final class AudioRecorder {
                 Self.isAudioDeviceAlive(id),
                 Self.audioDeviceIsBuiltIn(id),
                 Self.audioDeviceInputFormatLooksDead(id),
-                Self.audioDeviceIsLastResortInput(id)
+                Self.audioDeviceIsLastResortInput(id),
+                Self.audioDeviceCFString(id, kAudioDevicePropertyDeviceUID),
+                Self.audioDeviceCFString(id, kAudioObjectPropertyName)
+            )
+        }
+    }
+
+    /// Live input choices for Settings. CoreAudio IDs change across launches;
+    /// Settings persists only the stable UID returned here.
+    static func availableInputDevices() -> [MicrophoneDevice] {
+        var seenUIDs = Set<String>()
+        return halInputDeviceCandidates().compactMap { candidate in
+            guard !candidate.uid.isEmpty, seenUIDs.insert(candidate.uid).inserted else { return nil }
+            return MicrophoneDevice(
+                uid: candidate.uid,
+                name: candidate.name.isEmpty ? "Microphone" : candidate.name
             )
         }
     }
@@ -862,6 +931,11 @@ final class AudioRecorder {
     /// `SettingsStore.allowLastResortInputFallback`. Default off.
     var allowLastResortInputFallbackProvider: (() -> Bool)?
 
+    /// Explicit input-device preference and Never use set, both keyed by
+    /// CoreAudio UID so a device ID never leaks into persisted settings.
+    var preferredInputDeviceUIDProvider: (() -> String?)?
+    var excludedInputDeviceUIDsProvider: (() -> Set<String>)?
+
     /// Short label for the HUD key chip (e.g. "fn", "⌥"). Wired by
     /// `AppDelegate` to `SettingsStore.activationKeyOption.hudLabel`.
     var activationKeyLabelProvider: (() -> String)?
@@ -892,6 +966,11 @@ final class AudioRecorder {
     /// ("thank you", "thanks for watching") on near-silence, so a hold with no
     /// real speech must inject nothing rather than a dreamed phrase.
     private var maxLevelObserved: Float = 0
+
+    /// A per-hold token for queued HUD updates from the audio callback. It is
+    /// guarded by `levelLock` with the cumulative RMS so an old hold cannot
+    /// paint a no-audio hint over a newer hold.
+    private var micHealthGeneration: UInt64 = 0
 
     /// Raw-RMS speech-presence threshold. If the loudest buffer of a whole
     /// recording never crosses this, the clip is treated as silence and the
@@ -1463,6 +1542,10 @@ final class AudioRecorder {
         streamingCoordinator.resetStreamTextLatch()
         didAnnounceListeningThisTake = false
         startTime = Date()
+        loggedUnavailablePreferredUID = nil
+        levelLock.lock()
+        micHealthGeneration &+= 1
+        levelLock.unlock()
 
         if streamingCoordinator.tryStartXAI(asrSelector: asrSelector, startMicCapture: { [weak self] in
             self?.startMicCapture()
@@ -2603,6 +2686,8 @@ final class AudioRecorder {
         let alpha: Float = rawRMS > smoothedLevel ? 0.6 : 0.3
         smoothedLevel = smoothedLevel + (rawRMS - smoothedLevel) * alpha
         let level = smoothedLevel
+        let maxLevel = maxLevelObserved
+        let healthGeneration = micHealthGeneration
         levelLock.unlock()
 
         // Map smoothed RMS to a 0…1 bar level. This mic runs quiet (measured
@@ -2613,8 +2698,29 @@ final class AudioRecorder {
         let normalized = min(1.0, max(0, level - 0.003) * 50)
 
         DispatchQueue.main.async { [weak self] in
-            self?.hud.pushLevel(normalized)
+            guard let self else { return }
+            self.hud.pushLevel(normalized)
+            guard self.wantsRecording,
+                  !self.isStopping,
+                  self.isCurrentMicHealthGeneration(healthGeneration)
+            else { return }
+            let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? 0
+            if MicHealth.shouldShowNoAudioWarning(
+                elapsed: elapsed,
+                maxRMS: maxLevel,
+                engineRunning: self.engine.isRunning
+            ) {
+                self.hud.showMicrophoneNoAudio(self.lastBoundInputDeviceName)
+            } else if maxLevel >= MicHealth.realRMSThreshold {
+                self.hud.clearMicrophoneNoAudio()
+            }
         }
+    }
+
+    private func isCurrentMicHealthGeneration(_ generation: UInt64) -> Bool {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        return generation == micHealthGeneration
     }
 
     // MARK: - Write captured audio

@@ -55,7 +55,7 @@ final class MainWindowController: NSWindowController {
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
         // The window uses a fixed dark Liquid Glass palette (dark-first by
-        // design, not auto-switching — see plans/015-briefs/mockup-v3.html),
+        // design, not auto-switching; the cited mockup-v3 was never committed),
         // so pin it to the darkAqua appearance. Otherwise, on a Mac in light
         // mode, system-default controls (e.g. radio-group picker labels
         // using Color.primary) render dark-on-dark against the fixed

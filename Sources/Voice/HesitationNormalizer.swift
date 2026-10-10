@@ -74,7 +74,7 @@ enum HesitationNormalizer {
     }
 
     private static func persistedLanguage() -> String {
-        let stored = UserDefaults.standard.string(forKey: "voice.settings.selectedLanguage")
+        let stored = VoiceDefaults.shared.string(forKey: "voice.settings.selectedLanguage")
         return (stored?.isEmpty == false ? stored : nil) ?? "en"
     }
 

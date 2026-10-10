@@ -35,14 +35,7 @@ struct DictionaryView: View {
     @FocusState private var focusedEditID: UUID?
 
     private var filteredEntries: [DictionaryEntry] {
-        guard !searchText.trimmingCharacters(in: .whitespaces).isEmpty else {
-            return store.entries
-        }
-        let needle = searchText.lowercased()
-        return store.entries.filter {
-            $0.term.lowercased().contains(needle) ||
-            $0.variants.contains { $0.lowercased().contains(needle) }
-        }
+        DictionarySearch.entries(store.entries, query: searchText)
     }
 
     var body: some View {
@@ -66,6 +59,7 @@ struct DictionaryView: View {
                 }
             }
         }
+        .saveFailureBanner(store.saveFailure, onDismiss: store.dismissSaveFailure)
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete dictionary term?",
@@ -98,13 +92,7 @@ struct DictionaryView: View {
     // MARK: - Recent corrections
 
     private var visibleCorrectionGroups: [CorrectionGroup] {
-        let groups = correctionsLog.groupedRecent(days: 7)
-        let needle = searchText.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !needle.isEmpty else { return groups }
-        return groups.filter { group in
-            group.replaced.lowercased().contains(needle)
-                || group.rows.contains { $0.heard.lowercased().contains(needle) }
-        }
+        DictionarySearch.corrections(correctionsLog.groupedRecent(days: 7), query: searchText)
     }
 
     @ViewBuilder
@@ -380,7 +368,7 @@ struct DictionaryView: View {
 
     @ViewBuilder
     private var autoLearnedSection: some View {
-        let autoLearned = store.entries.filter { $0.isAutoLearned }
+        let autoLearned = filteredEntries.filter { $0.isAutoLearned }
         if !autoLearned.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 Text("Auto-learned entries")
@@ -455,6 +443,7 @@ struct DictionaryView: View {
 
                 Button("Add term", action: addTerm)
                     .buttonStyle(.glassProminent)
+                    .foregroundColor(Theme.ctaText)
                     .tint(Theme.lavender)
                     .font(.system(size: 13, weight: .semibold))
                     .disabled(newTerm.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -481,7 +470,8 @@ struct DictionaryView: View {
         SearchBar(
             text: $searchText,
             placeholder: "Search terms",
-            resultCount: searchText.isEmpty ? nil : filteredEntries.count,
+            resultCount: DictionarySearch.needle(searchText).isEmpty ? nil
+                : DictionarySearch.resultCount(entries: filteredEntries, groups: visibleCorrectionGroups),
             isFocused: $isSearchFocused
         )
         .padding(12)
@@ -490,7 +480,7 @@ struct DictionaryView: View {
     // MARK: - List
 
     private var termsSectionHeader: some View {
-        Text(searchText.isEmpty ? "Your words (\(store.entries.count))" : "Your words (\(filteredEntries.count))")
+        Text("Your words (\(filteredEntries.count))")
             .font(.system(size: 12, weight: .semibold))
             .foregroundColor(Theme.textSecondary)
             .padding(.horizontal, 16)
@@ -532,7 +522,7 @@ struct DictionaryView: View {
                 Spacer()
 
                 if entry.fixCount > 0 {
-                    Text("\(entry.fixCount) fix\(entry.fixCount == 1 ? "" : "es")")
+                    Text("\(entry.fixCount) correction\(entry.fixCount == 1 ? "" : "s")")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Theme.textSecondary)
                         .padding(.horizontal, 8)
@@ -608,6 +598,7 @@ struct DictionaryView: View {
 
                 Button("Save") { saveEdit(for: entry) }
                     .buttonStyle(.glassProminent)
+                    .foregroundColor(Theme.ctaText)
                     .tint(Theme.lavender)
                     .font(.system(size: 12, weight: .semibold))
                     .keyboardShortcut(.return, modifiers: [])
@@ -740,5 +731,36 @@ private struct ChipFlowLayout: Layout {
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
         }
+    }
+}
+
+enum DictionarySearch {
+    static func needle(_ query: String) -> String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    static func entries(_ entries: [DictionaryEntry], query: String) -> [DictionaryEntry] {
+        let needle = needle(query)
+        guard !needle.isEmpty else { return entries }
+        return entries.filter {
+            $0.term.lowercased().contains(needle)
+                || $0.variants.contains { $0.lowercased().contains(needle) }
+        }
+    }
+
+    static func corrections(_ groups: [CorrectionGroup], query: String) -> [CorrectionGroup] {
+        let needle = needle(query)
+        guard !needle.isEmpty else { return groups }
+        return groups.compactMap { group in
+            if group.replaced.lowercased().contains(needle) { return group }
+            let rows = group.rows.filter { $0.heard.lowercased().contains(needle) }
+            guard !rows.isEmpty else { return nil }
+            return CorrectionGroup(replaced: group.replaced, rows: rows, recordIDs: rows.map(\.id))
+        }
+    }
+
+    static func resultCount(entries: [DictionaryEntry], groups: [CorrectionGroup]) -> Int {
+        // Auto-learned terms also appear in the approval section.
+        entries.count + entries.filter(\.isAutoLearned).count + groups.reduce(0) { $0 + $1.rows.count }
     }
 }

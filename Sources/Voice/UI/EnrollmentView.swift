@@ -4,6 +4,7 @@ struct EnrollmentSheetView: View {
     @ObservedObject var coordinator: EnrollmentCoordinator
     var onDone: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isRecording = false
 
     var body: some View {
@@ -45,6 +46,7 @@ struct EnrollmentSheetView: View {
                     coordinator.start()
                 }
                 .buttonStyle(.glassProminent)
+                .foregroundColor(Theme.ctaText)
                 .tint(Theme.lavender)
                 .font(Theme.body(12, weight: .medium))
             }
@@ -82,6 +84,7 @@ struct EnrollmentSheetView: View {
                     }
                 }
                 .buttonStyle(.glassProminent)
+                .foregroundColor(Theme.ctaText)
                 .tint(Theme.lavender)
                 .font(Theme.body(12, weight: .medium))
                 .disabled(isRecording)
@@ -111,6 +114,7 @@ struct EnrollmentSheetView: View {
                     onDone()
                 }
                 .buttonStyle(.glassProminent)
+                .foregroundColor(Theme.ctaText)
                 .tint(Theme.lavender)
                 .font(Theme.body(12, weight: .medium))
             }
@@ -128,6 +132,7 @@ struct EnrollmentSheetView: View {
                     coordinator.start()
                 }
                 .buttonStyle(.glassProminent)
+                .foregroundColor(Theme.ctaText)
                 .tint(Theme.lavender)
                 .font(Theme.body(12, weight: .medium))
             }
@@ -143,7 +148,7 @@ struct EnrollmentSheetView: View {
             }
         }
         .frame(height: 28, alignment: .bottom)
-        .animation(.easeOut(duration: 0.08), value: coordinator.level)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.08), value: coordinator.level)
     }
 
     private func barFill(for index: Int) -> Bool {
@@ -153,6 +158,7 @@ struct EnrollmentSheetView: View {
 
     private func barHeight(for index: Int) -> CGFloat {
         let base: CGFloat = 8
+        guard !reduceMotion else { return base }
         let maxExtra: CGFloat = 20
         let progress = CGFloat(min(1, max(0, coordinator.level)))
         let indexBoost = CGFloat(index) / 11.0

@@ -15,7 +15,7 @@ final class StyleStore: ObservableObject {
 
     @Published var selected: StyleProfile {
         didSet {
-            UserDefaults.standard.set(selected.rawValue, forKey: Keys.selectedStyle)
+            VoiceDefaults.shared.set(selected.rawValue, forKey: Keys.selectedStyle)
             applyGlobalStyle()
         }
     }
@@ -41,14 +41,14 @@ final class StyleStore: ObservableObject {
     weak var asrEngineSelector: ASREngineSelector?
 
     init() {
-        if let raw = UserDefaults.standard.string(forKey: Keys.selectedStyle),
+        if let raw = VoiceDefaults.shared.string(forKey: Keys.selectedStyle),
            let profile = StyleProfile(rawValue: raw) {
             selected = profile
         } else {
             selected = .casual
         }
 
-        if let data = UserDefaults.standard.data(forKey: Keys.appProfileMap),
+        if let data = VoiceDefaults.shared.data(forKey: Keys.appProfileMap),
            let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
             appProfileMap = decoded.compactMapValues { StyleProfile(rawValue: $0) }
         }
@@ -147,7 +147,7 @@ final class StyleStore: ObservableObject {
     private func persistAppMap() {
         let raw = appProfileMap.mapValues { $0.rawValue }
         if let data = try? JSONEncoder().encode(raw) {
-            UserDefaults.standard.set(data, forKey: Keys.appProfileMap)
+            VoiceDefaults.shared.set(data, forKey: Keys.appProfileMap)
         }
     }
 }

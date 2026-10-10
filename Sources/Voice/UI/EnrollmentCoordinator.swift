@@ -19,21 +19,30 @@ final class EnrollmentCoordinator: ObservableObject, Identifiable {
     private let profileStore: VoiceProfileStore
     private let sensitivityProvider: () -> VoiceGateSensitivity
     private let onGatingShouldRefresh: () -> Void
+    private let makeEmbeddingProvider: () -> SpeakerEmbeddingProviding
+    private let retryEmbeddingProvider: (SpeakerEmbeddingProviding) -> Void
 
-    private var embeddingProvider: FluidAudioEmbeddingProvider?
+    private var embeddingProvider: SpeakerEmbeddingProviding?
     private let enrollmentCapture = EnrollmentCapture()
     private var downloadTask: Task<Void, Never>?
     private var recordingTask: Task<Void, Never>?
+    private var enrollmentTask: Task<VoiceProfile?, Never>?
     private var accumulatedWindows: [[Float]] = []
 
     init(
         profileStore: VoiceProfileStore,
         sensitivityProvider: @escaping () -> VoiceGateSensitivity,
-        onGatingShouldRefresh: @escaping () -> Void
+        onGatingShouldRefresh: @escaping () -> Void,
+        makeEmbeddingProvider: @escaping () -> SpeakerEmbeddingProviding = { FluidAudioEmbeddingProvider() },
+        retryEmbeddingProvider: @escaping (SpeakerEmbeddingProviding) -> Void = {
+            ($0 as? FluidAudioEmbeddingProvider)?.retryLoadingIfNeeded()
+        }
     ) {
         self.profileStore = profileStore
         self.sensitivityProvider = sensitivityProvider
         self.onGatingShouldRefresh = onGatingShouldRefresh
+        self.makeEmbeddingProvider = makeEmbeddingProvider
+        self.retryEmbeddingProvider = retryEmbeddingProvider
     }
 
     func start() {
@@ -49,7 +58,10 @@ final class EnrollmentCoordinator: ObservableObject, Identifiable {
             guard let self else { return }
 
             if self.embeddingProvider == nil {
-                self.embeddingProvider = FluidAudioEmbeddingProvider()
+                self.embeddingProvider = self.makeEmbeddingProvider()
+            }
+            if let provider = self.embeddingProvider {
+                self.retryEmbeddingProvider(provider)
             }
             guard let provider = self.embeddingProvider else {
                 await MainActor.run {
@@ -137,6 +149,8 @@ final class EnrollmentCoordinator: ObservableObject, Identifiable {
         downloadTask = nil
         recordingTask?.cancel()
         recordingTask = nil
+        enrollmentTask?.cancel()
+        enrollmentTask = nil
         enrollmentCapture.stopCapture()
         accumulatedWindows.removeAll(keepingCapacity: false)
         level = 0
@@ -153,7 +167,7 @@ final class EnrollmentCoordinator: ObservableObject, Identifiable {
 
     // MARK: - Private
 
-    private func runEnrollment() async {
+    func runEnrollment(segments: [[Float]]? = nil) async {
         guard let provider = embeddingProvider else {
             await MainActor.run {
                 flow.computingFailed("Voice model is not available.")
@@ -161,20 +175,27 @@ final class EnrollmentCoordinator: ObservableObject, Identifiable {
             return
         }
 
-        let windows = accumulatedWindows
+        let windows = segments ?? accumulatedWindows
         let sensitivity = sensitivityProvider()
         let store = profileStore
 
-        let profile = await Task.detached(priority: .userInitiated) {
+        let task: Task<VoiceProfile?, Never> = Task.detached(priority: .userInitiated) { () -> VoiceProfile? in
+            guard !Task.isCancelled else { return nil }
             let gate = VoiceGate(
                 profileStore: store,
                 embeddingProvider: provider,
                 sensitivity: sensitivity
             )
             return gate.enroll(segments: windows)
-        }.value
+        }
+        enrollmentTask = task
+
+        let profile = await task.value
+        guard !Task.isCancelled, !task.isCancelled else { return }
 
         await MainActor.run {
+            guard !task.isCancelled else { return }
+            self.enrollmentTask = nil
             if profile != nil {
                 flow.computingSucceeded()
                 onGatingShouldRefresh()

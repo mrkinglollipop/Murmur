@@ -143,7 +143,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 switch state {
                 case .signedIn(let session):
-                    Task { await self.entitlementStore.refresh(session: session) }
+                    // A refreshed session re-enters here once; the preflight
+                    // then returns it unchanged, so this cannot loop.
+                    Task {
+                        await self.entitlementStore.refresh(session: session) {
+                            await self.authFlow.authenticatedSession()
+                        }
+                    }
                 case .signedOut:
                     self.entitlementStore.clear()
                 case .waitingForBrowser, .exchanging, .failed:
@@ -216,6 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsStore.activationController = activationController
         settingsStore.asrEngineSelector = activationController?.audioRecorder.asrSelector
         settingsStore.audioRecorder = activationController?.audioRecorder
+        settingsStore.microphoneDeviceProvider = { AudioRecorder.availableInputDevices() }
         settingsStore.modelManager = modelManager
         // History must be wired before applyOnLaunch so budget prune can
         // protect failed-retry audio paths (empty keep list = data loss).
@@ -229,6 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activationController?.audioRecorder.recordingBudgetBytesProvider = { [weak self] in
             self?.settingsStore.recordingBudgetBytes
                 ?? Int64(RecordingRetention.defaultBudgetMB) * 1024 * 1024
+        }
+        activationController?.audioRecorder.preferredInputDeviceUIDProvider = { [weak self] in
+            self?.settingsStore.preferredInputDeviceUID
+        }
+        activationController?.audioRecorder.excludedInputDeviceUIDsProvider = { [weak self] in
+            self?.settingsStore.excludedInputDeviceUIDs ?? []
         }
 
         settingsStore.applyOnLaunch()
@@ -404,7 +417,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// required bouncing the app because sign-in was the only refresh trigger.
     func applicationDidBecomeActive(_ notification: Notification) {
         if case .signedIn(let session) = authFlow.state {
-            Task { await entitlementStore.refresh(session: session) }
+            Task {
+                await entitlementStore.refresh(session: session) {
+                    await self.authFlow.authenticatedSession()
+                }
+            }
         }
     }
 
@@ -670,7 +687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
         switch state {
-        case .listening:
+        case .listening, .microphoneNoAudio:
             setMenuBarIcon(.listening)
         case .processing:
             setMenuBarIcon(.processing)
@@ -682,7 +699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func replayOnboarding() {
-        UserDefaults.standard.set(false, forKey: OnboardingStore.completeKey)
+        VoiceDefaults.shared.set(false, forKey: OnboardingStore.completeKey)
         showOnboarding()
     }
 

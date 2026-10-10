@@ -30,12 +30,6 @@ enum LearnToastPendingQueue {
 /// Plan toast teardown when Dictionary unlearn/revert hits correction
 /// identities that are still on-screen or queued.
 enum LearnToastUnlearnDismissal {
-    static func batchContains(identities: Set<UnlearnedCorrectionIdentity>, _ batch: LearnBatch) -> Bool {
-        batch.corrections.contains { correction in
-            identities.contains { $0.matches(correction) }
-        }
-    }
-
     /// Strips matching corrections from a batch. Returns `nil` when empty,
     /// the same batch when nothing matched, or a same-id batch with remainder.
     /// Match is entryID + variant + term (not entryID alone).

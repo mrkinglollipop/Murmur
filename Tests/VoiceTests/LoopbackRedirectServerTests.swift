@@ -19,6 +19,50 @@ final class LoopbackRedirectServerTests: XCTestCase {
         XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: "POST /auth-callback HTTP/1.1\r\n"))
         XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: "not http at all"))
         XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: ""))
+        XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: "GET /auth-callback HTTP/what\r\nHost: 127.0.0.1\r\n\r\n"))
+        XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: "GET /auth-callback HTTP/1.1\r\nMalformed header\r\n\r\n"))
+        XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: "GET /auth-callback HTTP/1.1 extra\r\nHost: 127.0.0.1\r\n\r\n"))
+    }
+
+    func testMalformedHeadGets400AndCannotProduceCallback() {
+        let malformed = "GET /auth-callback?code=must-not-deliver HTTP/1.1\r\nMalformed header\r\n\r\n"
+        XCTAssertEqual(LoopbackRedirectServer.responseStatus(forRequestHead: malformed), "400 Bad Request")
+        XCTAssertNil(LoopbackRedirectServer.requestTarget(fromRequestHead: malformed))
+    }
+
+    func testFragmentedRequestHeadWaitsThenDeliversOnlyAfterTerminator() {
+        let first = Data("GET /auth-callback?code=fragment HTTP/1.1\r\nHost: 127.0.0.1\r\n".utf8)
+        XCTAssertEqual(
+            LoopbackRedirectServer.requestHeadResult(accumulated: Data(), received: first, complete: false),
+            .waitForMore
+        )
+        XCTAssertEqual(
+            LoopbackRedirectServer.requestHeadResult(accumulated: first, received: Data("\r\n".utf8), complete: false),
+            .target("/auth-callback?code=fragment")
+        )
+    }
+
+    func testOversizeHeadIsRejectedBeforeCallbackParsing() {
+        let oversized = Data(repeating: 65, count: 9 * 1024)
+        XCTAssertEqual(
+            LoopbackRedirectServer.requestHeadResult(accumulated: Data(), received: oversized, complete: false),
+            .badRequest
+        )
+    }
+
+    func testConnectionAdmissionIsBoundedAndStopsAfterEnd() {
+        XCTAssertTrue(LoopbackRedirectServer.shouldAcceptConnection(
+            retainedCount: 7, hasResultHandler: true, isStopped: false
+        ))
+        XCTAssertFalse(LoopbackRedirectServer.shouldAcceptConnection(
+            retainedCount: 8, hasResultHandler: true, isStopped: false
+        ))
+        XCTAssertFalse(LoopbackRedirectServer.shouldAcceptConnection(
+            retainedCount: 0, hasResultHandler: false, isStopped: false
+        ))
+        XCTAssertFalse(LoopbackRedirectServer.shouldAcceptConnection(
+            retainedCount: 0, hasResultHandler: true, isStopped: true
+        ))
     }
 
     // MARK: - Callback extraction (pure)
@@ -48,6 +92,12 @@ final class LoopbackRedirectServerTests: XCTestCase {
     func testNonCallbackPathsReturnNil() {
         XCTAssertNil(LoopbackRedirectServer.callbackResult(fromTarget: "/favicon.ico"))
         XCTAssertNil(LoopbackRedirectServer.callbackResult(fromTarget: "/"))
+    }
+
+    func testCallbackPageMakesNoSignInClaim() {
+        let page = LoopbackRedirectServer.responseHTML()
+        XCTAssertTrue(page.contains("You can return to Murmur"))
+        XCTAssertFalse(page.localizedCaseInsensitiveContains("signed in"))
     }
 
     // MARK: - Redirect URI shape

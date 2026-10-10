@@ -64,9 +64,28 @@ struct ClipboardView: View {
         let needle = searchText.trimmingCharacters(in: .whitespaces).lowercased()
         guard !needle.isEmpty else { return byKind }
         return byKind.filter {
-            $0.preview.lowercased().contains(needle)
+            Self.displayPreview(for: $0).lowercased().contains(needle)
                 || ($0.sourceBundleID.map { id in id.lowercased().contains(needle) } ?? false)
         }
+    }
+
+    /// The captured preview can include Markdown from rich-text producers;
+    /// rows and search use the user-facing plain text rather than syntax.
+    static func plainTextPreview(_ preview: String) -> String {
+        preview
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line in
+                guard let attributed = try? AttributedString(
+                    markdown: String(line),
+                    options: .init(interpretedSyntax: .full)
+                ) else { return String(line) }
+                return String(attributed.characters)
+            }
+            .joined(separator: "\n")
+    }
+
+    static func displayPreview(for entry: ClipboardEntry) -> String {
+        entry.kind == .text ? plainTextPreview(entry.preview) : entry.preview
     }
 
     /// `filteredEntries` bucketed by calendar day, newest day first. Same
@@ -115,6 +134,13 @@ struct ClipboardView: View {
                     actionTitle: "Dismiss",
                     action: { store.dismissOversizedSkip() }
                 )
+            } else if store.isSecureInputActive {
+                banner(
+                    icon: "eye.slash.fill",
+                    tint: Theme.amberBorder,
+                    title: "Copies are not being saved right now",
+                    message: "An app has turned on Secure Input, usually a password field or Terminal’s Secure Keyboard Entry. Saving resumes when it turns off."
+                )
             } else if store.isLockedOut {
                 banner(
                     icon: "lock.fill",
@@ -127,22 +153,20 @@ struct ClipboardView: View {
             }
 
             GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
-                    SearchBar(
-                        text: $searchText,
-                        placeholder: "Search clipboard",
-                        resultCount: searchText.isEmpty ? nil : filteredEntries.count,
-                        isFocused: $isSearchFocused
-                    )
-                    .frame(maxWidth: .infinity)
-
-                    clearAllButton
-                }
+                SearchBar(
+                    text: $searchText,
+                    placeholder: "Search clipboard",
+                    resultCount: searchText.isEmpty ? nil : filteredEntries.count,
+                    isFocused: $isSearchFocused
+                )
             }
             .padding(.horizontal, 12)
             .padding(.top, 12)
 
-            filterChips
+            HStack(spacing: 8) {
+                filterChips
+                clearAllButton
+            }
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
 
@@ -167,7 +191,8 @@ struct ClipboardView: View {
         )
         .confirmDelete(
             isPresented: $showClearAllConfirmation,
-            title: "Delete all clipboard history?",
+            title: "Delete all \(store.entries.count) clipboard items?",
+            message: "This cannot be undone.",
             onConfirm: {
                 withAnimation(Theme.easeOutOrNil()) { store.clearAll() }
             }
@@ -370,13 +395,14 @@ private struct ClipboardRow: View {
 
     @State private var isHovering = false
     @State private var thumbnail: NSImage?
+    @State private var pasteableByteCount: Int?
 
     var body: some View {
         HStack(spacing: 12) {
             leading
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(entry.preview.isEmpty ? "(empty)" : entry.preview)
+                Text(plainTextPreview.isEmpty ? "(empty)" : plainTextPreview)
                     .font(entry.kind == .text ? Theme.body(13.5) : Theme.body(13.5, weight: .medium))
                     .foregroundColor(Theme.textPrimary)
                     .lineLimit(1)
@@ -389,7 +415,9 @@ private struct ClipboardRow: View {
                     }
                     Text(clipboardTimeFormatter.string(from: entry.date))
                     Text("·").opacity(0.45)
-                    Text(sizeLabel)
+                    if let sizeLabel {
+                        Text(sizeLabel)
+                    }
                 }
                 .font(Theme.body(11.5))
                 .foregroundColor(Theme.textSecondary)
@@ -417,8 +445,9 @@ private struct ClipboardRow: View {
         .contentShape(Rectangle())
         .onTapGesture(count: 2, perform: onCopy)
         .task(id: entry.id) { await loadThumbnail() }
+        .task(id: entry.id) { await loadPasteableByteCount() }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(entry.kind.rawValue), \(entry.preview)")
+        .accessibilityLabel("\(entry.kind.rawValue), \(plainTextPreview)")
     }
 
     @ViewBuilder
@@ -491,12 +520,26 @@ private struct ClipboardRow: View {
         return bundleID.split(separator: ".").last.map(String.init) ?? bundleID
     }
 
-    private var sizeLabel: String {
+    private var plainTextPreview: String {
+        ClipboardView.displayPreview(for: entry)
+    }
+
+    private var sizeLabel: String? {
         if entry.kind == .files {
             let count = entry.preview.split(separator: ",").count
             return count == 1 ? "1 file" : "\(count) files"
         }
-        return ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file)
+        guard let pasteableByteCount else { return nil }
+        return ByteCountFormatter.string(fromByteCount: Int64(pasteableByteCount), countStyle: .file)
+    }
+
+    private func loadPasteableByteCount() async {
+        guard entry.kind != .files else { return }
+        pasteableByteCount = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: store.pasteableByteCount(for: entry))
+            }
+        }
     }
 }
 

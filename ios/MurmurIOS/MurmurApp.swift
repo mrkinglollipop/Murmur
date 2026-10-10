@@ -54,13 +54,17 @@ struct MurmurApp: App {
                     SessionView()
                 }
             }
-            .onAppear { session.restoreIfNeeded() }
+            .onAppear {
+                MurmurStores.dictionary.reload()
+                session.restoreIfNeeded()
+            }
             .onOpenURL { url in
                 MurmurOpenURL.handle(url, sourceApplication: MurmurOpenURL.sourceApplication)
             }
             .onChange(of: scenePhase) { _, phase in
                 switch phase {
                 case .active:
+                    MurmurStores.dictionary.reload()
                     session.setForeground(true)
                     session.becomeActive()
                 case .background:

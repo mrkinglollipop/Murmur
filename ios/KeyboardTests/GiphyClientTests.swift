@@ -74,7 +74,60 @@ final class GiphyClientTests: XCTestCase {
         XCTAssertEqual(gifs[0].sendURL.absoluteString, "https://media.giphy.com/original.gif")
     }
 
+    func testDownloadRejectsOversizedContentLengthBeforeReading() async {
+        let source = CountingBytes(count: 1)
+        do {
+            _ = try await GiphyClient.boundedData(source, expectedLength: Int64(GiphyClient.maxDownloadBytes + 1))
+            XCTFail("Oversized Content-Length must be refused")
+        } catch {
+            XCTAssertEqual(error as? GiphyClient.ClientError, .decode)
+        }
+        XCTAssertEqual(source.readCount, 0)
+    }
+
+    func testDownloadStopsUnknownLengthStreamAtLimit() async {
+        let source = CountingBytes(count: GiphyClient.maxDownloadBytes + 100)
+        do {
+            _ = try await GiphyClient.boundedData(source, expectedLength: -1)
+            XCTFail("Oversized streaming body must be refused")
+        } catch {
+            XCTAssertEqual(error as? GiphyClient.ClientError, .decode)
+        }
+        XCTAssertEqual(source.readCount, GiphyClient.maxDownloadBytes + 1)
+    }
+
+    func testDownloadAcceptsExactLimit() async throws {
+        let source = CountingBytes(count: GiphyClient.maxDownloadBytes)
+        let data = try await GiphyClient.boundedData(source, expectedLength: Int64(GiphyClient.maxDownloadBytes))
+        XCTAssertEqual(data.count, GiphyClient.maxDownloadBytes)
+    }
+
+    func testDownloadChecksBodyEvenWhenContentLengthIsUnderstated() async {
+        let source = CountingBytes(count: GiphyClient.maxDownloadBytes + 100)
+        do {
+            _ = try await GiphyClient.boundedData(source, expectedLength: 1)
+            XCTFail("An understated Content-Length must not bypass the streaming cap")
+        } catch {
+            XCTAssertEqual(error as? GiphyClient.ClientError, .decode)
+        }
+        XCTAssertEqual(source.readCount, GiphyClient.maxDownloadBytes + 1)
+    }
+
     private func value(_ name: String, in items: [URLQueryItem]) -> String? {
         items.first(where: { $0.name == name })?.value
+    }
+}
+
+private final class CountingBytes: AsyncSequence, AsyncIteratorProtocol {
+    typealias Element = UInt8
+    private let count: Int
+    private(set) var readCount = 0
+
+    init(count: Int) { self.count = count }
+    func makeAsyncIterator() -> CountingBytes { self }
+    func next() async -> UInt8? {
+        guard readCount < count else { return nil }
+        readCount += 1
+        return 0
     }
 }

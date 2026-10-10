@@ -357,6 +357,16 @@ final class ClipboardStore: ObservableObject {
     /// persistent quarantine marker behind. A later successful save or launch
     /// clears it.
     @Published private(set) var isStorageUnavailable = false
+
+    /// Secure Input (a password field, or Terminal's Secure Keyboard Entry)
+    /// hides copies from every clipboard manager. Shown so a silent gap in
+    /// history has a visible cause.
+    @Published private(set) var isSecureInputActive = false
+
+    func noteSecureInput(_ active: Bool) {
+        let apply = { if self.isSecureInputActive != active { self.isSecureInputActive = active } }
+        Thread.isMainThread ? apply() : DispatchQueue.main.async(execute: apply)
+    }
     private var loadedMetadata = false
 
     /// Guards `activate()` against re-entry while its Keychain resolution is
@@ -1031,6 +1041,31 @@ final class ClipboardStore: ObservableObject {
             markUnreadable(entry.id)
             return nil
         }
+    }
+
+    /// Read-only display metric. The encrypted blob's byte count includes
+    /// alternate pasteboard representations and encryption overhead, so it is
+    /// not a user-facing size. Select one pasteable representation per item;
+    /// call this off the main thread.
+    func pasteableByteCount(for entry: ClipboardEntry) -> Int? {
+        guard let snapshot = payload(for: entry) else { return nil }
+        var total = 0
+        for item in snapshot {
+            let representation: Data?
+            switch entry.kind {
+            case .text:
+                representation = item[.string]
+            case .image:
+                representation = item[.png] ?? item[.tiff]
+            case .other:
+                representation = ClipboardFingerprint.canonicalPayload(of: item)
+            case .files:
+                return nil
+            }
+            guard let representation else { return nil }
+            total += representation.count
+        }
+        return total
     }
 
     /// Puts `entry` back on the pasteboard with every representation it was

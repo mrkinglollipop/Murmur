@@ -154,7 +154,7 @@ struct TransformsView: View {
             .pickerStyle(.menu)
             .labelsHidden()
 
-            Text("Global hotkey: ⌃⌥⌘T runs your auto-run transform (or the first one, if none is set) on your last dictation and copies the result.")
+            Text("Press ⌃⌥⌘T to apply your auto-run transform to your last dictation and copy the result. If none is set, the first transform is used.")
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
         }
@@ -177,7 +177,7 @@ struct TransformsView: View {
                 Text("Create new transform")
                     .font(Theme.body(13, weight: .semibold))
             }
-            .foregroundColor(Theme.lavenderText)
+            .foregroundColor(Theme.ctaText)
         }
         .buttonStyle(.glassProminent)
         .tint(Theme.lavender)
@@ -312,7 +312,7 @@ struct TransformsView: View {
                     Text(buttonLabel(for: transform))
                         .font(Theme.body(12, weight: .semibold))
                 }
-                .foregroundColor(Theme.lavenderText)
+                .foregroundColor(Theme.ctaText)
             }
             .buttonStyle(.glassProminent)
             .tint(Theme.lavender)
