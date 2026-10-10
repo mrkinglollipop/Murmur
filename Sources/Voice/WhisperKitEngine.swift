@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import os.log
 import WhisperKit
@@ -65,8 +66,7 @@ final class WhisperKitEngine: ASREngine {
     /// (observed 2026-08-09: a cloud→local fallback whose load never returned —
     /// no error, no thread, model resident — leaving the dictation hung forever).
     /// Timing out turns that into a visible failure with the audio retained for
-    /// retry. The transcription itself is NOT bounded — long audio legitimately
-    /// takes long.
+    /// retry. Decode has a separate budget scaled to the recording's duration.
     static let modelLoadTimeout: TimeInterval = 120
 
     /// Races `operation` against a deadline. On timeout cancellation is requested
@@ -109,15 +109,19 @@ final class WhisperKitEngine: ASREngine {
         options.suppressBlank = true
 
         let inferStart = Date()
-        let results = try await wk.transcribe(audioPath: audioURL.path, decodeOptions: options)
+        let audioFile = try AVAudioFile(forReading: audioURL)
+        let decodeOptions = options
+        let text = try await LocalTranscriptionDeadline.run(
+            seconds: LocalTranscriptionDeadline.seconds(for: audioFile),
+            engineName: displayName
+        ) {
+            let results = try await wk.transcribe(audioPath: audioURL.path, decodeOptions: decodeOptions)
+            return results
+                .compactMap { $0.text }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+        }
         vlog("inference \(String(format: "%.2f", Date().timeIntervalSince(inferStart)))s")
-
-        // `transcribe` returns [TranscriptionResult]; join all segments, then
-        // strip Whisper's non-speech sound captions (see stripSoundAnnotations).
-        let text = results
-            .compactMap { $0.text }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespaces)
 
         return WhisperKitEngine.stripSoundAnnotations(text)
     }

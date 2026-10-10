@@ -17,17 +17,32 @@ final class AppleSpeechEngine: ASREngine {
     }
 
     func transcribe(audioURL: URL) async throws -> String {
+        let audioFile = try AVAudioFile(forReading: audioURL)
+        let language = language
+        return try await LocalTranscriptionDeadline.run(
+            seconds: LocalTranscriptionDeadline.seconds(for: audioFile),
+            engineName: displayName
+        ) {
+            try await Self.transcribe(audioFile: audioFile, language: language)
+        }
+    }
+
+    private static func transcribe(audioFile: AVAudioFile, language: String) async throws -> String {
         let transcriber = try await Self.transcriber(language: language)
+        try Task.checkCancellation()
         let status = await AssetInventory.status(forModules: [transcriber])
+        try Task.checkCancellation()
         guard status == .installed else {
             throw AppleSpeechEngineError.assetNotInstalled(language: language)
         }
 
-        let audioFile = try AVAudioFile(forReading: audioURL)
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let transcriptTask = Task<String, Error> {
+            try Task.checkCancellation()
             var finalText = ""
-            for try await result in transcriber.results where result.isFinal {
+            for try await result in transcriber.results {
+                try Task.checkCancellation()
+                guard result.isFinal else { continue }
                 finalText = Self.appendingFinalSegment(
                     String(result.text.characters),
                     to: finalText
@@ -38,7 +53,9 @@ final class AppleSpeechEngine: ASREngine {
 
         return try await withTaskCancellationHandler {
             do {
+                try Task.checkCancellation()
                 let finalSample = try await analyzer.analyzeSequence(from: audioFile)
+                try Task.checkCancellation()
                 if let finalSample {
                     try await analyzer.finalizeAndFinish(through: finalSample)
                 } else {
