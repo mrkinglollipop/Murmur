@@ -1,5 +1,6 @@
 import AppKit
 import QuartzCore
+import SwiftUI
 
 // MARK: - RecordingHUD
 
@@ -14,6 +15,7 @@ import QuartzCore
 ///                 indeterminate pulse until hide() is called
 ///   .success    — brief checkmark flash before hide
 ///   .clipboardFlash — brief clipboard icon when text landed on clipboard
+///   .microphoneNoAudio — nonblocking in-hold hint; recording continues
 ///   .error      — red-tinted pill with a short failure message; auto-hides
 ///                 after 3s (see `showError(_:)`)
 
@@ -37,6 +39,7 @@ final class RecordingHUD {
         case processing
         case success
         case clipboardFlash
+        case microphoneNoAudio(String)
         case error(String)
 
         var accessibilityAnnouncement: String {
@@ -238,6 +241,30 @@ final class RecordingHUD {
         waveformView.pushLevel(level)
     }
 
+    /// Contextual warning for a live hold. This deliberately does not use the
+    /// terminal error pill: the user may simply be pausing before speaking.
+    func showMicrophoneNoAudio(_ deviceName: String) {
+        guard isVisible, !isProcessing else { return }
+        if case .microphoneNoAudio(let currentDeviceName) = currentState,
+           currentDeviceName == deviceName {
+            return
+        }
+        applyState(.microphoneNoAudio(deviceName))
+        resizePanel(forInterim: true)
+        positionOnMainScreen(offsetBelowFinal: 8)
+        notifyLayoutChange()
+    }
+
+    /// The first real RMS sample clears the in-hold hint without interrupting
+    /// the waveform or changing focus.
+    func clearMicrophoneNoAudio() {
+        guard case .microphoneNoAudio = currentState else { return }
+        applyState(.listening)
+        resizePanel(forInterim: false)
+        positionOnMainScreen(offsetBelowFinal: 8)
+        notifyLayoutChange()
+    }
+
     /// Shows a red-tinted error pill with `message`, then auto-hides after 3s.
     func showError(_ message: String) {
         let generation = beginTransition()
@@ -387,11 +414,11 @@ final class RecordingHUD {
     }
 
     private var currentPillSize: NSSize {
-        NSSize(width: pillWidth, height: waveformView.hasInterimText || waveformView.hasProcessingLabel ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight)
+        NSSize(width: pillWidth, height: waveformView.hasInterimText || waveformView.hasProcessingLabel || waveformView.hasMicrophoneWarning ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight)
     }
 
     private func resizePanel(forInterim: Bool, animatedShrink: Bool = false) {
-        let expanded = forInterim || waveformView.hasProcessingLabel
+        let expanded = forInterim || waveformView.hasProcessingLabel || waveformView.hasMicrophoneWarning
         let targetHeight = expanded ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight
         if panel.frame.height == targetHeight { return }
         var frame = panel.frame
@@ -456,6 +483,7 @@ private final class WaveformView: NSView {
 
     private(set) var hasInterimText = false
     private(set) var hasProcessingLabel = false
+    private(set) var hasMicrophoneWarning = false
     private(set) var correctionCount: Int = 0
 
     var onErrorDismiss: (() -> Void)?
@@ -630,7 +658,7 @@ private final class WaveformView: NSView {
         }
         clipboardIcon.frame = CGRect(x: bounds.midX - 12, y: midY - 12, width: 24, height: 24)
 
-        if hasInterimText || hasProcessingLabel {
+        if hasInterimText || hasProcessingLabel || hasMicrophoneWarning {
             interimLabel.isHidden = false
             interimLabel.frame = CGRect(x: 12, y: 4, width: bounds.width - 24, height: bounds.height - waveformBandHeight - 4)
         } else {
@@ -653,6 +681,7 @@ private final class WaveformView: NSView {
 
         switch newState {
         case .processing:
+            hasMicrophoneWarning = false
             pulsePhase = 0
             errorLabel.isHidden = true
             successIcon.isHidden = true
@@ -663,6 +692,7 @@ private final class WaveformView: NSView {
             layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
             layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         case .success:
+            hasMicrophoneWarning = false
             errorLabel.isHidden = true
             successIcon.isHidden = false
             clipboardIcon.isHidden = true
@@ -680,6 +710,7 @@ private final class WaveformView: NSView {
             layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
             animateFlashIcon(successIcon)
         case .clipboardFlash:
+            hasMicrophoneWarning = false
             errorLabel.isHidden = true
             successIcon.isHidden = true
             clipboardIcon.isHidden = false
@@ -690,7 +721,20 @@ private final class WaveformView: NSView {
             layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
             layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
             animateFlashIcon(clipboardIcon)
+        case .microphoneNoAudio(let deviceName):
+            hasMicrophoneWarning = true
+            errorLabel.isHidden = true
+            successIcon.isHidden = true
+            clipboardIcon.isHidden = true
+            fnChipBackground.isHidden = false
+            fnLabel.isHidden = false
+            for barLayer in barLayers { barLayer.isHidden = false }
+            interimLabel.stringValue = "No microphone audio · \(deviceName)"
+            interimLabel.isHidden = false
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
+            layer?.borderColor = NSColor(Theme.amberBorder).withAlphaComponent(0.65).cgColor
         case .error(let message):
+            hasMicrophoneWarning = false
             errorLabel.stringValue = message
             errorLabel.isHidden = false
             successIcon.isHidden = true
@@ -702,6 +746,7 @@ private final class WaveformView: NSView {
             layer?.backgroundColor = NSColor(calibratedRed: 0.22, green: 0.08, blue: 0.08, alpha: 0.98).cgColor
             layer?.borderColor = NSColor(calibratedRed: 0.85, green: 0.25, blue: 0.25, alpha: 0.55).cgColor
         case .listening:
+            hasMicrophoneWarning = false
             errorLabel.isHidden = true
             successIcon.isHidden = true
             clipboardIcon.isHidden = true
@@ -838,7 +883,7 @@ private final class WaveformView: NSView {
 
     private func tick() {
         switch state {
-        case .listening:
+        case .listening, .microphoneNoAudio:
             tickListening()
         case .processing:
             tickProcessing()

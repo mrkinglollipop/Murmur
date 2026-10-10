@@ -63,6 +63,8 @@ final class SettingsStore: ObservableObject {
         static let launchAtLogin = "voice.settings.launchAtLogin"
         static let playDictationSound = "voice.settings.playDictationSound"
         static let allowLastResortInputFallback = "voice.settings.allowLastResortInputFallback"
+        static let preferredInputDeviceUID = "voice.settings.preferredInputDeviceUID"
+        static let excludedInputDeviceUIDs = "voice.settings.excludedInputDeviceUIDs"
         static let useStreaming = "voice.settings.useStreaming"
         static let removeFillerWords = "voice.settings.removeFillerWords"
         static let elevenLabsFilterBackgroundAudio = "voice.settings.elevenLabsFilterBackgroundAudio"
@@ -267,6 +269,26 @@ final class SettingsStore: ObservableObject {
                 allowLastResortInputFallback,
                 forKey: Keys.allowLastResortInputFallback
             )
+        }
+    }
+
+    /// Nil means Automatic. A CoreAudio UID is stable across launches; an
+    /// `AudioDeviceID` is not and must never be persisted.
+    @Published var preferredInputDeviceUID: String? {
+        didSet {
+            if let preferredInputDeviceUID, !preferredInputDeviceUID.isEmpty {
+                defaults.set(preferredInputDeviceUID, forKey: Keys.preferredInputDeviceUID)
+            } else {
+                defaults.removeObject(forKey: Keys.preferredInputDeviceUID)
+            }
+        }
+    }
+
+    /// Microphone UIDs the user never wants Automatic or an explicit choice
+    /// to select. Exclusions are applied in `AudioRecorder` before picking.
+    @Published var excludedInputDeviceUIDs: Set<String> {
+        didSet {
+            defaults.set(excludedInputDeviceUIDs.sorted(), forKey: Keys.excludedInputDeviceUIDs)
         }
     }
 
@@ -556,6 +578,25 @@ final class SettingsStore: ObservableObject {
         didSet { wireVoiceGateTelemetryPublisher() }
     }
 
+    /// Injected by `AppDelegate`; tests never enumerate live CoreAudio state.
+    var microphoneDeviceProvider: (() -> [MicrophoneDevice])?
+
+    var microphoneDevices: [MicrophoneDevice] {
+        microphoneDeviceProvider?() ?? []
+    }
+
+    func isInputDeviceExcluded(_ uid: String) -> Bool {
+        excludedInputDeviceUIDs.contains(uid)
+    }
+
+    func setInputDeviceExcluded(_ uid: String, excluded: Bool) {
+        if excluded {
+            excludedInputDeviceUIDs.insert(uid)
+        } else {
+            excludedInputDeviceUIDs.remove(uid)
+        }
+    }
+
     /// Optional history store for prune protect-list + export transcripts.
     weak var historyStore: HistoryStore?
 
@@ -645,6 +686,9 @@ final class SettingsStore: ObservableObject {
         } else {
             allowLastResortInputFallback = false
         }
+
+        preferredInputDeviceUID = defaults.string(forKey: Keys.preferredInputDeviceUID)
+        excludedInputDeviceUIDs = Set(defaults.stringArray(forKey: Keys.excludedInputDeviceUIDs) ?? [])
 
         if defaults.object(forKey: Keys.useStreaming) != nil {
             useStreaming = defaults.bool(forKey: Keys.useStreaming)

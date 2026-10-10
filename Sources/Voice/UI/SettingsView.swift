@@ -107,6 +107,28 @@ struct SettingsView: View {
         SettingsSection.contains(card, in: selectedSection)
     }
 
+    private var microphoneSelection: Binding<String> {
+        Binding(
+            get: {
+                guard let uid = settingsStore.preferredInputDeviceUID,
+                      settingsStore.microphoneDevices.contains(where: { $0.uid == uid }),
+                      !settingsStore.isInputDeviceExcluded(uid)
+                else { return "" }
+                return uid
+            },
+            set: { uid in
+                settingsStore.preferredInputDeviceUID = uid.isEmpty ? nil : uid
+            }
+        )
+    }
+
+    private func microphoneExclusion(_ device: MicrophoneDevice) -> Binding<Bool> {
+        Binding(
+            get: { settingsStore.isInputDeviceExcluded(device.uid) },
+            set: { settingsStore.setInputDeviceExcluded(device.uid, excluded: $0) }
+        )
+    }
+
     /// Shared content keeps offscreen renders at the scroll pane's actual width.
     var sectionContent: some View {
             VStack(alignment: .leading, spacing: 20) {
@@ -350,6 +372,50 @@ struct SettingsView: View {
                 }
 
                 if shows("System") {
+                section(title: "Microphone") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Picker("Microphone", selection: microphoneSelection) {
+                            Text("Automatic").tag("")
+                            ForEach(settingsStore.microphoneDevices) { device in
+                                Text(device.name).tag(device.uid)
+                                    .disabled(settingsStore.isInputDeviceExcluded(device.uid))
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        Text("Automatic uses an available microphone. A selected microphone is used when it is connected.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+
+                        if let selectedUID = settingsStore.preferredInputDeviceUID,
+                           (!settingsStore.microphoneDevices.contains(where: { $0.uid == selectedUID })
+                               || settingsStore.isInputDeviceExcluded(selectedUID)) {
+                            Text("Saved microphone is unavailable or excluded. Using Automatic for this hold.")
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.amberText)
+                        }
+
+                        if !settingsStore.microphoneDevices.isEmpty {
+                            Divider().overlay(Theme.hairline)
+
+                            Text("Never use")
+                                .font(Theme.body(12, weight: .medium))
+                                .foregroundColor(Theme.textPrimary)
+
+                            Text("Excluded microphones are never selected, including as a fallback.")
+                                .font(Theme.body(10))
+                                .foregroundColor(Theme.textSecondary)
+
+                            ForEach(settingsStore.microphoneDevices) { device in
+                                Toggle(device.name, isOn: microphoneExclusion(device))
+                                    .toggleStyle(.switch)
+                                    .font(Theme.body(12))
+                                    .foregroundColor(Theme.textPrimary)
+                            }
+                        }
+                    }
+                }
+
                 section(title: "System") {
                     VStack(alignment: .leading, spacing: 12) {
                         Toggle("Launch at login", isOn: $settingsStore.launchAtLogin)
