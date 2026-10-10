@@ -68,6 +68,8 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
 /// pass transcript text to `vlog`, `os_log`, `print`, or any /tmp path.
 final class HistoryStore: ObservableObject {
 
+    @Published private(set) var saveFailure = SaveFailureNotice()
+
     @Published private(set) var entries: [HistoryEntry] = [] {
         didSet {
             let paths = entries.compactMap { entry -> String? in
@@ -113,6 +115,7 @@ final class HistoryStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("history.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -141,17 +144,30 @@ final class HistoryStore: ObservableObject {
             // binds to the move failure and shadows the decode failure, which is
             // the one that explains why history was quarantined at all.
             savesBlocked = true
+            reportSaveFailure()
             logger.error("Failed to quarantine corrupt history.json: \(error.localizedDescription); original decode error: \(decodeError.localizedDescription)")
         }
         entries = []
+    }
+
+    private func reportSaveFailure() {
+        saveFailure.report("History could not be saved. Copy any changes you want to keep before quitting.")
+    }
+
+    func dismissSaveFailure() {
+        saveFailure.dismiss()
     }
 
     private func save() {
         guard !savesBlocked else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(entries) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try encoder.encode(entries)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     private func scheduleSave() {

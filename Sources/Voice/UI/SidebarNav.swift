@@ -192,6 +192,7 @@ private struct NavRow: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(tab.title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .onHover { isHovering = $0 }
     }
 

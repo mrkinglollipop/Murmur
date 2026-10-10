@@ -16,6 +16,7 @@ import Foundation
 /// plain `String` (not baked into fixed logic) specifically so a wrong ID is
 /// a one-line fix here rather than a structural change.
 enum LocalModel: String, CaseIterable, Identifiable, Codable {
+    case appleSpeech          = "appleSpeech"
     case whisperLargeV3Turbo = "whisperLargeV3Turbo"
     case parakeetTDT06BV3    = "parakeetTDT06BV3"
     case whisperLargeV3      = "whisperLargeV3"
@@ -29,6 +30,7 @@ enum LocalModel: String, CaseIterable, Identifiable, Codable {
 
     var displayName: String {
         switch self {
+        case .appleSpeech:           return "Apple (built in)"
         case .whisperLargeV3Turbo:  return "Whisper large-v3-turbo"
         case .parakeetTDT06BV3:     return "Parakeet TDT 0.6B v3"
         case .whisperLargeV3:       return "Whisper large-v3"
@@ -40,6 +42,8 @@ enum LocalModel: String, CaseIterable, Identifiable, Codable {
     /// Which engine family backs this model.
     var engineID: ASREngineID {
         switch self {
+        case .appleSpeech:
+            return .appleSpeech
         case .parakeetTDT06BV3:
             return .parakeet
         default:
@@ -61,6 +65,7 @@ enum LocalModel: String, CaseIterable, Identifiable, Codable {
         case .distilWhisperLargeV3: return "distil-whisper_distil-large-v3"
         case .whisperBase:          return "openai_whisper-base"
         case .parakeetTDT06BV3:     return nil
+        case .appleSpeech:           return nil
         }
     }
 }

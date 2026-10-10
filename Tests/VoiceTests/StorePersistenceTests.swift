@@ -294,10 +294,10 @@ final class StorePersistenceTests: XCTestCase {
 
     func testEditingSelectedTransformUpdatesTheLivePipelineBeforeSave() throws {
         let key = "voice.settings.autoRunTransformID"
-        let previous = UserDefaults.standard.object(forKey: key)
+        let previous = VoiceDefaults.shared.object(forKey: key)
         defer {
-            if let previous { UserDefaults.standard.set(previous, forKey: key) }
-            else { UserDefaults.standard.removeObject(forKey: key) }
+            if let previous { VoiceDefaults.shared.set(previous, forKey: key) }
+            else { VoiceDefaults.shared.removeObject(forKey: key) }
         }
         let url = tempFile("live-transform")
         try Data("[]".utf8).write(to: url)

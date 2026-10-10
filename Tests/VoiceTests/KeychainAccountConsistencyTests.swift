@@ -47,6 +47,11 @@ final class KeychainAccountConsistencyTests: XCTestCase {
         XCTAssertEqual(query[kSecAttrAccount as String] as? String, CloudProvider.elevenLabs.keychainAccount)
     }
 
+    func testDefaultStoreUsesTheTestService() {
+        XCTAssertNotEqual(KeychainStore().service, KeychainStore.productionService)
+        XCTAssertEqual(KeychainStore().service, KeychainStore.defaultService)
+    }
+
     func testBaseQueryIsIdenticalForEveryAccountItsUsedWith() {
         let elevenLabsQuery = KeychainStore.baseQuery(service: "svc", account: CloudProvider.elevenLabs.keychainAccount)
         let xaiQuery = KeychainStore.baseQuery(service: "svc", account: CloudProvider.xai.keychainAccount)

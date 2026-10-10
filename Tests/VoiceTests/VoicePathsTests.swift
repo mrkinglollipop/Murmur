@@ -3,6 +3,13 @@ import XCTest
 
 final class VoicePathsTests: XCTestCase {
 
+    func testTestHostUsesTemporaryVoiceRoot() {
+        let realRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Voice", isDirectory: true)
+        XCTAssertNotEqual(VoicePaths.applicationSupportVoiceDirectory.path, realRoot.path)
+        XCTAssertTrue(VoicePaths.applicationSupportVoiceDirectory.path.hasPrefix(FileManager.default.temporaryDirectory.path))
+    }
+
     func testPrepareApplicationSupportVoiceDirectory_setsMode0700() throws {
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         let path = VoicePaths.applicationSupportVoiceDirectory.path

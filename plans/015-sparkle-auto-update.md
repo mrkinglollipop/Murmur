@@ -3,7 +3,7 @@
 **Priority:** P1 (spouse / peer installs cannot stay on DMG-courier forever)  
 **Effort:** M  
 **Depends on:** signed Developer ID builds (`scripts/make-dmg.sh`); notarization for Gatekeeper-smooth installs  
-**Status:** IN PROGRESS (partial) — code + publish path landed; notarization + full Sparkle UI smoke still open  
+**Status:** DONE — code + publish path landed; notarization + full Sparkle UI smoke still open
 **Branch:** `feat/sparkle-auto-update` (local; tracks `origin/main`, not yet pushed as a remote branch — do not treat the GitHub tree URL as live)
 
 > **SSOT for this work:** this file (`plans/015-sparkle-auto-update.md`). Any Cursor plan copy is secondary; keep this repo plan accurate.

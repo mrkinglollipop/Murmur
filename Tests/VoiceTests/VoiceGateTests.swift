@@ -152,6 +152,73 @@ final class VoiceGateTests: XCTestCase {
         XCTAssertNil(gate.enroll(segments: [[1, 2, 3]]))
     }
 
+    func testCancelledEnrollmentDoesNotPersistProfile() async {
+        let dir = tempDirectory()
+        let store = VoiceProfileStore(directoryURL: dir)
+        let provider = BlockingEmbeddingProvider(vector: [1, 0])
+        let gate = VoiceGate(profileStore: store, embeddingProvider: provider, sensitivity: .medium, modelId: "test")
+
+        let task = Task.detached { gate.enroll(segments: [[0]]) }
+        waitUntil { provider.embeddingCallCount == 1 }
+        task.cancel()
+        provider.unblock()
+
+        let profile = await task.value
+        XCTAssertNil(profile)
+        XCTAssertNil(store.load(), "cancelled enrollment must not persist a profile")
+    }
+
+    func testCoordinatorRetriesLoadingWhenEnrollmentRestarts() {
+        let store = VoiceProfileStore(directoryURL: tempDirectory())
+        let provider = FakeEmbeddingProvider(isReady: false)
+        var retryCount = 0
+        let retried = expectation(description: "embedding load retried")
+        let coordinator = EnrollmentCoordinator(
+            profileStore: store,
+            sensitivityProvider: { .medium },
+            onGatingShouldRefresh: {},
+            makeEmbeddingProvider: { provider },
+            retryEmbeddingProvider: { receivedProvider in
+                XCTAssertFalse(receivedProvider.isReady)
+                provider.isReady = true
+                retryCount += 1
+                retried.fulfill()
+            }
+        )
+
+        coordinator.start()
+        wait(for: [retried], timeout: 1)
+        coordinator.cancel()
+        XCTAssertEqual(retryCount, 1)
+    }
+
+    func testCoordinatorCancellationPreventsProfilePersistenceAndGatingRefresh() async {
+        let store = VoiceProfileStore(directoryURL: tempDirectory())
+        let provider = BlockingEmbeddingProvider(vector: [1, 0])
+        var didRefreshGating = false
+        let coordinator = EnrollmentCoordinator(
+            profileStore: store,
+            sensitivityProvider: { .medium },
+            onGatingShouldRefresh: { didRefreshGating = true },
+            makeEmbeddingProvider: { provider }
+        )
+
+        coordinator.start()
+        waitUntil {
+            if case .recording = coordinator.flow.phase { return true }
+            return false
+        }
+        let task = Task { await coordinator.runEnrollment(segments: [[0]]) }
+        waitUntil { provider.embeddingCallCount == 1 }
+        coordinator.cancel()
+        provider.unblock()
+        _ = await task.value
+
+        XCTAssertNil(store.load())
+        XCTAssertFalse(didRefreshGating)
+        XCTAssertEqual(coordinator.flow.phase, .notStarted)
+    }
+
     // MARK: - Threshold bands
 
     func testSensitivityThresholdBands() {

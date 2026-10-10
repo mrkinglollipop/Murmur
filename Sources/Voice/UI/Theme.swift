@@ -1,11 +1,10 @@
 import AppKit
 import SwiftUI
 
-/// Design tokens for the main window UI, matching the approved dark-first
-/// Liquid Glass mockup (`plans/015-briefs/mockup-v3.html` — the HTML comment
-/// block at the top of that file is the authoritative spec: palette, glass
-/// emulation tokens, per-frame layout). The floating HUD pill is a separate
-/// dark surface and is untouched by this file.
+/// Design tokens for the main window UI, matching the dark-first Liquid Glass
+/// design. The cited `plans/015-briefs/mockup-v3.html` was never committed;
+/// these tokens are the retained implementation reference. The floating HUD
+/// pill is a separate dark surface and is untouched by this file.
 enum Theme {
 
     // MARK: - Colors
@@ -30,10 +29,14 @@ enum Theme {
     /// across every view during a color-only retheme.
     static let lavender = Color(red: 0.847, green: 0.353, blue: 0.188)
 
-    /// Text/icon color for content sitting on a `lavender` coral fill —
-    /// #f5f5f7 (same as `textPrimary`; near-white reads cleanly on solid
-    /// coral, unlike the old deep-purple-on-light-lavender pairing).
+    /// Light text/icon highlight for glass selections and links — #f5f5f7.
+    /// Solid coral buttons use `ctaText` to meet small-text contrast.
     static let lavenderText = Color(red: 0.961, green: 0.961, blue: 0.969)
+
+    /// Small labels on solid coral need dark ink; selected glass keeps light text.
+    static let ctaText = bg
+    static let selectedText = textPrimary
+    static let errorText = Color(red: 0.98, green: 0.56, blue: 0.56)
 
     /// Primary text color — #f5f5f7.
     static let textPrimary = Color(red: 0.961, green: 0.961, blue: 0.969)
@@ -169,6 +172,58 @@ extension View {
                 self.background(Theme.surface)
             } else {
                 glassEffect(.regular, in: Rectangle())
+            }
+        }
+    }
+}
+
+struct SaveFailureNotice: Equatable {
+    private(set) var message: String?
+    private var reported = false
+
+    mutating func report(_ message: String) {
+        guard !reported else { return }
+        reported = true
+        self.message = message
+    }
+
+    mutating func dismiss() {
+        message = nil
+    }
+}
+
+private struct SaveFailureBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundColor(Theme.amberText)
+            Text(message)
+                .font(Theme.body(12))
+                .foregroundColor(Theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Theme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss save warning")
+        }
+        .modifier(MurmurToastSurface())
+        .padding(12)
+        .onAppear { AccessibilityAnnouncement.post(message, element: NSApp) }
+    }
+}
+
+extension View {
+    func saveFailureBanner(_ notice: SaveFailureNotice, onDismiss: @escaping () -> Void) -> some View {
+        safeAreaInset(edge: .top, spacing: 0) {
+            if let message = notice.message {
+                SaveFailureBanner(message: message, onDismiss: onDismiss)
             }
         }
     }

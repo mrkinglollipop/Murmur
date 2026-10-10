@@ -248,14 +248,15 @@ final class VoiceGate {
     /// Enrolls from per-segment ~1s 16kHz mono Float32 windows. Returns nil if
     /// the provider isn't ready or produced zero usable embeddings.
     func enroll(segments: [[Float]]) -> VoiceProfile? {
-        guard embeddingProvider.isReady else { return nil }
+        guard !Task.isCancelled, embeddingProvider.isReady else { return nil }
         var embeddings: [[Float]] = []
         for segment in segments {
+            guard !Task.isCancelled else { return nil }
             if let embedding = embeddingProvider.embedding(for: segment) {
                 embeddings.append(embedding)
             }
         }
-        guard !embeddings.isEmpty else { return nil }
+        guard !Task.isCancelled, !embeddings.isEmpty else { return nil }
         let mean = meanEmbedding(embeddings)
         guard !mean.isEmpty else { return nil }
         let normalized = l2Normalize(mean)
@@ -265,7 +266,7 @@ final class VoiceGate {
             createdAt: Date(),
             modelId: modelId
         )
-        guard profileStore.save(profile) else { return nil }
+        guard !Task.isCancelled, profileStore.save(profile) else { return nil }
         return profile
     }
 
