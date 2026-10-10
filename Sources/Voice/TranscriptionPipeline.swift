@@ -317,6 +317,7 @@ final class TranscriptionPipeline {
     ///   gaps. History-retry leaves them nil and keeps entry-sample behavior.
     func transcribeAndLog(
         audioURL: URL,
+        audioIsTemporary: Bool = false,
         replaceHistoryEntryID: UUID? = nil,
         sessionHeldToken providedToken: UInt64? = nil,
         sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
@@ -328,7 +329,7 @@ final class TranscriptionPipeline {
             return
         }
 
-        let audioPath = audioURL.path
+        let audioPath = Self.historyAudioPath(audioURL: audioURL, audioIsTemporary: audioIsTemporary)
         let replaceID = replaceHistoryEntryID
         // Prefer stop-sampled hold when provided; otherwise sample at entry
         // (history-retry / legacy callers). Entry sample still races a newer
@@ -399,6 +400,10 @@ final class TranscriptionPipeline {
         )
     }
 
+    static func historyAudioPath(audioURL: URL, audioIsTemporary: Bool) -> String? {
+        audioIsTemporary ? nil : audioURL.path
+    }
+
     /// Streaming entry point: takes text already produced by a live session.
     /// - Parameters sessionHeld*: when `sessionHeldToken` is non-nil, use that
     ///   stop-sampled triple (before streaming finalize Tasks) instead of
@@ -460,7 +465,7 @@ final class TranscriptionPipeline {
 
     private func transcribeLocally(
         audioURL: URL,
-        audioPath: String,
+        audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
@@ -507,7 +512,7 @@ final class TranscriptionPipeline {
 
     private func reportTranscriptionFailure(
         engineID: String,
-        audioPath: String,
+        audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
         completion: ((InjectPipelineResult) -> Void)?
@@ -680,9 +685,7 @@ final class TranscriptionPipeline {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
                 if !abandoned { self.onFailure?(.transcriptionFailed) }
-                if let audioPath {
-                    self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
-                }
+                self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 completion?(.failed)
             }
             return
@@ -914,6 +917,7 @@ final class TranscriptionPipeline {
                             replaceID
                         )
                     }
+                    Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog)
                     if let failure = outcome.failure {
                         self.onFailure?(failure)
                     }
@@ -981,6 +985,11 @@ final class TranscriptionPipeline {
             snippetExpansionOccurred: snippetExpansionOccurred,
             hadExplicitTrailingNewline: hadExplicitTrailingNewline
         )
+    }
+
+    static func discardUnloggedAudio(audioPath: String?, shouldLog: Bool) {
+        guard !shouldLog, let audioPath else { return }
+        try? FileManager.default.removeItem(atPath: audioPath)
     }
 
     /// Pure decision seam for the secure-input / history-logging / HUD outcome
