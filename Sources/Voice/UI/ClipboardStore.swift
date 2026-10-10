@@ -76,6 +76,21 @@ private struct StoredClipboardEntry: Codable {
         byteCount = entry.byteCount
         fingerprint = entry.fingerprint
     }
+
+    /// Keeps an already-sealed preview byte-for-byte. This matters when one
+    /// row is damaged: saving another row must not replace its ciphertext with
+    /// the placeholder we show in memory.
+    init(entry: ClipboardEntry, sealedPreview: Data) {
+        id = entry.id
+        date = entry.date
+        kind = entry.kind
+        preview = nil
+        self.sealedPreview = sealedPreview
+        sourceBundleID = entry.sourceBundleID
+        types = entry.types
+        byteCount = entry.byteCount
+        fingerprint = entry.fingerprint
+    }
 }
 
 struct ClipboardFileOperations {
@@ -278,7 +293,10 @@ final class ClipboardStore: ObservableObject {
     @Published private(set) var isKeyUnavailable = false
 
     /// Whether a capture can actually be sealed and stored right now.
-    var canCapture: Bool { isActivated && !isActivating && !isKeyUnavailable && !isLockedOut && !isMetadataCorrupt }
+    var canCapture: Bool {
+        isActivated && !isActivating && !isKeyUnavailable && !isLockedOut
+            && !isMetadataCorrupt && !isStorageUnavailable
+    }
 
     /// The most recent copy that was too large to store, until dismissed.
     ///
@@ -305,6 +323,7 @@ final class ClipboardStore: ObservableObject {
     private let directory: URL
     private let metadataURL: URL
     private let metadataQuarantineMarkerURL: URL
+    private let migrationBackupURL: URL
     private let blobsDirectory: URL
     private let thumbsDirectory: URL
     /// Main-thread owned. Resolved by `activate()`, off the launch path.
@@ -326,6 +345,11 @@ final class ClipboardStore: ObservableObject {
     /// A corrupt metadata file cannot distinguish orphaned blobs from
     /// recoverable history. Preserve files and refuse automatic writes.
     @Published private(set) var isMetadataCorrupt = false
+    /// A non-decode disk failure pauses this instance without leaving a
+    /// persistent quarantine marker behind. A later successful save or launch
+    /// clears it.
+    @Published private(set) var isStorageUnavailable = false
+    private var loadedMetadata = false
 
     /// Guards `activate()` against re-entry while its Keychain resolution is
     /// still in flight, when `isActivated` is not yet true.
@@ -356,6 +380,7 @@ final class ClipboardStore: ObservableObject {
         self.directory = root
         self.metadataURL = root.appendingPathComponent("clipboard.json")
         self.metadataQuarantineMarkerURL = root.appendingPathComponent("clipboard.json.quarantine")
+        self.migrationBackupURL = root.appendingPathComponent("clipboard.json.pre-migration-backup")
         self.blobsDirectory = root.appendingPathComponent("blobs", isDirectory: true)
         self.thumbsDirectory = root.appendingPathComponent("thumbs", isDirectory: true)
         self.maxBytes = maxBytes
@@ -400,7 +425,8 @@ final class ClipboardStore: ObservableObject {
             } else {
                 resolved = injected ?? ClipboardStore.resolveCrypto()
             }
-            let locked = !self.canOpenStoredBlob(probeOrder: probeOrder, using: resolved)
+            let locked = (!probeOrder.isEmpty || resolved != nil)
+                && !self.canOpenStoredBlob(probeOrder: probeOrder, using: resolved)
             DispatchQueue.main.async {
                 self.crypto = resolved
                 self.isKeyUnavailable = resolved == nil
@@ -413,23 +439,28 @@ final class ClipboardStore: ObservableObject {
                 do {
                     try FileManager.default.createDirectory(at: self.blobsDirectory, withIntermediateDirectories: true)
                     try FileManager.default.createDirectory(at: self.thumbsDirectory, withIntermediateDirectories: true)
-                    let needsMigration = self.storedEntries.contains { $0.preview != nil }
-                    self.entries = try self.storedEntries.map { stored in
-                        var entry = stored.entry
-                        if let sealed = stored.sealedPreview {
-                            let data = try resolved.open(sealed)
-                            guard let preview = String(data: data, encoding: .utf8) else {
-                                throw ClipboardCryptoError.keyUnavailable
-                            }
-                            entry.preview = preview
-                        }
-                        return entry
-                    }
-                    if needsMigration { self.save() }
                 } catch {
-                    self.isLockedOut = true
-                    self.logger.error("Clipboard history unlock failed: \(error.localizedDescription)")
+                    self.storageFailure(error)
+                    self.isActivating = false
+                    self.isActivated = true
+                    return
                 }
+                let needsMigration = self.storedEntries.contains { $0.preview != nil }
+                self.entries = self.storedEntries.map { stored in
+                    var entry = stored.entry
+                    if let sealed = stored.sealedPreview {
+                        if let data = try? resolved.open(sealed),
+                           let preview = String(data: data, encoding: .utf8) {
+                            entry.preview = preview
+                        } else {
+                            // A damaged row must not turn an otherwise usable
+                            // history into a whole-store lockout.
+                            entry.preview = "Unavailable clipboard item"
+                        }
+                    }
+                    return entry
+                }
+                if needsMigration { self.save() }
                 guard !self.isLockedOut, !self.isMetadataCorrupt else {
                     self.isActivating = false
                     self.isActivated = true
@@ -442,6 +473,13 @@ final class ClipboardStore: ObservableObject {
                 }
             }
         }
+    }
+
+    /// The Clipboard view gets one user-driven retry after a transient
+    /// Keychain denial. It never polls, enumerates, or retries a wrong key.
+    func retryKeyIfUnavailable() {
+        guard isKeyUnavailable else { return }
+        activate()
     }
 
     // MARK: - Paths and key
@@ -485,21 +523,29 @@ final class ClipboardStore: ObservableObject {
     /// problem, and treating it as a key failure would tell the user their
     /// history is encrypted shut when it is merely incomplete.
     private func canOpenStoredBlob(probeOrder: [UUID], using candidate: ClipboardCrypto?) -> Bool {
-        guard !probeOrder.isEmpty else { return true }
         guard let candidate else { return false }
+        var hasEncryptedComponent = false
+        for stored in storedEntries {
+            guard let sealed = stored.sealedPreview else { continue }
+            hasEncryptedComponent = true
+            if (try? candidate.open(sealed)) != nil { return true }
+        }
         for id in probeOrder {
             let url = blobURL(for: id)
             guard let sealed = try? Data(contentsOf: url) else { continue }
-            return (try? candidate.open(sealed)) != nil
+            hasEncryptedComponent = true
+            if (try? candidate.open(sealed)) != nil { return true }
         }
-        // Every blob is gone. Nothing to be locked out of.
-        return true
+        // Every blob may be gone; only an encrypted component that could not
+        // be opened establishes a wrong/missing key.
+        return !hasEncryptedComponent
     }
 
     // MARK: - Load / save
 
     private func load() {
-        guard !FileManager.default.fileExists(atPath: metadataQuarantineMarkerURL.path) else {
+        if FileManager.default.fileExists(atPath: metadataQuarantineMarkerURL.path) {
+            if recoverDowngradeQuarantine() { return }
             isMetadataCorrupt = true
             return
         }
@@ -507,17 +553,13 @@ final class ClipboardStore: ObservableObject {
         do {
             data = try fileOperations.read(metadataURL)
         } catch {
-            if !Self.isMissingFile(error) { metadataFailure(error) }
+            if !Self.isMissingFile(error) { storageFailure(error) }
             return
         }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
         do {
-            storedEntries = try decoder.decode([StoredClipboardEntry].self, from: data)
-            guard storedEntries.allSatisfy({ $0.preview != nil || $0.sealedPreview != nil }) else {
-                throw ClipboardCryptoError.keyUnavailable
-            }
+            storedEntries = try decodeStoredEntries(data)
             entries = storedEntries.map(\.entry)
+            loadedMetadata = true
         } catch {
             quarantineCorruptFile(error: error)
         }
@@ -529,43 +571,124 @@ final class ClipboardStore: ObservableObject {
             && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code)
     }
 
-    private func metadataFailure(_ error: Error) {
-        isMetadataCorrupt = true
-        saveWorkItem?.cancel()
-        saveWorkItem = nil
-        logger.error("Clipboard storage unavailable: \(error.localizedDescription)")
-        do {
-            try fileOperations.write(Data(), metadataQuarantineMarkerURL)
-        } catch {
-            logger.error("Clipboard quarantine marker write failed: \(error.localizedDescription)")
+    private func decodeStoredEntries(_ data: Data) throws -> [StoredClipboardEntry] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode([StoredClipboardEntry].self, from: data)
+        guard decoded.allSatisfy({ $0.preview != nil || $0.sealedPreview != nil }) else {
+            throw ClipboardCryptoError.keyUnavailable
         }
+        return decoded
+    }
+
+    /// Older builds quarantine the encrypted-preview schema because their
+    /// nonoptional plaintext `preview` cannot decode `null`. Prefer a current
+    /// metadata file, then only restore the newest quarantined current-format
+    /// generation while no metadata exists, so stale recovery never overwrites
+    /// a newer file.
+    private func recoverDowngradeQuarantine() -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: metadataURL.path) {
+            guard let data = try? fileOperations.read(metadataURL),
+                  let decoded = try? decodeStoredEntries(data) else { return false }
+            do {
+                try fm.removeItem(at: metadataQuarantineMarkerURL)
+                storedEntries = decoded
+                entries = decoded.map(\.entry)
+                loadedMetadata = true
+                return true
+            } catch {
+                storageFailure(error)
+                return false
+            }
+        }
+
+        let prefix = metadataURL.lastPathComponent + ".corrupt."
+        guard let candidates = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ).filter({ $0.lastPathComponent.hasPrefix(prefix) }) else { return false }
+        let newestFirst = candidates.sorted {
+            let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return lhs > rhs
+        }
+        guard let candidate = newestFirst.first,
+              let data = try? fileOperations.read(candidate),
+              let decoded = try? decodeStoredEntries(data) else { return false }
+        do {
+            try fm.moveItem(at: candidate, to: metadataURL)
+            try fm.removeItem(at: metadataQuarantineMarkerURL)
+            storedEntries = decoded
+            entries = decoded.map(\.entry)
+            loadedMetadata = true
+            return true
+        } catch {
+            storageFailure(error)
+            return false
+        }
+    }
+
+    /// The only intentional plaintext-metadata transition is backed up before
+    /// its first replacement. The fixed filename is deliberately write-once.
+    private func preserveMigrationBackup() throws {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: migrationBackupURL.path) else { return }
+        try fm.copyItem(at: metadataURL, to: migrationBackupURL)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: migrationBackupURL.path)
+    }
+
+    private func storageFailure(_ error: Error) {
+        isStorageUnavailable = true
+        logger.error("Clipboard storage unavailable: \(error.localizedDescription)")
+    }
+
+    /// A later capture may retry only when this process successfully decoded
+    /// the metadata first. Unknown or unreadable metadata remains paused until
+    /// a fresh launch can read it safely.
+    private func resumeStorageForSafeCaptureIfPossible() -> Bool {
+        guard isStorageUnavailable, loadedMetadata else { return !isStorageUnavailable }
+        isStorageUnavailable = false
+        return true
     }
 
     private func quarantineCorruptFile(error decodeError: Error) {
         let bak = URL(fileURLWithPath: metadataURL.path + ".corrupt.\(Int(Date().timeIntervalSince1970))")
         do {
-            if FileManager.default.fileExists(atPath: bak.path) {
-                try FileManager.default.removeItem(at: bak)
-            }
             try FileManager.default.moveItem(at: metadataURL, to: bak)
+            try fileOperations.write(Data(), metadataQuarantineMarkerURL)
             logger.error("Quarantined corrupt clipboard.json → \(bak.lastPathComponent): \(decodeError.localizedDescription)")
         } catch {
             logger.error("Failed to quarantine corrupt clipboard.json: \(error.localizedDescription); original decode error: \(decodeError.localizedDescription)")
         }
         entries = []
         isMetadataCorrupt = true
-        metadataFailure(decodeError)
     }
 
     private func save() {
-        guard !isMetadataCorrupt, !isLockedOut, let crypto else { return }
+        guard !isMetadataCorrupt, !isLockedOut,
+              !(isStorageUnavailable && !loadedMetadata), let crypto else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         do {
-            let stored = try entries.map { try StoredClipboardEntry(entry: $0, crypto: crypto) }
+            if storedEntries.contains(where: { $0.preview != nil }) {
+                try preserveMigrationBackup()
+            }
+            var previous: [UUID: StoredClipboardEntry] = [:]
+            for entry in storedEntries { previous[entry.id] = entry }
+            let stored = try entries.map { entry -> StoredClipboardEntry in
+                if let sealed = previous[entry.id]?.sealedPreview,
+                   previous[entry.id]?.preview == nil {
+                    return StoredClipboardEntry(entry: entry, sealedPreview: sealed)
+                }
+                return try StoredClipboardEntry(entry: entry, crypto: crypto)
+            }
             try fileOperations.write(try encoder.encode(stored), metadataURL)
+            storedEntries = stored
+            loadedMetadata = true
+            isStorageUnavailable = false
         } catch {
-            metadataFailure(error)
+            storageFailure(error)
         }
     }
 
@@ -618,7 +741,7 @@ final class ClipboardStore: ObservableObject {
     /// those, and because the retention budget only counts bytes it knows
     /// about, they would accumulate invisibly and forever.
     private func reconcileBlobsWithMetadata(completion: @escaping () -> Void) {
-        guard !isMetadataCorrupt, !isKeyUnavailable, !isLockedOut else {
+        guard !isMetadataCorrupt, !isStorageUnavailable, !isKeyUnavailable, !isLockedOut else {
             completion()
             return
         }
@@ -629,6 +752,24 @@ final class ClipboardStore: ObservableObject {
                 // Both enumerations must succeed before deleting anything.
                 let files = try self.fileOperations.contents(self.blobsDirectory)
                 let thumbs = try self.fileOperations.contents(self.thumbsDirectory)
+                let hasCorruptSibling = try self.fileOperations.contents(self.directory).contains {
+                    $0.lastPathComponent.hasPrefix(self.metadataURL.lastPathComponent + ".corrupt.")
+                }
+                // With no readable metadata, blobs and corrupt siblings are
+                // unknown history, not proven orphans. Pause capture rather
+                // than write fresh metadata that would make a later launch
+                // sweep the preserved files.
+                guard self.loadedMetadata || (files.isEmpty && !hasCorruptSibling) else {
+                    DispatchQueue.main.async {
+                        if !self.loadedMetadata { self.isStorageUnavailable = true }
+                        completion()
+                    }
+                    return
+                }
+                guard !hasCorruptSibling else {
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
                 let present = Set(files.map(\.lastPathComponent)).intersection(known)
                 for url in files + thumbs where !known.contains(url.lastPathComponent) {
                     try self.fileOperations.remove(url)
@@ -643,7 +784,7 @@ final class ClipboardStore: ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.metadataFailure(error)
+                    self.storageFailure(error)
                     completion()
                 }
             }
@@ -710,6 +851,7 @@ final class ClipboardStore: ObservableObject {
     /// the disk write, and preview generation all happen off it, and the entry
     /// appears once the blob is safely on disk.
     func record(snapshot: TextInjector.PasteboardSnapshot, sourceBundleID: String?) {
+        guard resumeStorageForSafeCaptureIfPossible() else { return }
         guard canCapture, let crypto else { return }
         let types = Array(Set(snapshot.flatMap { $0.keys.map(\.rawValue) })).sorted()
         guard let fingerprint = captureFingerprint(snapshot: snapshot, types: types) else { return }
@@ -751,7 +893,7 @@ final class ClipboardStore: ObservableObject {
                 DispatchQueue.main.async {
                     self.inFlightFingerprints.remove(fingerprint)
                     self.captureWorkItems.removeValue(forKey: id)
-                    self.metadataFailure(error)
+                    self.storageFailure(error)
                 }
                 return
             }
@@ -777,7 +919,7 @@ final class ClipboardStore: ObservableObject {
     /// Drops the oldest entries until both the byte budget and the count cap
     /// are satisfied, deleting their blobs.
     private func pruneToBudget() {
-        guard !isMetadataCorrupt, !isLockedOut, !isKeyUnavailable else { return }
+        guard !isMetadataCorrupt, !isStorageUnavailable, !isLockedOut, !isKeyUnavailable else { return }
         var running = 0
         var keep: [ClipboardEntry] = []
         var drop: [ClipboardEntry] = []
@@ -811,12 +953,27 @@ final class ClipboardStore: ObservableObject {
             }
             return true
         } catch {
-            metadataFailure(error)
+            storageFailure(error)
             return false
         }
     }
 
     // MARK: - Read back
+
+    /// A single broken payload is reported on that row only. The original
+    /// sealed preview remains in `storedEntries`, so a later metadata save
+    /// cannot replace it with this neutral display value.
+    private func markUnreadable(_ id: UUID) {
+        let mutate = {
+            guard let index = self.entries.firstIndex(where: { $0.id == id }) else { return }
+            self.entries[index].preview = "Unavailable clipboard item"
+        }
+        if Thread.isMainThread {
+            mutate()
+        } else {
+            DispatchQueue.main.async(execute: mutate)
+        }
+    }
 
     /// Decrypts and returns the full multi-representation payload for `entry`.
     ///
@@ -825,7 +982,10 @@ final class ClipboardStore: ObservableObject {
     /// main thread in response to a click without moving it off first.
     func payload(for entry: ClipboardEntry) -> TextInjector.PasteboardSnapshot? {
         guard let crypto else { return nil }
-        guard let sealed = try? Data(contentsOf: blobURL(for: entry.id)) else { return nil }
+        guard let sealed = try? Data(contentsOf: blobURL(for: entry.id)) else {
+            markUnreadable(entry.id)
+            return nil
+        }
         do {
             let opened = try crypto.open(sealed)
             let plist = try PropertyListDecoder().decode([[String: Data]].self, from: opened)
@@ -836,6 +996,7 @@ final class ClipboardStore: ObservableObject {
             }
         } catch {
             logger.error("Clipboard blob open failed: \(error.localizedDescription)")
+            markUnreadable(entry.id)
             return nil
         }
     }

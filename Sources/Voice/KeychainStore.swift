@@ -89,6 +89,13 @@ final class KeychainStore {
         ]
     }
 
+    /// Clipboard keys are create-only because overwriting one can make all
+    /// encrypted history unreadable. Generic API-key writes must refuse them
+    /// before any Keychain mutation.
+    static func isClipboardKeyAccount(service: String, account: String) -> Bool {
+        service == ClipboardKeyStore.service && account == ClipboardKeyStore.account
+    }
+
     /// Stores (or overwrites) the key for `account`. Uses SecItemAdd first;
     /// on `errSecDuplicateItem` falls back to SecItemUpdate so re-saving an
     /// existing provider's key doesn't require a manual delete first.
@@ -106,6 +113,10 @@ final class KeychainStore {
         for account: String,
         accessibility accessibilityClass: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
     ) -> Bool {
+        guard !Self.isClipboardKeyAccount(service: service, account: account) else {
+            assertionFailure("Clipboard key must use ClipboardKeyStore.createKey")
+            return false
+        }
         guard let data = value.data(using: .utf8) else { return false }
 
         let query = Self.baseQuery(service: service, account: account)
