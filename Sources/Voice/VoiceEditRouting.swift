@@ -24,11 +24,11 @@ enum VoiceEditRouting {
             return .dictate
         }
 
-        guard selectionLength <= maximumSelectionUTF16Length else {
-            return .selectionTooLong(utf16Count: selectionLength)
-        }
         guard let selection = selectedText(in: snapshot), !selection.isEmpty else {
             return .dictate
+        }
+        guard selectionLength <= maximumSelectionUTF16Length else {
+            return .selectionTooLong(utf16Count: selectionLength)
         }
         return .edit(selection: selection)
     }
@@ -50,4 +50,22 @@ enum VoiceEditRouting {
         guard !splitsSurrogatePair(snapshot.location), !splitsSurrogatePair(end) else { return nil }
         return String(decoding: units[snapshot.location..<end], as: UTF16.self)
     }
+    /// Rewrites share cleanup's length and symbol-only checks, but deliberately
+    /// skip word preservation: changing the wording is the requested operation.
+    static func resultLooksUsable(_ result: String, over selection: String) -> Bool {
+        let output = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty, output.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
+        let ratio = Double(output.count) / Double(max(selection.count, 1))
+        return (0.4...2.0).contains(ratio)
+    }
+
+    /// The entire field value and exact range must still match the hold-start
+    /// snapshot; equal text at a different location is a different selection.
+    static func selectionMatches(held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot) -> Bool {
+        guard let held, let selected = selectedText(in: held),
+              selectedText(in: fresh) == selected else { return false }
+        return held.value == fresh.value && held.location == fresh.location
+            && held.selectionLength == fresh.selectionLength
+    }
+
 }

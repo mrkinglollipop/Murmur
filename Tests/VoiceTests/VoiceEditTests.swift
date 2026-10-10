@@ -197,4 +197,226 @@ final class VoiceEditTests: XCTestCase {
         store.voiceEditSelectedText = false
         XCTAssertFalse(defaults.bool(forKey: "voice.settings.voiceEditSelectedText"))
     }
+    func testSelectionExtraction_rejectsBothSurrogateBoundariesAndOverflowingLengths() {
+        for (location, length) in [(0, 1), (1, 1), (1, 2), (0, -1), (0, Int.max), (Int.max, 1)] {
+            let input = snapshot(value: "😀a", location: location, selectionLength: .readable(length))
+            XCTAssertNil(VoiceEditRouting.selectedText(in: input))
+            XCTAssertEqual(VoiceEditRouting.decide(snapshot: input, enabled: true, shiftHeld: false), .dictate)
+        }
+    }
+
+    func testResultSanityChecksLengthAndSymbolsWithoutPreservingWords() {
+        let selection = "Do not ship 4 units."
+        let rewrite = "Deliver five crates."
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable(rewrite, over: selection))
+        XCTAssertFalse(TranscriptionPipeline.cleanupLooksSane(input: selection, output: rewrite))
+        for invalid in ["", "  \n", "…😀!!!", "x", String(repeating: "x", count: selection.count * 2 + 1)] {
+            XCTAssertFalse(VoiceEditRouting.resultLooksUsable(invalid, over: selection))
+        }
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("12345", over: "abcdefghij"))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("abcd", over: "abcdefghij"))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: 20), over: "abcdefghij"))
+        XCTAssertFalse(VoiceEditRouting.resultLooksUsable("abc", over: "abcdefghij"))
+    }
+
+    func testSelectionRecheckRequiresReadableUnchangedValueAndExactRange() {
+        let held = snapshot(value: "same same", location: 0, selectionLength: .readable(4))
+        XCTAssertTrue(VoiceEditRouting.selectionMatches(held: held, fresh: held))
+        for fresh in [
+            CaretContext.Snapshot.unknown,
+            snapshot(value: "same same", location: 0, selectionLength: .unreadable),
+            snapshot(value: "same same", location: 0, selectionLength: .readable(0)),
+            snapshot(value: "same same", location: 5, selectionLength: .readable(4)),
+            snapshot(value: "same changed", location: 0, selectionLength: .readable(4)),
+            snapshot(value: "else same", location: 0, selectionLength: .readable(4))
+        ] {
+            XCTAssertFalse(VoiceEditRouting.selectionMatches(held: held, fresh: fresh))
+        }
+        XCTAssertFalse(VoiceEditRouting.selectionMatches(held: nil, fresh: held))
+    }
+
+    @MainActor
+    private func assertEditDelivery(
+        result: String = "New words here.",
+        fresh: CaretContext.Snapshot? = nil,
+        currentPID: pid_t? = 42,
+        secureInput: Bool = false,
+        insertResult: TextInjector.InsertResult = .inserted(deliveredText: "New words here."),
+        expectedOutcome: TranscriptionPipeline.InjectPipelineResult,
+        expectedFailure: DictationFailure? = nil,
+        expectedClipboard: String? = nil,
+        expectedInsert: String? = nil,
+        startNewHold: Bool = false
+    ) {
+        let pipeline = TranscriptionPipeline()
+        let held = snapshot(value: "Old words here.", location: 0, selectionLength: .readable(15))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        var clipboard: String?
+        var inserted: String?
+        var failure: DictationFailure?
+        pipeline.voiceEditInjectionHooks = .init(
+            target: { .init(secureInput: secureInput, pid: currentPID, bundleIdentifier: "fixture") },
+            snapshot: { fresh ?? held },
+            insert: { text in inserted = text; return insertResult },
+            leaveOnClipboard: { clipboard = $0 }
+        )
+        pipeline.runVoiceEditTransform = { instruction, selection, _ in
+            XCTAssertEqual(instruction, "rewrite this")
+            XCTAssertEqual(selection, "Old words here.")
+            if startNewHold {
+                await MainActor.run { _ = pipeline.test_holdSnapshot(held, frontmostPID: 42) }
+            }
+            return result
+        }
+        pipeline.onTranscription = { _, _ in XCTFail("Edit must bypass dictionary correction"); return ("", []) }
+        pipeline.onSnippetExpand = { _ in XCTFail("Edit must bypass snippet expansion"); return "" }
+        pipeline.onFailure = { failure = $0 }
+        let completed = expectation(description: "edit delivery completed")
+        pipeline.finishTranscription(
+            text: "rewrite this",
+            hadExplicitTrailingNewline: false,
+            engineID: "fixture",
+            audioPath: nil,
+            replaceHistoryEntryID: nil,
+            sessionHeldToken: token,
+            sessionHeldSnapshot: held,
+            sessionHeldFrontmostPID: 42,
+            completion: { outcome in
+                XCTAssertEqual(outcome, expectedOutcome)
+                completed.fulfill()
+            }
+        )
+        wait(for: [completed], timeout: 5)
+        XCTAssertEqual(failure, expectedFailure)
+        XCTAssertEqual(clipboard, expectedClipboard)
+        XCTAssertEqual(inserted, expectedInsert)
+        if startNewHold { XCTAssertEqual(pipeline.test_heldCaretSnapshot, held) }
+        else { XCTAssertNil(pipeline.test_heldCaretSnapshot) }
+    }
+
+    @MainActor
+    func testEditDeliveryUnchangedSelectionUsesOneInjectAndPreservesRewrite() {
+        assertEditDelivery(expectedOutcome: .inserted, expectedInsert: "New words here.")
+    }
+
+    @MainActor
+    func testEditDeliveryChangedOrGoneSelectionLeavesResultOnClipboard() {
+        for fresh in [
+            snapshot(value: "Old words here.", location: 0, selectionLength: .readable(0)),
+            snapshot(value: "New field text.", location: 0, selectionLength: .readable(15)),
+            CaretContext.Snapshot.unknown
+        ] {
+            assertEditDelivery(fresh: fresh, expectedOutcome: .failed,
+                expectedFailure: .injectionFailed, expectedClipboard: "New words here.")
+        }
+    }
+
+    @MainActor
+    func testEditDeliveryAppSwitchOrMissingPIDUsesClipboard() {
+        for pid: pid_t? in [99, nil] {
+            assertEditDelivery(currentPID: pid, expectedOutcome: .failed,
+                expectedFailure: .injectionFailed, expectedClipboard: "New words here.")
+        }
+    }
+
+    @MainActor
+    func testEditDeliverySecureInputBlocksBothInjectAndClipboard() {
+        assertEditDelivery(currentPID: 99, secureInput: true, expectedOutcome: .failed,
+            expectedFailure: .secureInputBlocked)
+    }
+
+    @MainActor
+    func testEditDeliveryEmptyOrRejectedResultLeavesSelectionUntouched() {
+        for result in ["", "  \n", "!!!…😀", "x", String(repeating: "x", count: 31)] {
+            assertEditDelivery(result: result, expectedOutcome: .failed, expectedFailure: .voiceEditFailed)
+        }
+        XCTAssertEqual(DictationFailure.voiceEditFailed.message, "Try rephrasing")
+    }
+
+    @MainActor
+    func testEditDeliveryDedupeDoesNotReportASecondInsert() {
+        assertEditDelivery(insertResult: .deduped, expectedOutcome: .deduped, expectedInsert: "New words here.")
+    }
+
+    @MainActor
+    func testOlderEditCannotInjectOverANewerHold() {
+        assertEditDelivery(expectedOutcome: .failed, expectedFailure: .injectionFailed,
+            expectedClipboard: "New words here.", startNewHold: true)
+    }
+
+    @MainActor
+    func testOversizedSelectionRefusesWithoutTypingTheInstruction() {
+        let pipeline = TranscriptionPipeline()
+        let text = String(repeating: "x", count: 8_001)
+        let held = snapshot(value: text, location: 0, selectionLength: .readable(8_001))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        pipeline.runVoiceEditTransform = { _, _, _ in XCTFail("Oversized selection must not reach a backend"); return "" }
+        pipeline.onTranscription = { _, _ in XCTFail("Refusal must not become dictation"); return ("", []) }
+        pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in XCTFail("Refusal must not log the instruction") }
+        pipeline.onFailure = { XCTAssertEqual($0, .voiceEditSelectionTooLong) }
+        let completed = expectation(description: "oversized edit refused")
+        pipeline.finishTranscription(text: "rewrite this", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: token, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 42,
+            completion: { XCTAssertEqual($0, .failed); completed.fulfill() })
+        wait(for: [completed], timeout: 2)
+        XCTAssertEqual(DictationFailure.voiceEditSelectionTooLong.message, "Selection too long")
+    }
+
+    private struct UnexpectedCleanup: TranscriptCleanupService {
+        func cleanup(_ text: String, codeAware: Bool, styleInstruction: String?) async throws -> String {
+            XCTFail("A spoken edit instruction must not pass through dictation cleanup")
+            return text
+        }
+    }
+
+    @MainActor
+    func testStreamingEditPreservesInstructionAndUsesConfiguredCredentialsOnce() {
+        let selector = ASREngineSelector()
+        let pipeline = selector.pipeline
+        pipeline.cleanupEnabled = true
+        pipeline.codeAware = true
+        pipeline.cleanupService = UnexpectedCleanup()
+        selector.autoRunTransform = Transform(name: "Unexpected", prompt: "Do not run for an edit")
+        var credentialReads = 0
+        selector.transformCredentialsProvider = {
+            credentialReads += 1
+            return TransformCredentials(backend: .onDevice, openAIKey: "fixture-openai", xaiKey: "fixture-xai")
+        }
+        let held = snapshot(value: "Old words here.", location: 0, selectionLength: .readable(15))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        pipeline.runVoiceEditTransform = { instruction, selection, credentials in
+            XCTAssertEqual(instruction, "put dot and new line into this text")
+            XCTAssertEqual(selection, "Old words here.")
+            XCTAssertEqual(credentials.backend, .onDevice)
+            XCTAssertEqual(credentials.openAIKey, "fixture-openai")
+            XCTAssertEqual(credentials.xaiKey, "fixture-xai")
+            return ""
+        }
+        let completed = expectation(description: "streamed edit completed")
+        pipeline.onFailure = { XCTAssertEqual($0, .voiceEditFailed) }
+        pipeline.logStreamedTranscription(text: "put dot and new line into this text", engineID: "fixture",
+            sessionHeldToken: token, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 42,
+            completion: { XCTAssertEqual($0, .failed); completed.fulfill() })
+        wait(for: [completed], timeout: 5)
+        XCTAssertEqual(credentialReads, 1)
+        XCTAssertEqual(TransformRunner.orderedBackends(preferring: .onDevice), [.onDevice])
+    }
+
+    func testInjectorRejectsTargetSwitchAfterSelectionRecheckWithoutPostingEvents() {
+        let pasteboard = NSPasteboard(name: .init("murmur.voice-edit.\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        let injector = TextInjector(hooks: .init(
+            pasteboard: pasteboard,
+            target: { .init(secureInput: false, pid: 99, bundleIdentifier: "fixture") },
+            createObserver: { XCTFail("Target mismatch must not create an event tap"); return nil },
+            postUnicode: { _ in XCTFail("Target mismatch must not type"); return 0 },
+            postPasteChord: { XCTFail("Target mismatch must not paste"); return false },
+            postCanary: { XCTFail("Target mismatch must not probe"); return false },
+            waitForConfirmation: { _, _ in XCTFail("Target mismatch has no delivery to confirm"); return 0 }
+        ))
+        XCTAssertEqual(injector.insert("New words here.", expectedTargetPID: 42), .failed)
+        XCTAssertEqual(pasteboard.string(forType: .string), "New words here.")
+    }
+
 }
