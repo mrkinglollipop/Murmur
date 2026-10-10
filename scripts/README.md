@@ -14,7 +14,25 @@
 | `generate-app-icon.sh` | Regenerate iconset + `AppIcon.icns` from source PNG | After changing icon artwork |
 | `test-app-icon-helpers.sh` | Offline oracle for icon geometry / drift | After editing icon assets or generator |
 
-**Release path:** `make-dmg.sh` → `publish-sparkle.sh`.
+## Public release
+
+`publish-sparkle.sh` builds its own fresh DMG with `make-dmg.sh`, then mounts
+that exact artifact to check app identity, versions, notarization and signing.
+`DERIVED` can locate Sparkle tools but never selects the app to validate.
+
+Public publishing rejects `SKIP_MAKE_DMG=1`: a reused artifact has no
+authenticated binding to the committed source revision. Git status errors and
+dirty working trees both stop publication before artifact work.
+
+Versioned DMGs are immutable. `ALLOW_REPUBLISH_VERSION=1` no longer permits
+replacement, including after an interrupted publish. Bump both version numbers
+before publishing again. Versioned uploads never use `--clobber`, so an asset
+appearing after preflight also cannot be deleted. The appcast and stable
+`Murmur.dmg` alias retain their existing replacement behavior.
+
+`ALLOW_UNNOTARIZED=1` remains local-only and always builds a fresh artifact.
+Run `bash scripts/test-publish-guards.sh` for the offline, shared-lock guard
+oracle. Its private command stubs never build, sign, notarize or upload.
 
 ## Signing (`DEVELOPMENT_TEAM`)
 
