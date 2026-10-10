@@ -636,11 +636,12 @@ final class TranscriptionPipeline {
     static func cleanupLooksSane(input: String, output: String) -> Bool {
         func words(_ s: String) -> [String] {
             s.lowercased()
-                .split { !$0.isLetter && !$0.isNumber }
-                .map(String.init)
+                .replacingOccurrences(of: "’", with: "'")
+                .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
+                .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
                 .filter { !$0.isEmpty }
         }
-        let inWords = Set(words(input))
+        let inWords = words(input)
         let outWords = words(output)
         // No words in the input leaves nothing to compare against.
         guard !inWords.isEmpty else { return true }
@@ -651,8 +652,10 @@ final class TranscriptionPipeline {
         // A symbol-only reply ("…", an emoji) is not a cleanup of spoken words.
         guard !outWords.isEmpty else { return false }
 
-        let newWords = outWords.filter { !inWords.contains($0) }
-        return Double(newWords.count) / Double(outWords.count) <= 0.4
+        // Only unambiguous hesitation sounds may disappear. Ordered comparison
+        // preserves repeated words, sentences, negations, and numbers.
+        let fillers: Set<String> = ["um", "uh", "erm", "hmm"]
+        return inWords.filter { !fillers.contains($0) } == outWords.filter { !fillers.contains($0) }
     }
 
     func finishTranscription(

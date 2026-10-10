@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Voice
 
@@ -6,13 +7,23 @@ final class AuditFixTests: XCTestCase {
 
     // MARK: - Transform backend selection (F-27)
 
-    func testOrderedBackends_putsThePreferredBackendFirst() {
-        for preferred in CleanupBackend.allCases {
+    func testOrderedBackends_onDeviceNeverFallsBackToCloud() {
+        XCTAssertEqual(TransformRunner.orderedBackends(preferring: .onDevice), [.onDevice])
+    }
+
+    func testOrderedBackends_cloudSelectionsKeepConfiguredFallbacks() {
+        for preferred in [CleanupBackend.cloud, .xaiGrok] {
             let ordered = TransformRunner.orderedBackends(preferring: preferred)
             XCTAssertEqual(ordered.first, preferred)
             XCTAssertEqual(Set(ordered), Set(CleanupBackend.allCases))
             XCTAssertEqual(ordered.count, CleanupBackend.allCases.count, "no duplicates")
         }
+    }
+
+    func testUnavailableOnDeviceTransformExplainsPrivacyBoundary() {
+        let message = TransformRunnerError.onDeviceUnavailable.localizedDescription
+        XCTAssertTrue(message.contains("on-device model is unavailable"))
+        XCTAssertTrue(message.contains("no text was sent to a cloud backend"))
     }
 
     func testTransformCredentials_cloudNeedsAnOpenAIKey() {
@@ -42,6 +53,35 @@ final class AuditFixTests: XCTestCase {
         XCTAssertNil(TransformCredentials.unavailable.openAIKey)
         XCTAssertNil(TransformCredentials.unavailable.xaiKey)
         XCTAssertEqual(TransformCredentials.unavailable.backend, .onDevice)
+    }
+
+    // MARK: - Per-app style target
+
+    @MainActor
+    func testStyleTargetSkipsNonRegularAppsAndMurmur() {
+        for policy in [NSApplication.ActivationPolicy.accessory, .prohibited] {
+            XCTAssertNil(StyleStore.externalApp(
+                bundleID: "com.apple.SecurityAgent", name: "SecurityAgent",
+                activationPolicy: policy, ownBundleID: "com.matt.voice-dictation"
+            ))
+        }
+        XCTAssertNil(StyleStore.externalApp(
+            bundleID: "com.matt.voice-dictation", name: "Murmur",
+            activationPolicy: .regular, ownBundleID: "com.matt.voice-dictation"
+        ))
+        XCTAssertNil(StyleStore.externalApp(
+            bundleID: nil, name: "Unknown", activationPolicy: .regular
+        ))
+    }
+
+    @MainActor
+    func testStyleTargetKeepsRegularExternalAppsAndNameFallback() {
+        XCTAssertEqual(StyleStore.externalApp(
+            bundleID: "com.example.editor", name: "Editor", activationPolicy: .regular
+        ), StyleStore.ExternalApp(bundleID: "com.example.editor", name: "Editor"))
+        XCTAssertEqual(StyleStore.externalApp(
+            bundleID: "com.example.editor", name: nil, activationPolicy: .regular
+        ), StyleStore.ExternalApp(bundleID: "com.example.editor", name: "com.example.editor"))
     }
 
     // MARK: - Menu-bar version line (F-04)

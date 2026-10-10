@@ -979,9 +979,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             // Loose overlap path stays ≥6 to avoid short false positives.
             guard windowSize >= 6 else { continue }
             guard wordOverlapRatio(tailStr, right) >= 0.85 else { continue }
-            let tailTokenSet = Set(normalizedTokens(tailStr))
-            let diffCount = rightWords.filter { !tailTokenSet.contains($0) }.count
-            if diffCount >= 1 { return windowSize }
+            if isKnownSpellingRefinement(earlier: tailStr, later: right) { return windowSize }
         }
         return nil
     }
@@ -1022,8 +1020,19 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         let earlierTokens = normalizedTokens(earlier)
         let laterTokens = normalizedTokens(later)
         guard laterTokens.count >= earlierTokens.count else { return false }
-        let laterTokenSet = Set(laterTokens)
-        return earlierTokens.filter { !laterTokenSet.contains($0) }.count >= 1
+        return isKnownSpellingRefinement(earlier: earlier, later: later)
+    }
+
+    /// Token overlap alone cannot distinguish restatements from changed facts.
+    /// Only the known ASR spelling alias qualifies as a substituted word.
+    private static func isKnownSpellingRefinement(earlier: String, later: String) -> Bool {
+        let earlierTokens = normalizedEquivalenceTokens(earlier)
+        let laterTokens = normalizedEquivalenceTokens(later)
+        guard earlierTokens != laterTokens else { return false }
+        func canonical(_ token: String) -> String {
+            token == "fireclaw" ? "firecrawl" : token
+        }
+        return earlierTokens.map(canonical) == laterTokens.map(canonical)
     }
 
     static func replaceTailWindow(in left: String, dropWordCount: Int, with right: String) -> String {
@@ -1149,9 +1158,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
 
                 guard wordOverlapRatio(prevStr, tailStr) >= 0.85 else { continue }
 
-                let tailTokenSet = Set(tailNorm)
-                let diffCount = prevNorm.filter { !tailTokenSet.contains($0) }.count
-                guard diffCount >= 1 else { continue }
+                guard isKnownSpellingRefinement(earlier: prevStr, later: tailStr) else { continue }
 
                 words = Array(words.dropLast(window * 2)) + tail
                 changed = true

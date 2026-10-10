@@ -47,6 +47,16 @@ final class SpokenCapitalizationTests: XCTestCase {
         )
     }
 
+    func testMultiGraphemeUppercaseLetterFailsSoft() {
+        for text in ["ß capital ß", "ﬃ capital ﬃ", "street caps ß."] {
+            XCTAssertEqual(SpokenCapitalization.apply(text), text)
+        }
+    }
+
+    func testSingleGraphemeUnicodeLetterStillCapitalizes() {
+        XCTAssertEqual(SpokenCapitalization.apply("é capital é"), "É")
+    }
+
     func testUnknownLetterWordFailSoft() {
         XCTAssertEqual(
             SpokenCapitalization.apply("api key capital foobar"),
