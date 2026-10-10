@@ -24,6 +24,8 @@ struct ScratchpadNote: Codable, Identifiable, Equatable {
 /// same load/save/thread-hop approach).
 final class ScratchpadStore: ObservableObject {
 
+    @Published private(set) var saveFailure = SaveFailureNotice()
+
     @Published private(set) var notes: [ScratchpadNote] = []
 
     private let fileURL: URL
@@ -53,6 +55,7 @@ final class ScratchpadStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("scratchpad.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -75,17 +78,30 @@ final class ScratchpadStore: ObservableObject {
             logger.error("Quarantined corrupt scratchpad.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("Failed to quarantine corrupt scratchpad.json: \(error.localizedDescription)")
         }
         notes = []
+    }
+
+    private func reportSaveFailure() {
+        saveFailure.report("Notes could not be saved. Copy any changes you want to keep before quitting.")
+    }
+
+    func dismissSaveFailure() {
+        saveFailure.dismiss()
     }
 
     private func save() {
         guard !savesBlocked else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(notes) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try encoder.encode(notes)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     // MARK: - CRUD

@@ -436,10 +436,12 @@ final class ModelManager: ObservableObject {
                     progressCallback: { progress in
                         let fraction = progress.fractionCompleted
                         Task { @MainActor in
+                            guard self.downloadTickets.isCurrent(ticket, for: model) else { return }
                             self.downloadProgress[model] = fraction
                         }
                     }
                 )
+                try Task.checkCancellation()
                 await MainActor.run {
                     guard self.downloadTickets.retire(ticket, for: model) else { return }
                     self.state[model] = .idle
@@ -449,6 +451,7 @@ final class ModelManager: ObservableObject {
                 self.refreshStatus(model)
                 self.logger.info("ModelManager: download complete for \(model.rawValue, privacy: .public)")
             } catch {
+                let cancelled = Task.isCancelled
                 self.logger.error("ModelManager: download failed for \(model.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 await MainActor.run {
                     // Cancelled or superseded: `delete` already owns the
@@ -458,7 +461,7 @@ final class ModelManager: ObservableObject {
                     // attempt starts from a clean slate rather than resuming
                     // into (or being confused by) a truncated snapshot.
                     Self.cleanupPartialDownload(for: model)
-                    self.state[model] = .failed(error.localizedDescription)
+                    self.state[model] = Self.downloadFailureState(cancelled: cancelled, message: error.localizedDescription)
                     self.downloadProgress[model] = nil
                     self.downloadTasks[model] = nil
                 }
@@ -483,6 +486,14 @@ final class ModelManager: ObservableObject {
         download(model)
     }
 
+    func cancelDownload(_ model: LocalModel) {
+        downloadTasks[model]?.cancel()
+    }
+
+    nonisolated static func downloadFailureState(cancelled: Bool, message: String) -> ModelDownloadState {
+        cancelled ? .idle : .failed(message)
+    }
+
     // MARK: - Delete
 
     /// Deletes ONLY `model`'s own folder — never a bulk/all-models wipe.
@@ -493,7 +504,7 @@ final class ModelManager: ObservableObject {
         guard let folder = Self.modelFolderURL(for: model) else { return }
 
         // Don't delete out from under an in-flight download.
-        downloadTasks[model]?.cancel()
+        cancelDownload(model)
         downloadTasks[model] = nil
         downloadTickets.revoke(for: model)
         state[model] = .idle

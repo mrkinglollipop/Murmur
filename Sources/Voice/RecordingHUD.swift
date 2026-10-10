@@ -38,6 +38,16 @@ final class RecordingHUD {
         case success
         case clipboardFlash
         case error(String)
+
+        var accessibilityAnnouncement: String {
+            switch self {
+            case .listening: return "Listening"
+            case .processing: return "Transcribing"
+            case .success: return "Dictation complete"
+            case .clipboardFlash: return "Text copied to clipboard"
+            case .error(let message): return "Dictation failed. \(message)"
+            }
+        }
     }
 
     /// Invoked on every state transition — wired by AppDelegate for menu-bar icon sync.
@@ -87,6 +97,9 @@ final class RecordingHUD {
     private var pendingHideTimer: Timer?
     private var transitionToken = HUDTransitionToken()
     private var pendingCorrectionCount: Int = 0
+    private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    private var accessibilityObserver: NSObjectProtocol?
+    private var isHiding = false
 
     /// Short label for the push-to-talk key chip (e.g. "fn", "⌥").
     private(set) var activationKeyLabel: String = "fn"
@@ -115,6 +128,36 @@ final class RecordingHUD {
         waveformView.onErrorDismiss = { [weak self] in
             self?.hide()
         }
+        waveformView.setReduceMotion(reduceMotion)
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshMotionPreference()
+        }
+    }
+
+    deinit {
+        if let accessibilityObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver)
+        }
+        pendingHideTimer?.invalidate()
+    }
+
+    private func refreshMotionPreference() {
+        reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        waveformView.setReduceMotion(reduceMotion)
+        if reduceMotion, isHiding {
+            finishHide(generation: transitionToken.generation)
+        } else if isVisible {
+            if reduceMotion {
+                panel.setFrameOrigin(mainScreenOrigin())
+                panel.alphaValue = 1
+            }
+            waveformView.startAnimating()
+            notifyLayoutChange()
+        }
     }
 
     /// Updates the key-chip label to match the configured activation key.
@@ -139,7 +182,7 @@ final class RecordingHUD {
 
         let finalOrigin = mainScreenOrigin()
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.15
+            ctx.duration = reduceMotion ? 0 : 0.15
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
             panel.animator().setFrameOrigin(finalOrigin)
@@ -210,7 +253,7 @@ final class RecordingHUD {
         let finalOrigin = mainScreenOrigin()
         panel.alphaValue = 0
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.15
+            ctx.duration = reduceMotion ? 0 : 0.15
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
             panel.animator().setFrameOrigin(finalOrigin)
@@ -282,31 +325,39 @@ final class RecordingHUD {
             onHide?()
             return
         }
+        AccessibilityAnnouncement.post("Dictation stopped", element: panel)
         // Menu-bar idle immediately. Keep `isVisible` true through the fade so
         // LearnToastHUD does not snap to resting Y while the pill is still on
         // screen; clear visibility + re-stack after the animation completes.
         onHide?()
         var slidDown = panel.frame.origin
-        slidDown.y -= 8
+        isHiding = true
+        slidDown.y -= reduceMotion ? 0 : 8
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.18
+            ctx.duration = reduceMotion ? 0 : 0.18
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             panel.animator().alphaValue = 0
             panel.animator().setFrameOrigin(slidDown)
         }, completionHandler: { [weak self] in
-            guard let self = self, self.transitionToken.isCurrent(generation), self.isVisible else { return }
-            self.isVisible = false
-            self.waveformView.stopAnimating()
-            self.panel.orderOut(nil)
-            self.waveformView.setInterimText(nil)
-            self.waveformView.setProcessingLabel(false)
-            self.resizePanel(forInterim: false)
-            self.notifyLayoutChange()
+            self?.finishHide(generation: generation)
         })
+    }
+
+    private func finishHide(generation: Int) {
+        guard transitionToken.isCurrent(generation), isVisible else { return }
+        isVisible = false
+        isHiding = false
+        waveformView.stopAnimating()
+        panel.orderOut(nil)
+        waveformView.setInterimText(nil)
+        waveformView.setProcessingLabel(false)
+        resizePanel(forInterim: false)
+        notifyLayoutChange()
     }
 
     @discardableResult
     private func beginTransition() -> Int {
+        isHiding = false
         pendingHideTimer?.invalidate()
         pendingHideTimer = nil
         return transitionToken.advance()
@@ -320,6 +371,9 @@ final class RecordingHUD {
     }
 
     private func applyState(_ newState: State) {
+        if currentState != newState || !isVisible {
+            AccessibilityAnnouncement.post(newState.accessibilityAnnouncement, element: panel)
+        }
         currentState = newState
         waveformView.setState(newState)
         // Click-through everywhere except .error (see showError/H7) — reset
@@ -347,9 +401,9 @@ final class RecordingHUD {
         frame.size.height = targetHeight
         // Growth always animates. Shrink snaps during interim churn (overlapping
         // shrink animations stack up) but animates for terminal flash states.
-        if targetHeight > panel.frame.height || animatedShrink {
+        if !reduceMotion && (targetHeight > panel.frame.height || animatedShrink) {
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
+                ctx.duration = reduceMotion ? 0 : 0.15
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().setFrame(frame, display: true)
             }
@@ -379,7 +433,7 @@ final class RecordingHUD {
 
     private func positionOnMainScreen(offsetBelowFinal: CGFloat) {
         let final = mainScreenOrigin()
-        panel.setFrameOrigin(NSPoint(x: final.x, y: final.y - offsetBelowFinal))
+        panel.setFrameOrigin(NSPoint(x: final.x, y: final.y - (reduceMotion ? 0 : offsetBelowFinal)))
     }
 }
 
@@ -406,6 +460,7 @@ private final class WaveformView: NSView {
 
     var onErrorDismiss: (() -> Void)?
 
+    private var reduceMotion = false
     private var displayTimer: Timer?
     private var state: RecordingHUD.State = .listening
 
@@ -534,6 +589,9 @@ private final class WaveformView: NSView {
 
     override func layout() {
         super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(reduceMotion)
+        defer { CATransaction.commit() }
 
         let chipWidth: CGFloat = 26
         let chipHeight: CGFloat = 18
@@ -707,7 +765,7 @@ private final class WaveformView: NSView {
 
     private func animateFlashIcon(_ icon: NSImageView) {
         icon.layer?.removeAnimation(forKey: "flashScale")
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        if reduceMotion {
             icon.layer?.setAffineTransform(.identity)
             return
         }
@@ -741,11 +799,26 @@ private final class WaveformView: NSView {
 
     // MARK: - Animation driver
 
+    func setReduceMotion(_ enabled: Bool) {
+        reduceMotion = enabled
+        if enabled {
+            stopAnimating()
+            displayedHeights = Array(repeating: restingHeight, count: barCount)
+            successIcon.layer?.setAffineTransform(.identity)
+            clipboardIcon.layer?.setAffineTransform(.identity)
+            needsLayout = true
+        }
+    }
+
     func startAnimating() {
         stopAnimating()
         noLevelTicks = 0
         levelHistory = Array(repeating: 0, count: barCount)
         displayedHeights = Array(repeating: restingHeight, count: barCount)
+        guard !reduceMotion else {
+            needsLayout = true
+            return
+        }
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -816,5 +889,18 @@ private final class WaveformView: NSView {
             let target = restingHeight + (wave * 0.5 + 0.5) * 6
             displayedHeights[i] = displayedHeights[i] + (target - displayedHeights[i]) * 0.3
         }
+    }
+}
+
+enum AccessibilityAnnouncement {
+    static func post(_ message: String, element: Any) {
+        NSAccessibility.post(
+            element: element,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue
+            ]
+        )
     }
 }

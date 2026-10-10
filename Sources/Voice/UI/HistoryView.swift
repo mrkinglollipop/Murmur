@@ -28,7 +28,8 @@ struct HistoryView: View {
     @State private var copiedID: UUID?
     @State private var editingID: UUID?
     @State private var draftText: String = ""
-    @State private var retryingID: UUID?
+    @State private var retries = HistoryRetryState()
+    @State private var exportFailure = SaveFailureNotice()
     @State private var pendingDeleteID: UUID?
     @State private var showDeleteConfirmation = false
     @State private var scrollNearTop = true
@@ -86,6 +87,8 @@ struct HistoryView: View {
                 list
             }
         }
+        .saveFailureBanner(store.saveFailure, onDismiss: store.dismissSaveFailure)
+        .saveFailureBanner(exportFailure) { exportFailure.dismiss() }
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete transcription?",
@@ -130,13 +133,20 @@ struct HistoryView: View {
     }
 
     private func exportJSON() {
-        guard let data = store.exportJSON() else { return }
+        guard let data = store.exportJSON() else {
+            reportExportFailure()
+            return
+        }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "voice-history.json"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            try? data.write(to: url, options: .atomic)
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                reportExportFailure()
+            }
         }
     }
 
@@ -147,8 +157,16 @@ struct HistoryView: View {
         panel.nameFieldStringValue = "voice-history.md"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            try? markdown.write(to: url, atomically: true, encoding: .utf8)
+            do {
+                try markdown.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                reportExportFailure()
+            }
         }
+    }
+
+    private func reportExportFailure() {
+        exportFailure.report("History could not be exported. Choose another location and try again.")
     }
 
     private var list: some View {
@@ -244,7 +262,7 @@ struct HistoryView: View {
                 Spacer()
 
                 Group {
-                    if entry.audioPath != nil, retryingID != entry.id {
+                    if entry.audioPath != nil, !retries.contains(entry.id) {
                         Button {
                             retryEntry(entry)
                         } label: {
@@ -254,7 +272,7 @@ struct HistoryView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Transcribe the recording again and save the result in History")
-                    } else if retryingID == entry.id {
+                    } else if retries.contains(entry.id) {
                         ProgressView()
                             .controlSize(.small)
                             .scaleEffect(0.7)
@@ -351,6 +369,7 @@ struct HistoryView: View {
                 }
                 if entry.audioPath != nil {
                     Button("Retry") { retryEntry(entry) }
+                        .disabled(retries.contains(entry.id))
                 }
                 Divider()
                 Button("Delete", role: .destructive) {
@@ -396,7 +415,7 @@ struct HistoryView: View {
             Text(HistoryEntry.failedPlaceholderText)
         }
         .font(.system(size: 11, weight: .medium))
-        .foregroundColor(Theme.recordRed.opacity(0.85))
+        .foregroundColor(Theme.errorText)
         .padding(.horizontal, 9)
         .padding(.vertical, 3)
         .overlay(
@@ -462,10 +481,11 @@ struct HistoryView: View {
     }
 
     private func retryEntry(_ entry: HistoryEntry) {
-        guard let selector = asrEngineSelector() else { return }
-        retryingID = entry.id
+        guard let selector = asrEngineSelector(), retries.begin(entry.id) else { return }
         store.retryTranscription(id: entry.id, asrSelector: selector) {
-            retryingID = nil
+            DispatchQueue.main.async {
+                retries.finish(entry.id)
+            }
         }
     }
 
@@ -488,4 +508,14 @@ struct HistoryView: View {
         editingID = nil
         focusedEditID = nil
     }
+}
+
+struct HistoryRetryState {
+    private var ids: Set<UUID> = []
+
+    func contains(_ id: UUID) -> Bool { ids.contains(id) }
+
+    mutating func begin(_ id: UUID) -> Bool { ids.insert(id).inserted }
+
+    mutating func finish(_ id: UUID) { ids.remove(id) }
 }

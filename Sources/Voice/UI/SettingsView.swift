@@ -142,7 +142,7 @@ struct SettingsView: View {
                             .font(Theme.body(12))
                             .foregroundColor(Theme.textPrimary)
 
-                        Text("Double-tap fn within 400ms to start hands-free recording that continues after release. Tap fn again to stop.")
+                        Text("Double-tap fn quickly to start hands-free recording that continues after release. Tap fn again to stop.")
                             .font(Theme.body(10))
                             .foregroundColor(Theme.textSecondary)
                     }
@@ -667,6 +667,7 @@ struct SettingsView: View {
                     exportRecordingsAndTranscripts()
                 }
                 .buttonStyle(.glassProminent)
+                .foregroundColor(Theme.ctaText)
                 .tint(Theme.lavender)
                 .font(Theme.body(12, weight: .medium))
             }
@@ -731,7 +732,7 @@ struct SettingsView: View {
     @ViewBuilder
     private var voiceSectionContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Toggle("Focus on my voice", isOn: $settingsStore.speakerGatingEnabled)
+            Toggle("Focus on my voice (experimental)", isOn: $settingsStore.speakerGatingEnabled)
                 .toggleStyle(.switch)
                 .font(Theme.body(12))
                 .foregroundColor(Theme.textPrimary)
@@ -786,6 +787,7 @@ struct SettingsView: View {
                     enrollmentCoordinator = makeEnrollmentCoordinator()
                 }
                 .buttonStyle(.glassProminent)
+                .foregroundColor(Theme.ctaText)
                 .tint(Theme.lavender)
                 .font(Theme.body(12, weight: .medium))
 
@@ -799,18 +801,18 @@ struct SettingsView: View {
     @ViewBuilder
     private var voiceGateTelemetrySummary: some View {
         let telemetry = settingsStore.voiceGateTelemetry
-        let prefix = telemetry.isSessionActive ? "Voice windows" : "Last session"
+        let prefix = telemetry.isSessionActive ? "Voice checks" : "Last session"
 
         if telemetry.attemptedWindows == 0 {
             let message = telemetry.isSessionActive
-                ? "\(prefix): listening — gate stats appear as one-second windows are evaluated."
-                : "\(prefix): no gate data yet — stats appear after you dictate with Focus on."
+                ? "\(prefix): Listening — voice checks appear as you dictate."
+                : "\(prefix): No voice checks yet — dictate with Focus on my voice turned on."
             Text(message)
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
                 .accessibilityLabel(message)
         } else if telemetry.evaluatedWindows == 0 {
-            let message = "\(prefix): \(telemetry.unscoredWindows) voice window\(telemetry.unscoredWindows == 1 ? "" : "s") could not be scored (gate unavailable). Speaker-gate stats only — not transcription accuracy."
+            let message = "\(prefix): \(telemetry.unscoredWindows) voice check\(telemetry.unscoredWindows == 1 ? "" : "s") could not be completed. These checks identify your voice; they do not measure transcription accuracy."
             Text(message)
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
@@ -818,14 +820,14 @@ struct SettingsView: View {
         } else {
             let medianText = telemetry.medianSimilarity.map { String(format: "%.2f", $0) } ?? "—"
             let unscoredSuffix = telemetry.unscoredWindows > 0
-                ? " · \(telemetry.unscoredWindows) unscored"
+                ? " · \(telemetry.unscoredWindows) not checked"
                 : ""
-            let summary = "\(prefix): \(telemetry.passedWindows)/\(telemetry.evaluatedWindows) voice windows passed · \(telemetry.attenuatedWindows) attenuated\(unscoredSuffix) · median \(medianText)"
+            let summary = "\(prefix): \(telemetry.passedWindows)/\(telemetry.evaluatedWindows) voice checks passed · \(telemetry.attenuatedWindows) quietened\(unscoredSuffix) · median \(medianText)"
             Text(summary)
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
                 .accessibilityLabel(summary)
-                .accessibilityHint("Speaker-gate stats for one-second audio windows. This is not transcription accuracy.")
+                .accessibilityHint("Checks that identify your voice each second. These do not measure transcription accuracy.")
         }
     }
 
@@ -898,6 +900,7 @@ struct SettingsView: View {
                         }
                     }
                     .buttonStyle(.glassProminent)
+                    .foregroundColor(Theme.ctaText)
                     .tint(Theme.lavender)
                     .font(Theme.body(11, weight: .medium))
                     .disabled(apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -982,6 +985,7 @@ struct SettingsView: View {
                         }
                     }
                     .buttonStyle(.glassProminent)
+                    .foregroundColor(Theme.ctaText)
                     .tint(Theme.lavender)
                     .font(Theme.body(11, weight: .medium))
                     .disabled(cleanupKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1129,9 +1133,18 @@ struct SettingsView: View {
                     .foregroundColor(Theme.primary)
                 }
             case .downloading:
-                Text("\(Int((modelManager.downloadProgress[model] ?? 0) * 100))%")
-                    .font(Theme.body(11))
-                    .foregroundColor(Theme.textSecondary)
+                HStack(spacing: 8) {
+                    Text("\(Int((modelManager.downloadProgress[model] ?? 0) * 100))%")
+                        .font(Theme.body(11))
+                        .foregroundColor(Theme.textSecondary)
+                    Button("Cancel") {
+                        modelManager.cancelDownload(model)
+                    }
+                    .buttonStyle(.glass)
+                    .font(Theme.body(11, weight: .medium))
+                    .foregroundColor(Theme.primary)
+                    .accessibilityLabel("Cancel \(model.displayName) download")
+                }
             case .failed:
                 Button("Retry") {
                     modelManager.retry(model)
@@ -1149,11 +1162,11 @@ struct SettingsView: View {
     private func statusLine(_ model: LocalModel, isSidecar: Bool) -> some View {
         if isSidecar {
             if let size = modelManager.diskSizeDisplay(model) {
-                Text("Managed by Parakeet sidecar (HF cache) · \(size)")
+                Text("Managed by Parakeet · \(size)")
                     .font(Theme.body(10))
                     .foregroundColor(Theme.textSecondary)
             } else {
-                Text("Managed by Parakeet sidecar — size unavailable")
+                Text("Managed by Parakeet — size unavailable")
                     .font(Theme.body(10))
                     .foregroundColor(Theme.textSecondary)
             }
