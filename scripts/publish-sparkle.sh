@@ -31,8 +31,9 @@
 #   - The app's SUPublicEDKey must equal the public half of SPARKLE_PRIVATE_KEY
 #     (the file that actually signs); a readable Keychain key must match too.
 #   - Release v<SHORT> must not already hold a DMG (the previous appcast item
-#     still points at it) unless ALLOW_REPUBLISH_VERSION=1.
-#   - SKIP_MAKE_DMG=1 + NOTARIZE=1 also needs stapler validate + codesign --strict.
+#     still points at it). ALLOW_REPUBLISH_VERSION no longer overrides this.
+#   - SKIP_MAKE_DMG=1 is refused for public publishing: reuse has no authenticated
+#     committed-source provenance. Always inspect the mounted DMG payload.
 #   Feed missing but release 'appcast' exists? scripts/recover-appcast.sh.
 #
 # After AudioRecorder / HAL / engine.start / bind changes: VoiceTests is not
@@ -40,11 +41,13 @@
 # (2026-08-17: Sparkle 0.1.36 shipped on green tests; every hold SIGABRT).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=release-lib.sh
 source "$ROOT/scripts/release-lib.sh"
 
+initialize_publish() {
+cd "$ROOT"
+trap cleanup_dmg_mount EXIT
 if [[ "${NOTARIZE:-0}" != "1" && "${ALLOW_UNNOTARIZED:-0}" != "1" ]]; then
   echo "error: NOTARIZE=1 is required (or ALLOW_UNNOTARIZED=1 for a local-only artifact)." >&2
   echo "  Notarization needs a configured notarytool profile (default NOTARY_PROFILE=AC_PASSWORD)." >&2
@@ -65,6 +68,8 @@ STAGE_APPCAST="$ROOT/build/appcast.xml"
 PREV_APPCAST="$ROOT/build/appcast.prev.xml"
 SPARKLE_ACCOUNT="${SPARKLE_ACCOUNT:-murmur}"
 SPARKLE_PRIVATE_KEY="${SPARKLE_PRIVATE_KEY:-}"
+
+}
 
 resolve_sparkle_bin() {
   if [[ -n "${SPARKLE_BIN:-}" && -x "${SPARKLE_BIN}/sign_update" ]]; then
@@ -263,13 +268,11 @@ cleanup_dmg_mount() {
     DMG_MOUNT=""
   fi
 }
-trap cleanup_dmg_mount EXIT
-
 mount_dmg_app() {
   local dmg="$1"
   cleanup_dmg_mount
-  mkdir -p "$ROOT/build"
-  DMG_MOUNT="$(mktemp -d "$ROOT/build/dmg-mount.XXXXXX")"
+  mkdir -p "$ROOT/build" || return 1
+  DMG_MOUNT="$(mktemp -d "$ROOT/build/dmg-mount.XXXXXX")" || return 1
   if ! hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$DMG_MOUNT" >/dev/null; then
     echo "error: failed to mount DMG: $dmg" >&2
     rmdir "$DMG_MOUNT" 2>/dev/null || true
@@ -346,6 +349,113 @@ load_gh_release_asset_names() {
   GH_RELEASE_ASSET_NAMES="$out"
 }
 
+assert_clean_source() {
+  local status
+  if ! status="$(git status --porcelain)"; then
+    echo "error: git status failed; cannot establish committed-source provenance." >&2
+    return 1
+  fi
+  if [[ -n "$status" ]]; then
+    echo "error: working tree is dirty; release artifacts must be built from a committed source revision." >&2
+    return 1
+  fi
+}
+
+# Versioned assets are immutable, even when a previous publish was interrupted.
+# The override cannot prove that an existing DMG is unadvertised or unused.
+guard_version_collision() {
+  if gh_release_exists "v${SHORT}" "version-collision check"; then
+    load_gh_release_asset_names "v${SHORT}"
+    local asset_status=0
+    printf '%s\n' "$GH_RELEASE_ASSET_NAMES" | assets_include_dmg || asset_status=$?
+    if [[ "$asset_status" -eq 0 ]]; then
+      echo "error: release v${SHORT} on $UPDATES_REPO already has a DMG asset." >&2
+      echo "  Versioned DMGs are immutable; ALLOW_REPUBLISH_VERSION cannot override this." >&2
+      echo "  Bump CFBundleShortVersionString/CFBundleVersion in project.yml." >&2
+      return 1
+    elif [[ "$asset_status" -ne 1 ]]; then
+      echo "error: cannot inspect release assets; refusing public publish." >&2
+      return 1
+    fi
+  fi
+}
+
+require_fresh_public_build() {
+  if [[ "${SKIP_MAKE_DMG:-0}" == "1" ]]; then
+    echo "error: SKIP_MAKE_DMG=1 is not permitted for public publishing." >&2
+    echo "  A reused DMG has no authenticated binding to the committed source revision; rebuild it." >&2
+    return 1
+  fi
+}
+
+prepare_public_dmg() {
+  require_fresh_public_build || return 1
+  echo "==> make-dmg.sh (NOTARIZE=${NOTARIZE:-0})"
+  # make-dmg.sh honors DMG_PATH; clear it and stale output so the public path
+  # always receives the artifact built during this invocation.
+  DMG="$ROOT/build/Murmur-$SHORT.dmg"
+  rm -f "$DMG" || return 1
+  env -u DMG_PATH NOTARIZE="${NOTARIZE:-0}" NOTARY_PROFILE="$NOTARY_PROFILE" bash "$ROOT/scripts/make-dmg.sh" || return 1
+  if [[ ! -f "$DMG" ]]; then
+    echo "error: expected DMG at $DMG" >&2
+    return 1
+  fi
+}
+
+validate_dmg_payload() {
+  # DerivedData can point at a different app than make-dmg.sh packages.
+  # All identity, version and signature checks must use the uploaded payload.
+  echo "==> Mounting DMG to verify Murmur.app"
+  mount_dmg_app "$DMG" || return 1
+  APP="$DMG_APP"
+  APP_SHORT="$(plist_get CFBundleShortVersionString "$APP/Contents/Info.plist")" || return 1
+  APP_BUILD="$(plist_get CFBundleVersion "$APP/Contents/Info.plist")" || return 1
+  APP_FEED="$(plist_get SUFeedURL "$APP/Contents/Info.plist")" || return 1
+  APP_PUBKEY="$(plist_get SUPublicEDKey "$APP/Contents/Info.plist")" || return 1
+  if [[ -z "$APP_PUBKEY" ]]; then
+    echo "error: Release app missing SUPublicEDKey" >&2
+    return 1
+  fi
+  if [[ -z "$APP_FEED" || "$APP_FEED" == *example.com* ]]; then
+    echo "error: Release app has missing or placeholder SUFeedURL: $APP_FEED" >&2
+    return 1
+  fi
+  if [[ "$APP_SHORT" != "$SHORT" || "$APP_BUILD" != "$BUILD" ]]; then
+    echo "error: DMG Murmur.app version $APP_SHORT/$APP_BUILD != project.yml $SHORT/$BUILD." >&2
+    return 1
+  fi
+  local app_is_pro=0
+  is_pro_app_bundle "$APP" || app_is_pro=$?
+  if [[ "$app_is_pro" -eq 0 ]]; then
+    echo "error: refusing to publish a Pro build to the public Murmur-updates feed." >&2
+    return 1
+  elif [[ "$app_is_pro" -ne 1 ]]; then
+    echo "error: cannot determine whether the built app is Pro; refusing public publish." >&2
+    return 1
+  fi
+  if ! xcrun stapler validate "$DMG"; then
+    echo "error: DMG has no valid notarization ticket: $DMG" >&2
+    return 1
+  fi
+  if ! codesign --verify --deep --strict "$APP"; then
+    echo "error: Murmur.app inside the DMG fails codesign --verify --deep --strict." >&2
+    return 1
+  fi
+  cleanup_dmg_mount
+}
+
+upload_versioned_dmg() {
+  # Without --clobber, an asset created after preflight is also preserved.
+  if gh_release_exists "$TAG" "DMG upload"; then
+    gh release upload "$TAG" "$DMG" --repo "$UPDATES_REPO" || return 1
+    gh release edit "$TAG" --repo "$UPDATES_REPO" --notes "$WHATSNEW_NOTES" || return 1
+  else
+    gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "$WHATSNEW_NOTES"
+  fi
+}
+
+publish_main() {
+initialize_publish
 # --- 1) Load / bump versions ---
 SHORT="$(yaml_get_voice_version | sed -n '1p')"
 BUILD="$(yaml_get_voice_version | sed -n '2p')"
@@ -354,10 +464,7 @@ if [[ -z "$SHORT" || -z "$BUILD" ]]; then
   exit 1
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "error: working tree is dirty; release artifacts must be built from a committed source revision." >&2
-  exit 1
-fi
+assert_clean_source || exit 1
 RELEASE_SHA="$(git rev-parse HEAD)" || {
   echo "error: could not determine the committed source revision." >&2
   exit 1
@@ -385,6 +492,8 @@ if [[ "${ALLOW_UNNOTARIZED:-0}" == "1" ]]; then
   echo "  Built from commit: $RELEASE_SHA"
   exit 0
 fi
+
+require_fresh_public_build || exit 1
 
 if [[ -z "${SPARKLE_PRIVATE_KEY}" ]]; then
   echo "error: SPARKLE_PRIVATE_KEY is unset. Set it to your EdDSA private key file, or use Keychain via SPARKLE_ACCOUNT / generate_keys --account." >&2
@@ -452,21 +561,8 @@ fi
 
 # A rebuild at the same short version would --clobber the DMG the previous
 # appcast item still points at (its edSignature would then no longer match the
-# bytes users download). Refuse before spending a build, unless overridden.
-if gh_release_exists "v${SHORT}" "version-collision check"; then
-  load_gh_release_asset_names "v${SHORT}"
-  if printf '%s\n' "$GH_RELEASE_ASSET_NAMES" | assets_include_dmg; then
-    if [[ "${ALLOW_REPUBLISH_VERSION:-0}" == "1" ]]; then
-      echo "warning: release v${SHORT} already has a DMG; ALLOW_REPUBLISH_VERSION=1 — it will be overwritten." >&2
-    else
-      echo "error: release v${SHORT} on $UPDATES_REPO already has a DMG asset." >&2
-      echo "  Publishing again would overwrite bytes the current appcast item is signed for." >&2
-      echo "  Bump CFBundleShortVersionString/CFBundleVersion in project.yml, or (deliberately," >&2
-      echo "  e.g. resuming a run that died before the appcast upload) set ALLOW_REPUBLISH_VERSION=1." >&2
-      exit 1
-    fi
-  fi
-fi
+# bytes users download). Refuse before spending a build.
+guard_version_collision || exit 1
 
 echo "==> Publishing Murmur $SHORT (build $BUILD) → $UPDATES_REPO"
 echo "  Built from commit: $RELEASE_SHA"
@@ -475,94 +571,9 @@ echo "==> xcodegen generate"
 xcodegen generate
 
 # --- 2) Notarized DMG ---
-SKIPPED_MAKE_DMG=0
-if [[ "${SKIP_MAKE_DMG:-0}" == "1" && -f "${DMG_PATH:-}" ]]; then
-  DMG="$DMG_PATH"
-  SKIPPED_MAKE_DMG=1
-  echo "==> Reusing DMG: $DMG"
-elif [[ "${SKIP_MAKE_DMG:-0}" == "1" ]]; then
-  DMG="$ROOT/build/Murmur-$SHORT.dmg"
-  if [[ ! -f "$DMG" ]]; then
-    echo "error: SKIP_MAKE_DMG=1 but no DMG at $DMG (set DMG_PATH=…)" >&2
-    exit 1
-  fi
-  SKIPPED_MAKE_DMG=1
-  echo "==> Reusing DMG: $DMG"
-else
-  echo "==> make-dmg.sh (NOTARIZE=${NOTARIZE:-0})"
-  # make-dmg.sh honors an exported DMG_PATH; this path publishes
-  # build/Murmur-$SHORT.dmg, so strip DMG_PATH (else the DMG lands elsewhere and
-  # a stale same-version build/ DMG gets published) and clear any stale file.
-  DMG="$ROOT/build/Murmur-$SHORT.dmg"
-  rm -f "$DMG"
-  env -u DMG_PATH NOTARIZE="${NOTARIZE:-0}" NOTARY_PROFILE="$NOTARY_PROFILE" bash "$ROOT/scripts/make-dmg.sh"
-fi
-if [[ ! -f "$DMG" ]]; then
-  echo "error: expected DMG at $DMG" >&2
-  exit 1
-fi
+prepare_public_dmg || exit 1
 
-# Confirm app plist. SKIP_MAKE_DMG must validate the DMG payload (not stale
-# DerivedData) against project.yml — fail closed on mismatch.
-if [[ "$SKIPPED_MAKE_DMG" == "1" ]]; then
-  echo "==> Mounting reused DMG to verify Murmur.app versions"
-  mount_dmg_app "$DMG"
-  APP="$DMG_APP"
-else
-  APP="$DERIVED/Build/Products/Release/Murmur.app"
-fi
-APP_SHORT="$(plist_get CFBundleShortVersionString "$APP/Contents/Info.plist")"
-APP_BUILD="$(plist_get CFBundleVersion "$APP/Contents/Info.plist")"
-APP_FEED="$(plist_get SUFeedURL "$APP/Contents/Info.plist")"
-APP_PUBKEY="$(plist_get SUPublicEDKey "$APP/Contents/Info.plist")"
-if [[ -z "$APP_PUBKEY" ]]; then
-  echo "error: Release app missing SUPublicEDKey" >&2
-  exit 1
-fi
-if [[ "$APP_FEED" == *example.com* ]]; then
-  echo "error: Release app still has placeholder SUFeedURL: $APP_FEED" >&2
-  exit 1
-fi
-if [[ "$APP_SHORT" != "$SHORT" || "$APP_BUILD" != "$BUILD" ]]; then
-  if [[ "$SKIPPED_MAKE_DMG" == "1" ]]; then
-    echo "error: DMG Murmur.app version $APP_SHORT/$APP_BUILD != project.yml $SHORT/$BUILD." >&2
-    echo "  Refusing SKIP_MAKE_DMG (stale or wrong DMG). Rebuild with make-dmg.sh or fix versions." >&2
-  else
-    echo "error: built app version $APP_SHORT/$APP_BUILD != project.yml $SHORT/$BUILD (did xcodegen run?)" >&2
-  fi
-  exit 1
-fi
-set +e
-is_pro_app_bundle "$APP"
-app_is_pro=$?
-set -e
-if [[ "$app_is_pro" -eq 0 ]]; then
-  echo "error: refusing to publish a Pro build to the public Murmur-updates feed." >&2
-  exit 1
-elif [[ "$app_is_pro" -ne 1 ]]; then
-  echo "error: cannot determine whether the built app is Pro; refusing public publish." >&2
-  exit 1
-fi
-if [[ "$SKIPPED_MAKE_DMG" == "1" ]]; then
-  echo "==> DMG payload versions match project.yml ($APP_SHORT / $APP_BUILD)"
-  # A reused DMG never went through make-dmg.sh in this run, so a matching
-  # version proves nothing about notarization or signing. Check both while the
-  # image is still mounted.
-  if [[ "${NOTARIZE:-0}" == "1" ]]; then
-    echo "==> NOTARIZE=1: validating reused DMG (stapler + codesign --strict)"
-    if ! xcrun stapler validate "$DMG"; then
-      echo "error: reused DMG has no valid notarization ticket (xcrun stapler validate failed): $DMG" >&2
-      echo "  Refusing SKIP_MAKE_DMG with NOTARIZE=1. Re-run make-dmg.sh with NOTARIZE=1." >&2
-      exit 1
-    fi
-    if ! codesign --verify --deep --strict "$APP"; then
-      echo "error: Murmur.app inside the reused DMG fails codesign --verify --deep --strict." >&2
-      exit 1
-    fi
-    echo "  stapled ticket valid; app signature verified"
-  fi
-  cleanup_dmg_mount
-fi
+validate_dmg_payload || exit 1
 
 # Signing (sign_update below and --verify) uses the SPARKLE_PRIVATE_KEY FILE, so
 # that file's public half — not the Keychain's — is what installed apps must
@@ -811,12 +822,7 @@ else:
             print(f"- {item}")
 PY
 )"
-if gh_release_exists "$TAG" "DMG upload"; then
-  gh release upload "$TAG" "$DMG" --repo "$UPDATES_REPO" --clobber
-  gh release edit "$TAG" --repo "$UPDATES_REPO" --notes "$WHATSNEW_NOTES"
-else
-  gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "$WHATSNEW_NOTES"
-fi
+upload_versioned_dmg || exit 1
 
 # --- 6b) Verify the bytes users will actually download, BEFORE the appcast ---
 # points at them. The local sign_update --verify covered the local file; this
@@ -942,3 +948,9 @@ echo "  Feed:   $FEED_URL"
 echo "  DMG:    $ENCLOSURE_URL"
 echo "  Stable: $STABLE_DMG_URL"
 echo "  App:    $SHORT ($BUILD) pubkey present"
+
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  publish_main "$@"
+fi
