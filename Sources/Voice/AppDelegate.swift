@@ -523,7 +523,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setMenuBarIcon(_ icon: MenuBarIcon) {
-        statusItem?.button?.image = icon.image
+        guard let button = statusItem?.button else { return }
+        button.image = icon.image
+        button.setAccessibilityLabel(icon.accessibilityDescription)
     }
 
     // MARK: - Onboarding

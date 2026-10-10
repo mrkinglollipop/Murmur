@@ -12,6 +12,11 @@ final class MenuBarIconTests: XCTestCase {
         }
     }
 
+    func testRecordingStatesHaveDistinctAccessibilityDescriptions() {
+        let descriptions = [MenuBarIcon.idle, .listening, .processing].map(\.accessibilityDescription)
+        XCTAssertEqual(Set(descriptions).count, 3)
+    }
+
     func testPausedIsFlatAndIdleIsNot() {
         XCTAssertEqual(Set(MenuBarIcon.barHeights(for: .paused)).count, 1)
         XCTAssertGreaterThan(Set(MenuBarIcon.barHeights(for: .idle)).count, 1)

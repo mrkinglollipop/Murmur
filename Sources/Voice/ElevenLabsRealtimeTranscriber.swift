@@ -318,7 +318,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         guard let continuation else { return }
         guard let pcmData = convertToPCM16(buffer) else {
             markStreamIntegrityFailed()
-            vlog("elevenlabs-stream: send — conversion produced no data, dropping buffer")
+            vlogFromAudioTap(.conversionFailure(.elevenlabs, .emptyConversion))
             return
         }
         continuation.yield(Self.makeInputAudioChunkFrame(pcmData: pcmData, commit: false))
@@ -1008,7 +1008,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
         if converter == nil || converterInputFormat != inputFormat {
             guard let newConverter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                vlog("elevenlabs-stream: failed to create AVAudioConverter for input format")
+                vlogFromAudioTap(.conversionFailure(.elevenlabs, .converterCreation))
                 return nil
             }
             converter = newConverter
@@ -1020,7 +1020,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             (Double(buffer.frameLength) * outputFormat.sampleRate / inputFormat.sampleRate).rounded(.up) + 16
         )
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            vlog("elevenlabs-stream: failed to allocate output PCM buffer")
+            vlogFromAudioTap(.conversionFailure(.elevenlabs, .bufferAllocation))
             return nil
         }
 
@@ -1037,7 +1037,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         }
 
         guard status != .error, error == nil else {
-            vlog("elevenlabs-stream: conversion error: \(error?.localizedDescription ?? "unknown")")
+            vlogFromAudioTap(.conversionFailure(.elevenlabs, .conversion))
             return nil
         }
         guard let int16Data = outputBuffer.int16ChannelData else {

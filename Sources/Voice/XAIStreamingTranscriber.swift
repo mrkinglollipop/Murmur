@@ -337,7 +337,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard let continuation else { return }
         guard let pcmData = convertToPCM16(buffer) else {
             markStreamIntegrityFailed()
-            vlog("xai-stream: send — conversion produced no data, dropping buffer")
+            vlogFromAudioTap(.conversionFailure(.xai, .emptyConversion))
             return
         }
         continuation.yield(pcmData)
@@ -1310,7 +1310,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         if converter == nil || converterInputFormat != inputFormat {
             guard let newConverter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                vlog("xai-stream: failed to create AVAudioConverter for input format")
+                vlogFromAudioTap(.conversionFailure(.xai, .converterCreation))
                 return nil
             }
             converter = newConverter
@@ -1324,7 +1324,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             (Double(buffer.frameLength) * outputFormat.sampleRate / inputFormat.sampleRate).rounded(.up) + 16
         )
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            vlog("xai-stream: failed to allocate output PCM buffer")
+            vlogFromAudioTap(.conversionFailure(.xai, .bufferAllocation))
             return nil
         }
 
@@ -1341,7 +1341,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
 
         guard status != .error, error == nil else {
-            vlog("xai-stream: conversion error: \(error?.localizedDescription ?? "unknown")")
+            vlogFromAudioTap(.conversionFailure(.xai, .conversion))
             return nil
         }
         guard let int16Data = outputBuffer.int16ChannelData else {
