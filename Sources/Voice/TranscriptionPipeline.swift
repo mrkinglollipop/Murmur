@@ -59,6 +59,7 @@ final class TranscriptionPipeline {
     /// ordinary dictation against the newer selection.
     private enum VoiceEditIntent {
         case edit(selection: String)
+        case selectionTooLong
     }
     private var voiceEditIntents: [UInt64: VoiceEditIntent] = [:]
 
@@ -67,6 +68,12 @@ final class TranscriptionPipeline {
 
     /// Active cleanup backend, or `nil` if cleanup can't run right now.
     var cleanupService: TranscriptCleanupService?
+
+    /// Injectable transform operation; production preserves TransformRunner's
+    /// backend ordering, including the on-device-only privacy boundary.
+    var runVoiceEditTransform: (String, String, TransformCredentials) async throws -> String = { instruction, selection, credentials in
+        try await TransformRunner.run(prompt: instruction, over: selection, credentials: credentials)
+    }
 
     /// Dictionary-correction hook — applied BEFORE injection and history.
     var onTranscription: ((String, String) -> (String, [CorrectionRecord]))?
@@ -115,7 +122,8 @@ final class TranscriptionPipeline {
         case .edit(let selection):
             voiceEditIntents[heldCaretToken] = .edit(selection: selection)
         case .selectionTooLong(let utf16Count):
-            vlog("voice edit selection too long: \(utf16Count) UTF-16 units; dictating normally")
+            voiceEditIntents[heldCaretToken] = .selectionTooLong
+            vlog("voice edit selection too long: \(utf16Count) UTF-16 units")
         case .dictate:
             break
         }
@@ -126,9 +134,9 @@ final class TranscriptionPipeline {
     /// When `matching` is set, clears only if the current token still matches
     /// that session — older finish/fail paths must not wipe a newer hold.
     func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
-        if let token, heldCaretToken != token { return }
         if let token {
             voiceEditIntents.removeValue(forKey: token)
+            if heldCaretToken != token { return }
         } else {
             voiceEditIntents.removeAll()
         }
@@ -411,8 +419,8 @@ final class TranscriptionPipeline {
                         model: cloudModel,
                         language: selector.selectedLanguage
                     )
-                    let cleaned = await self.applyCleanup(text)
-                    let transformed = await self.applyAutoTransform(cleaned.text)
+                    let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID)
+                    let transformed = cleaned.text
                     self.finishTranscription(
                         text: transformed,
                         hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
@@ -476,8 +484,8 @@ final class TranscriptionPipeline {
                 providedPID: providedPID
             )
         Task {
-            let cleaned = await self.applyCleanup(text)
-            let transformed = await self.applyAutoTransform(cleaned.text)
+            let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: nil)
+            let transformed = cleaned.text
             self.finishTranscription(
                 text: transformed,
                 hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
@@ -535,8 +543,8 @@ final class TranscriptionPipeline {
         Task {
             do {
                 let text = try await engine.transcribe(audioURL: audioURL)
-                let cleaned = await self.applyCleanup(text)
-                let transformed = await self.applyAutoTransform(cleaned.text)
+                let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceHistoryEntryID)
+                let transformed = cleaned.text
                 self.finishTranscription(
                     text: transformed,
                     hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
@@ -602,6 +610,27 @@ final class TranscriptionPipeline {
             punctuated,
             codeAware: codeAware,
             enabled: removeFillerWords
+        )
+    }
+
+    private func prepareTranscript(
+        _ text: String,
+        holdToken: UInt64,
+        replaceHistoryEntryID: UUID?
+    ) async -> PreprocessedTranscript {
+        let isEdit = await MainActor.run {
+            replaceHistoryEntryID == nil && self.isVoiceEditHold(holdToken)
+        }
+        if isEdit {
+            return PreprocessedTranscript(
+                text: Self.normalizeTranscriptForInjection(NonSpeechAnnotations.stripRecognizedTags(text)),
+                hadExplicitTrailingNewline: false
+            )
+        }
+        let cleaned = await applyCleanup(text)
+        return PreprocessedTranscript(
+            text: await applyAutoTransform(cleaned.text),
+            hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline
         )
     }
 
@@ -780,14 +809,57 @@ final class TranscriptionPipeline {
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
+        voiceEditInstruction: String? = nil,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         let trimmed = Self.normalizeTranscriptForInjection(text)
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 
-        guard !trimmed.isEmpty else {
-            DispatchQueue.main.async {
+        DispatchQueue.main.async {
+            if replaceHistoryEntryID == nil, voiceEditInstruction == nil,
+               let intent = self.consumeVoiceEditIntent(matching: sessionHeldToken) {
+                switch intent {
+                case .selectionTooLong:
+                    self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                    self.onFailure?(.voiceEditSelectionTooLong)
+                    completion?(.failed)
+                case .edit(let selection):
+                    guard !trimmed.isEmpty else {
+                        self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                        self.onFailure?(.voiceEditFailed)
+                        completion?(.failed)
+                        return
+                    }
+                    let credentials = self.engineSelector?.transformCredentialsProvider?() ?? .unavailable
+                    Task {
+                        do {
+                            let result = try await self.runVoiceEditTransform(trimmed, selection, credentials)
+                            self.finishTranscription(
+                                text: result,
+                                hadExplicitTrailingNewline: false,
+                                engineID: engineID,
+                                audioPath: audioPath,
+                                replaceHistoryEntryID: nil,
+                                sessionHeldToken: sessionHeldToken,
+                                sessionHeldSnapshot: sessionHeldSnapshot,
+                                sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                                voiceEditInstruction: trimmed,
+                                completion: completion
+                            )
+                        } catch {
+                            DispatchQueue.main.async {
+                                let abandoned = self.consumeAbandonedHold(token: sessionHeldToken, replaceHistoryEntryID: nil)
+                                self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                                if !abandoned { self.onFailure?(.voiceEditFailed) }
+                                completion?(.failed)
+                            }
+                        }
+                    }
+                }
+                return
+            }
+            guard !trimmed.isEmpty else {
                 let abandoned = self.consumeAbandonedHold(
                     token: sessionHeldToken,
                     replaceHistoryEntryID: replaceHistoryEntryID
@@ -795,27 +867,18 @@ final class TranscriptionPipeline {
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if !abandoned { self.onFailure?(.transcriptionFailed) }
-                if let audioPath {
+                if !abandoned { self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed) }
+                if let audioPath, voiceEditInstruction == nil {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
                 completion?(.failed)
-            }
-            return
-        }
-
-        DispatchQueue.main.async {
-            if self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
-                // Edit instructions must not enter dictation, History, or
-                // TextInjector while the selected text remains untouched.
-                self.clearHeldCaretSnapshot(matching: sessionHeldToken)
-                self.onFailure?(.voiceEditFailed)
-                completion?(.failed)
                 return
             }
-            let (corrected, records) = self.onTranscription?(trimmed, engineID) ?? (trimmed, [])
+            let (corrected, records) = voiceEditInstruction == nil
+                ? (self.onTranscription?(trimmed, engineID) ?? (trimmed, []))
+                : (trimmed, [])
             if !records.isEmpty { self.onCorrectionsRecorded?(records) }
-            let expanded = self.onSnippetExpand?(corrected) ?? corrected
+            let expanded = voiceEditInstruction == nil ? (self.onSnippetExpand?(corrected) ?? corrected) : corrected
             let snippetExpansionOccurred = expanded != corrected
             let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
             let abandoned = self.consumeAbandonedHold(
@@ -915,7 +978,7 @@ final class TranscriptionPipeline {
                     liveSecure = DispatchQueue.main.sync {
                         IsSecureEventInputEnabled()
                     }
-                    textToInject = Self.applyInjectTransforms(
+                    textToInject = voiceEditInstruction != nil ? expanded : Self.applyInjectTransforms(
                         expanded: Self.prepareResolvedSnapshotTextForInjection(
                             expanded: expanded,
                             snapshot: resolved,

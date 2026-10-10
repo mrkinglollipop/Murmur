@@ -154,6 +154,12 @@ final class VoiceEditTests: XCTestCase {
             snapshot(value: "selected text", location: 0, selectionLength: .readable(8))
         )
         let failure = expectation(description: "voice edit fails closed")
+        pipeline.runVoiceEditTransform = { instruction, selected, credentials in
+            XCTAssertEqual(instruction, "make it shorter")
+            XCTAssertEqual(selected, "selected")
+            XCTAssertEqual(credentials.backend, .onDevice)
+            throw TransformRunnerError.emptyResponse
+        }
         pipeline.onTranscription = { _, _ in
             XCTFail("An edit instruction must not enter ordinary dictation")
             return ("", [])

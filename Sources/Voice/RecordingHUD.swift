@@ -112,6 +112,7 @@ final class RecordingHUD {
     private var accessibilityObserver: NSObjectProtocol?
     private var isHiding = false
     private var shouldShowEditingSelection = false
+    private var recordingIsVoiceEdit = false
 
     /// Short label for the push-to-talk key chip (e.g. "fn", "⌥").
     private(set) var activationKeyLabel: String = "fn"
@@ -211,6 +212,7 @@ final class RecordingHUD {
     /// recording as an edit.
     func prepareForRecording(editingSelection: Bool) {
         shouldShowEditingSelection = editingSelection
+        recordingIsVoiceEdit = editingSelection
     }
 
     /// Switches to `.processing` state (indeterminate pulse) without
@@ -277,7 +279,7 @@ final class RecordingHUD {
     /// the waveform or changing focus.
     func clearMicrophoneNoAudio() {
         guard case .microphoneNoAudio = currentState else { return }
-        applyState(.listening)
+        applyState(recordingIsVoiceEdit ? .editingSelection : .listening)
         resizePanel(forInterim: false)
         positionOnMainScreen(offsetBelowFinal: 8)
         notifyLayoutChange()

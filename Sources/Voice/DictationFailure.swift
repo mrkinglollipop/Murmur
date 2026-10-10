@@ -9,6 +9,7 @@ enum DictationFailure: Equatable {
     case micStartFailed
     case micDeliveredNoAudio
     case secureInputBlocked
+    case voiceEditSelectionTooLong
     case voiceEditFailed
 
     /// User-facing copy for the HUD error pill.
@@ -26,6 +27,8 @@ enum DictationFailure: Equatable {
             return "No mic audio — check Sound input"
         case .secureInputBlocked:
             return "Secure field — can't paste"
+        case .voiceEditSelectionTooLong:
+            return "Selection too long"
         case .voiceEditFailed:
             return "Try rephrasing"
         }

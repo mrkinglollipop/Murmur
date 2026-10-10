@@ -33,27 +33,21 @@ enum VoiceEditRouting {
         return .edit(selection: selection)
     }
 
-    /// Extracts a UTF-16 AX selection without splitting a grapheme or trusting
-    /// an invalid range. Returns nil rather than falling through to partial text.
+    /// AX ranges may split composed graphemes at scalar boundaries, but a
+    /// boundary inside a UTF-16 surrogate pair cannot represent selected text.
     static func selectedText(in snapshot: CaretContext.Snapshot) -> String? {
-        guard case .readable(let length) = snapshot.selectionLength,
-              snapshot.location >= 0,
-              length > 0,
-              snapshot.location <= snapshot.value.utf16.count - length,
-              let range = Range(NSRange(location: snapshot.location, length: length), in: snapshot.value),
-              let lower = range.lowerBound.samePosition(in: snapshot.value.utf16),
-              let upper = range.upperBound.samePosition(in: snapshot.value.utf16)
-        else {
-            return nil
+        let units = Array(snapshot.value.utf16)
+        guard !snapshot.isUnknown,
+              case .readable(let length) = snapshot.selectionLength,
+              snapshot.location >= 0, length > 0, length <= units.count,
+              snapshot.location <= units.count - length else { return nil }
+        let end = snapshot.location + length
+        func splitsSurrogatePair(_ offset: Int) -> Bool {
+            offset > 0 && offset < units.count
+                && (0xD800...0xDBFF).contains(units[offset - 1])
+                && (0xDC00...0xDFFF).contains(units[offset])
         }
-        let actualLocation = snapshot.value.utf16.distance(
-            from: snapshot.value.utf16.startIndex,
-            to: lower
-        )
-        let actualLength = snapshot.value.utf16.distance(from: lower, to: upper)
-        guard actualLocation == snapshot.location, actualLength == length else {
-            return nil
-        }
-        return String(snapshot.value[range])
+        guard !splitsSurrogatePair(snapshot.location), !splitsSurrogatePair(end) else { return nil }
+        return String(decoding: units[snapshot.location..<end], as: UTF16.self)
     }
 }
