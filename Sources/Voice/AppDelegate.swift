@@ -158,6 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsStore.activationController = activationController
         settingsStore.asrEngineSelector = activationController?.audioRecorder.asrSelector
         settingsStore.audioRecorder = activationController?.audioRecorder
+        settingsStore.microphoneDeviceProvider = { AudioRecorder.availableInputDevices() }
         settingsStore.modelManager = modelManager
         // History must be wired before applyOnLaunch so budget prune can
         // protect failed-retry audio paths (empty keep list = data loss).
@@ -171,6 +172,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activationController?.audioRecorder.recordingBudgetBytesProvider = { [weak self] in
             self?.settingsStore.recordingBudgetBytes
                 ?? Int64(RecordingRetention.defaultBudgetMB) * 1024 * 1024
+        }
+        activationController?.audioRecorder.preferredInputDeviceUIDProvider = { [weak self] in
+            self?.settingsStore.preferredInputDeviceUID
+        }
+        activationController?.audioRecorder.excludedInputDeviceUIDsProvider = { [weak self] in
+            self?.settingsStore.excludedInputDeviceUIDs ?? []
         }
 
         settingsStore.applyOnLaunch()
@@ -592,7 +599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
         switch state {
-        case .listening:
+        case .listening, .microphoneNoAudio:
             setMenuBarIcon(.listening)
         case .processing:
             setMenuBarIcon(.processing)
