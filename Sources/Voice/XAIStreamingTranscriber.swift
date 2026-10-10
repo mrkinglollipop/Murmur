@@ -747,7 +747,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// `latestInterim` may hold unfinalized text for the current segment while
     /// `confirmedText` holds earlier chunks — returning only `confirmedText`
     /// drops that tail.
-    private func mergeConfirmedWithInterim() -> String {
+    /// Internal (not private) for @testable replay tests — see Plan 002.
+    func mergeConfirmedWithInterim() -> String {
         if confirmedText.isEmpty { return latestInterim }
         if latestInterim.isEmpty { return confirmedText }
 
@@ -776,7 +777,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     /// Incorporates a chunk- or utterance-final partial. Must be called with `stateLock` held.
-    private func ingestFinalSegment(text: String, words: [TranscriptWord], speechFinal: Bool) {
+    /// Internal (not private) for @testable replay tests — see Plan 002.
+    func ingestFinalSegment(text: String, words: [TranscriptWord], speechFinal: Bool) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 

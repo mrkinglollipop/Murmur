@@ -1,0 +1,24 @@
+{
+  "name": "regression-extension-with-trailer",
+  "events": [
+    {
+      "type": "final",
+      "text": "Has anyone built a model of the red planet?",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Has anyone built a model of the red planet from clay?",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "A sculpture though, not a globe.",
+      "speechFinal": true,
+      "words": []
+    }
+  ],
+  "expected": "Has anyone built a model of the red planet from clay? A sculpture though, not a globe."
+}
