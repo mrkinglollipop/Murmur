@@ -1,0 +1,71 @@
+import Foundation
+
+/// Decides whether a hold with a focused selection is an edit instruction or
+/// ordinary dictation. Kept pure so AX reads stay at lifecycle boundaries and the safety
+/// boundary is covered without starting recording services in tests.
+enum VoiceEditRouting {
+    static let maximumSelectionUTF16Length = 8_000
+
+    enum Decision: Equatable {
+        case dictate
+        case edit(selection: String)
+        case selectionTooLong(utf16Count: Int)
+    }
+
+    static func decide(
+        snapshot: CaretContext.Snapshot,
+        enabled: Bool,
+        shiftHeld: Bool
+    ) -> Decision {
+        guard enabled, !shiftHeld, !snapshot.isUnknown,
+              case .readable(let selectionLength) = snapshot.selectionLength,
+              selectionLength > 0
+        else {
+            return .dictate
+        }
+
+        guard let selection = selectedText(in: snapshot), !selection.isEmpty else {
+            return .dictate
+        }
+        guard selectionLength <= maximumSelectionUTF16Length else {
+            return .selectionTooLong(utf16Count: selectionLength)
+        }
+        return .edit(selection: selection)
+    }
+
+    /// AX ranges may split composed graphemes at scalar boundaries, but a
+    /// boundary inside a UTF-16 surrogate pair cannot represent selected text.
+    static func selectedText(in snapshot: CaretContext.Snapshot) -> String? {
+        let units = Array(snapshot.value.utf16)
+        guard !snapshot.isUnknown,
+              case .readable(let length) = snapshot.selectionLength,
+              snapshot.location >= 0, length > 0, length <= units.count,
+              snapshot.location <= units.count - length else { return nil }
+        let end = snapshot.location + length
+        func splitsSurrogatePair(_ offset: Int) -> Bool {
+            offset > 0 && offset < units.count
+                && (0xD800...0xDBFF).contains(units[offset - 1])
+                && (0xDC00...0xDFFF).contains(units[offset])
+        }
+        guard !splitsSurrogatePair(snapshot.location), !splitsSurrogatePair(end) else { return nil }
+        return String(decoding: units[snapshot.location..<end], as: UTF16.self)
+    }
+    /// Rewrites share cleanup's length and symbol-only checks, but deliberately
+    /// skip word preservation: changing the wording is the requested operation.
+    static func resultLooksUsable(_ result: String, over selection: String) -> Bool {
+        let output = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty, output.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
+        let ratio = Double(output.count) / Double(max(selection.count, 1))
+        return (0.4...2.0).contains(ratio)
+    }
+
+    /// The entire field value and exact range must still match the hold-start
+    /// snapshot; equal text at a different location is a different selection.
+    static func selectionMatches(held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot) -> Bool {
+        guard let held, let selected = selectedText(in: held),
+              selectedText(in: fresh) == selected else { return false }
+        return held.value == fresh.value && held.location == fresh.location
+            && held.selectionLength == fresh.selectionLength
+    }
+
+}

@@ -64,7 +64,8 @@ enum TransformRunner {
                     let session = LanguageModelSession(instructions: prompt)
                     let response = try await session.respond(to: text)
                     let result = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return result.isEmpty ? text : result
+                    guard !result.isEmpty else { throw TransformRunnerError.emptyResponse }
+                    return result
                 }
                 #endif
             case .cloud:

@@ -639,7 +639,7 @@ final class TextInjector {
     }
 
     @discardableResult
-    func insert(_ text: String) -> InsertResult {
+    func insert(_ text: String, expectedTargetPID: pid_t? = nil) -> InsertResult {
         let trimmed = Self.trimmingTrailingWhitespaceAndNewlines(text)
         guard !trimmed.isEmpty,
               trimmed.contains(where: { !$0.isWhitespace && !$0.isNewline }) else { return .failed }
@@ -647,6 +647,12 @@ final class TextInjector {
         let target = targetAtInsert()
         if target.secureInput {
             Self.log("blocked secure-input chars=\(trimmed.count)")
+            return .failed
+        }
+
+        // Keep the selection's app anchored across the pipeline-to-inject gap.
+        if let expectedTargetPID, target.pid != expectedTargetPID {
+            leaveOnClipboard(trimmed)
             return .failed
         }
 

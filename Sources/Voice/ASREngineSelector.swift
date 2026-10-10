@@ -49,9 +49,9 @@ final class ASREngineSelector {
     /// local engine rather than failing the dictation.
     var apiKeyProvider: ((CloudProvider) -> String?)?
 
-    /// OpenAI key for transform auto-run and other LLM paths that reuse the
-    /// cleanup Keychain account. Wired by `AppDelegate` to
-    /// `SettingsStore.cleanupKeyValue()`.
+    /// Configured cleanup backend and credentials, resolved fresh for saved
+    /// transforms and voice edits. Wired by `AppDelegate` to
+    /// `SettingsStore.transformCredentials()`.
     var transformCredentialsProvider: (() -> TransformCredentials)?
 
     /// BCP-47 language code for cloud/local ASR (e.g. `"en"`). Pushed by
@@ -152,8 +152,14 @@ final class ASREngineSelector {
     /// Capture caret AX snapshot on the main thread at recording-will-start.
     /// Returns the generation token for token-matched clear on failed start.
     @discardableResult
-    func holdCaretSnapshotFromRecordingWillStart() -> UInt64 {
-        pipeline.holdCaretSnapshotFromRecordingWillStart()
+    func holdCaretSnapshotFromRecordingWillStart(
+        voiceEditEnabled: Bool = true,
+        shiftHeld: Bool = false
+    ) -> UInt64 {
+        pipeline.holdCaretSnapshotFromRecordingWillStart(
+            voiceEditEnabled: voiceEditEnabled,
+            shiftHeld: shiftHeld
+        )
     }
 
     /// Clear held caret snapshot (abort / cancel / stop without inject).
@@ -165,6 +171,10 @@ final class ASREngineSelector {
     /// Package-visible held state for lifecycle unit tests.
     var test_heldCaretToken: UInt64 { pipeline.test_heldCaretToken }
     var test_heldCaretSnapshot: CaretContext.Snapshot? { pipeline.test_heldCaretSnapshot }
+
+    func isVoiceEditHold(_ token: UInt64) -> Bool {
+        pipeline.isVoiceEditHold(token)
+    }
 
     @discardableResult
     func test_holdSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
@@ -239,6 +249,11 @@ final class ASREngineSelector {
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)? {
         get { pipeline.onTranscriptionLogged }
         set { pipeline.onTranscriptionLogged = newValue }
+    }
+
+    var onVoiceEditLogged: ((String, String, String, Bool, Bool) -> Void)? {
+        get { pipeline.onVoiceEditLogged }
+        set { pipeline.onVoiceEditLogged = newValue }
     }
 
     var onAbandonedHoldSaved: ((String, String, String?) -> Void)? {
