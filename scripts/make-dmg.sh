@@ -7,9 +7,6 @@
 # unnotarized DMG opens on this Mac but triggers a
 # Gatekeeper prompt (right-click > Open) on other machines.
 #
-# Assumes the Xcode project is generated (run `xcodegen generate` first if you
-# changed project.yml) — matches install-local.sh, which also builds the
-# committed project rather than regenerating.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,6 +22,9 @@ PRODUCT="$DERIVED/Build/Products/Release/Murmur.app"
 STAGE="$ROOT/build/dmg-stage"
 
 ENTITLEMENTS="$ROOT/Sources/Voice/Voice.entitlements"
+
+echo "==> xcodegen generate"
+xcodegen generate
 
 echo "==> Building Release (signed, arm64-only)"
 # Secure timestamp + no injected get-task-allow — required for Apple notarization.
@@ -69,20 +69,7 @@ codesign --force --options runtime --timestamp \
   --sign "$IDENTITY" \
   "$PRODUCT"
 codesign --verify --deep --strict "$PRODUCT"
-# Capture first, then test: in a `codesign | grep -q … && … || true` pipeline
-# under pipefail, SIGPIPE (141) or a codesign failure silently skipped the check.
-if ! ENTITLEMENTS_OUT="$(codesign -d --entitlements :- "$PRODUCT" 2>/dev/null)"; then
-  echo "error: could not read entitlements from re-signed $PRODUCT" >&2
-  exit 1
-fi
-if [[ -z "$ENTITLEMENTS_OUT" ]]; then
-  echo "error: re-signed app reports no entitlements (expected Voice.entitlements)" >&2
-  exit 1
-fi
-if grep -q get-task-allow <<<"$ENTITLEMENTS_OUT"; then
-  echo "error: get-task-allow still present after re-sign" >&2
-  exit 1
-fi
+assert_no_get_task_allow "$PRODUCT" || exit 1
 
 echo "==> Staging (Murmur.app + /Applications symlink)"
 rm -rf "$STAGE" "$DMG"
