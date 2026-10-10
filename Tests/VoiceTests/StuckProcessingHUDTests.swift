@@ -6,6 +6,54 @@ import XCTest
 /// upload + local fallback) with no History row.
 final class StuckProcessingHUDTests: XCTestCase {
 
+    // MARK: - Cloud silence versus failure
+
+    func testCloudFallbackTruthTable() {
+        XCTAssertFalse(TranscriptionPipeline.shouldFallBackToLocal(
+            after: CloudTranscriptionError.emptyTranscript(provider: .elevenLabs)))
+        XCTAssertTrue(TranscriptionPipeline.shouldFallBackToLocal(
+            after: CloudTranscriptionError.httpStatus(500, provider: .elevenLabs)))
+        XCTAssertTrue(TranscriptionPipeline.shouldFallBackToLocal(
+            after: CloudTranscriptionError(provider: .elevenLabs, message: "Decode failed")))
+        XCTAssertTrue(TranscriptionPipeline.shouldFallBackToLocal(after: URLError(.timedOut)))
+        // These providers still conflate malformed and empty responses.
+        for provider in [CloudProvider.gemini, .meta] {
+            XCTAssertTrue(TranscriptionPipeline.shouldFallBackToLocal(
+                after: CloudTranscriptionError(provider: provider, message: "No transcript in response")))
+        }
+    }
+
+    func testElevenLabsEmptyTextIsHeardNothing() {
+        XCTAssertThrowsError(try ElevenLabsTranscriptionService.decodeTranscript(
+            from: Data(#"{"text":""}"#.utf8))) { error in
+            XCTAssertEqual((error as? CloudTranscriptionError)?.heardNothing, true)
+            XCTAssertEqual((error as? CloudTranscriptionError)?.provider, .elevenLabs)
+            XCTAssertEqual(error.localizedDescription, "ElevenLabs: No transcript in response")
+        }
+    }
+
+    func testElevenLabsWhitespaceTextIsHeardNothing() {
+        XCTAssertThrowsError(try ElevenLabsTranscriptionService.decodeTranscript(
+            from: Data(#"{"text":" \t\r\n "}"#.utf8))) { error in
+            XCTAssertEqual((error as? CloudTranscriptionError)?.heardNothing, true)
+        }
+    }
+
+    func testElevenLabsMalformedResponseStillFallsBack() {
+        for json in ["not JSON", "{}", #"{"text":null}"#, #"{"text":42}"#] {
+            XCTAssertThrowsError(try ElevenLabsTranscriptionService.decodeTranscript(
+                from: Data(json.utf8))) { error in
+                XCTAssertEqual((error as? CloudTranscriptionError)?.heardNothing, false)
+                XCTAssertTrue(TranscriptionPipeline.shouldFallBackToLocal(after: error))
+            }
+        }
+    }
+
+    func testElevenLabsValidTextIsPreserved() throws {
+        XCTAssertEqual(try ElevenLabsTranscriptionService.decodeTranscript(
+            from: Data(#"{"text":" Hello there.\n"}"#.utf8)), " Hello there.\n")
+    }
+
     // MARK: - Accidental tap
 
     func testAccidentalTapTruthTable() {

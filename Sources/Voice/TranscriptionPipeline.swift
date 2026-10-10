@@ -464,6 +464,21 @@ final class TranscriptionPipeline {
                         completion: completion
                     )
                 } catch {
+                    if !Self.shouldFallBackToLocal(after: error) {
+                        vlog("cloud empty transcript [\(engineTag)] chars=0")
+                        self.finishTranscription(
+                            text: "",
+                            hadExplicitTrailingNewline: false,
+                            engineID: engineTag,
+                            audioPath: audioPath,
+                            replaceHistoryEntryID: replaceID,
+                            sessionHeldToken: sessionHeldToken,
+                            sessionHeldSnapshot: sessionHeldSnapshot,
+                            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                            completion: completion
+                        )
+                        return
+                    }
                     self.logger.error("Cloud transcription failed [\(engineTag)]: \(error.localizedDescription)")
                     vlog("cloud transcription error [\(engineTag)]: \(error.localizedDescription) — falling back to local")
                     self.transcribeLocally(
@@ -489,6 +504,10 @@ final class TranscriptionPipeline {
             sessionHeldFrontmostPID: sessionHeldFrontmostPID,
             completion: completion
         )
+    }
+
+    static func shouldFallBackToLocal(after error: Error) -> Bool {
+        (error as? CloudTranscriptionError)?.heardNothing != true
     }
 
     static func historyAudioPath(audioURL: URL, audioIsTemporary: Bool) -> String? {
