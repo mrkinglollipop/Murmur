@@ -46,9 +46,16 @@ final class CleanupSanityTests: XCTestCase {
         XCTAssertFalse(ASREngineSelector.cleanupLooksSane(input: "Charge 12.50 to the client today.", output: "Charge 12 to the client today."))
     }
 
-    func testReorderedContentRejected() {
-        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
-            input: "Alex will call Sam tomorrow.", output: "Sam will call Alex tomorrow."
+    /// Styles rewrite tone through cleanup; a rephrase that keeps every
+    /// sentence, negation and number must still pass.
+    func testRephraseKeepingContentAccepted() {
+        XCTAssertTrue(ASREngineSelector.cleanupLooksSane(
+            input: "so like I think we should um ship it on Friday. I mean the tests don't fail anymore.",
+            output: "I think we should ship it on Friday. The tests don't fail anymore."
+        ))
+        XCTAssertTrue(ASREngineSelector.cleanupLooksSane(
+            input: "I want to I want to go to the store",
+            output: "I want to go to the store."
         ))
     }
 

@@ -1023,16 +1023,36 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         return isKnownSpellingRefinement(earlier: earlier, later: later)
     }
 
-    /// Token overlap alone cannot distinguish restatements from changed facts.
-    /// Only the known ASR spelling alias qualifies as a substituted word.
+    /// Token overlap alone cannot distinguish restatements from changed facts
+    /// ("Monday morning" / "Tuesday morning"). A restatement differs only by
+    /// respelling: same token count, and every differing pair is a long,
+    /// digit-free word within two edits of its counterpart.
     private static func isKnownSpellingRefinement(earlier: String, later: String) -> Bool {
         let earlierTokens = normalizedEquivalenceTokens(earlier)
         let laterTokens = normalizedEquivalenceTokens(later)
-        guard earlierTokens != laterTokens else { return false }
-        func canonical(_ token: String) -> String {
-            token == "fireclaw" ? "firecrawl" : token
+        guard earlierTokens != laterTokens, earlierTokens.count == laterTokens.count else { return false }
+        for (a, b) in zip(earlierTokens, laterTokens) where a != b {
+            guard a.count >= 5, b.count >= 5,
+                  !a.contains(where: \.isNumber), !b.contains(where: \.isNumber),
+                  editDistance(a, b) <= 2 else { return false }
         }
-        return earlierTokens.map(canonical) == laterTokens.map(canonical)
+        return true
+    }
+
+    private static func editDistance(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        guard !a.isEmpty, !b.isEmpty else { return max(a.count, b.count) }
+        var row = Array(0...b.count)
+        for i in 1...a.count {
+            var previous = row[0]
+            row[0] = i
+            for j in 1...b.count {
+                let current = row[j]
+                row[j] = min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] == b[j - 1] ? 0 : 1))
+                previous = current
+            }
+        }
+        return row[b.count]
     }
 
     static func replaceTailWindow(in left: String, dropWordCount: Int, with right: String) -> String {
