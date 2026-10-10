@@ -1,0 +1,18 @@
+{
+  "name": "regression-short-clause-extension",
+  "events": [
+    {
+      "type": "final",
+      "text": "How do I attach ribbons?",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "How do I attach ribbons onto lanterns?",
+      "speechFinal": true,
+      "words": []
+    }
+  ],
+  "expected": "How do I attach ribbons onto lanterns?"
+}

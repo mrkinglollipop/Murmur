@@ -1,0 +1,24 @@
+{
+  "name": "chunk-overlap",
+  "events": [
+    {
+      "type": "final",
+      "text": "The silver lantern",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "silver lantern glows",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "lantern glows at dusk",
+      "speechFinal": true,
+      "words": []
+    }
+  ],
+  "expected": "The silver lantern glows at dusk"
+}

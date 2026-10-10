@@ -1,0 +1,27 @@
+{
+  "name": "speech-final-containment",
+  "events": [
+    {
+      "type": "final",
+      "text": "silver lantern",
+      "speechFinal": false,
+      "words": [],
+      "expectedAfter": "silver lantern"
+    },
+    {
+      "type": "interim",
+      "text": "irrelevant interim tail",
+      "speechFinal": false,
+      "words": [],
+      "expectedAfter": "silver lantern irrelevant interim tail"
+    },
+    {
+      "type": "final",
+      "text": "The SILVER LANTERN glows.",
+      "speechFinal": true,
+      "words": [],
+      "expectedAfter": "The SILVER LANTERN glows."
+    }
+  ],
+  "expected": "The SILVER LANTERN glows."
+}

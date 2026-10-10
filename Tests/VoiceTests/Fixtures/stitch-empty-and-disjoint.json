@@ -1,0 +1,30 @@
+{
+  "name": "empty-and-disjoint",
+  "events": [
+    {
+      "type": "final",
+      "text": "  \n ",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Paper stars rise",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "   ",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Painted moons follow",
+      "speechFinal": true,
+      "words": []
+    }
+  ],
+  "expected": "Paper stars rise Painted moons follow"
+}
