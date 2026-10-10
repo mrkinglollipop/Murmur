@@ -729,7 +729,8 @@ final class DictionaryStore: ObservableObject {
             }
 
             if let merge = findMerge(oldWords: oldWords, newWords: newWords, startOld: i, startNew: j) {
-                if let correction = recordLearnedVariant(
+                if isLearnableVariant(merge.variant),
+                   let correction = recordLearnedVariant(
                     merge.variant,
                     mapsTo: merge.term,
                     respectBlocklist: !userInitiated
@@ -742,7 +743,8 @@ final class DictionaryStore: ObservableObject {
             }
 
             if let split = findSplit(oldWords: oldWords, newWords: newWords, startOld: i, startNew: j) {
-                if let correction = recordLearnedVariant(
+                if isLearnableVariant(split.variant),
+                   let correction = recordLearnedVariant(
                     split.variant,
                     mapsTo: split.term,
                     respectBlocklist: !userInitiated
@@ -862,8 +864,9 @@ final class DictionaryStore: ObservableObject {
     private func isLearnableVariant(_ stripped: String) -> Bool {
         // A one-letter variant ("I") would rewrite every occurrence of that
         // letter/pronoun from a single edit.
-        guard stripped.count > 1 else { return false }
-        guard stripped.rangeOfCharacter(from: .decimalDigits.inverted) != nil else { return false }
+        let compact = stripped.filter { !$0.isWhitespace }
+        guard compact.count > 1 else { return false }
+        guard compact.rangeOfCharacter(from: .decimalDigits.inverted) != nil else { return false }
         return true
     }
 
@@ -951,7 +954,7 @@ final class DictionaryStore: ObservableObject {
                 $0.caseInsensitiveCompare(correction.variant) != .orderedSame
             }
             if others.isEmpty {
-                if deleteIfCreatedAndEmpty || existing.isAutoLearned {
+                if deleteIfCreatedAndEmpty && existing.isAutoLearned {
                     delete(existing)
                     return true
                 }
