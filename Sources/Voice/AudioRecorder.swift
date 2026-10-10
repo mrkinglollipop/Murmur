@@ -138,22 +138,28 @@ final class AudioRecorder {
             return
         }
         let currentDefault = Self.halDefaultInputDeviceID()
-        // Continuity appearing fires this listener ~80ms after a good start.
-        // Same Sound Input → keep the live tap. Tearing down anyway is the
-        // 195ms double-start that clips the front of the take (2026-08-19).
-        guard Self.shouldRebuildCaptureAfterInputReroute(
+        let preferredUID = preferredInputDeviceUIDProvider?()
+        let boundUID = lastBoundInputDeviceID.map {
+            Self.audioDeviceCFString($0, kAudioDevicePropertyDeviceUID)
+        }
+        let boundIsHealthy = lastBoundInputDeviceID.map {
+            Self.isAudioDeviceAlive($0) && !Self.audioDeviceInputFormatLooksDead($0)
+                && !(excludedInputDeviceUIDsProvider?() ?? []).contains(boundUID ?? "")
+        } ?? false
+        let action = MicHealth.inputRerouteAction(
             lastBound: lastBoundInputDeviceID,
-            currentDefault: currentDefault
-        ) else {
-            vlog("audio engine configuration change MID-HOLD — default unchanged, keeping live tap")
+            currentDefault: currentDefault,
+            boundUID: boundUID,
+            preferredUID: preferredUID,
+            boundIsHealthy: boundIsHealthy,
+            engineRunning: engine.isRunning
+        )
+        guard case .rebuild(let failedID) = action else {
+            vlog("audio engine configuration change MID-HOLD — keeping live tap")
             return
         }
         watchdogRetriedThisTake = true
         vlog("audio engine configuration change MID-HOLD — rebuilding engine, restarting capture")
-        let failedID = Self.excludeAfterInputReroute(
-            lastBound: lastBoundInputDeviceID,
-            currentDefault: currentDefault
-        )
         teardownMicEngine()
         rebuildEngine(excluding: failedID)
         startMicCapture(isWatchdogRetry: true, excluding: failedID)
@@ -971,6 +977,7 @@ final class AudioRecorder {
     /// guarded by `levelLock` with the cumulative RMS so an old hold cannot
     /// paint a no-audio hint over a newer hold.
     private var micHealthGeneration: UInt64 = 0
+    private var micHealthMonitor: MicHealthWarningMonitor?
 
     /// Raw-RMS speech-presence threshold. If the loudest buffer of a whole
     /// recording never crosses this, the clip is treated as silence and the
@@ -1546,6 +1553,7 @@ final class AudioRecorder {
         levelLock.lock()
         micHealthGeneration &+= 1
         levelLock.unlock()
+        startMicHealthMonitoring()
 
         if streamingCoordinator.tryStartXAI(asrSelector: asrSelector, startMicCapture: { [weak self] in
             self?.startMicCapture()
@@ -2686,7 +2694,6 @@ final class AudioRecorder {
         let alpha: Float = rawRMS > smoothedLevel ? 0.6 : 0.3
         smoothedLevel = smoothedLevel + (rawRMS - smoothedLevel) * alpha
         let level = smoothedLevel
-        let maxLevel = maxLevelObserved
         let healthGeneration = micHealthGeneration
         levelLock.unlock()
 
@@ -2704,17 +2711,35 @@ final class AudioRecorder {
                   !self.isStopping,
                   self.isCurrentMicHealthGeneration(healthGeneration)
             else { return }
-            let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? 0
-            if MicHealth.shouldShowNoAudioWarning(
-                elapsed: elapsed,
-                maxRMS: maxLevel,
-                engineRunning: self.engine.isRunning
-            ) {
-                self.hud.showMicrophoneNoAudio(self.lastBoundInputDeviceName)
-            } else if maxLevel >= MicHealth.realRMSThreshold {
-                self.hud.clearMicrophoneNoAudio()
-            }
+            self.micHealthMonitor?.evaluate()
         }
+    }
+
+    private func startMicHealthMonitoring() {
+        let generation = micHealthGeneration
+        micHealthMonitor = MicHealthWarningMonitor(
+            snapshot: { [weak self] in
+                guard let self, self.wantsRecording, !self.isStopping else { return nil }
+                self.levelLock.lock()
+                let isCurrent = generation == self.micHealthGeneration
+                let maxLevel = self.maxLevelObserved
+                self.levelLock.unlock()
+                guard isCurrent else { return nil }
+                return MicHealthWarningMonitor.Snapshot(
+                    elapsed: self.startTime.map { Date().timeIntervalSince($0) } ?? 0,
+                    maxRMS: maxLevel,
+                    engineRunning: self.engine.isRunning,
+                    deviceName: self.lastBoundInputDeviceName
+                )
+            },
+            warning: { [weak self] deviceName in
+                if let deviceName {
+                    self?.hud.showMicrophoneNoAudio(deviceName)
+                } else {
+                    self?.hud.clearMicrophoneNoAudio()
+                }
+            }
+        )
     }
 
     private func isCurrentMicHealthGeneration(_ generation: UInt64) -> Bool {
