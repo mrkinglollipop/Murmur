@@ -36,13 +36,34 @@ else
   fail "upload phase still uses bare gh release view"
 fi
 
+echo "==> local unnotarized path never reaches public release state"
+if grep -q 'git status --porcelain' "$SCRIPT" \
+  && grep -q 'if \[\[ "\${ALLOW_UNNOTARIZED:-0}" == "1" \]\]; then' "$SCRIPT" \
+  && grep -q 'is_stable_dmg_path "\$DMG" "\$ROOT/build/Murmur.dmg"' "$SCRIPT" \
+  && grep -q 'is_pro_app_bundle "\$APP"' "$SCRIPT" \
+  && grep -q 'Local-only artifact' "$SCRIPT" \
+  && grep -q 'Built from commit' "$SCRIPT"; then
+  pass "dirty tree, stable alias, Pro bundle, and commit-SHA gates are present"
+else
+  fail "publish-sparkle.sh lost a release safety gate"
+fi
+LOCAL_EXIT_LINE="$(grep -n 'Local-only artifact' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
+PUBLIC_FLOW_LINE="$(grep -n '^HAS_PRIOR=0' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
+if [[ -n "$LOCAL_EXIT_LINE" && -n "$PUBLIC_FLOW_LINE" ]] && (( LOCAL_EXIT_LINE < PUBLIC_FLOW_LINE )); then
+  pass "local-only exit precedes the public publish flow"
+else
+  fail "could not prove local-only exit precedes the public publish flow"
+fi
+
 echo "==> What's New release notes wired into appcast item"
 if grep -q 'Resources/WhatsNew/releases\.json' "$SCRIPT" \
   && grep -q 'WhatsNew' "$SCRIPT" \
-  && grep -q '<description><!\[CDATA\[' "$SCRIPT"; then
-  pass "releases.json + CDATA description in publish-sparkle.sh"
+  && grep -q '<description><!\[CDATA\[' "$SCRIPT" \
+  && grep -q 'Built from commit {release_sha}' "$SCRIPT" \
+  && grep -q 'gh release edit "\$TAG" --repo "\$UPDATES_REPO" --notes "\$WHATSNEW_NOTES"' "$SCRIPT"; then
+  pass "releases.json, commit SHA, and CDATA description in publish-sparkle.sh"
 else
-  fail "publish-sparkle.sh must build <description> from Resources/WhatsNew/releases.json"
+  fail "publish-sparkle.sh must update every release's notes from Resources/WhatsNew/releases.json with its commit SHA"
 fi
 
 echo "==> appcast description builder (python)"

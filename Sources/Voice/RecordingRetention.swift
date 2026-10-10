@@ -25,21 +25,23 @@ enum RecordingRetention {
     static var recordingsDirectoryOverride: URL?
 
     static var recordingsDirectory: URL {
+        let dir: URL
         if let recordingsDirectoryOverride {
-            try? FileManager.default.createDirectory(
-                at: recordingsDirectoryOverride,
-                withIntermediateDirectories: true
-            )
-            return recordingsDirectoryOverride
+            dir = recordingsDirectoryOverride
+        } else {
+            VoicePaths.prepareApplicationSupportVoiceDirectory()
+            dir = VoicePaths.recordingsDirectory
         }
-        VoicePaths.prepareApplicationSupportVoiceDirectory()
-        let dir = VoicePaths.recordingsDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var excludedDirectory = dir
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? excludedDirectory.setResourceValues(values)
         return dir
     }
 
     /// Copies `tempURL` into Application Support, prunes older files, and
-    /// returns the retained destination path. Returns `nil` if the copy fails.
+    /// returns the retained destination path. Returns `nil` if the copy fails or the new file is pruned.
     /// - Parameter keepPaths: absolute paths that must not be pruned (e.g.
     ///   failed history rows still eligible for retry).
     /// - Parameter maxBytes: size budget; oldest unprotected files are removed
@@ -73,6 +75,19 @@ enum RecordingRetention {
         // A newly copied file can be pruned immediately when its size exceeds
         // the selected budget. Never hand history a dangling audio path.
         return fileManager.fileExists(atPath: destination.path) ? destination : nil
+    }
+
+    /// Retention is optional; the capture remains readable until ASR completes.
+    static func handoffForTranscription(
+        from tempURL: URL,
+        keepPaths: [String] = [],
+        maxBytes: Int64 = Int64(defaultBudgetMB) * 1024 * 1024,
+        transcribe: (URL, URL?, @escaping () -> Void) -> Void
+    ) {
+        let retainedURL = retain(from: tempURL, keepPaths: keepPaths, maxBytes: maxBytes)
+        transcribe(retainedURL ?? tempURL, retainedURL) {
+            try? FileManager.default.removeItem(at: tempURL)
+        }
     }
 
     /// Total bytes of retained recording files (0 if the directory is empty/missing).

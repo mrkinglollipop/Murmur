@@ -168,10 +168,13 @@ final class SettingsStore: ObservableObject {
     /// persisted to UserDefaults — only the boolean toggle and model choice
     /// are; per-provider key presence is queried live via `hasAPIKey(for:)`.
     private let keychain = KeychainStore()
+    private let defaults: UserDefaults
+    private let profileDirectory: URL?
+    private let readAPIKey: (String) -> String?
 
     @Published var activationKeyOption: ActivationKeyOption {
         didSet {
-            UserDefaults.standard.set(activationKeyOption.rawValue, forKey: Keys.activationKey)
+            defaults.set(activationKeyOption.rawValue, forKey: Keys.activationKey)
             applyActivationKey()
         }
     }
@@ -181,7 +184,7 @@ final class SettingsStore: ObservableObject {
     /// change and on launch.
     @Published var selectedLocalModel: LocalModel {
         didSet {
-            UserDefaults.standard.set(selectedLocalModel.rawValue, forKey: Keys.selectedLocalModel)
+            defaults.set(selectedLocalModel.rawValue, forKey: Keys.selectedLocalModel)
             applyLocalModel()
             ensureSelectedModelDownloaded()
         }
@@ -192,7 +195,7 @@ final class SettingsStore: ObservableObject {
     /// and forth.
     @Published var selectedCloudModel: CloudModel {
         didSet {
-            UserDefaults.standard.set(selectedCloudModel.rawValue, forKey: Keys.selectedCloudModel)
+            defaults.set(selectedCloudModel.rawValue, forKey: Keys.selectedCloudModel)
             applyCloudSettings()
         }
     }
@@ -203,7 +206,7 @@ final class SettingsStore: ObservableObject {
     /// is stored for it — see `ASREngineSelector.transcribeAndLog`).
     @Published var useCloudEngine: Bool {
         didSet {
-            UserDefaults.standard.set(useCloudEngine, forKey: Keys.useCloudEngine)
+            defaults.set(useCloudEngine, forKey: Keys.useCloudEngine)
             applyCloudSettings()
         }
     }
@@ -214,7 +217,7 @@ final class SettingsStore: ObservableObject {
     /// now opt-in via the Settings toggle rather than on by default).
     @Published var cleanupEnabled: Bool {
         didSet {
-            UserDefaults.standard.set(cleanupEnabled, forKey: Keys.cleanupEnabled)
+            defaults.set(cleanupEnabled, forKey: Keys.cleanupEnabled)
             applyCleanupSettings()
         }
     }
@@ -222,7 +225,7 @@ final class SettingsStore: ObservableObject {
     /// Which backend runs cleanup — on-device (default) or cloud (BYO key).
     @Published var cleanupBackend: CleanupBackend {
         didSet {
-            UserDefaults.standard.set(cleanupBackend.rawValue, forKey: Keys.cleanupBackend)
+            defaults.set(cleanupBackend.rawValue, forKey: Keys.cleanupBackend)
             applyCleanupSettings()
         }
     }
@@ -231,7 +234,7 @@ final class SettingsStore: ObservableObject {
     /// honors spoken punctuation, for programmers dictating code.
     @Published var codeAwareMode: Bool {
         didSet {
-            UserDefaults.standard.set(codeAwareMode, forKey: Keys.codeAwareMode)
+            defaults.set(codeAwareMode, forKey: Keys.codeAwareMode)
             applyCleanupSettings()
         }
     }
@@ -240,7 +243,7 @@ final class SettingsStore: ObservableObject {
     /// (macOS 13+ public API — no helper-app bundle needed). Defaults to off.
     @Published var launchAtLogin: Bool {
         didSet {
-            UserDefaults.standard.set(launchAtLogin, forKey: Keys.launchAtLogin)
+            defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
             applyLaunchAtLogin()
         }
     }
@@ -249,7 +252,7 @@ final class SettingsStore: ObservableObject {
     /// gated in `AudioRecorder` via `playDictationSoundProvider`.
     @Published var playDictationSound: Bool {
         didSet {
-            UserDefaults.standard.set(playDictationSound, forKey: Keys.playDictationSound)
+            defaults.set(playDictationSound, forKey: Keys.playDictationSound)
         }
     }
 
@@ -259,7 +262,7 @@ final class SettingsStore: ObservableObject {
     /// `allowLastResortInputFallbackProvider`.
     @Published var allowLastResortInputFallback: Bool {
         didSet {
-            UserDefaults.standard.set(
+            defaults.set(
                 allowLastResortInputFallback,
                 forKey: Keys.allowLastResortInputFallback
             )
@@ -274,7 +277,7 @@ final class SettingsStore: ObservableObject {
     /// Exposed as a toggle so streaming can be A/B'd against the batch path.
     @Published var useStreaming: Bool {
         didSet {
-            UserDefaults.standard.set(useStreaming, forKey: Keys.useStreaming)
+            defaults.set(useStreaming, forKey: Keys.useStreaming)
             applyCloudSettings()
         }
     }
@@ -284,7 +287,7 @@ final class SettingsStore: ObservableObject {
     /// because provider disfluency removal can swallow deliberate corrections.
     @Published var removeFillerWords: Bool {
         didSet {
-            UserDefaults.standard.set(removeFillerWords, forKey: Keys.removeFillerWords)
+            defaults.set(removeFillerWords, forKey: Keys.removeFillerWords)
             applyCloudSettings()
         }
     }
@@ -294,7 +297,7 @@ final class SettingsStore: ObservableObject {
     /// "Focus on my voice" speaker gating.
     @Published var elevenLabsFilterBackgroundAudio: Bool {
         didSet {
-            UserDefaults.standard.set(
+            defaults.set(
                 elevenLabsFilterBackgroundAudio,
                 forKey: Keys.elevenLabsFilterBackgroundAudio
             )
@@ -304,7 +307,7 @@ final class SettingsStore: ObservableObject {
 
     @Published var elevenLabsCommitStrategy: ElevenLabsCommitStrategy {
         didSet {
-            UserDefaults.standard.set(
+            defaults.set(
                 elevenLabsCommitStrategy.rawValue,
                 forKey: Keys.elevenLabsCommitStrategy
             )
@@ -322,7 +325,7 @@ final class SettingsStore: ObservableObject {
                 elevenLabsVadThreshold = clamped
                 return
             }
-            UserDefaults.standard.set(elevenLabsVadThreshold, forKey: Keys.elevenLabsVadThreshold)
+            defaults.set(elevenLabsVadThreshold, forKey: Keys.elevenLabsVadThreshold)
             applyCloudSettings()
         }
     }
@@ -337,7 +340,7 @@ final class SettingsStore: ObservableObject {
                 elevenLabsVadSilenceThresholdSecs = clamped
                 return
             }
-            UserDefaults.standard.set(
+            defaults.set(
                 elevenLabsVadSilenceThresholdSecs,
                 forKey: Keys.elevenLabsVadSilenceThresholdSecs
             )
@@ -355,7 +358,7 @@ final class SettingsStore: ObservableObject {
                 elevenLabsMinSpeechDurationMs = clamped
                 return
             }
-            UserDefaults.standard.set(
+            defaults.set(
                 elevenLabsMinSpeechDurationMs,
                 forKey: Keys.elevenLabsMinSpeechDurationMs
             )
@@ -373,7 +376,7 @@ final class SettingsStore: ObservableObject {
                 elevenLabsMinSilenceDurationMs = clamped
                 return
             }
-            UserDefaults.standard.set(
+            defaults.set(
                 elevenLabsMinSilenceDurationMs,
                 forKey: Keys.elevenLabsMinSilenceDurationMs
             )
@@ -389,7 +392,7 @@ final class SettingsStore: ObservableObject {
                 xaiEndpointingMs = clamped
                 return
             }
-            UserDefaults.standard.set(xaiEndpointingMs, forKey: Keys.xaiEndpointingMs)
+            defaults.set(xaiEndpointingMs, forKey: Keys.xaiEndpointingMs)
             applyCloudSettings()
         }
     }
@@ -407,21 +410,21 @@ final class SettingsStore: ObservableObject {
 
     @Published var geminiVadMode: GeminiVadMode {
         didSet {
-            UserDefaults.standard.set(geminiVadMode.rawValue, forKey: Keys.geminiVadMode)
+            defaults.set(geminiVadMode.rawValue, forKey: Keys.geminiVadMode)
             applyCloudSettings()
         }
     }
 
     @Published var geminiStartSensitivity: GeminiStartSensitivity {
         didSet {
-            UserDefaults.standard.set(geminiStartSensitivity.rawValue, forKey: Keys.geminiStartSensitivity)
+            defaults.set(geminiStartSensitivity.rawValue, forKey: Keys.geminiStartSensitivity)
             applyCloudSettings()
         }
     }
 
     @Published var geminiEndSensitivity: GeminiEndSensitivity {
         didSet {
-            UserDefaults.standard.set(geminiEndSensitivity.rawValue, forKey: Keys.geminiEndSensitivity)
+            defaults.set(geminiEndSensitivity.rawValue, forKey: Keys.geminiEndSensitivity)
             applyCloudSettings()
         }
     }
@@ -433,7 +436,7 @@ final class SettingsStore: ObservableObject {
                 geminiPrefixPaddingMs = clamped
                 return
             }
-            UserDefaults.standard.set(geminiPrefixPaddingMs, forKey: Keys.geminiPrefixPaddingMs)
+            defaults.set(geminiPrefixPaddingMs, forKey: Keys.geminiPrefixPaddingMs)
             applyCloudSettings()
         }
     }
@@ -445,7 +448,7 @@ final class SettingsStore: ObservableObject {
                 geminiSilenceDurationMs = clamped
                 return
             }
-            UserDefaults.standard.set(geminiSilenceDurationMs, forKey: Keys.geminiSilenceDurationMs)
+            defaults.set(geminiSilenceDurationMs, forKey: Keys.geminiSilenceDurationMs)
             applyCloudSettings()
         }
     }
@@ -464,7 +467,7 @@ final class SettingsStore: ObservableObject {
     /// (recording continues after release until tapped again).
     @Published var useToggleLock: Bool {
         didSet {
-            UserDefaults.standard.set(useToggleLock, forKey: Keys.useToggleLock)
+            defaults.set(useToggleLock, forKey: Keys.useToggleLock)
         }
     }
 
@@ -472,7 +475,7 @@ final class SettingsStore: ObservableObject {
     /// so dictated text doesn't glue to the character before the caret.
     @Published var smartLeadingSpace: Bool {
         didSet {
-            UserDefaults.standard.set(smartLeadingSpace, forKey: Keys.smartLeadingSpace)
+            defaults.set(smartLeadingSpace, forKey: Keys.smartLeadingSpace)
             applyCleanupSettings()
         }
     }
@@ -481,7 +484,7 @@ final class SettingsStore: ObservableObject {
     @Published var learnFromInlineCorrections: Bool {
         didSet {
             guard !isHydrating else { return }
-            UserDefaults.standard.set(learnFromInlineCorrections, forKey: Keys.learnFromInlineCorrections)
+            defaults.set(learnFromInlineCorrections, forKey: Keys.learnFromInlineCorrections)
             applyLearnFromInlineCorrections()
         }
     }
@@ -494,7 +497,7 @@ final class SettingsStore: ObservableObject {
                 selectedLanguage = iso
                 return
             }
-            UserDefaults.standard.set(selectedLanguage, forKey: Keys.selectedLanguage)
+            defaults.set(selectedLanguage, forKey: Keys.selectedLanguage)
             applyLanguage()
         }
     }
@@ -503,7 +506,7 @@ final class SettingsStore: ObservableObject {
     /// profile before transcription. Requires a stored profile (session B UI).
     @Published var speakerGatingEnabled: Bool {
         didSet {
-            UserDefaults.standard.set(speakerGatingEnabled, forKey: Keys.speakerGatingEnabled)
+            defaults.set(speakerGatingEnabled, forKey: Keys.speakerGatingEnabled)
             applySpeakerGatingSettings()
         }
     }
@@ -511,7 +514,7 @@ final class SettingsStore: ObservableObject {
     /// Cosine-similarity threshold band for speaker gating (session B UI).
     @Published var speakerGatingSensitivity: VoiceGateSensitivity {
         didSet {
-            UserDefaults.standard.set(speakerGatingSensitivity.rawValue, forKey: Keys.speakerGatingSensitivity)
+            defaults.set(speakerGatingSensitivity.rawValue, forKey: Keys.speakerGatingSensitivity)
             applySpeakerGatingSettings()
         }
     }
@@ -534,7 +537,7 @@ final class SettingsStore: ObservableObject {
                 recordingBudgetMB = clamped
                 return
             }
-            UserDefaults.standard.set(recordingBudgetMB, forKey: Keys.recordingBudgetMB)
+            defaults.set(recordingBudgetMB, forKey: Keys.recordingBudgetMB)
             applyRecordingBudget()
         }
     }
@@ -567,8 +570,11 @@ final class SettingsStore: ObservableObject {
     /// init cannot prune with a nil `historyStore` (empty protect list).
     private var isHydrating = true
 
-    init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults = .standard, profileDirectory: URL? = nil,
+         apiKeyLookup: ((String) -> String?)? = nil) {
+        self.defaults = defaults
+        self.profileDirectory = profileDirectory
+        self.readAPIKey = apiKeyLookup ?? { KeychainStore().key(for: $0) }
 
         if let raw = defaults.string(forKey: Keys.activationKey),
            let option = ActivationKeyOption(rawValue: raw) {
@@ -774,7 +780,7 @@ final class SettingsStore: ObservableObject {
             speakerGatingSensitivity = .medium
         }
 
-        enrolledVoiceProfile = VoiceProfileStore().load()
+        enrolledVoiceProfile = VoiceProfileStore(directoryURL: profileDirectory).load()
 
         if defaults.object(forKey: Keys.recordingBudgetMB) != nil {
             recordingBudgetMB = Self.clampBudgetMB(defaults.integer(forKey: Keys.recordingBudgetMB))
@@ -835,7 +841,7 @@ final class SettingsStore: ObservableObject {
     /// and a profile exists, turn Focus on my voice on so a finished enrollment
     /// is immediately usable (toggle used to stay disabled until relaunch).
     func refreshEnrolledVoiceProfile(autoEnableGatingIfPresent: Bool) {
-        let profile = VoiceProfileStore().load()
+        let profile = VoiceProfileStore(directoryURL: profileDirectory).load()
         enrolledVoiceProfile = profile
         guard autoEnableGatingIfPresent, profile != nil else {
             applySpeakerGatingSettings()
@@ -868,8 +874,8 @@ final class SettingsStore: ObservableObject {
     private func applyCloudSettings() {
         guard let asrEngineSelector else { return }
         asrEngineSelector.cloudModel = useCloudEngine ? selectedCloudModel : nil
-        asrEngineSelector.apiKeyProvider = { [keychain] provider in
-            keychain.key(for: provider.keychainAccount)
+        asrEngineSelector.apiKeyProvider = { [readAPIKey] provider in
+            readAPIKey(provider.keychainAccount)
         }
         asrEngineSelector.xaiStreamingEnabled = useStreaming
         asrEngineSelector.removeFillerWordsEnabled = removeFillerWords
@@ -890,8 +896,8 @@ final class SettingsStore: ObservableObject {
         asrEngineSelector.smartLeadingSpaceEnabled = smartLeadingSpace
         asrEngineSelector.cleanupService = CleanupFactory.service(
             backend: cleanupBackend,
-            openAIKey: keychain.key(for: Self.cleanupKeyAccount),
-            xaiKey: keychain.key(for: CloudProvider.xai.keychainAccount)
+            openAIKey: readAPIKey(Self.cleanupKeyAccount),
+            xaiKey: readAPIKey(CloudProvider.xai.keychainAccount)
         )
     }
 
@@ -948,7 +954,7 @@ final class SettingsStore: ObservableObject {
 
     /// Whether a non-empty cleanup cloud API key is currently stored.
     func hasCleanupKey() -> Bool {
-        guard let key = keychain.key(for: Self.cleanupKeyAccount) else { return false }
+        guard let key = readAPIKey(Self.cleanupKeyAccount) else { return false }
         return !key.isEmpty
     }
 
@@ -957,7 +963,7 @@ final class SettingsStore: ObservableObject {
     /// account rather than a separate one (a Transform run shares cleanup's
     /// backend-selection logic).
     func cleanupKeyValue() -> String? {
-        keychain.key(for: Self.cleanupKeyAccount)
+        readAPIKey(Self.cleanupKeyAccount)
     }
 
     /// Backend choice + keys for a Transform run, resolved fresh so a Settings
@@ -966,8 +972,8 @@ final class SettingsStore: ObservableObject {
     func transformCredentials() -> TransformCredentials {
         TransformCredentials(
             backend: cleanupBackend,
-            openAIKey: keychain.key(for: Self.cleanupKeyAccount),
-            xaiKey: keychain.key(for: CloudProvider.xai.keychainAccount)
+            openAIKey: readAPIKey(Self.cleanupKeyAccount),
+            xaiKey: readAPIKey(CloudProvider.xai.keychainAccount)
         )
     }
 
@@ -990,7 +996,7 @@ final class SettingsStore: ObservableObject {
     /// currently stored — the View uses this to warn when Grok cleanup is
     /// selected but no key has been entered yet (in the Cloud Model section).
     func hasXAIKey() -> Bool {
-        guard let key = keychain.key(for: CloudProvider.xai.keychainAccount) else { return false }
+        guard let key = readAPIKey(CloudProvider.xai.keychainAccount) else { return false }
         return !key.isEmpty
     }
 
@@ -1022,7 +1028,7 @@ final class SettingsStore: ObservableObject {
 
     /// Whether a non-empty API key is currently stored for `provider`.
     func hasAPIKey(for provider: CloudProvider) -> Bool {
-        guard let key = keychain.key(for: provider.keychainAccount) else { return false }
+        guard let key = readAPIKey(provider.keychainAccount) else { return false }
         return !key.isEmpty
     }
 

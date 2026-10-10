@@ -4,6 +4,17 @@ import Carbon
 import CoreGraphics
 import Foundation
 
+protocol TextInjectionObserver: AnyObject {
+    var observedUTF16Units: Int { get }
+    var observedPasteChordCount: Int { get }
+    var keycodeZeroKeyDownCount: Int { get }
+    var canaryObservedCount: Int { get }
+    var wentBlind: Bool { get }
+    func resetObservedCount()
+    func resetCanaryCount()
+    func stop()
+}
+
 // MARK: - TextInjector
 
 /// Inserts recognised text at the current cursor position in the focused app.
@@ -22,6 +33,53 @@ import Foundation
 /// accept separately-posted unicode chunks out of order even when the event tap
 /// observes every chunk in order.
 final class TextInjector {
+
+    struct InjectionTarget {
+        let secureInput: Bool
+        let pid: pid_t?
+        let bundleIdentifier: String?
+    }
+
+    struct Hooks {
+        let pasteboard: NSPasteboard
+        let target: () -> InjectionTarget
+        let createObserver: () -> TextInjectionObserver?
+        let postUnicode: (String) -> Int
+        let postPasteChord: () -> Bool
+        let postCanary: () -> Bool
+        let waitForConfirmation: (TextInjectionObserver, ConfirmationCounter) -> Int
+    }
+
+    private let hooks: Hooks?
+    private var preparedPasteboardChangeCount: Int?
+    private var pasteboard: NSPasteboard { hooks?.pasteboard ?? .general }
+
+    init(hooks: Hooks? = nil) {
+        self.hooks = hooks
+    }
+
+    private enum InjectionAbort: Error {
+        case secureInput
+        case appSwitch
+    }
+
+    private func currentTarget() -> InjectionTarget {
+        if let hooks { return hooks.target() }
+        let app = NSWorkspace.shared.frontmostApplication
+        return InjectionTarget(
+            secureInput: IsSecureEventInputEnabled(),
+            pid: app?.processIdentifier,
+            bundleIdentifier: app?.bundleIdentifier
+        )
+    }
+
+    private func checkInjectionAllowed(targetPID: pid_t?) throws {
+        let current = currentTarget()
+        guard !current.secureInput else { throw InjectionAbort.secureInput }
+        if TranscriptionPipeline.shouldAbortInjectForFrontmostMismatch(held: targetPID, current: current.pid) {
+            throw InjectionAbort.appSwitch
+        }
+    }
 
     private static let dedupeLock = NSLock()
     private static let dedupeWindow: TimeInterval = 1.0
@@ -169,6 +227,8 @@ final class TextInjector {
     /// the previous transcript, then supersede the pending restore — losing
     /// the user's original clipboard for good.
     private static var pendingRestoreBaseline: PasteboardSnapshot?
+    private static var pendingRestoreChangeCount: Int?
+    private static var pendingRestorePasteboardName: NSPasteboard.Name?
 
     static let concealedPasteboardType = NSPasteboard.PasteboardType(
         rawValue: "org.nspasteboard.ConcealedType"
@@ -390,10 +450,12 @@ final class TextInjector {
     typealias PasteboardSnapshot = [[NSPasteboard.PasteboardType: Data]]
 
     /// Baseline for an insert about to run: the original clipboard captured by a
-    /// still-pending deferred restore, else the live pasteboard.
+    /// still-pending deferred restore, unless an external copy changed it.
     static func pasteboardBaselineSnapshot(from pasteboard: NSPasteboard) -> PasteboardSnapshot {
         restoreGenerationLock.lock()
-        let pending = pendingRestoreBaseline
+        let pending = pendingRestorePasteboardName == pasteboard.name
+            && pendingRestoreChangeCount == pasteboard.changeCount
+            ? pendingRestoreBaseline : nil
         restoreGenerationLock.unlock()
         return pending ?? pasteboardSnapshot(from: pasteboard)
     }
@@ -401,6 +463,8 @@ final class TextInjector {
     private static func clearPendingRestoreBaseline() {
         restoreGenerationLock.lock()
         pendingRestoreBaseline = nil
+        pendingRestoreChangeCount = nil
+        pendingRestorePasteboardName = nil
         restoreGenerationLock.unlock()
     }
 
@@ -451,7 +515,18 @@ final class TextInjector {
         maxAttempts: Int = 3,
         retryDelay: TimeInterval = 0.01
     ) -> Bool {
+        preparePasteboardForPasteStable(text, on: pasteboard, maxAttempts: maxAttempts, retryDelay: retryDelay, beforeWrite: {})
+    }
+
+    static func preparePasteboardForPasteStable(
+        _ text: String,
+        on pasteboard: NSPasteboard,
+        maxAttempts: Int = 3,
+        retryDelay: TimeInterval = 0.01,
+        beforeWrite: () throws -> Void
+    ) rethrows -> Bool {
         for attempt in 1...max(1, maxAttempts) {
+            try beforeWrite()
             preparePasteboardForPaste(text, on: pasteboard)
             if pasteboardHoldsExpectedString(text, on: pasteboard) {
                 return true
@@ -483,6 +558,7 @@ final class TextInjector {
         savedPasteboard: PasteboardSnapshot,
         on pasteboard: NSPasteboard = .general,
         delay: TimeInterval = pasteboardRestoreDelay,
+        expectedChangeCount: Int? = nil,
         asyncAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, work in
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
@@ -490,7 +566,10 @@ final class TextInjector {
         restoreGenerationLock.lock()
         restoreGeneration &+= 1
         let generation = restoreGeneration
+        let changeCount = expectedChangeCount ?? pasteboard.changeCount
         pendingRestoreBaseline = savedPasteboard
+        pendingRestoreChangeCount = changeCount
+        pendingRestorePasteboardName = pasteboard.name
         restoreGenerationLock.unlock()
 
         asyncAfter(delay) {
@@ -498,13 +577,16 @@ final class TextInjector {
             let current = restoreGeneration
             if generation == current {
                 pendingRestoreBaseline = nil
+                pendingRestoreChangeCount = nil
+                pendingRestorePasteboardName = nil
             }
             restoreGenerationLock.unlock()
             guard generation == current else {
                 log("skip deferred pasteboard restore — superseded")
                 return
             }
-            guard shouldRestoreSavedPasteboard(injectedText: injectedText, on: pasteboard) else {
+            guard pasteboard.changeCount == changeCount,
+                  shouldRestoreSavedPasteboard(injectedText: injectedText, on: pasteboard) else {
                 log("skip deferred pasteboard restore — external overwrite after paste")
                 return
             }
@@ -518,6 +600,8 @@ final class TextInjector {
         restoreGenerationLock.lock()
         restoreGeneration = 0
         pendingRestoreBaseline = nil
+        pendingRestoreChangeCount = nil
+        pendingRestorePasteboardName = nil
         restoreGenerationLock.unlock()
     }
 
@@ -549,9 +633,9 @@ final class TextInjector {
 
     /// `insert` normally runs off-main. AppKit's frontmost-application state is
     /// sampled on main at the actual insertion boundary, after pipeline work.
-    private static func frontmostBundleIdentifierAtInsert() -> String? {
-        let sample = { NSWorkspace.shared.frontmostApplication?.bundleIdentifier }
-        return Thread.isMainThread ? sample() : DispatchQueue.main.sync(execute: sample)
+    private func targetAtInsert() -> InjectionTarget {
+        if hooks != nil || Self.deliveryLaneForTesting != nil { return currentTarget() }
+        return Thread.isMainThread ? currentTarget() : DispatchQueue.main.sync { self.currentTarget() }
     }
 
     @discardableResult
@@ -560,15 +644,14 @@ final class TextInjector {
         guard !trimmed.isEmpty,
               trimmed.contains(where: { !$0.isWhitespace && !$0.isNewline }) else { return .failed }
 
-        if IsSecureEventInputEnabled() {
+        let target = targetAtInsert()
+        if target.secureInput {
             Self.log("blocked secure-input chars=\(trimmed.count)")
             return .failed
         }
 
         // Never synchronously hop to main while holding the dedupe lock: a
         // main-thread insertion may already be waiting for that same lock.
-        let bundleIdentifier = Self.deliveryLaneForTesting == nil
-            ? Self.frontmostBundleIdentifierAtInsert() : nil
         Self.dedupeLock.lock()
         defer { Self.dedupeLock.unlock() }
 
@@ -588,10 +671,17 @@ final class TextInjector {
         if let deliveryLane = Self.deliveryLaneForTesting {
             result = deliveryLane(trimmed) ? .inserted(deliveredText: trimmed) : .failed
         } else {
-            result = performInsert(
-                trimmed,
-                bundleIdentifier: bundleIdentifier
-            )
+            do {
+                result = try performInsert(trimmed, target: target)
+            } catch {
+                if case InjectionAbort.appSwitch = error {
+                    leaveOnClipboard(trimmed)
+                    Self.log("inject aborted — frontmost app changed")
+                } else {
+                    Self.log("inject aborted — secure input enabled")
+                }
+                result = .failed
+            }
         }
 
         if case .inserted = result {
@@ -615,12 +705,25 @@ final class TextInjector {
 
     private func attemptUnicodeTyping(
         _ trimmed: String,
-        observer: UnicodeDeliveryObserver,
+        observer: TextInjectionObserver,
         chunkTarget: Int,
-        attemptLabel: String
-    ) -> UnicodeAttemptResult {
-        observer.resetObservedCount()
-        let posted = insertViaUnicodeTyping(trimmed)
+        attemptLabel: String,
+        targetPID: pid_t?,
+        isRetry: Bool = false
+    ) throws -> UnicodeAttemptResult {
+        var acceptLateDelivery = false
+        let posted = try insertViaUnicodeTyping(trimmed, targetPID: targetPID) {
+            if isRetry, observer.wentBlind || observer.observedUTF16Units > 0 || observer.keycodeZeroKeyDownCount > 0 {
+                acceptLateDelivery = true
+                return false
+            }
+            observer.resetObservedCount()
+            return true
+        }
+        if acceptLateDelivery {
+            Self.log("late unicode evidence or blind observer before retry — accepting without retype")
+            return .confirmed
+        }
         guard posted > 0 else { return .postFailed }
 
         let observed = waitForConfirmation(observer: observer, target: posted, counter: .utf16Units)
@@ -651,9 +754,9 @@ final class TextInjector {
     ///
     /// Only the canary counter is cleared: the unicode counters must survive
     /// the wait so chunks delivered late (delayed, not dropped) are noticed.
-    private func probeCanary(observer: UnicodeDeliveryObserver, isSecondAttempt: Bool) -> CanaryVerdict {
+    private func probeCanary(observer: TextInjectionObserver, isSecondAttempt: Bool, targetPID: pid_t?) throws -> CanaryVerdict {
         observer.resetCanaryCount()
-        _ = postCanary()
+        _ = try postCanary(targetPID: targetPID)
         let observedCanary = waitForConfirmation(
             observer: observer,
             target: 1,
@@ -675,38 +778,40 @@ final class TextInjector {
         )
     }
 
-    private func performInsert(_ trimmed: String, bundleIdentifier: String?) -> InsertResult {
+    private func performInsert(_ trimmed: String, target: InjectionTarget) throws -> InsertResult {
         let utf16Count = trimmed.utf16.count
-        // Snapshot before any lane that may write the pasteboard. Unicode-first
-        // never writes on success; paste fallback needs this to put the user's
-        // prior copy back after Cmd-V.
-        // While a prior deferred restore is pending the live pasteboard holds
-        // that transcript, so the baseline is the original the restore owns.
-        let savedPasteboard = Self.pasteboardBaselineSnapshot(from: NSPasteboard.general)
-
-        guard let observer = UnicodeDeliveryObserver.create() else {
+        let createdObserver: TextInjectionObserver?
+        if let hooks {
+            createdObserver = hooks.createObserver()
+        } else {
+            createdObserver = UnicodeDeliveryObserver.create()
+        }
+        guard let observer = createdObserver else {
             // Paste-blind is unconfirmed — fail closed for watch / InsertResult.
             // Do not restore the pre-insert pasteboard: the pipeline maps this
             // to `.failed` and the HUD tells the user the transcript is on
             // the clipboard. A deferred restore would clobber that promise.
-            _ = insertViaPasteBlind(trimmed)
+            _ = try insertViaPasteBlind(trimmed, targetPID: target.pid)
             return .failed
         }
         defer { observer.stop() }
 
         let chunkTarget = Self.chunkUTF16Units(trimmed).count
         let lanes = Self.injectionLanes(
-            bundleIdentifier: bundleIdentifier,
+            bundleIdentifier: target.bundleIdentifier,
             chunkCount: chunkTarget
         )
 
         if lanes == [.pasteOnce] {
-            let pasteSucceeded = tryPasteLane(trimmed, observer: observer, retryOnAmbiguous: false)
+            let savedPasteboard = Self.pasteboardBaselineSnapshot(from: pasteboard)
+            let pasteSucceeded = try tryPasteLane(trimmed, observer: observer, retryOnAmbiguous: false, targetPID: target.pid)
             if pasteSucceeded {
                 Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
                 Self.scheduleDeferredPasteboardRestore(
                     injectedText: trimmed,
-                    savedPasteboard: savedPasteboard
+                    savedPasteboard: savedPasteboard,
+                    on: pasteboard,
+                    expectedChangeCount: preparedPasteboardChangeCount
                 )
                 Self.log("Safari atomic paste transport observed chars=\(utf16Count) — target acceptance unverified")
                 return .inserted(deliveredText: trimmed)
@@ -728,25 +833,25 @@ final class TextInjector {
         // moment AND it proves our text did not arrive. Anything unprovable
         // is accepted once and logged — a silently-lost dictation beats
         // duplicated text.
-        switch attemptUnicodeTyping(trimmed, observer: observer, chunkTarget: chunkTarget, attemptLabel: "") {
+        switch try attemptUnicodeTyping(trimmed, observer: observer, chunkTarget: chunkTarget, attemptLabel: "", targetPID: target.pid) {
         case .confirmed:
             confirmed = true
         case .postFailed:
             break // No CGEventSource — skip straight to the paste lane below.
         case .needsCanaryProbe:
-            switch probeCanary(observer: observer, isSecondAttempt: false) {
+            switch try probeCanary(observer: observer, isSecondAttempt: false, targetPID: target.pid) {
             case .acceptUnverified:
                 Self.log("observer blind — accepting unverified (anti-double)")
                 confirmed = true
             case .retypeOnce:
                 Self.log("delivery drop detected — retrying")
-                switch attemptUnicodeTyping(trimmed, observer: observer, chunkTarget: chunkTarget, attemptLabel: " on retry") {
+                switch try attemptUnicodeTyping(trimmed, observer: observer, chunkTarget: chunkTarget, attemptLabel: " on retry", targetPID: target.pid, isRetry: true) {
                 case .confirmed:
                     retryConfirmed = true
                 case .postFailed:
                     break
                 case .needsCanaryProbe:
-                    switch probeCanary(observer: observer, isSecondAttempt: true) {
+                    switch try probeCanary(observer: observer, isSecondAttempt: true, targetPID: target.pid) {
                     case .acceptUnverified:
                         Self.log("observer blind — accepting unverified (anti-double)")
                         retryConfirmed = true
@@ -766,7 +871,8 @@ final class TextInjector {
 
         // Paste fallback (Wispr-style). Touches the pasteboard; restore prior
         // after pasteboardRestoreDelay so Electron/Cursor can still consume.
-        let pasteSucceeded = tryPasteLane(trimmed, observer: observer, retryOnAmbiguous: true)
+        let savedPasteboard = Self.pasteboardBaselineSnapshot(from: pasteboard)
+        let pasteSucceeded = try tryPasteLane(trimmed, observer: observer, retryOnAmbiguous: true, targetPID: target.pid)
         if pasteSucceeded {
             Thread.sleep(forTimeInterval: Self.pasteConsumerDelay)
             switch Self.resolveSavedPasteboardRestore(
@@ -777,11 +883,13 @@ final class TextInjector {
             case .restoreSavedDeferred:
                 Self.scheduleDeferredPasteboardRestore(
                     injectedText: trimmed,
-                    savedPasteboard: savedPasteboard
+                    savedPasteboard: savedPasteboard,
+                    on: pasteboard,
+                    expectedChangeCount: preparedPasteboardChangeCount
                 )
             case .restoreSaved:
-                if Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: NSPasteboard.general) {
-                    Self.restorePasteboardSnapshot(savedPasteboard, on: NSPasteboard.general)
+                if Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: pasteboard) {
+                    Self.restorePasteboardSnapshot(savedPasteboard, on: pasteboard)
                 } else {
                     Self.log("skip pasteboard restore — external overwrite after paste")
                 }
@@ -812,18 +920,18 @@ final class TextInjector {
     /// ("your text is on the clipboard, paste it yourself"). Restoring — even
     /// after `pasteboardRestoreDelay` — made that promise false.
     @discardableResult
-    private func insertViaPasteBlind(_ text: String) -> Bool {
-        guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
+    private func insertViaPasteBlind(_ text: String, targetPID: pid_t?) throws -> Bool {
+        guard try preparePasteboard(text, targetPID: targetPID) else {
             Self.log("paste blind aborted — pasteboard unstable chars=\(text.utf16.count)")
             leaveOnClipboard(text)
             return false
         }
-        guard Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general) else {
+        guard Self.pasteboardHoldsExpectedString(text, on: pasteboard) else {
             Self.log("paste blind aborted — pasteboard mismatch before chord")
             leaveOnClipboard(text)
             return false
         }
-        guard postPasteChord() else {
+        guard try postPasteChord(targetPID: targetPID) else {
             Self.log("paste blind aborted — chord post failed chars=\(text.utf16.count)")
             leaveOnClipboard(text)
             return false
@@ -838,27 +946,38 @@ final class TextInjector {
     /// Clipboard win the race and paste stale iPhone copy.
     private func tryPasteLane(
         _ text: String,
-        observer: UnicodeDeliveryObserver,
-        retryOnAmbiguous: Bool
-    ) -> Bool {
-        guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
+        observer: TextInjectionObserver,
+        retryOnAmbiguous: Bool,
+        targetPID: pid_t?
+    ) throws -> Bool {
+        guard try preparePasteboard(text, targetPID: targetPID) else {
             Self.log("paste lane aborted — could not stabilize pasteboard")
             return false
         }
 
-        func attempt() -> (landed: Bool, chordObserved: Bool) {
-            if !Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general) {
+        func attempt(isRetry: Bool = false) throws -> (landed: Bool, chordObserved: Bool) {
+            try checkInjectionAllowed(targetPID: targetPID)
+            if !Self.pasteboardHoldsExpectedString(text, on: pasteboard) {
                 Self.log("pasteboard mismatch before chord — re-stabilizing")
-                guard Self.preparePasteboardForPasteStable(text, on: NSPasteboard.general) else {
+                guard try preparePasteboard(text, targetPID: targetPID) else {
                     return (false, false)
                 }
             }
-            guard Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general) else {
+            guard Self.pasteboardHoldsExpectedString(text, on: pasteboard) else {
                 return (false, false)
             }
 
-            observer.resetObservedCount()
-            guard postPasteChord() else { return (false, false) }
+            let posted = try postPasteChord(targetPID: targetPID) {
+                if isRetry, observer.wentBlind || observer.observedPasteChordCount > 0 { return false }
+                observer.resetObservedCount()
+                return true
+            }
+            guard posted else {
+                let chordObserved = observer.observedPasteChordCount >= Self.pasteChordTarget
+                // Late chord evidence blocks retry; it cannot prove which
+                // clipboard payload the earlier chord consumed.
+                return (false, chordObserved)
+            }
             // Chord observation is binary (target 1) — a WindowServer stall
             // DELAYS the CGEvent reaching the observer tap, it does not drop
             // it. The original 0.4s window mistook "still in flight" for
@@ -880,32 +999,36 @@ final class TextInjector {
             // still holding the transcript proves Continuity did not overwrite
             // between prepare and paste. Neither checks target-app content.
             let landed = chordObserved
-                && Self.pasteboardHoldsExpectedString(text, on: NSPasteboard.general)
+                && Self.pasteboardHoldsExpectedString(text, on: pasteboard)
             return (landed, chordObserved)
         }
 
-        let first = attempt()
+        let first = try attempt()
         if first.landed {
             return true
         }
 
         guard Self.shouldRetryPaste(
             chordObserved: first.chordObserved,
-            retryOnAmbiguous: retryOnAmbiguous
+            retryOnAmbiguous: retryOnAmbiguous,
+            wentBlind: observer.wentBlind
         ) else { return false }
         Self.log("paste delivery drop detected — retrying")
-        return attempt().landed
+        return try attempt(isRetry: true).landed
     }
 
     /// A second Cmd-V is only safe when the first chord was never observed
-    /// (dropped). An observed chord with the pasteboard overwritten afterwards
-    /// means the target already pasted — retrying would paste twice.
-    static func shouldRetryPaste(chordObserved: Bool, retryOnAmbiguous: Bool) -> Bool {
-        retryOnAmbiguous && !chordObserved
+    /// by an observer that stayed live. An observed chord with the pasteboard
+    /// overwritten afterwards means the target already pasted — retrying would
+    /// paste twice.
+    static func shouldRetryPaste(chordObserved: Bool, retryOnAmbiguous: Bool, wentBlind: Bool = false) -> Bool {
+        retryOnAmbiguous && !chordObserved && !wentBlind
     }
 
     @discardableResult
-    private func postPasteChord() -> Bool {
+    private func postPasteChord(targetPID: pid_t?, beforePost: () -> Bool = { true }) throws -> Bool {
+        try checkInjectionAllowed(targetPID: targetPID)
+        if let hooks { return beforePost() && hooks.postPasteChord() }
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             Self.log("no CGEventSource")
             return false
@@ -921,6 +1044,8 @@ final class TextInjector {
             return false
         }
         keyDown.flags = .maskCommand
+        try checkInjectionAllowed(targetPID: targetPID)
+        guard beforePost() else { return false }
         keyDown.post(tap: .cgSessionEventTap)
 
         guard let keyUp = CGEvent(
@@ -955,7 +1080,9 @@ final class TextInjector {
     /// mutating the document, so a blind unicode observer can be
     /// distinguished from a genuinely dropped delivery (see `canaryVerdict`).
     @discardableResult
-    private func postCanary() -> Bool {
+    private func postCanary(targetPID: pid_t?) throws -> Bool {
+        try checkInjectionAllowed(targetPID: targetPID)
+        if let hooks { return hooks.postCanary() }
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             Self.log("no CGEventSource")
             return false
@@ -971,6 +1098,7 @@ final class TextInjector {
             return false
         }
         keyDown.flags = Self.syntheticTypingFlags(inherited: keyDown.flags)
+        try checkInjectionAllowed(targetPID: targetPID)
         keyDown.post(tap: .cgSessionEventTap)
 
         guard let keyUp = CGEvent(
@@ -989,7 +1117,9 @@ final class TextInjector {
     // MARK: - Unicode typing
 
     /// Posts unicode key events via the session tap. Returns UTF-16 units posted, or 0 on failure.
-    private func insertViaUnicodeTyping(_ text: String) -> Int {
+    private func insertViaUnicodeTyping(_ text: String, targetPID: pid_t?, beforePost: () -> Bool) throws -> Int {
+        try checkInjectionAllowed(targetPID: targetPID)
+        if let hooks { return beforePost() ? hooks.postUnicode(text) : 0 }
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             Self.log("no CGEventSource")
             return 0
@@ -999,7 +1129,7 @@ final class TextInjector {
         let chunks = Self.chunkUTF16Units(text)
         guard !chunks.isEmpty else { return 0 }
 
-        for chunk in chunks {
+        for (index, chunk) in chunks.enumerated() {
             var mutableChunk = chunk
             guard let keyDown = CGEvent(
                 keyboardEventSource: source,
@@ -1011,6 +1141,8 @@ final class TextInjector {
             }
             keyDown.keyboardSetUnicodeString(stringLength: mutableChunk.count, unicodeString: &mutableChunk)
             keyDown.flags = Self.syntheticTypingFlags(inherited: keyDown.flags)
+            try checkInjectionAllowed(targetPID: targetPID)
+            if index == 0, !beforePost() { return 0 }
             keyDown.post(tap: .cgSessionEventTap)
 
             if let keyUp = CGEvent(
@@ -1025,7 +1157,7 @@ final class TextInjector {
         return chunks.reduce(0) { $0 + $1.count }
     }
 
-    private enum ConfirmationCounter {
+    enum ConfirmationCounter {
         case utf16Units
         case pasteChord
         case canary
@@ -1038,13 +1170,14 @@ final class TextInjector {
     /// `unicodeLaneVerdict`, not a bare Bool, so a delayed-but-partial delivery is
     /// distinguishable from a genuine drop.
     private func waitForConfirmation(
-        observer: UnicodeDeliveryObserver,
+        observer: TextInjectionObserver,
         target: Int,
         counter: ConfirmationCounter,
         baseWindow: TimeInterval = TextInjector.confirmationBaseWindow,
         progressExtension: TimeInterval = TextInjector.confirmationProgressExtension,
         maxWait: TimeInterval = TextInjector.confirmationMaxWait
     ) -> Int {
+        if let hooks { return hooks.waitForConfirmation(observer, counter) }
         let observedCount: () -> Int = {
             switch counter {
             case .utf16Units:
@@ -1099,8 +1232,23 @@ final class TextInjector {
         return finalObserved
     }
 
+    private func preparePasteboard(_ text: String, targetPID: pid_t?) throws -> Bool {
+        let prepared = try Self.preparePasteboardForPasteStable(text, on: pasteboard) {
+            try self.checkInjectionAllowed(targetPID: targetPID)
+        }
+        if prepared { preparedPasteboardChangeCount = pasteboard.changeCount }
+        return prepared
+    }
+
     private func leaveOnClipboard(_ text: String) {
-        Self.leaveTranscriptOnClipboard(text)
+        guard !currentTarget().secureInput else { return }
+        if let hooks {
+            Self.clearPendingRestoreBaseline()
+            hooks.pasteboard.clearContents()
+            hooks.pasteboard.setString(text, forType: .string)
+        } else {
+            Self.leaveTranscriptOnClipboard(text)
+        }
     }
 
     // MARK: - Debug log
@@ -1112,7 +1260,7 @@ final class TextInjector {
 
 // MARK: - Unicode delivery observer
 
-private final class UnicodeDeliveryObserver {
+private final class UnicodeDeliveryObserver: TextInjectionObserver {
     private let lock = NSLock()
     private var observedUTF16UnitsStorage = 0
     private var observedPasteChordCountStorage = 0

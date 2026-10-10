@@ -1,7 +1,46 @@
+import AppKit
 import XCTest
 @testable import Voice
 
 final class CorrectionWatcherLogicTests: XCTestCase {
+
+    @MainActor
+    func testWorkspaceActivationObserverUsesWorkspaceCenterAndRemovesFromIt() {
+        let watcher = CorrectionWatcher()
+        var activations = 0
+        watcher.installWorkspaceObserver { activations += 1 }
+        defer { watcher.removeWorkspaceObserver() }
+
+        NotificationCenter.default.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        XCTAssertEqual(activations, 0)
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        XCTAssertEqual(activations, 1)
+
+        watcher.removeWorkspaceObserver()
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        XCTAssertEqual(activations, 1)
+    }
+
+    @MainActor
+    func testWorkspaceActivationObserverIsRemovedOnDeinit() {
+        var watcher: CorrectionWatcher? = CorrectionWatcher()
+        var activations = 0
+        watcher?.installWorkspaceObserver { activations += 1 }
+        watcher = nil
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        XCTAssertEqual(activations, 0)
+    }
+
+    @MainActor
+    func testWorkspaceActivationObserverReplacementDoesNotDoubleSubscribe() {
+        let watcher = CorrectionWatcher()
+        var activations = 0
+        watcher.installWorkspaceObserver { activations += 10 }
+        watcher.installWorkspaceObserver { activations += 1 }
+        defer { watcher.removeWorkspaceObserver() }
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        XCTAssertEqual(activations, 1)
+    }
 
     func testIdleSettleAfterKeyDown() {
         var state = CorrectionWatcherLogic.State()

@@ -2797,48 +2797,29 @@ final class AudioRecorder {
                 self.logger.info("Audio written: \(tmpURL.path) (\(String(format: "%.2f", duration))s)")
                 vlog("Audio file: \(tmpURL.path)  duration: \(String(format: "%.2f", duration))s")
 
-                // Copy into Application Support before transcription so failure
-                // history rows and retry always reference a stable path — the
-                // ephemeral /tmp file is removed in the completion handler.
                 let keepPaths = self.protectedAudioPathsProvider?() ?? []
                 let maxBytes = self.recordingBudgetBytesProvider?()
                     ?? Int64(RecordingRetention.defaultBudgetMB) * 1024 * 1024
-                guard let retainedURL = RecordingRetention.retain(
+                RecordingRetention.handoffForTranscription(
                     from: tmpURL,
                     keepPaths: keepPaths,
                     maxBytes: maxBytes
-                ) else {
-                    self.logger.error("Failed to retain recording for transcription.")
-                    try? FileManager.default.removeItem(at: tmpURL)
+                ) { audioURL, retainedURL, cleanup in
                     DispatchQueue.main.async {
-                        self.clearHeldCaretSnapshotMatchingSession(sessionHeldToken)
-                        self.asrSelector.onTranscriptionLogged?(
-                            "",
-                            "file",
-                            false,
-                            nil,
-                            true,
-                            nil
-                        )
-                        self.asrSelector.onFailure?(.audioWriteFailed)
-                        self.hud.hide()
-                    }
-                    return
-                }
-
-                DispatchQueue.main.async {
-                    self.asrSelector.setLastRetainedRecordingURL(retainedURL)
-                    self.asrSelector.transcribeAndLog(
-                        audioURL: retainedURL,
-                        sessionHeldToken: sessionHeldToken,
-                        sessionHeldSnapshot: sessionHeldSnapshot,
-                        sessionHeldFrontmostPID: sessionHeldFrontmostPID
-                    ) { [weak self] result in
-                        try? FileManager.default.removeItem(at: tmpURL)
-                        self?.finishHUDAfterPipeline(
-                            result: result,
-                            sessionHeldToken: sessionHeldToken
-                        )
+                        self.asrSelector.setLastRetainedRecordingURL(retainedURL)
+                        self.asrSelector.transcribeAndLog(
+                            audioURL: audioURL,
+                            audioIsTemporary: retainedURL == nil,
+                            sessionHeldToken: sessionHeldToken,
+                            sessionHeldSnapshot: sessionHeldSnapshot,
+                            sessionHeldFrontmostPID: sessionHeldFrontmostPID
+                        ) { [weak self] result in
+                            cleanup()
+                            self?.finishHUDAfterPipeline(
+                                result: result,
+                                sessionHeldToken: sessionHeldToken
+                            )
+                        }
                     }
                 }
             } catch {

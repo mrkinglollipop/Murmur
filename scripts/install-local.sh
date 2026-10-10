@@ -22,6 +22,9 @@ cleanup_install() {
 }
 trap cleanup_install EXIT
 
+echo "==> xcodegen generate"
+xcodegen generate
+
 echo "==> Building Release (signed, arm64-only)"
 # ARCHS must be on the xcodebuild line — SPM package targets (FluidAudio) ignore
 # project.yml ARCHS and otherwise still compile x86_64 (Float16 unavailable).
@@ -33,6 +36,7 @@ echo "==> Building Release (signed, arm64-only)"
   DEVELOPMENT_TEAM="$TEAM" \
   CODE_SIGN_IDENTITY="$IDENTITY" \
   CODE_SIGN_STYLE=Manual \
+  CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
   | (command -v xcpretty >/dev/null && xcpretty || cat)
 
 if [[ ! -d "$PRODUCT" ]]; then
@@ -42,21 +46,25 @@ fi
 
 echo "==> Verifying build product signature"
 codesign --verify --deep --strict "$PRODUCT"
+assert_no_get_task_allow "$PRODUCT" || exit 1
 
 # A standard checkout must not silently replace the owner's private Pro app.
-python3 - "$PRODUCT" "$DEST" <<'PY'
-import pathlib, plistlib, sys
-def is_pro(path):
-    plist = pathlib.Path(path) / 'Contents/Info.plist'
-    if not plist.exists():
-        return False
-    info = plistlib.loads(plist.read_bytes())
-    return any(item.get('CFBundleURLName') == 'com.matt.voice-dictation.auth'
-               or 'murmur' in item.get('CFBundleURLSchemes', [])
-               for item in info.get('CFBundleURLTypes', []))
-if is_pro(sys.argv[2]) and not is_pro(sys.argv[1]):
-    sys.exit('error: refusing to replace the installed Pro app with a standard build. Build from the private Pro checkout.')
-PY
+if [[ -e "$DEST" ]]; then
+  set +e
+  is_pro_app_bundle "$DEST"
+  dest_is_pro=$?
+  is_pro_app_bundle "$PRODUCT"
+  product_is_pro=$?
+  set -e
+  if [[ "$dest_is_pro" -eq 2 || "$product_is_pro" -eq 2 ]]; then
+    echo "error: cannot determine whether the installed or built app is Pro; refusing replacement." >&2
+    exit 1
+  fi
+  if [[ "$dest_is_pro" -eq 0 && "$product_is_pro" -ne 0 ]]; then
+    echo "error: refusing to replace the installed Pro app with a standard build. Build from the private Pro checkout." >&2
+    exit 1
+  fi
+fi
 
 INSTALL_ROOT="$(mktemp -d /Applications/.Murmur-install.XXXXXX)"
 STAGING="$INSTALL_ROOT/Murmur.app"

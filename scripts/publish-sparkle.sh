@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Publish a Murmur DMG + Sparkle appcast to the public Murmur-updates repo.
-# Prefer notarized publishes (NOTARIZE=1). ALLOW_UNNOTARIZED=1 is for local /
-# Gatekeeper-prompt publishes only — other Macs need right-click → Open.
+# Prefer notarized publishes (NOTARIZE=1). ALLOW_UNNOTARIZED=1 produces a
+# local artifact only; it never contacts the public updates repository.
 # Does NOT extend make-dmg.sh — calls it, then signs/merges/uploads.
 #
 # Required:
-#   NOTARIZE=1   (or ALLOW_UNNOTARIZED=1)
+#   NOTARIZE=1   (or ALLOW_UNNOTARIZED=1 for a local-only artifact)
 #   SPARKLE_PRIVATE_KEY=/path/to/sparkle_ed25519  (signs; Keychain key, if
 #                readable via SPARKLE_ACCOUNT, must be the same key)
 #   Notarization credentials when NOTARIZE=1 (NOTARY_PROFILE / notarytool store)
@@ -46,15 +46,14 @@ cd "$ROOT"
 source "$ROOT/scripts/release-lib.sh"
 
 if [[ "${NOTARIZE:-0}" != "1" && "${ALLOW_UNNOTARIZED:-0}" != "1" ]]; then
-  echo "error: NOTARIZE=1 is required (or ALLOW_UNNOTARIZED=1 for local/Gatekeeper-prompt publishes)." >&2
+  echo "error: NOTARIZE=1 is required (or ALLOW_UNNOTARIZED=1 for a local-only artifact)." >&2
   echo "  Notarization needs a configured notarytool profile (default NOTARY_PROFILE=AC_PASSWORD)." >&2
   echo "  Without credentials, do not invent them — configure notarytool store-credentials, then re-run." >&2
   exit 1
 fi
-if [[ "${ALLOW_UNNOTARIZED:-0}" == "1" && "${NOTARIZE:-0}" != "1" ]]; then
-  echo "warning: ALLOW_UNNOTARIZED=1 — DMG will not be notarized; other Macs need right-click → Open." >&2
-fi
-if [[ "${NOTARIZE:-0}" == "1" ]]; then
+if [[ "${ALLOW_UNNOTARIZED:-0}" == "1" ]]; then
+  echo "warning: ALLOW_UNNOTARIZED=1 — local DMG only; no public release, appcast, or stable alias will be changed." >&2
+elif [[ "${NOTARIZE:-0}" == "1" ]]; then
   echo "==> Notarization required (NOTARY_PROFILE=${NOTARY_PROFILE:-AC_PASSWORD}). If notarytool fails, fix credentials — do not set ALLOW_UNNOTARIZED for peer installs." >&2
 fi
 
@@ -66,18 +65,6 @@ STAGE_APPCAST="$ROOT/build/appcast.xml"
 PREV_APPCAST="$ROOT/build/appcast.prev.xml"
 SPARKLE_ACCOUNT="${SPARKLE_ACCOUNT:-murmur}"
 SPARKLE_PRIVATE_KEY="${SPARKLE_PRIVATE_KEY:-}"
-
-if [[ -z "${SPARKLE_PRIVATE_KEY}" ]]; then
-  echo "error: SPARKLE_PRIVATE_KEY is unset. Set it to your EdDSA private key file, or use Keychain via SPARKLE_ACCOUNT / generate_keys --account." >&2
-  exit 1
-fi
-if [[ ! -f "${SPARKLE_PRIVATE_KEY}" ]]; then
-  echo "error: SPARKLE_PRIVATE_KEY does not point to a readable file." >&2
-  exit 1
-fi
-# Preflight before ANY network call: a placeholder team id (the example file's
-# YOUR_TEAM_ID) would otherwise surface only after gh/curl work and a build.
-resolve_development_team "$ROOT/Config/Team.xcconfig" >/dev/null || exit 1
 
 resolve_sparkle_bin() {
   if [[ -n "${SPARKLE_BIN:-}" && -x "${SPARKLE_BIN}/sign_update" ]]; then
@@ -99,11 +86,6 @@ resolve_sparkle_bin() {
   echo "error: Sparkle CLI not found. Set SPARKLE_BIN to …/Sparkle/bin (sign_update + generate_keys)." >&2
   exit 1
 }
-
-SPARKLE_BIN="$(resolve_sparkle_bin)"
-SIGN_UPDATE="$SPARKLE_BIN/sign_update"
-GENERATE_KEYS="$SPARKLE_BIN/generate_keys"
-echo "==> Sparkle CLI: $SPARKLE_BIN"
 
 # --- helpers ---
 plist_get() {
@@ -372,6 +354,54 @@ if [[ -z "$SHORT" || -z "$BUILD" ]]; then
   exit 1
 fi
 
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "error: working tree is dirty; release artifacts must be built from a committed source revision." >&2
+  exit 1
+fi
+RELEASE_SHA="$(git rev-parse HEAD)" || {
+  echo "error: could not determine the committed source revision." >&2
+  exit 1
+}
+
+echo "==> App icon oracle (test-app-icon-helpers.sh)"
+bash "$ROOT/scripts/test-app-icon-helpers.sh"
+
+if [[ "${ALLOW_UNNOTARIZED:-0}" == "1" ]]; then
+  DMG="${DMG_PATH:-$ROOT/build/Murmur-$SHORT.dmg}"
+  set +e
+  is_stable_dmg_path "$DMG" "$ROOT/build/Murmur.dmg"
+  stable_dmg_path=$?
+  set -e
+  if [[ "$stable_dmg_path" -eq 0 ]]; then
+    echo "error: ALLOW_UNNOTARIZED=1 refuses the stable alias path: $DMG" >&2
+    exit 1
+  elif [[ "$stable_dmg_path" -ne 1 ]]; then
+    echo "error: cannot resolve the requested local DMG path; refusing to overwrite it." >&2
+    exit 1
+  fi
+  echo "==> Building local unnotarized Murmur $SHORT (build $BUILD) from $RELEASE_SHA"
+  DMG_PATH="$DMG" NOTARIZE=0 NOTARY_PROFILE="$NOTARY_PROFILE" bash "$ROOT/scripts/make-dmg.sh"
+  echo "==> Local-only artifact: $DMG"
+  echo "  Built from commit: $RELEASE_SHA"
+  exit 0
+fi
+
+if [[ -z "${SPARKLE_PRIVATE_KEY}" ]]; then
+  echo "error: SPARKLE_PRIVATE_KEY is unset. Set it to your EdDSA private key file, or use Keychain via SPARKLE_ACCOUNT / generate_keys --account." >&2
+  exit 1
+fi
+if [[ ! -f "${SPARKLE_PRIVATE_KEY}" ]]; then
+  echo "error: SPARKLE_PRIVATE_KEY does not point to a readable file." >&2
+  exit 1
+fi
+# Preflight before ANY network call: a placeholder team id (the example file's
+# YOUR_TEAM_ID) would otherwise surface only after gh/curl work and a build.
+resolve_development_team "$ROOT/Config/Team.xcconfig" >/dev/null || exit 1
+SPARKLE_BIN="$(resolve_sparkle_bin)"
+SIGN_UPDATE="$SPARKLE_BIN/sign_update"
+GENERATE_KEYS="$SPARKLE_BIN/generate_keys"
+echo "==> Sparkle CLI: $SPARKLE_BIN"
+
 HAS_PRIOR=0
 if fetch_prior_appcast; then
   HAS_PRIOR=1
@@ -439,14 +469,12 @@ if gh_release_exists "v${SHORT}" "version-collision check"; then
 fi
 
 echo "==> Publishing Murmur $SHORT (build $BUILD) → $UPDATES_REPO"
-
-echo "==> App icon oracle (test-app-icon-helpers.sh)"
-bash "$ROOT/scripts/test-app-icon-helpers.sh"
+echo "  Built from commit: $RELEASE_SHA"
 
 echo "==> xcodegen generate"
 xcodegen generate
 
-# --- 2) Notarized DMG (or signed-only when ALLOW_UNNOTARIZED=1) ---
+# --- 2) Notarized DMG ---
 SKIPPED_MAKE_DMG=0
 if [[ "${SKIP_MAKE_DMG:-0}" == "1" && -f "${DMG_PATH:-}" ]]; then
   DMG="$DMG_PATH"
@@ -502,6 +530,17 @@ if [[ "$APP_SHORT" != "$SHORT" || "$APP_BUILD" != "$BUILD" ]]; then
   else
     echo "error: built app version $APP_SHORT/$APP_BUILD != project.yml $SHORT/$BUILD (did xcodegen run?)" >&2
   fi
+  exit 1
+fi
+set +e
+is_pro_app_bundle "$APP"
+app_is_pro=$?
+set -e
+if [[ "$app_is_pro" -eq 0 ]]; then
+  echo "error: refusing to publish a Pro build to the public Murmur-updates feed." >&2
+  exit 1
+elif [[ "$app_is_pro" -ne 1 ]]; then
+  echo "error: cannot determine whether the built app is Pro; refusing public publish." >&2
   exit 1
 fi
 if [[ "$SKIPPED_MAKE_DMG" == "1" ]]; then
@@ -752,10 +791,10 @@ PY
 # --- 6) Upload DMG release ---
 TAG="v${SHORT}"
 echo "==> GitHub release $TAG on $UPDATES_REPO"
-WHATSNEW_NOTES="$(python3 - "$SHORT" "$BUILD" <<'PY'
+WHATSNEW_NOTES="$(python3 - "$SHORT" "$BUILD" "$RELEASE_SHA" <<'PY'
 import json, sys
 from pathlib import Path
-short, build = sys.argv[1], sys.argv[2]
+short, build, release_sha = sys.argv[1], sys.argv[2], sys.argv[3]
 path = Path("Resources/WhatsNew/releases.json")
 data = json.loads(path.read_text(encoding="utf-8"))
 entry = next((e for e in data if str(e.get("build", "")) == build), None)
@@ -770,10 +809,12 @@ else:
         item = str(item).strip()
         if item:
             print(f"- {item}")
+print(f"\nBuilt from commit {release_sha}.")
 PY
 )"
 if gh_release_exists "$TAG" "DMG upload"; then
   gh release upload "$TAG" "$DMG" --repo "$UPDATES_REPO" --clobber
+  gh release edit "$TAG" --repo "$UPDATES_REPO" --notes "$WHATSNEW_NOTES"
 else
   gh release create "$TAG" "$DMG" --repo "$UPDATES_REPO" --title "Murmur $SHORT" --notes "$WHATSNEW_NOTES"
 fi

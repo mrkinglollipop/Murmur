@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyController: HotkeyController?
     private var updaterController: SPUStandardUpdaterController?
     private var onboardingWindow: NSWindow?
+    private var isDictationPaused = false
 
     /// True while the menu-bar error badge (`mic.badge.xmark`) is showing —
     /// guards `resetMenuBarIconToIdle()` from clobbering it early.
@@ -502,37 +503,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(
-                systemSymbolName: "mic",
-                accessibilityDescription: "Murmur"
-            )
-            button.image?.isTemplate = true  // adapts to dark/light menu bar
+            setMenuBarIcon(named: "mic", accessibilityDescription: "Murmur")
         }
+        rebuildStatusMenu()
+    }
 
-        let menu = NSMenu()
-        menu.addItem(
-            withTitle: Self.versionMenuTitle(),
-            action: nil,
-            keyEquivalent: ""
-        ).isEnabled = false
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(
-            withTitle: "Open Murmur",
-            action: #selector(openVoiceMenuItemClicked),
-            keyEquivalent: ""
-        ).target = self
-        menu.addItem(
-            withTitle: "Settings…",
-            action: #selector(openSettingsMenuItemClicked),
-            keyEquivalent: ""
-        ).target = self
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(
-            withTitle: "Quit",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"
+    private func rebuildStatusMenu() {
+        let updatesEnabled = SparkleSupport.isEnabled && updaterController != nil
+        let updateTitle = SparkleSupport.status == .brokenSignature
+            ? "Check for Updates… (signature broken)" : "Check for Updates…"
+        statusItem?.menu = Self.makeStatusMenu(
+            versionTitle: Self.versionMenuTitle(),
+            isPaused: isDictationPaused,
+            updateTitle: updateTitle,
+            updatesEnabled: updatesEnabled,
+            target: self,
+            updater: updaterController
         )
-        statusItem?.menu = menu
+    }
+
+    static func makeStatusMenu(
+        versionTitle: String,
+        isPaused: Bool,
+        updateTitle: String,
+        updatesEnabled: Bool,
+        target: AnyObject?,
+        updater: AnyObject?
+    ) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(withTitle: versionTitle, action: nil, keyEquivalent: "").isEnabled = false
+        menu.addItem(.separator())
+        let open = menu.addItem(withTitle: "Open Murmur", action: #selector(openVoiceMenuItemClicked), keyEquivalent: "")
+        open.target = target
+        let settings = menu.addItem(withTitle: "Settings…", action: #selector(openSettingsMenuItemClicked), keyEquivalent: ",")
+        settings.target = target
+        settings.keyEquivalentModifierMask = .command
+        menu.addItem(.separator())
+        let pause = menu.addItem(withTitle: isPaused ? "Resume dictation" : "Pause dictation", action: #selector(toggleDictationPause), keyEquivalent: "")
+        pause.target = target
+        let update = menu.addItem(withTitle: updateTitle, action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
+        update.target = updater
+        update.isEnabled = updatesEnabled
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit Murmur", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        return menu
     }
 
     /// Menu-bar header line. Read from the bundle rather than written inline —
@@ -558,6 +572,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettingsMenuItemClicked() {
         mainWindowController.showSettingsTab()
+    }
+
+    @objc private func toggleDictationPause() {
+        isDictationPaused.toggle()
+        activationController?.isPaused = isDictationPaused
+        hotkeyController?.isPaused = isDictationPaused
+        setMenuBarIcon(
+            named: isDictationPaused ? "mic.slash" : "mic",
+            accessibilityDescription: isDictationPaused ? "Murmur, paused" : "Murmur"
+        )
+        rebuildStatusMenu()
+    }
+
+    private func setMenuBarIcon(named name: String, accessibilityDescription: String) {
+        statusItem?.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription)
+        statusItem?.button?.image?.isTemplate = true
     }
 
     // MARK: - Onboarding
@@ -639,13 +669,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Don't stamp over a live error badge (e.g. H7's click-to-dismiss
         // firing hide() well before the badge's own independent 3s clear) —
         // let setMenuBarErrorBadge(false) own that transition, unchanged.
-        guard !isShowingMenuBarErrorBadge, let button = statusItem?.button else { return }
-        button.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "Murmur")
-        button.image?.isTemplate = true
+        guard !isShowingMenuBarErrorBadge, !isDictationPaused else { return }
+        setMenuBarIcon(named: "mic", accessibilityDescription: "Murmur")
     }
 
     private func updateMenuBarIcon(for state: RecordingHUD.State) {
-        guard let button = statusItem?.button else { return }
+        guard !isDictationPaused else { return }
         let imageName: String
         switch state {
         case .listening:
@@ -659,8 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .error:
             return
         }
-        button.image = NSImage(systemSymbolName: imageName, accessibilityDescription: "Murmur")
-        button.image?.isTemplate = true
+        setMenuBarIcon(named: imageName, accessibilityDescription: "Murmur")
     }
 
     func replayOnboarding() {
@@ -670,19 +698,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Shows a red badge on the menu-bar mic icon when `show` is true.
     func setMenuBarErrorBadge(_ show: Bool) {
-        guard let button = statusItem?.button else { return }
+        guard statusItem?.button != nil else { return }
+        if isDictationPaused {
+            setMenuBarIcon(named: "mic.slash", accessibilityDescription: "Murmur, paused")
+            return
+        }
         if show {
-            button.image = NSImage(
-                systemSymbolName: "mic.badge.xmark",
-                accessibilityDescription: "Murmur — error"
-            )
-            button.image?.isTemplate = true
+            setMenuBarIcon(named: "mic.badge.xmark", accessibilityDescription: "Murmur — error")
         } else {
-            button.image = NSImage(
-                systemSymbolName: "mic",
-                accessibilityDescription: "Murmur"
-            )
-            button.image?.isTemplate = true
+            setMenuBarIcon(named: "mic", accessibilityDescription: "Murmur")
         }
     }
 }

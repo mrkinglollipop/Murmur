@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.1.55",
+    "build": "56",
+    "title": "What's New in 0.1.55",
+    "items": [
+      "Settings is now split into sections, and Permissions shows which grants are in place with a button to fix any that are missing.",
+      "The menu-bar icon can pause dictation and check for updates.",
+      "Transforms set to on-device no longer fall back to a cloud service when the on-device model is unavailable.",
+      "A long recording is no longer lost when saved audio is over its storage limit.",
+      "Cleanup can no longer drop a sentence, a \"not\", or a number from what you said.",
+      "Fixed a case where text could be pasted twice, and one where a similar sentence was removed as a duplicate.",
+      "Insights shows formatted totals and a clearer activity heatmap."
+    ]
+  },
+  {
     "version": "0.1.54",
     "build": "55",
     "title": "What's New in 0.1.54",
