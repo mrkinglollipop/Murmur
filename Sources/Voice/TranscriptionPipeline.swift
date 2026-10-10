@@ -54,6 +54,14 @@ final class TranscriptionPipeline {
     /// older `finishTranscription` cannot clear a newer session's held.
     private var heldCaretToken: UInt64 = 0
 
+    /// Selection intent captured with the AX snapshot at hold start. Values are
+    /// token-scoped so a rapid re-press cannot turn an older instruction into
+    /// ordinary dictation against the newer selection.
+    private enum VoiceEditIntent {
+        case edit(selection: String)
+    }
+    private var voiceEditIntents: [UInt64: VoiceEditIntent] = [:]
+
     /// Active Style profile formality instruction for cleanup.
     var styleInstruction: String?
 
@@ -89,12 +97,28 @@ final class TranscriptionPipeline {
     /// recording-will-start. Replaces any prior hold and bumps the generation token.
     /// Reads frontmost PID once so AX snapshot and held PID cannot desync.
     @discardableResult
-    func holdCaretSnapshotFromRecordingWillStart() -> UInt64 {
+    func holdCaretSnapshotFromRecordingWillStart(
+        voiceEditEnabled: Bool = true,
+        shiftHeld: Bool = false
+    ) -> UInt64 {
         assert(Thread.isMainThread, "holdCaretSnapshotFromRecordingWillStart requires main thread")
         heldCaretToken &+= 1
         let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        heldCaretSnapshot = CaretContext.snapshot(frontmostPID: pid)
+        let snapshot = CaretContext.snapshot(frontmostPID: pid)
+        heldCaretSnapshot = snapshot
         heldFrontmostPID = pid
+        switch VoiceEditRouting.decide(
+            snapshot: snapshot,
+            enabled: voiceEditEnabled,
+            shiftHeld: shiftHeld
+        ) {
+        case .edit(let selection):
+            voiceEditIntents[heldCaretToken] = .edit(selection: selection)
+        case .selectionTooLong(let utf16Count):
+            vlog("voice edit selection too long: \(utf16Count) UTF-16 units; dictating normally")
+        case .dictate:
+            break
+        }
         return heldCaretToken
     }
 
@@ -103,6 +127,11 @@ final class TranscriptionPipeline {
     /// that session — older finish/fail paths must not wipe a newer hold.
     func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
         if let token, heldCaretToken != token { return }
+        if let token {
+            voiceEditIntents.removeValue(forKey: token)
+        } else {
+            voiceEditIntents.removeAll()
+        }
         heldCaretSnapshot = nil
         heldFrontmostPID = nil
     }
@@ -111,6 +140,14 @@ final class TranscriptionPipeline {
     var test_heldCaretToken: UInt64 { heldCaretToken }
     var test_heldCaretSnapshot: CaretContext.Snapshot? { heldCaretSnapshot }
     var test_heldFrontmostPID: pid_t? { heldFrontmostPID }
+
+    func isVoiceEditHold(_ token: UInt64) -> Bool {
+        voiceEditIntents[token] != nil
+    }
+
+    private func consumeVoiceEditIntent(matching token: UInt64) -> VoiceEditIntent? {
+        voiceEditIntents.removeValue(forKey: token)
+    }
 
     /// Hold tokens whose processing HUD was already dismissed by the
     /// recorder's watchdog. A late result for one of these is saved to History
@@ -148,6 +185,21 @@ final class TranscriptionPipeline {
         heldCaretSnapshot = snapshot
         heldFrontmostPID = frontmostPID
         return heldCaretToken
+    }
+
+    /// Test-only route seam; production capture always goes through the AX
+    /// snapshot path above.
+    @discardableResult
+    func test_holdVoiceEditSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
+        let token = test_holdSnapshot(snapshot)
+        if case .edit(let selection) = VoiceEditRouting.decide(
+            snapshot: snapshot,
+            enabled: true,
+            shiftHeld: false
+        ) {
+            voiceEditIntents[token] = .edit(selection: selection)
+        }
+        return token
     }
 
     /// Copy held snapshot + PID when `token` still owns the slot.
@@ -753,6 +805,14 @@ final class TranscriptionPipeline {
         }
 
         DispatchQueue.main.async {
+            if self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
+                // Edit instructions must not enter dictation, History, or
+                // TextInjector while the selected text remains untouched.
+                self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                self.onFailure?(.voiceEditFailed)
+                completion?(.failed)
+                return
+            }
             let (corrected, records) = self.onTranscription?(trimmed, engineID) ?? (trimmed, [])
             if !records.isEmpty { self.onCorrectionsRecorded?(records) }
             let expanded = self.onSnippetExpand?(corrected) ?? corrected

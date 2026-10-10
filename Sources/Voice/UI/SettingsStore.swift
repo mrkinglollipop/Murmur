@@ -78,6 +78,7 @@ final class SettingsStore: ObservableObject {
         static let geminiSilenceDurationMs = "voice.settings.geminiSilenceDurationMs"
         static let xaiEndpointingMs = "voice.settings.xaiEndpointingMs"
         static let useToggleLock = "voice.settings.useToggleLock"
+        static let voiceEditSelectedText = "voice.settings.voiceEditSelectedText"
         static let smartLeadingSpace = "voice.settings.smartLeadingSpace"
         static let learnFromInlineCorrections = "voice.settings.learnFromInlineCorrections"
         static let selectedLanguage = "voice.settings.selectedLanguage"
@@ -471,6 +472,14 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Holds with a readable selection become an edit instruction unless Shift
+    /// is held. UI exposure lands with the History/Settings slice.
+    @Published var voiceEditSelectedText: Bool {
+        didSet {
+            defaults.set(voiceEditSelectedText, forKey: Keys.voiceEditSelectedText)
+        }
+    }
+
     /// Prepends a leading space before injection when caret context warrants it,
     /// so dictated text doesn't glue to the character before the caret.
     @Published var smartLeadingSpace: Bool {
@@ -748,6 +757,12 @@ final class SettingsStore: ObservableObject {
         }
 
         useToggleLock = defaults.bool(forKey: Keys.useToggleLock)
+
+        if defaults.object(forKey: Keys.voiceEditSelectedText) != nil {
+            voiceEditSelectedText = defaults.bool(forKey: Keys.voiceEditSelectedText)
+        } else {
+            voiceEditSelectedText = true
+        }
 
         if defaults.object(forKey: Keys.smartLeadingSpace) != nil {
             smartLeadingSpace = defaults.bool(forKey: Keys.smartLeadingSpace)

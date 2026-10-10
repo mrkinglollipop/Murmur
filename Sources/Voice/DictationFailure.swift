@@ -9,6 +9,7 @@ enum DictationFailure: Equatable {
     case micStartFailed
     case micDeliveredNoAudio
     case secureInputBlocked
+    case voiceEditFailed
 
     /// User-facing copy for the HUD error pill.
     var message: String {
@@ -25,6 +26,8 @@ enum DictationFailure: Equatable {
             return "No mic audio — check Sound input"
         case .secureInputBlocked:
             return "Secure field — can't paste"
+        case .voiceEditFailed:
+            return "Try rephrasing"
         }
     }
 }

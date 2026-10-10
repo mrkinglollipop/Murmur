@@ -119,6 +119,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activationController?.useToggleLockProvider = { [weak self] in
             self?.settingsStore.useToggleLock ?? false
         }
+        activationController?.voiceEditEnabledProvider = { [weak self] in
+            self?.settingsStore.voiceEditSelectedText ?? true
+        }
         activationController?.start()
 
         hotkeyController = HotkeyController()
@@ -592,7 +595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
         switch state {
-        case .listening:
+        case .listening, .editingSelection:
             setMenuBarIcon(.listening)
         case .processing:
             setMenuBarIcon(.processing)

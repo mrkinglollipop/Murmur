@@ -149,8 +149,14 @@ final class ASREngineSelector {
     /// Capture caret AX snapshot on the main thread at recording-will-start.
     /// Returns the generation token for token-matched clear on failed start.
     @discardableResult
-    func holdCaretSnapshotFromRecordingWillStart() -> UInt64 {
-        pipeline.holdCaretSnapshotFromRecordingWillStart()
+    func holdCaretSnapshotFromRecordingWillStart(
+        voiceEditEnabled: Bool = true,
+        shiftHeld: Bool = false
+    ) -> UInt64 {
+        pipeline.holdCaretSnapshotFromRecordingWillStart(
+            voiceEditEnabled: voiceEditEnabled,
+            shiftHeld: shiftHeld
+        )
     }
 
     /// Clear held caret snapshot (abort / cancel / stop without inject).
@@ -162,6 +168,10 @@ final class ASREngineSelector {
     /// Package-visible held state for lifecycle unit tests.
     var test_heldCaretToken: UInt64 { pipeline.test_heldCaretToken }
     var test_heldCaretSnapshot: CaretContext.Snapshot? { pipeline.test_heldCaretSnapshot }
+
+    func isVoiceEditHold(_ token: UInt64) -> Bool {
+        pipeline.isVoiceEditHold(token)
+    }
 
     @discardableResult
     func test_holdSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
