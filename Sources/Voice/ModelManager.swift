@@ -1,5 +1,6 @@
 import Foundation
 import os.log
+import Speech
 import WhisperKit
 
 // MARK: - Per-model download / storage state
@@ -125,6 +126,9 @@ final class ModelManager: ObservableObject {
     /// second HubApi snapshot for the same files.
     private var downloadTasks: [LocalModel: Task<Void, Never>] = [:]
     private var downloadTickets = DownloadTicketBook()
+    private var systemAssetRequests: [LocalModel: AssetInstallationRequest] = [:]
+    private var systemAssetProgressObservers: [LocalModel: NSKeyValueObservation] = [:]
+    private var appleSpeechLanguage = "en"
 
     init(loadDiskState: Bool = true) {
         guard loadDiskState else { return }
@@ -295,6 +299,11 @@ final class ModelManager: ObservableObject {
     /// by `SettingsStore` — it never trusts a stale cache to decide whether
     /// a multi-GB download is needed.
     func downloadIfNeeded(_ model: LocalModel) {
+        if model == .appleSpeech {
+            refreshStatus(model)
+            requestAppleSpeechAssetIfNeeded()
+            return
+        }
         guard !isSidecarManaged(model) else { return }
         Task {
             let (isPresent, bytes) = await Self.scanDisk(for: model)
@@ -307,6 +316,10 @@ final class ModelManager: ObservableObject {
     }
 
     func refreshStatus(_ model: LocalModel) {
+        if model == .appleSpeech {
+            refreshAppleSpeechAssetStatus()
+            return
+        }
         Task {
             let (isPresent, bytes) = await Self.scanDisk(for: model)
             self.downloaded[model] = isPresent
@@ -404,6 +417,164 @@ final class ModelManager: ObservableObject {
         model.engineID == .parakeet
     }
 
+    /// System-managed Apple speech assets follow the same published readiness
+    /// dictionaries as downloaded models, but never use our filesystem or
+    /// WhisperKit downloader.
+    func isSystemAssetManaged(_ model: LocalModel) -> Bool {
+        model == .appleSpeech
+    }
+
+    /// Settings calls this whenever the dictation language changes so Apple
+    /// asset readiness always describes the locale the engine will use.
+    func updateAppleSpeechLanguage(_ language: String) {
+        guard appleSpeechLanguage != language else { return }
+        appleSpeechLanguage = language
+        refreshStatus(.appleSpeech)
+    }
+
+    /// Existing installs with a model already on disk keep their selected
+    /// engine. This is intentionally synchronous so SettingsStore can make its
+    /// first-run decision before ModelManager is constructed.
+    nonisolated static func hasAnyDownloadedModel() -> Bool {
+        LocalModel.allCases.contains { model in
+            guard model != .appleSpeech else { return false }
+            if let folder = modelFolderURL(for: model) {
+                return variantFolderHasModelPayload(folder)
+            }
+            return parakeetCacheInfo().0
+        }
+    }
+
+    private func refreshAppleSpeechAssetStatus() {
+        let language = appleSpeechLanguage
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let transcriber = try await AppleSpeechEngine.transcriber(language: language)
+                let status = await AssetInventory.status(forModules: [transcriber])
+                guard self.appleSpeechLanguage == language else { return }
+                self.applyAppleSpeechAssetStatus(status, language: language)
+            } catch {
+                guard self.appleSpeechLanguage == language else { return }
+                self.downloaded[.appleSpeech] = false
+                self.diskSize[.appleSpeech] = nil
+                self.state[.appleSpeech] = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func applyAppleSpeechAssetStatus(
+        _ status: AssetInventory.Status,
+        language: String
+    ) {
+        guard appleSpeechLanguage == language else { return }
+        switch status {
+        case .installed:
+            downloaded[.appleSpeech] = true
+            diskSize[.appleSpeech] = nil
+            state[.appleSpeech] = .idle
+            downloadProgress[.appleSpeech] = nil
+        case .downloading:
+            downloaded[.appleSpeech] = false
+            diskSize[.appleSpeech] = nil
+            state[.appleSpeech] = .downloading
+        case .supported:
+            downloaded[.appleSpeech] = false
+            diskSize[.appleSpeech] = nil
+            state[.appleSpeech] = .idle
+            downloadProgress[.appleSpeech] = nil
+        case .unsupported:
+            downloaded[.appleSpeech] = false
+            diskSize[.appleSpeech] = nil
+            state[.appleSpeech] = .failed("Apple speech is unavailable for \(language).")
+            downloadProgress[.appleSpeech] = nil
+        @unknown default:
+            downloaded[.appleSpeech] = false
+            diskSize[.appleSpeech] = nil
+            state[.appleSpeech] = .failed("Apple speech asset status is unavailable.")
+            downloadProgress[.appleSpeech] = nil
+        }
+    }
+
+    /// Requests Apple's system asset installer for the selected locale. The
+    /// request's own Progress drives the existing model status/progress path;
+    /// no Murmur download or model folder is created.
+    private func requestAppleSpeechAssetIfNeeded() {
+        let model = LocalModel.appleSpeech
+        guard downloadTasks[model] == nil else { return }
+        let language = appleSpeechLanguage
+        let task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let transcriber = try await AppleSpeechEngine.transcriber(language: language)
+                let currentStatus = await AssetInventory.status(forModules: [transcriber])
+                guard self.appleSpeechLanguage == language else {
+                    self.finishAppleSpeechAssetRequest()
+                    self.refreshAppleSpeechAssetStatus()
+                    self.requestAppleSpeechAssetIfNeeded()
+                    return
+                }
+                guard currentStatus != .installed else {
+                    self.applyAppleSpeechAssetStatus(currentStatus, language: language)
+                    self.downloadTasks[model] = nil
+                    return
+                }
+
+                self.downloaded[model] = false
+                self.state[model] = .downloading
+                self.downloadProgress[model] = 0
+                guard let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else {
+                    self.downloadTasks[model] = nil
+                    self.refreshAppleSpeechAssetStatus()
+                    return
+                }
+                guard self.appleSpeechLanguage == language else {
+                    self.finishAppleSpeechAssetRequest()
+                    self.refreshAppleSpeechAssetStatus()
+                    self.requestAppleSpeechAssetIfNeeded()
+                    return
+                }
+
+                self.systemAssetRequests[model] = request
+                self.systemAssetProgressObservers[model] = request.progress.observe(
+                    \.fractionCompleted,
+                    options: [.initial, .new]
+                ) { [weak self] progress, _ in
+                    Task { @MainActor in
+                        guard let self, self.appleSpeechLanguage == language else { return }
+                        self.downloadProgress[model] = progress.fractionCompleted
+                    }
+                }
+                try await request.downloadAndInstall()
+                let languageChanged = self.appleSpeechLanguage != language
+                self.finishAppleSpeechAssetRequest()
+                self.refreshAppleSpeechAssetStatus()
+                if languageChanged {
+                    self.requestAppleSpeechAssetIfNeeded()
+                }
+            } catch {
+                let languageChanged = self.appleSpeechLanguage != language
+                self.finishAppleSpeechAssetRequest()
+                guard !languageChanged else {
+                    self.refreshAppleSpeechAssetStatus()
+                    self.requestAppleSpeechAssetIfNeeded()
+                    return
+                }
+                self.downloaded[model] = false
+                self.state[model] = .failed(error.localizedDescription)
+                self.downloadProgress[model] = nil
+            }
+        }
+        downloadTasks[model] = task
+    }
+
+    private func finishAppleSpeechAssetRequest() {
+        let model = LocalModel.appleSpeech
+        downloadTasks[model] = nil
+        systemAssetProgressObservers[model] = nil
+        systemAssetRequests[model] = nil
+    }
+
     // MARK: - Download
 
     /// Triggers (or awaits, if already in flight) a download of `model`'s
@@ -412,6 +583,10 @@ final class ModelManager: ObservableObject {
     /// On failure, cleans up any partial folder so a subsequent retry starts
     /// clean instead of resuming into a corrupt partial snapshot.
     func download(_ model: LocalModel) {
+        if model == .appleSpeech {
+            requestAppleSpeechAssetIfNeeded()
+            return
+        }
         guard !isSidecarManaged(model) else { return }
         guard let variant = model.whisperKitModelID else { return }
 
@@ -477,6 +652,11 @@ final class ModelManager: ObservableObject {
     /// Re-attempts a failed download. Equivalent to calling `download(_:)`
     /// again once the prior failure has been cleaned up.
     func retry(_ model: LocalModel) {
+        if model == .appleSpeech {
+            state[model] = .idle
+            requestAppleSpeechAssetIfNeeded()
+            return
+        }
         state[model] = .idle
         download(model)
     }
@@ -495,6 +675,7 @@ final class ModelManager: ObservableObject {
     /// No-op for Parakeet (sidecar-managed). Updates `downloaded`/`diskSize`
     /// afterward so the UI reflects the removal immediately.
     func delete(_ model: LocalModel) {
+        guard model != .appleSpeech else { return }
         guard !isSidecarManaged(model) else { return }
         guard let folder = Self.modelFolderURL(for: model) else { return }
 

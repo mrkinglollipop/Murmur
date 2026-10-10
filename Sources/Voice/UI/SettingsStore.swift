@@ -618,7 +618,8 @@ final class SettingsStore: ObservableObject {
         self.keychain = keychain
         self.defaults = defaults
         self.profileDirectory = profileDirectory
-        self.readAPIKey = apiKeyLookup ?? { keychain.key(for: $0) }
+        let apiKeyReader = apiKeyLookup ?? { keychain.key(for: $0) }
+        self.readAPIKey = apiKeyReader
 
         if let raw = defaults.string(forKey: Keys.activationKey),
            let option = ActivationKeyOption(rawValue: raw) {
@@ -627,11 +628,29 @@ final class SettingsStore: ObservableObject {
             activationKeyOption = .fnGlobe
         }
 
-        if let raw = defaults.string(forKey: Keys.selectedLocalModel),
-           let model = LocalModel(rawValue: raw) {
-            selectedLocalModel = model
+        if let storedLocalModelRawValue = defaults.string(forKey: Keys.selectedLocalModel) {
+            // Existing local selections win without consulting Keychain or the
+            // filesystem; this is migration logic, not a reason to touch user
+            // state during hydration.
+            selectedLocalModel = Self.initialLocalModel(
+                storedRawValue: storedLocalModelRawValue,
+                hasStoredCloudSelection: false,
+                hasCloudKey: false,
+                hasDownloadedLocalModel: false
+            )
         } else {
-            selectedLocalModel = .default
+            let hasCloudKey = CloudProvider.allCases.contains { provider in
+                guard let key = apiKeyReader(provider.keychainAccount) else { return false }
+                return !key.isEmpty
+            }
+            let hasStoredCloudSelection = defaults.object(forKey: Keys.useCloudEngine) != nil
+                || defaults.string(forKey: Keys.selectedCloudModel) != nil
+            selectedLocalModel = Self.initialLocalModel(
+                storedRawValue: nil,
+                hasStoredCloudSelection: hasStoredCloudSelection,
+                hasCloudKey: hasCloudKey,
+                hasDownloadedLocalModel: ModelManager.hasAnyDownloadedModel()
+            )
         }
 
         // A previously-stored (or the static `.default`) selection may point
@@ -845,11 +864,11 @@ final class SettingsStore: ObservableObject {
     /// objects (they otherwise start with their own hardcoded defaults).
     func applyOnLaunch() {
         applyActivationKey(restartTap: false)
+        applyLanguage()
         applyLocalModel()
         ensureSelectedModelDownloaded()
         applyCloudSettings()
         applyCleanupSettings()
-        applyLanguage()
         applyLearnFromInlineCorrections()
         refreshEnrolledVoiceProfile(autoEnableGatingIfPresent: false)
         applySpeakerGatingSettings()
@@ -954,7 +973,12 @@ final class SettingsStore: ObservableObject {
     }
 
     private func applyLanguage() {
-        asrEngineSelector?.selectedLanguage = Self.isoLanguageCode(from: selectedLanguage)
+        let language = Self.isoLanguageCode(from: selectedLanguage)
+        asrEngineSelector?.selectedLanguage = language
+        modelManager?.updateAppleSpeechLanguage(language)
+        if selectedLocalModel == .appleSpeech {
+            modelManager?.downloadIfNeeded(.appleSpeech)
+        }
     }
 
     private func applySpeakerGatingSettings() {
@@ -1093,6 +1117,24 @@ final class SettingsStore: ObservableObject {
     private func ensureSelectedModelDownloaded() {
         guard let modelManager else { return }
         modelManager.downloadIfNeeded(selectedLocalModel)
+    }
+
+    /// Preserves an existing local selection. Apple is the default only for a
+    /// genuinely fresh local setup: no stored selection, cloud credential, or
+    /// user-downloaded local model.
+    nonisolated static func initialLocalModel(
+        storedRawValue: String?,
+        hasStoredCloudSelection: Bool,
+        hasCloudKey: Bool,
+        hasDownloadedLocalModel: Bool
+    ) -> LocalModel {
+        if let storedRawValue {
+            return LocalModel(rawValue: storedRawValue) ?? .default
+        }
+        if !hasStoredCloudSelection && !hasCloudKey && !hasDownloadedLocalModel {
+            return .appleSpeech
+        }
+        return .default
     }
 
     /// Registers/unregisters `SMAppService.mainApp` to match `launchAtLogin`.
