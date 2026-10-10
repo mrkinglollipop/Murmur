@@ -19,6 +19,7 @@ final class TextInjectorTests: XCTestCase {
   override func tearDown() {
     TextInjector.resetDedupeStateForTesting()
     TextInjector.deliveryLaneForTesting = nil
+    TextInjector.resetDeferredRestoreGenerationForTesting()
     testPasteboard.clearContents()
     super.tearDown()
   }
@@ -98,6 +99,293 @@ final class TextInjectorTests: XCTestCase {
     func testShouldRetryPaste_retriesDroppedChordOnlyWhenAllowed() {
         XCTAssertTrue(TextInjector.shouldRetryPaste(chordObserved: false, retryOnAmbiguous: true))
         XCTAssertFalse(TextInjector.shouldRetryPaste(chordObserved: false, retryOnAmbiguous: false))
+    }
+
+    func testShouldRetryPaste_blindObserverDoesNotDuplicateDeliveredPaste() {
+        var field = "delivered transcript"
+        if TextInjector.shouldRetryPaste(chordObserved: false, retryOnAmbiguous: true, wentBlind: true) {
+            field += "delivered transcript"
+        }
+        XCTAssertEqual(field, "delivered transcript")
+    }
+
+    private final class FakeObserver: TextInjectionObserver {
+        var observedUTF16Units = 0
+        var observedPasteChordCount = 0
+        var keycodeZeroKeyDownCount = 0
+        var canaryObservedCount = 0
+        var wentBlind = false
+        var stopped = false
+
+        func resetObservedCount() {
+            observedUTF16Units = 0
+            observedPasteChordCount = 0
+            keycodeZeroKeyDownCount = 0
+            canaryObservedCount = 0
+        }
+        func resetCanaryCount() { canaryObservedCount = 0 }
+        func stop() { stopped = true }
+    }
+
+    private final class InjectionHarness {
+        let observer = FakeObserver()
+        let pasteboard: NSPasteboard
+        var secureInput = false
+        var pid: pid_t? = 123
+        var bundleIdentifier = "com.example.editor"
+        var observerAvailable = true
+        var unicodePosts = 0
+        var pastePosts = 0
+        var canaryPosts = 0
+        var unicodeResult = 4
+        var afterUnicode: (() -> Void)?
+        var beforeTargetRead: (() -> Void)?
+        var onWait: ((TextInjector.ConfirmationCounter) -> Int)?
+
+        init(pasteboard: NSPasteboard) {
+            self.pasteboard = pasteboard
+        }
+
+        func injector() -> TextInjector {
+            TextInjector(hooks: TextInjector.Hooks(
+                pasteboard: pasteboard,
+                target: {
+                    self.beforeTargetRead?()
+                    return TextInjector.InjectionTarget(
+                        secureInput: self.secureInput,
+                        pid: self.pid,
+                        bundleIdentifier: self.bundleIdentifier
+                    )
+                },
+                createObserver: { self.observerAvailable ? self.observer : nil },
+                postUnicode: { _ in
+                    self.unicodePosts += 1
+                    self.afterUnicode?()
+                    return self.unicodeResult
+                },
+                postPasteChord: {
+                    self.pastePosts += 1
+                    return true
+                },
+                postCanary: {
+                    self.canaryPosts += 1
+                    return true
+                },
+                waitForConfirmation: { _, counter in self.onWait?(counter) ?? 0 }
+            ))
+        }
+    }
+
+    func testInsert_blindPasteObserverPostsOnlyOneChord() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.onWait = { counter in
+            if case .pasteChord = counter { harness.observer.wentBlind = true }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 1)
+        XCTAssertTrue(harness.observer.stopped)
+    }
+
+    func testInsert_liveObserverZeroPasteEvidenceAllowsOneRetry() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 2)
+    }
+
+    func testInsert_lateUnicodeEvidenceDuringRetrySafetyCheckPreventsRetype() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        var retryEligible = false
+        harness.onWait = { counter in
+            if case .canary = counter {
+                retryEligible = true
+                return 1
+            }
+            return 0
+        }
+        harness.beforeTargetRead = {
+            if retryEligible { harness.observer.observedUTF16Units = 1 }
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .inserted(deliveredText: "text"))
+        XCTAssertEqual(harness.unicodePosts, 1)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testInsert_latePasteEvidenceDuringRetrySafetyCheckPreventsSecondChord() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        var retryEligible = false
+        harness.onWait = { counter in
+            if case .pasteChord = counter {
+                retryEligible = true
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("external copy", forType: .string)
+            }
+            return 0
+        }
+        harness.beforeTargetRead = {
+            if retryEligible { harness.observer.observedPasteChordCount = 1 }
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 1)
+    }
+
+    func testInsert_secureInputBeforeUnicodeRetryAbortsWithoutClipboardWrite() {
+        testPasteboard.clearContents()
+        testPasteboard.setString("user copy", forType: .string)
+        let count = testPasteboard.changeCount
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.onWait = { counter in
+            if case .canary = counter {
+                harness.secureInput = true
+                return 1
+            }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.unicodePosts, 1)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.changeCount, count)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "user copy")
+        XCTAssertTrue(harness.observer.stopped)
+    }
+
+    func testInsert_appSwitchBeforeUnicodeRetryUsesClipboardFallback() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.onWait = { counter in
+            if case .canary = counter {
+                harness.pid = 456
+                return 1
+            }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.unicodePosts, 1)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "text")
+    }
+
+    func testInsert_secureInputBeforePasteLaneLeavesClipboardUntouched() {
+        testPasteboard.clearContents()
+        testPasteboard.setString("user copy", forType: .string)
+        let count = testPasteboard.changeCount
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.afterUnicode = { harness.secureInput = true }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.changeCount, count)
+    }
+
+    func testInsert_appSwitchBeforePasteLaneUsesClipboardFallback() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.afterUnicode = { harness.pid = 456 }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "text")
+    }
+
+    func testInsert_secureInputBeforePasteRetryDoesNotPostAgainOrRewriteClipboard() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        var countAfterFirstPaste = 0
+        harness.onWait = { counter in
+            if case .pasteChord = counter {
+                countAfterFirstPaste = self.testPasteboard.changeCount
+                harness.secureInput = true
+            }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 1)
+        XCTAssertEqual(testPasteboard.changeCount, countAfterFirstPaste)
+    }
+
+    func testInsert_appSwitchBeforePasteRetryUsesClipboardFallback() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.onWait = { counter in
+            if case .pasteChord = counter { harness.pid = 456 }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 1)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "text")
+    }
+
+    func testInsert_secureInputAfterPasteboardPrepareBlocksChord() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        testPasteboard.clearContents()
+        harness.beforeTargetRead = {
+            if self.testPasteboard.string(forType: .string) == "text" {
+                harness.secureInput = true
+            }
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testInsert_appSwitchAfterPasteboardPrepareBlocksChord() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        testPasteboard.clearContents()
+        harness.beforeTargetRead = {
+            if self.testPasteboard.string(forType: .string) == "text" { harness.pid = 456 }
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "text")
+    }
+
+    func testInsert_appSwitchAbortRechecksSecureInputBeforeClipboardFallback() {
+        testPasteboard.clearContents()
+        testPasteboard.setString("user copy", forType: .string)
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.afterUnicode = { harness.pid = 456 }
+        var switchedReads = 0
+        harness.beforeTargetRead = {
+            if harness.pid == 456 {
+                switchedReads += 1
+                if switchedReads > 1 { harness.secureInput = true }
+            }
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "user copy")
+    }
+
+    func testInsert_blindPasteLaneRechecksSecureInputBeforeWrite() {
+        testPasteboard.clearContents()
+        testPasteboard.setString("user copy", forType: .string)
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.observerAvailable = false
+        var reads = 0
+        harness.beforeTargetRead = {
+            reads += 1
+            if reads > 1 { harness.secureInput = true }
+        }
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "user copy")
+    }
+
+    func testInsert_safariPasteLaneRechecksAppIdentityBeforeWrite() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.bundleIdentifier = "com.apple.Safari"
+        var reads = 0
+        harness.beforeTargetRead = {
+            reads += 1
+            if reads > 1 { harness.pid = 456 }
+        }
+        XCTAssertEqual(harness.injector().insert(String(repeating: "a", count: 40)), .failed)
+        XCTAssertEqual(harness.unicodePosts, 0)
+        XCTAssertEqual(harness.pastePosts, 0)
+        XCTAssertEqual(testPasteboard.string(forType: .string), String(repeating: "a", count: 40))
     }
 
     // MARK: - Safari atomic-paste routing
@@ -660,6 +948,75 @@ final class TextInjectorTests: XCTestCase {
 
         let next = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
         XCTAssertEqual(next.first?[.string].flatMap { String(data: $0, encoding: .utf8) }, "user copy")
+    }
+
+    func testBackToBackPasteInserts_preserveCopyMadeDuringPendingRestore() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("original", forType: .string)
+        var callbacks: [() -> Void] = []
+        func pasteInsert(_ text: String) {
+            let baseline = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
+            TextInjector.preparePasteboardForPaste(text, on: testPasteboard)
+            TextInjector.scheduleDeferredPasteboardRestore(
+                injectedText: text,
+                savedPasteboard: baseline,
+                on: testPasteboard,
+                asyncAfter: { _, callback in callbacks.append(callback) }
+            )
+        }
+        pasteInsert("first")
+        testPasteboard.clearContents()
+        let userCopy = NSPasteboardItem()
+        userCopy.setString("latest copy", forType: .string)
+        userCopy.setData(Data([1, 2, 3]), forType: .tiff)
+        testPasteboard.writeObjects([userCopy])
+        let expected = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        pasteInsert("second")
+        callbacks[0]()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "second")
+        callbacks[1]()
+        XCTAssertEqual(TextInjector.pasteboardSnapshot(from: testPasteboard), expected)
+    }
+
+    func testPasteboardBaseline_newCopyOfSameTranscriptIsPreserved() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("original", forType: .string)
+        let baseline = TextInjector.pasteboardBaselineSnapshot(from: testPasteboard)
+        TextInjector.preparePasteboardForPaste("first", on: testPasteboard)
+        var callback: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "first", savedPasteboard: baseline, on: testPasteboard,
+            asyncAfter: { _, work in callback = work }
+        )
+        testPasteboard.clearContents()
+        testPasteboard.setString("first", forType: .string)
+        let latest = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        XCTAssertEqual(TextInjector.pasteboardBaselineSnapshot(from: testPasteboard), latest)
+        callback?()
+        XCTAssertEqual(TextInjector.pasteboardSnapshot(from: testPasteboard), latest)
+    }
+
+    func testScheduleDeferredPasteboardRestore_copyBeforeSchedulingIsNotClobbered() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("original", forType: .string)
+        let baseline = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        TextInjector.preparePasteboardForPaste("first", on: testPasteboard)
+        let countAfterPrepare = testPasteboard.changeCount
+        testPasteboard.clearContents()
+        testPasteboard.setString("first", forType: .string)
+        var callback: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "first", savedPasteboard: baseline, on: testPasteboard,
+            expectedChangeCount: countAfterPrepare,
+            asyncAfter: { _, work in callback = work }
+        )
+        XCTAssertEqual(TextInjector.pasteboardBaselineSnapshot(from: testPasteboard),
+                       TextInjector.pasteboardSnapshot(from: testPasteboard))
+        callback?()
+        XCTAssertEqual(testPasteboard.string(forType: .string), "first")
     }
 
     // MARK: - Pasteboard helpers (named test pasteboard only)
