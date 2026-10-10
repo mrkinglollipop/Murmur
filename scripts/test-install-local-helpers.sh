@@ -104,14 +104,15 @@ else
   fail "package/install get-task-allow gate is incomplete"
 fi
 
-echo "==> install release signing matches DMG release hardening"
+echo "==> install regenerates and builds without injected entitlements"
+# No --timestamp here: a local install must work offline.
 if grep -q 'xcodegen generate' "$SCRIPT" \
   && grep -q 'CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO' "$SCRIPT" \
-  && grep -q 'Deep-signing Sparkle nested binaries' "$SCRIPT" \
-  && grep -q -- '--entitlements "\$ENTITLEMENTS"' "$SCRIPT"; then
-  pass "install regenerates and explicit Developer-ID re-signs without injected entitlements"
+  && grep -q 'assert_no_get_task_allow "\$PRODUCT"' "$SCRIPT" \
+  && ! grep -q -- '--timestamp' "$SCRIPT"; then
+  pass "install regenerates, skips entitlement injection, and asserts the result"
 else
-  fail "install-local.sh lost regeneration, hardened signing, or explicit re-sign"
+  fail "install-local.sh lost regeneration, the injection setting, or the entitlement assert"
 fi
 
 echo "==> Pro bundle detection fails closed"

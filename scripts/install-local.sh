@@ -14,7 +14,6 @@ IDENTITY="${CODE_SIGN_IDENTITY:-Developer ID Application}"
 DERIVED="$ROOT/build/DerivedData"
 PRODUCT="$DERIVED/Build/Products/Release/Murmur.app"
 DEST="/Applications/Murmur.app"
-ENTITLEMENTS="$ROOT/Sources/Voice/Voice.entitlements"
 INSTALL_ROOT=""
 cleanup_install() {
   if [[ -n "$INSTALL_ROOT" && -d "$INSTALL_ROOT" ]]; then
@@ -37,7 +36,6 @@ echo "==> Building Release (signed, arm64-only)"
   DEVELOPMENT_TEAM="$TEAM" \
   CODE_SIGN_IDENTITY="$IDENTITY" \
   CODE_SIGN_STYLE=Manual \
-  OTHER_CODE_SIGN_FLAGS="--timestamp" \
   CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
   | (command -v xcpretty >/dev/null && xcpretty || cat)
 
@@ -45,25 +43,6 @@ if [[ ! -d "$PRODUCT" ]]; then
   echo "error: build product missing: $PRODUCT" >&2
   exit 1
 fi
-
-echo "==> Deep-signing Sparkle nested binaries + Murmur.app (Developer ID + timestamp)"
-SPARKLE="$PRODUCT/Contents/Frameworks/Sparkle.framework"
-SPARKLE_CURRENT="$SPARKLE/Versions/Current"
-sign_nested() {
-  codesign --force --options runtime --timestamp --sign "$IDENTITY" "$1"
-}
-for nested in Autoupdate Updater.app XPCServices/Downloader.xpc XPCServices/Installer.xpc; do
-  if [[ ! -e "$SPARKLE_CURRENT/$nested" ]]; then
-    echo "error: expected Sparkle nested binary missing: $SPARKLE_CURRENT/$nested" >&2
-    exit 1
-  fi
-  sign_nested "$SPARKLE_CURRENT/$nested"
-done
-sign_nested "$SPARKLE"
-codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" \
-  --sign "$IDENTITY" \
-  "$PRODUCT"
 
 echo "==> Verifying build product signature"
 codesign --verify --deep --strict "$PRODUCT"
