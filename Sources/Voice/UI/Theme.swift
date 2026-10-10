@@ -1,11 +1,10 @@
 import AppKit
 import SwiftUI
 
-/// Design tokens for the main window UI, matching the approved dark-first
-/// Liquid Glass mockup (`plans/015-briefs/mockup-v3.html` — the HTML comment
-/// block at the top of that file is the authoritative spec: palette, glass
-/// emulation tokens, per-frame layout). The floating HUD pill is a separate
-/// dark surface and is untouched by this file.
+/// Design tokens for the main window UI, matching the dark-first Liquid Glass
+/// design. The cited `plans/015-briefs/mockup-v3.html` was never committed;
+/// these tokens are the retained implementation reference. The floating HUD
+/// pill is a separate dark surface and is untouched by this file.
 enum Theme {
 
     // MARK: - Colors

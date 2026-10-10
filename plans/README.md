@@ -16,7 +16,7 @@ current setup and contribution guidance.
 | 002 | Fixture-driven stitch replay harness | TODO |
 | 003 | CLAUDE.md for agent sessions | DONE |
 | 004 | Small-fixes bundle (races, logs, cleanup) | DONE |
-| 005 | Docs & deps batch | TODO |
+| 005 | Docs & deps batch | PARTIAL — only the Parakeet pin remains open |
 | 006 | Spike: WPM + latency insights | PARTIAL |
 | 007 | Spike: retry-from-history with engine picker | PARTIAL |
 | 008 | Spike: per-app Snippets / Dictionary / Transforms | TODO |
@@ -32,7 +32,7 @@ current setup and contribution guidance.
 | 018 | Disk I/O off the dictation hot path | DONE |
 | 019 | Docs truth-up | DONE |
 | 020 | Polish bundle | DONE |
-| 021 | FluidVoice-inspired scope | DRAFT |
+| 021 | FluidVoice-inspired scope | DRAFT — largely implemented; remaining scope needs review |
 | 022 | Speaker-gating spike report | DONE (spike) |
 | 023 | Open-source readiness | SHIPPED (Phases 1–5) |
 | 024 | Repo audit findings | archival (fix pass 1 landed) |

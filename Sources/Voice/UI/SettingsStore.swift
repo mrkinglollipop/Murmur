@@ -166,11 +166,12 @@ final class SettingsStore: ObservableObject {
 
     /// Keychain-backed storage for user-supplied cloud API keys. Not
     /// persisted to UserDefaults — only the boolean toggle and model choice
-    /// are; per-provider key presence is queried live via `hasAPIKey(for:)`.
-    private let keychain = KeychainStore()
-    private let defaults: UserDefaults
+    /// are; key presence is cached for published UI state.
+    private let keychain: KeychainStore
+    let defaults: UserDefaults
     private let profileDirectory: URL?
     private let readAPIKey: (String) -> String?
+    @Published private(set) var apiKeyPresence: [String: Bool] = [:]
 
     @Published var activationKeyOption: ActivationKeyOption {
         didSet {
@@ -570,11 +571,13 @@ final class SettingsStore: ObservableObject {
     /// init cannot prune with a nil `historyStore` (empty protect list).
     private var isHydrating = true
 
-    init(defaults: UserDefaults = .standard, profileDirectory: URL? = nil,
+    init(defaults: UserDefaults = VoiceDefaults.shared, profileDirectory: URL? = nil,
+         keychain: KeychainStore = KeychainStore(),
          apiKeyLookup: ((String) -> String?)? = nil) {
+        self.keychain = keychain
         self.defaults = defaults
         self.profileDirectory = profileDirectory
-        self.readAPIKey = apiKeyLookup ?? { KeychainStore().key(for: $0) }
+        self.readAPIKey = apiKeyLookup ?? { keychain.key(for: $0) }
 
         if let raw = defaults.string(forKey: Keys.activationKey),
            let option = ActivationKeyOption(rawValue: raw) {
@@ -790,6 +793,7 @@ final class SettingsStore: ObservableObject {
 
         refreshRecordingUsage()
         isHydrating = false
+        refreshKeyPresence()
     }
 
     /// Call once after `activationController` / `asrEngineSelector` are set,
@@ -934,6 +938,24 @@ final class SettingsStore: ObservableObject {
     /// distinct from the cloud-ASR provider accounts in `CloudProvider`.
     private static let cleanupKeyAccount = "cleanup-openai"
 
+    /// Re-reads only presence flags. Views consume this published cache and
+    /// never synchronously query Keychain from their body.
+    func refreshKeyPresence() {
+        var presence = Dictionary(uniqueKeysWithValues: CloudProvider.allCases.map {
+            ($0.keychainAccount, !(readAPIKey($0.keychainAccount) ?? "").isEmpty)
+        })
+        presence[Self.cleanupKeyAccount] = !(readAPIKey(Self.cleanupKeyAccount) ?? "").isEmpty
+        apiKeyPresence = presence
+    }
+
+    var hasXAIKey: Bool {
+        apiKeyPresence[CloudProvider.xai.keychainAccount] == true
+    }
+
+    var hasCleanupKey: Bool {
+        apiKeyPresence[Self.cleanupKeyAccount] == true
+    }
+
     /// Saves the cleanup cloud API key and republishes cleanup settings so a
     /// live cloud-backend session picks it up immediately.
     /// Returns `false` if the Keychain write failed (input should stay in UI).
@@ -941,7 +963,7 @@ final class SettingsStore: ObservableObject {
     func saveCleanupKey(_ value: String) -> Bool {
         guard keychain.setKey(value, for: Self.cleanupKeyAccount) else { return false }
         applyCleanupSettings()
-        objectWillChange.send()
+        refreshKeyPresence()
         return true
     }
 
@@ -949,13 +971,7 @@ final class SettingsStore: ObservableObject {
     func removeCleanupKey() {
         keychain.deleteKey(for: Self.cleanupKeyAccount)
         applyCleanupSettings()
-        objectWillChange.send()
-    }
-
-    /// Whether a non-empty cleanup cloud API key is currently stored.
-    func hasCleanupKey() -> Bool {
-        guard let key = readAPIKey(Self.cleanupKeyAccount) else { return false }
-        return !key.isEmpty
+        refreshKeyPresence()
     }
 
     /// The raw cleanup cloud API key, if any — used by `TransformRunner` via
@@ -992,14 +1008,6 @@ final class SettingsStore: ObservableObject {
         #endif
     }
 
-    /// Whether the xAI Keychain key (shared with xAI transcription) is
-    /// currently stored — the View uses this to warn when Grok cleanup is
-    /// selected but no key has been entered yet (in the Cloud Model section).
-    func hasXAIKey() -> Bool {
-        guard let key = readAPIKey(CloudProvider.xai.keychainAccount) else { return false }
-        return !key.isEmpty
-    }
-
     // MARK: - API key management (Keychain-backed)
 
     /// Saves `value` as the API key for `provider` and republishes cloud
@@ -1012,7 +1020,7 @@ final class SettingsStore: ObservableObject {
         if provider == .xai {
             applyCleanupSettings()
         }
-        objectWillChange.send()
+        refreshKeyPresence()
         return true
     }
 
@@ -1023,13 +1031,12 @@ final class SettingsStore: ObservableObject {
         if provider == .xai {
             applyCleanupSettings()
         }
-        objectWillChange.send()
+        refreshKeyPresence()
     }
 
     /// Whether a non-empty API key is currently stored for `provider`.
     func hasAPIKey(for provider: CloudProvider) -> Bool {
-        guard let key = readAPIKey(provider.keychainAccount) else { return false }
-        return !key.isEmpty
+        apiKeyPresence[provider.keychainAccount] == true
     }
 
     /// Kicks off a download for the currently-selected local model if it
