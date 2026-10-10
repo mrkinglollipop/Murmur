@@ -75,7 +75,7 @@ final class ClipboardWatcher {
             lastChangeCount = current
             return
         }
-        guard store.canCapture else { return }
+        guard store.canAttemptCapture else { return }
         guard current != lastChangeCount else { return }
         lastChangeCount = current
 

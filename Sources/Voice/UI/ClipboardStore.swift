@@ -4,6 +4,7 @@
 
 import AppKit
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 import os.log
@@ -298,6 +299,12 @@ final class ClipboardStore: ObservableObject {
             && !isMetadataCorrupt && !isStorageUnavailable
     }
 
+    /// Transient writes may be retried only after history was read or proven empty.
+    var canAttemptCapture: Bool {
+        isActivated && !isActivating && !isKeyUnavailable && !isLockedOut
+            && !isMetadataCorrupt && (!isStorageUnavailable || loadedMetadata)
+    }
+
     /// The most recent copy that was too large to store, until dismissed.
     ///
     /// A clipboard manager that silently drops a copy is worse than one that
@@ -319,6 +326,7 @@ final class ClipboardStore: ObservableObject {
 
     private let fileOperations: ClipboardFileOperations
     private var storedEntries: [StoredClipboardEntry] = []
+    private var unreadablePreviews: [UUID: String] = [:]
     private var captureWorkItems: [UUID: DispatchWorkItem] = [:]
     private let directory: URL
     private let metadataURL: URL
@@ -592,6 +600,7 @@ final class ClipboardStore: ObservableObject {
             guard let data = try? fileOperations.read(metadataURL),
                   let decoded = try? decodeStoredEntries(data) else { return false }
             do {
+                try archiveSupersededQuarantines(by: decoded)
                 try fm.removeItem(at: metadataQuarantineMarkerURL)
                 storedEntries = decoded
                 entries = decoded.map(\.entry)
@@ -618,6 +627,7 @@ final class ClipboardStore: ObservableObject {
               let decoded = try? decodeStoredEntries(data) else { return false }
         do {
             try fm.moveItem(at: candidate, to: metadataURL)
+            try archiveSupersededQuarantines(by: decoded)
             try fm.removeItem(at: metadataQuarantineMarkerURL)
             storedEntries = decoded
             entries = decoded.map(\.entry)
@@ -629,27 +639,42 @@ final class ClipboardStore: ObservableObject {
         }
     }
 
-    /// The only intentional plaintext-metadata transition is backed up before
-    /// its first replacement. The fixed filename is deliberately write-once.
+    /// Archive only readable generations whose rows remain in recovered metadata.
+    /// Unknown siblings still protect history from orphan cleanup.
+    private func archiveSupersededQuarantines(by decoded: [StoredClipboardEntry]) throws {
+        let prefix = metadataURL.lastPathComponent + ".corrupt."
+        let known = Set(decoded.map(\.id))
+        for url in try fileOperations.contents(directory) where url.lastPathComponent.hasPrefix(prefix) {
+            guard let data = try? fileOperations.read(url),
+                  let rows = try? decodeStoredEntries(data),
+                  Set(rows.map(\.id)).isSubset(of: known) else { continue }
+            let archived = directory.appendingPathComponent("clipboard.json.recovered.\(UUID().uuidString)")
+            try FileManager.default.moveItem(at: url, to: archived)
+        }
+    }
+
+    /// The fixed backup filename is write-once and owner-only from creation.
     private func preserveMigrationBackup() throws {
-        let fm = FileManager.default
-        guard !fm.fileExists(atPath: migrationBackupURL.path) else { return }
-        try fm.copyItem(at: metadataURL, to: migrationBackupURL)
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: migrationBackupURL.path)
+        let data = try fileOperations.read(metadataURL)
+        let descriptor = Darwin.open(migrationBackupURL.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else {
+            if errno == EEXIST { return }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: migrationBackupURL)
+            throw error
+        }
     }
 
     private func storageFailure(_ error: Error) {
         isStorageUnavailable = true
         logger.error("Clipboard storage unavailable: \(error.localizedDescription)")
-    }
-
-    /// A later capture may retry only when this process successfully decoded
-    /// the metadata first. Unknown or unreadable metadata remains paused until
-    /// a fresh launch can read it safely.
-    private func resumeStorageForSafeCaptureIfPossible() -> Bool {
-        guard isStorageUnavailable, loadedMetadata else { return !isStorageUnavailable }
-        isStorageUnavailable = false
-        return true
     }
 
     private func quarantineCorruptFile(error decodeError: Error) {
@@ -681,7 +706,9 @@ final class ClipboardStore: ObservableObject {
                    previous[entry.id]?.preview == nil {
                     return StoredClipboardEntry(entry: entry, sealedPreview: sealed)
                 }
-                return try StoredClipboardEntry(entry: entry, crypto: crypto)
+                var original = entry
+                if let preview = unreadablePreviews[entry.id] { original.preview = preview }
+                return try StoredClipboardEntry(entry: original, crypto: crypto)
             }
             try fileOperations.write(try encoder.encode(stored), metadataURL)
             storedEntries = stored
@@ -750,7 +777,9 @@ final class ClipboardStore: ObservableObject {
             guard let self else { return }
             do {
                 // Both enumerations must succeed before deleting anything.
-                let files = try self.fileOperations.contents(self.blobsDirectory)
+                let files = try self.fileOperations.contents(self.blobsDirectory).filter {
+                    !$0.lastPathComponent.hasPrefix(".") && !$0.lastPathComponent.hasSuffix(".tmp")
+                }
                 let thumbs = try self.fileOperations.contents(self.thumbsDirectory)
                 let hasCorruptSibling = try self.fileOperations.contents(self.directory).contains {
                     $0.lastPathComponent.hasPrefix(self.metadataURL.lastPathComponent + ".corrupt.")
@@ -761,7 +790,7 @@ final class ClipboardStore: ObservableObject {
                 // sweep the preserved files.
                 guard self.loadedMetadata || (files.isEmpty && !hasCorruptSibling) else {
                     DispatchQueue.main.async {
-                        if !self.loadedMetadata { self.isStorageUnavailable = true }
+                        if !self.loadedMetadata { self.isMetadataCorrupt = true }
                         completion()
                     }
                     return
@@ -776,6 +805,7 @@ final class ClipboardStore: ObservableObject {
                 }
                 let missing = known.subtracting(present)
                 DispatchQueue.main.async {
+                    self.loadedMetadata = true
                     if !missing.isEmpty {
                         self.entries.removeAll { missing.contains($0.id.uuidString) }
                         self.scheduleSave()
@@ -851,8 +881,7 @@ final class ClipboardStore: ObservableObject {
     /// the disk write, and preview generation all happen off it, and the entry
     /// appears once the blob is safely on disk.
     func record(snapshot: TextInjector.PasteboardSnapshot, sourceBundleID: String?) {
-        guard resumeStorageForSafeCaptureIfPossible() else { return }
-        guard canCapture, let crypto else { return }
+        guard canAttemptCapture, let crypto else { return }
         let types = Array(Set(snapshot.flatMap { $0.keys.map(\.rawValue) })).sorted()
         guard let fingerprint = captureFingerprint(snapshot: snapshot, types: types) else { return }
 
@@ -966,6 +995,9 @@ final class ClipboardStore: ObservableObject {
     private func markUnreadable(_ id: UUID) {
         let mutate = {
             guard let index = self.entries.firstIndex(where: { $0.id == id }) else { return }
+            if self.unreadablePreviews[id] == nil {
+                self.unreadablePreviews[id] = self.entries[index].preview
+            }
             self.entries[index].preview = "Unavailable clipboard item"
         }
         if Thread.isMainThread {
@@ -1023,6 +1055,7 @@ final class ClipboardStore: ObservableObject {
             guard !self.isMetadataCorrupt,
                   self.deleteBlobs(for: [entry.id]) else { return }
             self.entries.removeAll { $0.id == entry.id }
+            self.unreadablePreviews.removeValue(forKey: entry.id)
             self.scheduleSave()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
@@ -1040,7 +1073,25 @@ final class ClipboardStore: ObservableObject {
             self.inFlightFingerprints.removeAll()
             let ids = Array(Set(self.entries.map(\.id) + pendingIDs))
             guard self.deleteBlobs(for: ids) else { return }
+            do {
+                let archives = try self.fileOperations.contents(self.directory).filter {
+                    $0.lastPathComponent.hasPrefix("clipboard.json.recovered.")
+                }
+                for url in archives { try self.fileOperations.remove(url) }
+                do {
+                    try self.fileOperations.remove(self.migrationBackupURL)
+                } catch {
+                    if !Self.isMissingFile(error) { throw error }
+                }
+            } catch {
+                if !Self.isMissingFile(error) {
+                    self.storageFailure(error)
+                    return
+                }
+            }
             self.entries = []
+            self.storedEntries = []
+            self.unreadablePreviews.removeAll()
             self.isLockedOut = false
             self.scheduleSave()
         }
@@ -1059,6 +1110,7 @@ final class ClipboardStore: ObservableObject {
             let root = self.directory
             let metadata = self.metadataURL
             let marker = self.metadataQuarantineMarkerURL
+            let backup = self.migrationBackupURL
             let blobs = self.blobsDirectory
             let thumbs = self.thumbsDirectory
             self.blobQueue.async { [weak self] in
@@ -1103,7 +1155,9 @@ final class ClipboardStore: ObservableObject {
                     rootFiles = []
                     self.logger.error("Failed to enumerate quarantined clipboard metadata: \(error.localizedDescription)")
                 }
-                for url in rootFiles where url.lastPathComponent.hasPrefix(prefix) {
+                for url in rootFiles where url.lastPathComponent.hasPrefix(prefix)
+                    || url.lastPathComponent.hasPrefix("clipboard.json.recovered.")
+                    || url.lastPathComponent == backup.lastPathComponent {
                     do {
                         try fm.removeItem(at: url)
                     } catch {
@@ -1121,16 +1175,28 @@ final class ClipboardStore: ObservableObject {
                 }
                 guard succeeded else { return }
                 do {
+                    try fm.createDirectory(at: blobs, withIntermediateDirectories: true)
+                    try fm.createDirectory(at: thumbs, withIntermediateDirectories: true)
+                } catch {
+                    self.logger.error("Failed to prepare clipboard recovery directories: \(error.localizedDescription)")
+                    return
+                }
+                do {
                     try fm.removeItem(at: marker)
                 } catch {
-                    self.logger.error("Failed to finish corrupt clipboard recovery: \(error.localizedDescription)")
-                    return
+                    if !Self.isMissingFile(error) {
+                        self.logger.error("Failed to finish corrupt clipboard recovery: \(error.localizedDescription)")
+                        return
+                    }
                 }
                 DispatchQueue.main.async {
                     guard self.isMetadataCorrupt else { return }
                     self.isMetadataCorrupt = false
                     self.isLockedOut = false
                     self.entries = []
+                    self.storedEntries = []
+                    self.unreadablePreviews.removeAll()
+                    self.loadedMetadata = true
                     self.save()
                 }
             }

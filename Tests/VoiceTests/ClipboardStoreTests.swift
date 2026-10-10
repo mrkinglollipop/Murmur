@@ -1504,6 +1504,196 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertTrue(waitUntil { store.canCapture })
     }
 
+    func testMissingMetadataIgnoresDotfilesAndAtomicTemporaryFiles() throws {
+        let directory = tempDirectory()
+        let blobs = directory.appendingPathComponent("blobs")
+        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        for name in [".DS_Store", ".atomic-write", "capture.tmp"] {
+            try Data("temporary".utf8).write(to: blobs.appendingPathComponent(name))
+        }
+        let store = makeStore(directory: directory)
+        XCTAssertFalse(store.isMetadataCorrupt)
+        XCTAssertTrue(store.canCapture)
+        store.record(snapshot: textSnapshot("ordinary copy"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+    }
+
+    func testMissingMetadataUnknownHistoryRequiresExplicitDiscard() throws {
+        for siblingOnly in [false, true] {
+            let directory = tempDirectory()
+            let blobs = directory.appendingPathComponent("blobs")
+            try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+            let preserved = siblingOnly
+                ? directory.appendingPathComponent("clipboard.json.corrupt.1")
+                : blobs.appendingPathComponent(UUID().uuidString)
+            let data = Data("unknown preserved history".utf8)
+            try data.write(to: preserved)
+            let backup = directory.appendingPathComponent("clipboard.json.pre-migration-backup")
+            try Data("plaintext backup".utf8).write(to: backup)
+            let store = makeStore(directory: directory)
+            XCTAssertTrue(store.isMetadataCorrupt)
+            XCTAssertFalse(store.canAttemptCapture)
+            store.clearAll()
+            store.flush()
+            XCTAssertEqual(try Data(contentsOf: preserved), data)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+            store.discardCorruptHistory()
+            XCTAssertTrue(waitUntil { !store.isMetadataCorrupt && store.canCapture })
+            XCTAssertFalse(FileManager.default.fileExists(atPath: preserved.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+            store.record(snapshot: textSnapshot("after explicit recovery"), sourceBundleID: nil)
+            XCTAssertTrue(waitForEntries(store, count: 1))
+        }
+    }
+
+    func testClearAllDeletesMigrationBackupWithoutRecreatingIt() throws {
+        let directory = tempDirectory()
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        let original = activated(ClipboardStore(directory: directory, crypto: crypto))
+        original.record(snapshot: textSnapshot("legacy private preview"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(original, count: 1))
+        original.flush()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(original.entries).write(to: directory.appendingPathComponent("clipboard.json"))
+        var operations = ClipboardFileOperations()
+        operations.write = { _, _ in
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        }
+        let migrating = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
+        let backup = directory.appendingPathComponent("clipboard.json.pre-migration-backup")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+        migrating.clearAll()
+        migrating.flush()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+    }
+
+    func testDiscardCorruptMetadataDeletesMigrationBackupAndAllowsCleanup() throws {
+        let directory = tempDirectory()
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        let metadata = directory.appendingPathComponent("clipboard.json")
+        let backup = directory.appendingPathComponent("clipboard.json.pre-migration-backup")
+        try Data("broken".utf8).write(to: metadata)
+        try Data("private plaintext".utf8).write(to: backup)
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertTrue(store.isMetadataCorrupt)
+        store.discardCorruptHistory()
+        XCTAssertTrue(waitUntil { !store.isMetadataCorrupt })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+        let orphan = directory.appendingPathComponent("blobs").appendingPathComponent(UUID().uuidString)
+        try Data("orphan".utf8).write(to: orphan)
+        _ = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+    }
+
+    func testUnreadableLegacyPayloadDoesNotPersistPlaceholderAfterMigrationRetry() throws {
+        let directory = tempDirectory()
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        let original = activated(ClipboardStore(directory: directory, crypto: crypto))
+        original.record(snapshot: textSnapshot("original legacy preview"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(original, count: 1))
+        original.flush()
+        let entry = try XCTUnwrap(original.entries.first)
+        let metadata = directory.appendingPathComponent("clipboard.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(original.entries).write(to: metadata)
+        var fail = true
+        var operations = ClipboardFileOperations()
+        operations.write = { data, url in
+            if fail && url == metadata {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+            }
+            try data.write(to: url, options: .atomic)
+        }
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
+        let blob = directory.appendingPathComponent("blobs").appendingPathComponent(entry.id.uuidString)
+        let originalBlob = try Data(contentsOf: blob)
+        try Data("damaged".utf8).write(to: blob)
+        XCTAssertNil(store.payload(for: try XCTUnwrap(store.entries.first)))
+        XCTAssertEqual(store.entries.first?.preview, "Unavailable clipboard item")
+        fail = false
+        store.flush()
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadata)) as? [[String: Any]])
+        let sealed = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(rows.first?["sealedPreview"] as? String)))
+        XCTAssertEqual(String(data: try crypto.open(sealed), encoding: .utf8), "original legacy preview")
+        try originalBlob.write(to: blob)
+        let relaunched = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertEqual(relaunched.entries.first?.preview, "original legacy preview")
+    }
+
+    func testRecoveredCurrentMetadataArchivesHandledSiblingAndCleansOrphans() throws {
+        let directory = tempDirectory()
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        let original = activated(ClipboardStore(directory: directory, crypto: crypto))
+        original.record(snapshot: textSnapshot("current history"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(original, count: 1))
+        original.flush()
+        let metadata = directory.appendingPathComponent("clipboard.json")
+        let sibling = directory.appendingPathComponent("clipboard.json.corrupt.1")
+        let data = try Data(contentsOf: metadata)
+        try data.write(to: sibling)
+        try Data().write(to: directory.appendingPathComponent("clipboard.json.quarantine"))
+        let orphan = directory.appendingPathComponent("blobs").appendingPathComponent(UUID().uuidString)
+        try Data("orphan".utf8).write(to: orphan)
+        let recovered = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertFalse(recovered.isMetadataCorrupt)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sibling.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+        let archives = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("clipboard.json.recovered.") }
+        XCTAssertEqual(archives.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(archives.first)), data)
+        let nextOrphan = directory.appendingPathComponent("blobs").appendingPathComponent(UUID().uuidString)
+        try Data("later orphan".utf8).write(to: nextOrphan)
+        _ = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: nextOrphan.path))
+        recovered.clearAll()
+        recovered.flush()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(archives.first).path))
+    }
+
+    func testUnreadableUnpersistedPayloadRetainsOriginalPreview() throws {
+        let directory = tempDirectory()
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto))
+        store.record(snapshot: textSnapshot("not saved yet"), sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        let entry = try XCTUnwrap(store.entries.first)
+        try Data("damaged".utf8).write(to: directory.appendingPathComponent("blobs").appendingPathComponent(entry.id.uuidString))
+        XCTAssertNil(store.payload(for: entry))
+        XCTAssertNil(store.payload(for: try XCTUnwrap(store.entries.first)))
+        store.flush()
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("clipboard.json"))) as? [[String: Any]])
+        let sealed = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(rows.first?["sealedPreview"] as? String)))
+        XCTAssertEqual(String(data: try crypto.open(sealed), encoding: .utf8), "not saved yet")
+    }
+
+    func testRestoredDowngradeArchivesOnlyHandledSiblings() throws {
+        for unreadableSibling in [false, true] {
+            let directory = tempDirectory()
+            let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+            let original = activated(ClipboardStore(directory: directory, crypto: crypto))
+            original.record(snapshot: textSnapshot("restored history"), sourceBundleID: nil)
+            XCTAssertTrue(waitForEntries(original, count: 1))
+            original.flush()
+            let metadata = directory.appendingPathComponent("clipboard.json")
+            let sibling = directory.appendingPathComponent("clipboard.json.corrupt.1")
+            let data = try Data(contentsOf: metadata)
+            try (unreadableSibling ? Data("unknown".utf8) : data).write(to: sibling)
+            try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: sibling.path)
+            try FileManager.default.moveItem(at: metadata, to: directory.appendingPathComponent("clipboard.json.corrupt.2"))
+            try Data().write(to: directory.appendingPathComponent("clipboard.json.quarantine"))
+            let orphan = directory.appendingPathComponent("blobs").appendingPathComponent(UUID().uuidString)
+            try Data("unknown blob".utf8).write(to: orphan)
+            let recovered = activated(ClipboardStore(directory: directory, crypto: crypto))
+            XCTAssertFalse(recovered.isMetadataCorrupt)
+            XCTAssertEqual(recovered.entries.first?.preview, "restored history")
+            XCTAssertEqual(FileManager.default.fileExists(atPath: sibling.path), unreadableSibling)
+            XCTAssertEqual(FileManager.default.fileExists(atPath: orphan.path), unreadableSibling)
+        }
+    }
+
     // MARK: - Classification
 
     func testKindClassification() {

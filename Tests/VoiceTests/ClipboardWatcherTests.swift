@@ -34,14 +34,15 @@ final class ClipboardWatcherTests: XCTestCase {
         return pasteboard
     }
 
-    private func makeStore(activate: Bool = true) -> ClipboardStore {
+    private func makeStore(activate: Bool = true, fileOperations: ClipboardFileOperations = ClipboardFileOperations()) -> ClipboardStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("murmur-watcher-test-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         tempDirectories.append(directory)
         let store = ClipboardStore(
             directory: directory,
-            crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256))
+            crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256)),
+            fileOperations: fileOperations
         )
         guard activate else { return store }
         // Capture needs a key, and `activate()` resolves it off the launch
@@ -93,6 +94,96 @@ final class ClipboardWatcherTests: XCTestCase {
         XCTAssertTrue(waitForEntries(store, count: 1))
         XCTAssertEqual(store.entries.first?.preview, "copied text")
         XCTAssertEqual(store.entries.first?.kind, .text)
+    }
+
+    func testWatcherRetriesTransientBlobWriteOnNextChange() {
+        var writes = 0
+        var operations = ClipboardFileOperations()
+        operations.write = { data, url in
+            if url.deletingLastPathComponent().lastPathComponent == "blobs" {
+                writes += 1
+                if writes == 1 {
+                    throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+                }
+            }
+            try data.write(to: url, options: .atomic)
+        }
+        let store = makeStore(fileOperations: operations)
+        let pasteboard = makePasteboard()
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, secureInputEnabled: { false })
+        pasteboard.clearContents()
+        pasteboard.setString("failed copy", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitUntil { store.isStorageUnavailable })
+        XCTAssertTrue(store.entries.isEmpty)
+        watcher.tick()
+        settle()
+        XCTAssertEqual(writes, 1, "unchanged clipboard must not poll storage retries")
+        pasteboard.clearContents()
+        pasteboard.setString("successful copy", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        store.flush()
+        XCTAssertFalse(store.isStorageUnavailable)
+        XCTAssertEqual(store.entries.first?.preview, "successful copy")
+        XCTAssertEqual(writes, 2)
+    }
+
+    func testWatcherRetriesTransientMetadataWriteOnNextChange() {
+        var fail = false
+        var operations = ClipboardFileOperations()
+        operations.write = { data, url in
+            if fail && url.lastPathComponent == "clipboard.json" {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+            }
+            try data.write(to: url, options: .atomic)
+        }
+        let store = makeStore(fileOperations: operations)
+        let pasteboard = makePasteboard()
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, secureInputEnabled: { false })
+        pasteboard.clearContents()
+        pasteboard.setString("saved copy", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        store.flush()
+        fail = true
+        pasteboard.clearContents()
+        pasteboard.setString("unsaved metadata", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 2))
+        store.flush()
+        XCTAssertTrue(store.isStorageUnavailable)
+        fail = false
+        pasteboard.clearContents()
+        pasteboard.setString("recovery copy", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 3))
+        store.flush()
+        XCTAssertFalse(store.isStorageUnavailable)
+        XCTAssertEqual(store.entries.first?.preview, "recovery copy")
+    }
+
+    func testWatcherNeverRetriesWhenMetadataCouldNotBeRead() {
+        var operations = ClipboardFileOperations()
+        operations.read = { _ in
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+        }
+        var writes = 0
+        operations.write = { _, _ in writes += 1 }
+        let store = makeStore(fileOperations: operations)
+        XCTAssertTrue(store.isStorageUnavailable)
+        XCTAssertFalse(store.canAttemptCapture)
+        let pasteboard = makePasteboard()
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, secureInputEnabled: { false })
+        for text in ["first", "second"] {
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            watcher.tick()
+        }
+        settle()
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertEqual(writes, 0)
+        XCTAssertTrue(store.isStorageUnavailable)
     }
 
     /// The `changeCount` guard is what keeps the steady-state poll to a single
