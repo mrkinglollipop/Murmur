@@ -25,23 +25,11 @@ final class ParakeetEngine: ASREngine {
     func transcribe(audioURL: URL) async throws -> String {
         let interpreterDescription = Self.resolvedPythonInterpreterDescription()
 
-        guard let scriptURL = Bundle.main.url(
-            forResource: "parakeet_transcribe",
-            withExtension: "py",
-            subdirectory: nil
+        guard let scriptURL = Self.resolveScriptURL(
+            bundledURL: Bundle.main.url(forResource: "parakeet_transcribe", withExtension: "py"),
+            appBundleURL: Bundle.main.bundleURL
         ) else {
-            // Fallback path for running directly from build products (no bundle)
-            let devScriptURL = Bundle.main.bundleURL
-                .deletingLastPathComponent()
-                .appendingPathComponent("parakeet_transcribe.py")
-            if FileManager.default.fileExists(atPath: devScriptURL.path) {
-                return try await runSidecar(
-                    scriptURL: devScriptURL,
-                    audioURL: audioURL,
-                    interpreterDescription: interpreterDescription
-                )
-            }
-            logger.error("Parakeet: sidecar script not found in bundle or build products.")
+            logger.error("Parakeet: sidecar script not found.")
             throw ParakeetError.sidecarNotFound(interpreterDescription: interpreterDescription)
         }
 
@@ -50,6 +38,18 @@ final class ParakeetEngine: ASREngine {
             audioURL: audioURL,
             interpreterDescription: interpreterDescription
         )
+    }
+
+    static func resolveScriptURL(bundledURL: URL?, appBundleURL: URL) -> URL? {
+        if let bundledURL { return bundledURL }
+        #if DEBUG
+        let devScriptURL = appBundleURL.deletingLastPathComponent()
+            .appendingPathComponent("parakeet_transcribe.py")
+        if FileManager.default.fileExists(atPath: devScriptURL.path) {
+            return devScriptURL
+        }
+        #endif
+        return nil
     }
 
     // MARK: - Private
@@ -115,14 +115,22 @@ enum ParakeetProcessRunner {
         arguments: [String],
         interpreterDescription: String,
         timeoutSeconds: TimeInterval = 120,
-        terminationGraceSeconds: TimeInterval = 0.35
+        terminationGraceSeconds: TimeInterval = 0.35,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
     ) async throws -> String {
+        let sidecarDirectory = temporaryDirectory.appendingPathComponent("murmur-parakeet-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sidecarDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         let invocation = ParakeetProcessInvocation(
             executableURL: executableURL,
             arguments: arguments,
             interpreterDescription: interpreterDescription,
             timeoutSeconds: timeoutSeconds,
-            terminationGraceSeconds: terminationGraceSeconds
+            terminationGraceSeconds: terminationGraceSeconds,
+            temporaryDirectory: sidecarDirectory
         )
         return try await withTaskCancellationHandler {
             try await invocation.run()
@@ -144,6 +152,7 @@ private final class ParakeetProcessInvocation: @unchecked Sendable {
     private let interpreterDescription: String
     private let timeoutSeconds: TimeInterval
     private let terminationGraceSeconds: TimeInterval
+    private let temporaryDirectory: URL
     private let stateLock = NSLock()
     private let outputLock = NSLock()
 
@@ -163,11 +172,16 @@ private final class ParakeetProcessInvocation: @unchecked Sendable {
         arguments: [String],
         interpreterDescription: String,
         timeoutSeconds: TimeInterval,
-        terminationGraceSeconds: TimeInterval
+        terminationGraceSeconds: TimeInterval,
+        temporaryDirectory: URL
     ) {
         self.interpreterDescription = interpreterDescription
         self.timeoutSeconds = timeoutSeconds
         self.terminationGraceSeconds = terminationGraceSeconds
+        self.temporaryDirectory = temporaryDirectory
+        var environment = ProcessInfo.processInfo.environment
+        environment["TMPDIR"] = temporaryDirectory.path
+        process.environment = environment
         process.executableURL = executableURL
         process.arguments = arguments
         process.standardOutput = stdout
@@ -181,12 +195,17 @@ private final class ParakeetProcessInvocation: @unchecked Sendable {
             let cancelledBeforeLaunch = stopReason != nil
             stateLock.unlock()
             guard !cancelledBeforeLaunch else {
+                try? FileManager.default.removeItem(at: temporaryDirectory)
                 finish(.failure(CancellationError()))
                 return
             }
 
             installPipeReaders()
+            // Python's tempfile uses this invocation-owned TMPDIR. Cleanup is
+            // tied to process exit, including SIGKILL which skips Python finally.
+            let cleanupDirectory = temporaryDirectory
             process.terminationHandler = { [weak self] process in
+                try? FileManager.default.removeItem(at: cleanupDirectory)
                 self?.processTerminated(process)
             }
 
@@ -197,6 +216,7 @@ private final class ParakeetProcessInvocation: @unchecked Sendable {
                 try? stdout.fileHandleForWriting.close()
                 try? stderr.fileHandleForWriting.close()
             } catch {
+                try? FileManager.default.removeItem(at: temporaryDirectory)
                 closePipesAndSnapshot()
                 finish(.failure(error))
                 return

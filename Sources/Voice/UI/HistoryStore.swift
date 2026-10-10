@@ -211,7 +211,12 @@ final class HistoryStore: ObservableObject {
             )
             self.entries.insert(entry, at: 0)
             if self.entries.count > self.maxEntries {
+                let droppedPaths = Set(self.entries.suffix(self.entries.count - self.maxEntries).compactMap(\.audioPath))
                 self.entries.removeLast(self.entries.count - self.maxEntries)
+                let remainingPaths = Set(self.entries.compactMap(\.audioPath))
+                for path in droppedPaths.subtracting(remainingPaths) where !path.isEmpty {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
             }
             self.save()
         }

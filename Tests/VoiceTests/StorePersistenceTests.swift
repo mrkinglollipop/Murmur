@@ -241,6 +241,35 @@ final class StorePersistenceTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), original)
     }
 
+    @MainActor
+    func testHistoryCapDeletesOnlyUnreferencedDroppedAudio() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("murmur-history-cap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        tempURLs.append(directory)
+        let droppedAudio = directory.appendingPathComponent("dropped.caf")
+        let sharedAudio = directory.appendingPathComponent("shared.caf")
+        let newestAudio = directory.appendingPathComponent("newest.caf")
+        for audio in [droppedAudio, sharedAudio, newestAudio] { try Data([0]).write(to: audio) }
+        var entries = (0..<998).map { HistoryEntry(text: "row \($0)", engine: "test", injected: true) }
+        entries[0].audioPath = sharedAudio.path
+        entries.append(HistoryEntry(text: "old shared", engine: "test", injected: true, audioPath: sharedAudio.path))
+        entries.append(HistoryEntry(text: "", engine: "test", injected: false, audioPath: droppedAudio.path, failed: true))
+        let file = directory.appendingPathComponent("history.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(entries).write(to: file)
+        let store = HistoryStore(fileURL: file)
+        store.append(text: "newest", engine: "test", injected: true, audioPath: newestAudio.path)
+        XCTAssertEqual(store.entries.count, 1000)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: droppedAudio.path))
+        XCTAssertFalse(store.protectedAudioPathsSnapshot().contains(droppedAudio.path))
+        store.append(text: "another", engine: "test", injected: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sharedAudio.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: newestAudio.path))
+        XCTAssertEqual(HistoryStore(fileURL: file).entries.count, 1000)
+    }
+
     func testHistoryDeleteRemovesRetainedAudioFile() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("murmur-test-audio-\(UUID().uuidString)", isDirectory: true)
