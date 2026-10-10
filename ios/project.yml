@@ -238,6 +238,7 @@ targets:
       - path: Resources
         buildPhase: resources
       - path: Shared/HostFingerprint.swift
+      - path: Keyboard/KeyboardDocumentState.swift
       - path: Shared/GiphyClient.swift
       - path: Shared/AppGroupStore.swift
       - path: ../Sources/Voice/ElevenLabsRealtimeOptions.swift
