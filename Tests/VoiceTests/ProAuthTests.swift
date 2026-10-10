@@ -28,6 +28,8 @@ final class ProAuthTests: XCTestCase {
             await withCheckedContinuation { startWaiters.append((count, $0)) }
         }
 
+        func numberOfStarts() -> Int { startCount }
+
         func succeed(_ session: SupabaseAuthClient.Session) {
             guard !continuations.isEmpty else { return }
             continuations.removeFirst().resume(returning: session)
@@ -39,14 +41,31 @@ final class ProAuthTests: XCTestCase {
         }
     }
 
-    private func session(refreshToken: String = "refreshed") -> SupabaseAuthClient.Session {
+    private func session(
+        refreshToken: String = "refreshed",
+        expiresIn: TimeInterval = 3600
+    ) -> SupabaseAuthClient.Session {
         SupabaseAuthClient.Session(
             accessToken: "access",
             refreshToken: refreshToken,
-            expiresAt: Date().addingTimeInterval(3600),
+            expiresAt: Date().addingTimeInterval(expiresIn),
             userID: "user-1",
             email: nil
         )
+    }
+
+    @MainActor
+    private func waitForState(
+        _ controller: AuthFlowController,
+        _ expected: AuthFlowController.State,
+        timeout: TimeInterval = 10
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if controller.state == expected { return }
+            await Task.yield()
+        }
+        XCTAssertEqual(controller.state, expected, "controller did not reach expected state before deadline")
     }
 
     // MARK: - PKCE
@@ -166,6 +185,22 @@ final class ProAuthTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testControllerOwnsAutomaticBrowserExpiry() async {
+        let controller = AuthFlowController(
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { _ in },
+            deleteStoredToken: {},
+            browserTimeout: -1,
+            waitForBrowserTimeout: {}
+        )
+        controller.beginSignIn(provider: .apple)
+        await waitForState(controller, .failed("That took too long — try again."))
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=late")!))
+        XCTAssertEqual(controller.state, .failed("That took too long — try again."))
+    }
+
     func testLoopbackCallbackMustMatchItsBrowserAttempt() {
         let waiting = AuthFlowController.State.waitingForBrowser(provider: .google, startedAt: Date())
         XCTAssertFalse(
@@ -234,7 +269,7 @@ final class ProAuthTests: XCTestCase {
         await gate.waitUntilStarted(count: 2)
         let accepted = session()
         await gate.succeed(accepted)
-        for _ in 0..<4 { await Task.yield() }
+        await waitForState(controller, .signedIn(accepted))
         XCTAssertEqual(controller.state, .signedIn(accepted))
     }
 
@@ -258,8 +293,231 @@ final class ProAuthTests: XCTestCase {
 
         await gate.succeed(accepted)
         await gate.fail()
-        for _ in 0..<4 { await Task.yield() }
+        await waitForState(controller, .signedIn(accepted))
         XCTAssertEqual(controller.state, .signedIn(accepted))
+    }
+
+    @MainActor
+    func testAuthenticatedSessionRefreshesWithinMarginAndPersistsRotation() async {
+        let initial = session(refreshToken: "initial", expiresIn: 30)
+        let refreshed = session(refreshToken: "rotated")
+        var storedTokens: [String] = []
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in initial },
+            refreshToken: { _ in refreshed },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { storedTokens.append($0) },
+            deleteStoredToken: {}
+        )
+
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(initial))
+
+        let safe = await controller.authenticatedSession()
+        XCTAssertEqual(safe, refreshed)
+        XCTAssertEqual(controller.state, .signedIn(refreshed))
+        XCTAssertEqual(storedTokens, ["initial", "rotated"])
+    }
+
+    @MainActor
+    func testFreshAuthenticatedSessionDoesNotRefresh() async {
+        let initial = session(refreshToken: "initial", expiresIn: 3600)
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in initial },
+            refreshToken: { _ in
+                XCTFail("fresh session must not refresh")
+                return initial
+            },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { _ in },
+            deleteStoredToken: {}
+        )
+
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(initial))
+        let safe = await controller.authenticatedSession()
+        XCTAssertEqual(safe, initial)
+    }
+
+    @MainActor
+    func testInitialTokenPersistenceFailureSurfacesControllerError() async {
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in self.session() },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            persistStoredToken: { _ in false },
+            removeStoredToken: { true }
+        )
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .failed("Murmur couldn't save your sign-in. Try again."))
+    }
+
+    @MainActor
+    func testRefreshTokenPersistenceFailurePreservesLiveSessionAndReportsError() async {
+        let initial = session(refreshToken: "initial", expiresIn: 30)
+        let refreshed = session(refreshToken: "rotated")
+        var writeCount = 0
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in initial },
+            refreshToken: { _ in refreshed },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            persistStoredToken: { _ in
+                writeCount += 1
+                return writeCount == 1
+            },
+            removeStoredToken: { true }
+        )
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(initial))
+        let safe = await controller.authenticatedSession()
+        XCTAssertEqual(safe, refreshed)
+        XCTAssertEqual(controller.state, .signedIn(refreshed))
+        XCTAssertEqual(controller.lastError, "Murmur couldn't save the renewed sign-in.")
+    }
+
+    @MainActor
+    func testTokenDeletionFailureKeepsAccountSheetOpenWithError() async {
+        let signedIn = session()
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in signedIn },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            persistStoredToken: { _ in true },
+            removeStoredToken: { false }
+        )
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(signedIn))
+        controller.signOut()
+        XCTAssertEqual(controller.state, .signedIn(signedIn))
+        XCTAssertEqual(controller.lastError, "Murmur couldn't remove your saved sign-in.")
+    }
+
+    @MainActor
+    func testConcurrentAuthenticatedRequestsShareOneRefresh() async {
+        let gate = SessionGate()
+        let initial = session(refreshToken: "initial", expiresIn: 30)
+        let refreshed = session(refreshToken: "initial")
+        var storedTokens: [String] = []
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in initial },
+            refreshToken: { _ in try await gate.fetch() },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { storedTokens.append($0) },
+            deleteStoredToken: {}
+        )
+
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(initial))
+
+        let first = Task { await controller.authenticatedSession() }
+        await gate.waitUntilStarted()
+        let second = Task { await controller.authenticatedSession() }
+        await gate.succeed(refreshed)
+        let firstValue = await first.value
+        let secondValue = await second.value
+        let starts = await gate.numberOfStarts()
+        XCTAssertEqual(firstValue, refreshed)
+        XCTAssertEqual(secondValue, refreshed)
+        XCTAssertEqual(starts, 1)
+        XCTAssertEqual(storedTokens, ["initial", "initial"], "shared refresh persists once even when rotation keeps the same token")
+    }
+
+    @MainActor
+    func testLateRefreshCannotReplaceNewSignInSession() async {
+        let gate = SessionGate()
+        let old = session(refreshToken: "shared", expiresIn: 30)
+        let new = session(refreshToken: "shared", expiresIn: 3600)
+        let controller = AuthFlowController(
+            exchangeCode: { code, _ in code == "new" ? new : old },
+            refreshToken: { _ in try await gate.fetch() },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { _ in },
+            deleteStoredToken: {}
+        )
+
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=old")!))
+        await waitForState(controller, .signedIn(old))
+        let refresh = Task { await controller.authenticatedSession() }
+        await gate.waitUntilStarted()
+
+        controller.signOut()
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=new")!))
+        await waitForState(controller, .signedIn(new))
+        await gate.succeed(session(refreshToken: "old-rotated"))
+
+        let oldRefreshResult = await refresh.value
+        XCTAssertNil(oldRefreshResult)
+        XCTAssertEqual(controller.state, .signedIn(new))
+    }
+
+    @MainActor
+    func testUnreachableRefreshPreservesSessionAndReportsError() async {
+        let initial = session(refreshToken: "initial", expiresIn: 30)
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in initial },
+            refreshToken: { _ in throw SupabaseAuthClient.AuthError.badResponse(503) },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { _ in },
+            deleteStoredToken: {}
+        )
+
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(initial))
+
+        let safe = await controller.authenticatedSession()
+        XCTAssertNil(safe)
+        XCTAssertEqual(controller.state, .signedIn(initial))
+        XCTAssertTrue(controller.lastError?.contains("can't reach the server") == true)
+    }
+
+    @MainActor
+    func testOnlyExplicitInvalidRefreshSignsOut() async {
+        let initial = session(refreshToken: "initial", expiresIn: 30)
+        var removed = false
+        let controller = AuthFlowController(
+            exchangeCode: { _, _ in initial },
+            refreshToken: { _ in throw SupabaseAuthClient.AuthError.invalidRefreshToken },
+            openBrowser: { _ in },
+            readStoredToken: { nil },
+            writeStoredToken: { _ in },
+            deleteStoredToken: { removed = true }
+        )
+
+        controller.beginSignIn(provider: .google)
+        XCTAssertTrue(controller.handleCallback(URL(string: "murmur://auth-callback?code=current")!))
+        await waitForState(controller, .signedIn(initial))
+
+        let safe = await controller.authenticatedSession()
+        XCTAssertNil(safe)
+        XCTAssertEqual(controller.state, .signedOut)
+        XCTAssertTrue(removed)
+    }
+
+    func testOnlyDocumentedRefreshCodesInvalidateSession() {
+        XCTAssertTrue(SupabaseAuthClient.isExplicitlyInvalidRefreshResponse(
+            Data(#"{"error_code":"refresh_token_not_found"}"#.utf8)
+        ))
+        XCTAssertTrue(SupabaseAuthClient.isExplicitlyInvalidRefreshResponse(
+            Data(#"{"code":"refresh_token_already_used"}"#.utf8)
+        ))
+        XCTAssertFalse(SupabaseAuthClient.isExplicitlyInvalidRefreshResponse(
+            Data(#"{"code":"unexpected_error"}"#.utf8)
+        ))
     }
 
     @MainActor
@@ -284,7 +542,7 @@ final class ProAuthTests: XCTestCase {
         await gate.waitUntilStarted()
         let accepted = session()
         await gate.succeed(accepted)
-        for _ in 0..<4 { await Task.yield() }
+        await waitForState(controller, .signedIn(accepted))
         XCTAssertEqual(controller.state, .signedIn(accepted))
     }
 

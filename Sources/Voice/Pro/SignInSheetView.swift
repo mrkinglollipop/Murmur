@@ -8,10 +8,6 @@ struct SignInSheetView: View {
     @ObservedObject var authFlow: AuthFlowController
     var onDismiss: () -> Void
 
-    /// Drives the 5-minute waiting-state expiry check (mock: fall back to
-    /// the buttons with "That took too long — try again.").
-    private let expiryTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
-
     var body: some View {
         VStack(spacing: 0) {
             switch authFlow.state {
@@ -26,7 +22,6 @@ struct SignInSheetView: View {
         .padding(24)
         .frame(width: 330)
         .background(Theme.bg)
-        .onReceive(expiryTimer) { _ in authFlow.expireIfTimedOut() }
     }
 
     private var buttonsContent: some View {
@@ -160,10 +155,18 @@ struct AccountSheetView: View {
                 }
             }
 
+            if let error = authFlow.lastError {
+                Text(error)
+                    .font(Theme.body(11))
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(Theme.amberText)
+                    .frame(maxWidth: 270)
+            }
+
             HStack(spacing: 10) {
                 Button("Sign out") {
                     authFlow.signOut()
-                    onDismiss()
+                    if case .signedOut = authFlow.state { onDismiss() }
                 }
                 .buttonStyle(.plain)
                 .font(Theme.body(12))

@@ -108,10 +108,29 @@ final class EntitlementStore: ObservableObject {
         fetched ?? cached ?? false
     }
 
-    func refresh(session: SupabaseAuthClient.Session) async {
+    /// The app supplies `authenticatedSession` when it needs an auth preflight.
+    /// Keeping the fetcher injection here preserves the entitlement cache
+    /// policy while making that handoff explicit and testable.
+    func refresh(
+        session: SupabaseAuthClient.Session,
+        authenticatedSession: (() async -> SupabaseAuthClient.Session?)? = nil
+    ) async {
         refreshGeneration &+= 1
         let generation = refreshGeneration
         isRefreshing = true
+
+        let resolvedSession: SupabaseAuthClient.Session?
+        if let authenticatedSession {
+            resolvedSession = await authenticatedSession()
+        } else {
+            resolvedSession = session
+        }
+        guard let session = resolvedSession else {
+            guard generation == refreshGeneration else { return }
+            isPro = Self.resolve(fetched: nil, cached: cachedAnswer(userID: session.userID))
+            isRefreshing = false
+            return
+        }
 
         var fetched: Bool?
         do {

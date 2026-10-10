@@ -136,6 +136,60 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertTrue(store.entries.isEmpty)
     }
 
+    func testTextDisplaySizeUsesPasteableTextNotWholePayload() {
+        let store = makeStore()
+        let text = "tiny"
+        let snapshot: TextInjector.PasteboardSnapshot = [[
+            .string: Data(text.utf8),
+            .rtf: Data(repeating: 0, count: 200_000)
+        ]]
+        store.record(snapshot: snapshot, sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        XCTAssertEqual(store.pasteableByteCount(for: try! XCTUnwrap(store.entries.first)), text.utf8.count)
+    }
+
+    func testImageDisplaySizeUsesPNGInsteadOfAdditionalTIFF() {
+        let store = makeStore()
+        let png = Data([1, 2, 3])
+        let snapshot: TextInjector.PasteboardSnapshot = [[
+            .png: png,
+            .tiff: Data(repeating: 4, count: 200_000)
+        ]]
+        store.record(snapshot: snapshot, sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        XCTAssertEqual(store.pasteableByteCount(for: try! XCTUnwrap(store.entries.first)), png.count)
+    }
+
+    func testOtherDisplaySizeUsesCanonicalPayloadInsteadOfSummingVariants() {
+        let store = makeStore()
+        let canonical = Data(repeating: 7, count: 9)
+        let snapshot: TextInjector.PasteboardSnapshot = [[
+            NSPasteboard.PasteboardType("com.murmur.variant-a"): Data(repeating: 1, count: 4),
+            NSPasteboard.PasteboardType("com.murmur.variant-b"): canonical
+        ]]
+        store.record(snapshot: snapshot, sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        XCTAssertEqual(store.pasteableByteCount(for: try! XCTUnwrap(store.entries.first)), canonical.count)
+    }
+
+    func testEmptyTextRepresentationDisplaysZeroBytes() {
+        let store = makeStore()
+        let snapshot: TextInjector.PasteboardSnapshot = [[
+            .string: Data(),
+            .rtf: Data("fallback representation".utf8)
+        ]]
+        store.record(snapshot: snapshot, sourceBundleID: nil)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+        XCTAssertEqual(store.pasteableByteCount(for: try! XCTUnwrap(store.entries.first)), 0)
+    }
+
+    func testClipboardPreviewRendersMarkdownAsPlainText() {
+        XCTAssertEqual(
+            ClipboardView.plainTextPreview("# Heading\n- **Bold** [link](https://example.com)"),
+            "Heading\nBold link"
+        )
+    }
+
     /// Re-copying older content is not a duplicate — it moves to the top. Only
     /// a repeat of the *newest* entry is suppressed.
     func testRecopyingOlderContentIsCaptured() {

@@ -1033,6 +1033,31 @@ final class ClipboardStore: ObservableObject {
         }
     }
 
+    /// Read-only display metric. The encrypted blob's byte count includes
+    /// alternate pasteboard representations and encryption overhead, so it is
+    /// not a user-facing size. Select one pasteable representation per item;
+    /// call this off the main thread.
+    func pasteableByteCount(for entry: ClipboardEntry) -> Int? {
+        guard let snapshot = payload(for: entry) else { return nil }
+        var total = 0
+        for item in snapshot {
+            let representation: Data?
+            switch entry.kind {
+            case .text:
+                representation = item[.string]
+            case .image:
+                representation = item[.png] ?? item[.tiff]
+            case .other:
+                representation = ClipboardFingerprint.canonicalPayload(of: item)
+            case .files:
+                return nil
+            }
+            guard let representation else { return nil }
+            total += representation.count
+        }
+        return total
+    }
+
     /// Puts `entry` back on the pasteboard with every representation it was
     /// captured with — reusing `TextInjector`'s restore, which is the same
     /// operation this app already performs after every dictation.

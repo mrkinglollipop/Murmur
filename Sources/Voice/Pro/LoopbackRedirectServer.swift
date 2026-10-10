@@ -14,6 +14,12 @@ import Network
 /// code to the flow controller. The custom-scheme path remains as fallback.
 final class LoopbackRedirectServer {
 
+    enum RequestHeadResult: Equatable {
+        case waitForMore
+        case target(String)
+        case badRequest
+    }
+
     /// Fixed ports registered verbatim in Supabase's redirect allow-list.
     /// Explicit entries because the allow-list's glob rules don't clearly
     /// cover port wildcards. Tried in order; all taken → caller falls back
@@ -30,9 +36,41 @@ final class LoopbackRedirectServer {
 
     /// "GET /auth-callback?code=x HTTP/1.1" → "/auth-callback?code=x".
     static func requestTarget(fromRequestHead head: String) -> String? {
-        let parts = head.split(separator: "\r\n").first?.split(separator: " ") ?? []
-        guard parts.count >= 3, parts[0] == "GET" else { return nil }
+        let lines = head.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return nil }
+        let parts = requestLine.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts[0] == "GET",
+              parts[1].first == "/",
+              parts[2] == "HTTP/1.1" || parts[2] == "HTTP/1.0" else { return nil }
+        for line in lines.dropFirst() where !line.isEmpty {
+            guard let colon = line.firstIndex(of: ":"), colon != line.startIndex,
+                  line[..<colon].allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) else {
+                return nil
+            }
+        }
         return String(parts[1])
+    }
+
+    static func responseStatus(forRequestHead head: String) -> String {
+        requestTarget(fromRequestHead: head) == nil ? "400 Bad Request" : "200 OK"
+    }
+
+    static func requestHeadResult(
+        accumulated: Data,
+        received: Data,
+        complete: Bool
+    ) -> RequestHeadResult {
+        let next = accumulated + received
+        guard next.count <= maximumRequestHeadBytes else { return .badRequest }
+        guard let terminator = next.range(of: Data("\r\n\r\n".utf8)) else {
+            return complete ? .badRequest : .waitForMore
+        }
+        guard let head = String(data: next[..<terminator.upperBound], encoding: .utf8),
+              let target = requestTarget(fromRequestHead: head) else {
+            return .badRequest
+        }
+        return .target(target)
     }
 
     /// nil when the target isn't the callback path (favicon and friends);
@@ -43,18 +81,14 @@ final class LoopbackRedirectServer {
         return SupabaseAuthClient.parseCallbackItems(components.queryItems ?? [])
     }
 
-    static func responseHTML(success: Bool) -> String {
-        let headline = success ? "You&#8217;re signed in" : "Sign-in didn&#8217;t complete"
-        let detail = success
-            ? "You can close this tab and return to Murmur."
-            : "You can close this tab and try again in Murmur."
+    static func responseHTML() -> String {
         return """
         <!doctype html><html><head><meta charset="utf-8"><title>Murmur</title>
         <style>
         body{font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#faf7f2;color:#3a3532}
         @media(prefers-color-scheme:dark){body{background:#1c1a18;color:#e8e2da}}
         main{text-align:center}h1{font-size:22px;font-weight:600;margin:0 0 8px}p{font-size:14px;opacity:.7;margin:0}
-        </style></head><body><main><h1>\(headline)</h1><p>\(detail)</p></main></body></html>
+        </style></head><body><main><h1>You can return to Murmur.</h1><p>You can close this tab.</p></main></body></html>
         """
     }
 
@@ -65,8 +99,22 @@ final class LoopbackRedirectServer {
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "com.matt.voice-dictation.loopback-auth")
+    /// A callback needs one short-lived connection. Keep a small cap so a
+    /// local process cannot make the listener retain an unbounded array while
+    /// a browser attempt is open.
+    private static let maximumConnections = 8
+    private static let maximumRequestHeadBytes = 8 * 1024
     private var connections: [NWConnection] = []
     private var onResult: ((Result<String, SupabaseAuthClient.AuthError>) -> Void)?
+    private var isStopped = false
+
+    static func shouldAcceptConnection(
+        retainedCount: Int,
+        hasResultHandler: Bool,
+        isStopped: Bool
+    ) -> Bool {
+        !isStopped && hasResultHandler && retainedCount < maximumConnections
+    }
 
     /// Binds the first free allow-listed port, or nil when none is available.
     /// `onResult` fires for each callback candidate, on an internal queue — hop
@@ -121,6 +169,7 @@ final class LoopbackRedirectServer {
 
     func stop() {
         queue.async { [self] in
+            isStopped = true
             onResult = nil
             listener.cancel()
             connections.forEach { $0.cancel() }
@@ -133,16 +182,33 @@ final class LoopbackRedirectServer {
     }
 
     private func accept(_ connection: NWConnection) {
+        guard Self.shouldAcceptConnection(
+            retainedCount: connections.count,
+            hasResultHandler: onResult != nil,
+            isStopped: isStopped
+        ) else {
+            connection.cancel()
+            return
+        }
         connections.append(connection)
         connection.start(queue: queue)
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, error in
-            guard let self, error == nil, let data,
-                  let head = String(data: data, encoding: .utf8),
-                  let target = Self.requestTarget(fromRequestHead: head) else {
-                connection.cancel()
+        receiveRequestHead(from: connection, accumulated: Data())
+    }
+
+    private func receiveRequestHead(from connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, complete, error in
+            guard let self, error == nil, let data else {
+                self?.close(connection)
                 return
             }
-            self.respond(to: connection, target: target)
+            switch Self.requestHeadResult(accumulated: accumulated, received: data, complete: complete) {
+            case .target(let target):
+                self.respond(to: connection, target: target)
+            case .badRequest:
+                self.send(connection, status: "400 Bad Request", body: "")
+            case .waitForMore:
+                self.receiveRequestHead(from: connection, accumulated: accumulated + data)
+            }
         }
     }
 
@@ -152,17 +218,20 @@ final class LoopbackRedirectServer {
             send(connection, status: "404 Not Found", body: "")
             return
         }
-        let success: Bool
-        if case .success = result { success = true } else { success = false }
-        send(connection, status: "200 OK", body: Self.responseHTML(success: success))
+        send(connection, status: "200 OK", body: Self.responseHTML())
         onResult?(result)
     }
 
     private func send(_ connection: NWConnection, status: String, body: String) {
         let payload = Data(body.utf8)
         let head = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(payload.count)\r\nConnection: close\r\n\r\n"
-        connection.send(content: Data(head.utf8) + payload, completion: .contentProcessed { _ in
-            connection.cancel()
+        connection.send(content: Data(head.utf8) + payload, completion: .contentProcessed { [weak self] _ in
+            self?.close(connection)
         })
+    }
+
+    private func close(_ connection: NWConnection) {
+        connection.cancel()
+        connections.removeAll { $0 === connection }
     }
 }

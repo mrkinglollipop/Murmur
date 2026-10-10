@@ -39,6 +39,10 @@ struct SupabaseAuthClient {
     enum AuthError: Error, Equatable {
         case callbackCarriedError(String)
         case callbackMissingCode
+        /// Supabase documents these stable refresh errors. Only these mean the
+        /// stored session is definitely gone; an HTTP status alone may be a
+        /// transient server or transport failure.
+        case invalidRefreshToken
         case badResponse(Int)
         case malformedSession
     }
@@ -154,8 +158,24 @@ struct SupabaseAuthClient {
         let req = tokenRequest(grantType: "refresh_token", body: ["refresh_token": refreshToken])
         let (data, resp) = try await URLSession.shared.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard status == 200 else { throw AuthError.badResponse(status) }
+        guard status == 200 else {
+            if isExplicitlyInvalidRefreshResponse(data) {
+                throw AuthError.invalidRefreshToken
+            }
+            throw AuthError.badResponse(status)
+        }
         guard let session = decodeSession(data) else { throw AuthError.malformedSession }
         return session
+    }
+
+    /// Only documented machine-readable codes revoke a local session. Generic
+    /// 400/401/5xx responses can come from an unavailable server or proxy and
+    /// must leave the signed-in session intact for an offline retry.
+    static func isExplicitlyInvalidRefreshResponse(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        let code = object["error_code"] as? String ?? object["code"] as? String
+        return code == "refresh_token_already_used" || code == "refresh_token_not_found"
     }
 }
