@@ -258,11 +258,19 @@ enum AutocorrectEngine {
         frequencyOrder: [String],
         names: Set<String>
     ) -> Bool {
+        shouldForceSpelling(span: span, guess: guess, frequency: Set(frequencyOrder), names: names)
+    }
+
+    static func shouldForceSpelling(
+        span: String,
+        guess: String,
+        frequency: Set<String>,
+        names: Set<String>
+    ) -> Bool {
         let typed = span.lowercased()
         let want = guess.lowercased()
         guard typed.count >= 3, typed != want else { return false }
         if names.contains(typed) { return false }
-        let frequency = Set(frequencyOrder)
         if frequency.contains(typed) { return false }
         guard frequency.contains(want) else { return false }
         return damerauLevenshtein(typed, want) <= 1
@@ -330,7 +338,7 @@ enum AutocorrectEngine {
         known: [String],
         frequencyOrder: [String]? = nil
     ) -> String? {
-        splitResult(span, known: known, frequencyOrder: frequencyOrder)?.text
+        splitWords(span, lexicon: SplitLexicon(known: known, frequencyOrder: frequencyOrder))
     }
 
     /// Spacebar split when both pieces are common (`hethe` → `he the`).
@@ -339,8 +347,31 @@ enum AutocorrectEngine {
         known: [String],
         frequencyOrder: [String]? = nil
     ) -> String? {
-        guard let result = splitResult(span, known: known, frequencyOrder: frequencyOrder),
-              result.highConfidence else { return nil }
+        forcedSplit(span, lexicon: SplitLexicon(known: known, frequencyOrder: frequencyOrder))
+    }
+
+    struct SplitLexicon {
+        let known: Set<String>
+        let rank: [String: Int]
+
+        init(known: [String], frequencyOrder: [String]? = nil) {
+            self.known = Set(known.map { $0.lowercased() })
+            var rank: [String: Int] = [:]
+            for (index, word) in (frequencyOrder ?? known).enumerated() {
+                let key = word.lowercased()
+                if rank[key] == nil { rank[key] = index }
+            }
+            for key in self.known where rank[key] == nil { rank[key] = 8_000 }
+            self.rank = rank
+        }
+    }
+
+    static func splitWords(_ span: String, lexicon: SplitLexicon) -> String? {
+        splitResult(span, lexicon: lexicon)?.text
+    }
+
+    static func forcedSplit(_ span: String, lexicon: SplitLexicon) -> String? {
+        guard let result = splitResult(span, lexicon: lexicon), result.highConfidence else { return nil }
         return result.text
     }
 
@@ -349,31 +380,12 @@ enum AutocorrectEngine {
         var highConfidence: Bool
     }
 
-    private static func splitResult(
-        _ span: String,
-        known: [String],
-        frequencyOrder: [String]?
-    ) -> WordSplit? {
+    private static func splitResult(_ span: String, lexicon: SplitLexicon) -> WordSplit? {
         let lower = span.lowercased()
         guard lower.count >= 4, lower.count <= 22 else { return nil }
         guard lower.allSatisfy(\.isLetter) else { return nil }
-        var knownSet = Set<String>()
-        knownSet.reserveCapacity(min(known.count, 8_192))
-        for word in known {
-            knownSet.insert(word.lowercased())
-        }
-        if knownSet.contains(lower) { return nil }
-
-        var rank: [String: Int] = [:]
-        rank.reserveCapacity(min(known.count, 8_192))
-        let order = frequencyOrder ?? known
-        for (index, word) in order.enumerated() {
-            let key = word.lowercased()
-            if rank[key] == nil { rank[key] = index }
-        }
-        for key in knownSet where rank[key] == nil {
-            rank[key] = 8_000
-        }
+        if lexicon.known.contains(lower) { return nil }
+        let rank = lexicon.rank
 
         var best: (score: Int, left: String, right: String, leftRank: Int, rightRank: Int)?
         for leftLen in 1..<(lower.count - 1) {
