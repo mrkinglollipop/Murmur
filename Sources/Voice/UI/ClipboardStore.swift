@@ -357,6 +357,16 @@ final class ClipboardStore: ObservableObject {
     /// persistent quarantine marker behind. A later successful save or launch
     /// clears it.
     @Published private(set) var isStorageUnavailable = false
+
+    /// Secure Input (a password field, or Terminal's Secure Keyboard Entry)
+    /// hides copies from every clipboard manager. Shown so a silent gap in
+    /// history has a visible cause.
+    @Published private(set) var isSecureInputActive = false
+
+    func noteSecureInput(_ active: Bool) {
+        let apply = { if self.isSecureInputActive != active { self.isSecureInputActive = active } }
+        Thread.isMainThread ? apply() : DispatchQueue.main.async(execute: apply)
+    }
     private var loadedMetadata = false
 
     /// Guards `activate()` against re-entry while its Keychain resolution is

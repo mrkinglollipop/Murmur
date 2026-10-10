@@ -134,6 +134,13 @@ struct ClipboardView: View {
                     actionTitle: "Dismiss",
                     action: { store.dismissOversizedSkip() }
                 )
+            } else if store.isSecureInputActive {
+                banner(
+                    icon: "eye.slash.fill",
+                    tint: Theme.amberBorder,
+                    title: "Copies are not being saved right now",
+                    message: "An app has turned on Secure Input, usually a password field or Terminal’s Secure Keyboard Entry. Saving resumes when it turns off."
+                )
             } else if store.isLockedOut {
                 banner(
                     icon: "lock.fill",

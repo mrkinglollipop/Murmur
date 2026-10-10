@@ -71,7 +71,9 @@ final class ClipboardWatcher {
         // Unprotected copies remain eligible while activation is pending.
         let current = pasteboard.changeCount
         // Consume protected copies so they cannot be captured after unlock.
-        guard !secureInputEnabled() else {
+        let secure = secureInputEnabled()
+        store.noteSecureInput(secure)
+        guard !secure else {
             lastChangeCount = current
             return
         }

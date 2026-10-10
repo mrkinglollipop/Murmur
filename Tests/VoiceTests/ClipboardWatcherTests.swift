@@ -408,4 +408,19 @@ final class ClipboardWatcherTests: XCTestCase {
         XCTAssertTrue(waitForEntries(store, count: 1))
         XCTAssertEqual(store.entries.first?.preview, "polled automatically")
     }
+
+    func testSecureInputStateIsSurfacedAndClears() {
+        let pasteboard = makePasteboard()
+        let store = makeStore()
+        var secure = true
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, secureInputEnabled: { secure })
+        pasteboard.clearContents()
+        pasteboard.setString("hidden", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(store.isSecureInputActive)
+        XCTAssertTrue(store.entries.isEmpty)
+        secure = false
+        watcher.tick()
+        XCTAssertFalse(store.isSecureInputActive)
+    }
 }
