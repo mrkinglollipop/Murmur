@@ -2,6 +2,13 @@ import AppKit
 import ApplicationServices
 
 enum CaretContext {
+    static let messagingTimeoutSeconds: Float = 0.3
+
+    struct AXReader {
+        var setTimeout: (AXUIElement, Float) -> AXError = AXUIElementSetMessagingTimeout
+        var copyAttribute: (AXUIElement, CFString, UnsafeMutablePointer<CFTypeRef?>) -> AXError = AXUIElementCopyAttributeValue
+    }
+
     enum PrecedingChar: Equatable {
         case known(Character)
         case startOfField
@@ -49,14 +56,16 @@ enum CaretContext {
 
     /// Single AX snapshot for strip + leading space (no dual fetch).
     static func snapshot(
-        frontmostPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        frontmostPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+        reader: AXReader = AXReader()
     ) -> Snapshot {
         guard let pid = frontmostPID else { return .unknown }
 
         let appElement = AXUIElementCreateApplication(pid)
+        _ = reader.setTimeout(appElement, messagingTimeoutSeconds)
 
         var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        guard reader.copyAttribute(
             appElement,
             kAXFocusedUIElementAttribute as CFString,
             &focusedRef
@@ -67,9 +76,10 @@ enum CaretContext {
             return .unknown
         }
         let focused = focusedRef as! AXUIElement
+        _ = reader.setTimeout(focused, messagingTimeoutSeconds)
 
         var valueRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        guard reader.copyAttribute(
             focused,
             kAXValueAttribute as CFString,
             &valueRef
@@ -78,7 +88,7 @@ enum CaretContext {
         }
 
         var rangeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        guard reader.copyAttribute(
             focused,
             kAXSelectedTextRangeAttribute as CFString,
             &rangeRef

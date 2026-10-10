@@ -8,7 +8,15 @@ import CoreGraphics
 /// Accessibility. Shown once until the user completes or skips onboarding.
 struct OnboardingView: View {
 
-    var onComplete: () -> Void = {}
+    var onComplete: () -> Void
+    var permissionOverride: PermissionSnapshot?
+
+    init(onComplete: @escaping () -> Void, initialStep: Int = 0,
+         permissionOverride: PermissionSnapshot? = nil) {
+        self.onComplete = onComplete
+        self.permissionOverride = permissionOverride
+        _stepIndex = State(initialValue: min(max(initialStep, 0), 3))
+    }
 
     @State private var stepIndex = 0
     @State private var permissionRefreshTick = 0
@@ -49,12 +57,22 @@ struct OnboardingView: View {
 
     private var isFinalStep: Bool { stepIndex == steps.count }
 
+    private var permissionSnapshot: PermissionSnapshot {
+        _ = permissionRefreshTick
+        if let permissionOverride { return permissionOverride }
+        return PermissionSnapshot(
+            microphone: MicrophonePermission.isGranted(),
+            accessibility: AXIsProcessTrusted(),
+            inputMonitoring: InputMonitoringPermission.isGranted()
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().overlay(Theme.hairline)
 
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 16) {
                 Group {
                     if isFinalStep {
                         finalStepContent
@@ -81,11 +99,16 @@ struct OnboardingView: View {
 
                     Spacer()
 
-                    if isFinalStep {
+                    if isFinalStep, permissionSnapshot.allGranted {
                         Button("Get Started") { completeOnboarding() }
                             .buttonStyle(.glassProminent)
                             .tint(Theme.lavender)
                             .font(Theme.body(12, weight: .semibold))
+                    } else if isFinalStep {
+                        Button("Continue anyway") { completeOnboarding() }
+                            .buttonStyle(.glass)
+                            .font(Theme.body(12, weight: .medium))
+                            .foregroundColor(Theme.textPrimary)
                     } else {
                         Button("Continue") {
                             withAnimation(Theme.easeOutOrNil()) { stepIndex += 1 }
@@ -187,8 +210,39 @@ struct OnboardingView: View {
     }
 
     private var finalStepContent: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(spacing: 12) {
+        Group {
+            if !permissionSnapshot.allGranted {
+                VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(Theme.amberText)
+                        .frame(width: 40)
+                    Text("Permissions need attention")
+                        .font(Theme.serifTitle(22, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                }
+                Text("Murmur needs these permissions before dictation can work everywhere.")
+                    .font(Theme.body(13))
+                    .foregroundColor(Theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(permissionSnapshot.missing, id: \.self) { destination in
+                    HStack {
+                        Text(destination.title)
+                            .font(Theme.body(12, weight: .medium))
+                            .foregroundColor(Theme.textPrimary)
+                        Spacer()
+                        Button("Open System Settings") { NSWorkspace.shared.open(destination.url) }
+                            .buttonStyle(.glass)
+                            .font(Theme.body(11, weight: .medium))
+                            .foregroundColor(Theme.primary)
+                            .accessibilityLabel("Open System Settings for \(destination.title)")
+                    }
+                }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 12) {
                 Image(systemName: "checkmark.seal.fill")
                     .font(.system(size: 28))
                     .foregroundColor(Theme.primary)
@@ -208,6 +262,8 @@ struct OnboardingView: View {
                 .font(Theme.body(13))
                 .foregroundColor(Theme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
@@ -278,6 +334,44 @@ enum OnboardingStore {
 
     static var isComplete: Bool {
         UserDefaults.standard.bool(forKey: completeKey)
+    }
+}
+
+enum PermissionDestination: CaseIterable {
+    case microphone
+    case accessibility
+    case inputMonitoring
+
+    var title: String {
+        switch self {
+        case .microphone: return "Microphone"
+        case .accessibility: return "Accessibility"
+        case .inputMonitoring: return "Input Monitoring"
+        }
+    }
+
+    var url: URL {
+        switch self {
+        case .microphone: return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
+        case .accessibility: return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        case .inputMonitoring: return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!
+        }
+    }
+}
+
+struct PermissionSnapshot {
+    let microphone: Bool
+    let accessibility: Bool
+    let inputMonitoring: Bool
+
+    var allGranted: Bool { microphone && accessibility && inputMonitoring }
+
+    var missing: [PermissionDestination] {
+        [
+            microphone ? nil : .microphone,
+            accessibility ? nil : .accessibility,
+            inputMonitoring ? nil : .inputMonitoring
+        ].compactMap { $0 }
     }
 }
 

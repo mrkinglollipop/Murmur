@@ -104,6 +104,14 @@ struct FnActivationLogic {
         state.fnPhysicallyDown = fnHeld
     }
 
+    /// Pause drops pending activation state without interrupting a recording.
+    static func prepareForPause(state: inout State) {
+        guard !state.isRecording else { return }
+        state.firstTapAnchor = nil
+        state.holdDeadline = nil
+        state.fnPhysicallyDown = false
+    }
+
     enum TapReenableEffect: Equatable {
         case cancelHoldTimer
         case stopStuckPTTRecording

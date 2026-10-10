@@ -45,6 +45,84 @@ resolve_development_team() {
   printf '%s\n' "$team"
 }
 
+# Return 0 for a Pro bundle, 1 for a standard bundle, and 2 when the bundle's
+# Info.plist is missing, unreadable, or malformed. Pro is identified by the
+# OAuth URL type shared with the private checkout; callers must treat 2 as a
+# refusal, never as a standard build.
+is_pro_app_bundle() {
+  python3 - "$1" <<'PY'
+import pathlib, plistlib, sys
+
+plist = pathlib.Path(sys.argv[1]) / "Contents" / "Info.plist"
+try:
+    info = plistlib.loads(plist.read_bytes())
+except FileNotFoundError:
+    print(f"error: bundle Info.plist is missing: {plist}", file=sys.stderr)
+    raise SystemExit(2)
+except Exception as error:
+    print(f"error: cannot read bundle Info.plist {plist}: {error}", file=sys.stderr)
+    raise SystemExit(2)
+
+if not isinstance(info, dict):
+    print(f"error: malformed Info.plist root in {plist}", file=sys.stderr)
+    raise SystemExit(2)
+
+url_types = info.get("CFBundleURLTypes", [])
+if not isinstance(url_types, list):
+    print(f"error: malformed CFBundleURLTypes in {plist}", file=sys.stderr)
+    raise SystemExit(2)
+
+for item in url_types:
+    if not isinstance(item, dict):
+        print(f"error: malformed CFBundleURLTypes entry in {plist}", file=sys.stderr)
+        raise SystemExit(2)
+    name = item.get("CFBundleURLName")
+    schemes = item.get("CFBundleURLSchemes", [])
+    if not isinstance(schemes, list):
+        print(f"error: malformed CFBundleURLSchemes in {plist}", file=sys.stderr)
+        raise SystemExit(2)
+    if name == "com.matt.voice-dictation.auth" or "murmur" in schemes:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Return 0 only when candidate resolves to the public stable alias. Path.resolve
+# covers a direct path, a symlink, and an alias through a symlinked parent.
+is_stable_dmg_path() {
+  python3 - "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    candidate = Path(sys.argv[1]).expanduser().resolve(strict=False)
+    stable = Path(sys.argv[2]).expanduser().resolve(strict=False)
+except OSError as error:
+    print(f"error: cannot resolve DMG path: {error}", file=sys.stderr)
+    raise SystemExit(2)
+raise SystemExit(0 if candidate == stable else 1)
+PY
+}
+
+# A Developer-ID release must never carry the debug entitlement. Capture the
+# command output before inspecting it so a codesign failure cannot be masked by
+# a pipeline.
+assert_no_get_task_allow() {
+  local app="$1" entitlements
+  if ! entitlements="$(codesign -d --entitlements :- "$app" 2>/dev/null)"; then
+    echo "error: could not read entitlements from $app" >&2
+    return 1
+  fi
+  if [[ -z "$entitlements" ]]; then
+    echo "error: app reports no entitlements: $app" >&2
+    return 1
+  fi
+  if grep -q get-task-allow <<<"$entitlements"; then
+    echo "error: get-task-allow is present: $app" >&2
+    return 1
+  fi
+}
+
 # --- Sparkle EdDSA keys ----------------------------------------------------
 
 # Public half (base64) of a Sparkle EdDSA seed file. Needs `cryptography` or

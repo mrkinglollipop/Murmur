@@ -4,6 +4,76 @@ import XCTest
 
 final class CaretContextTests: XCTestCase {
 
+    func testSnapshot_setsBoundedTimeoutBeforeEveryElementRead() {
+        let focused = AXUIElementCreateApplication(456)
+        var range = CFRange(location: 5, length: 0)
+        let rangeValue = AXValueCreate(.cfRange, &range)!
+        var calls: [String] = []
+        let reader = CaretContext.AXReader(
+            setTimeout: { element, seconds in
+                XCTAssertEqual(seconds, 0.3)
+                XCTAssertGreaterThanOrEqual(seconds, 0.25)
+                XCTAssertLessThanOrEqual(seconds, 0.5)
+                calls.append(CFEqual(element, focused) ? "focused timeout" : "app timeout")
+                return .success
+            },
+            copyAttribute: { _, attribute, output in
+                if attribute as String == kAXFocusedUIElementAttribute {
+                    calls.append("focus read")
+                    output.pointee = focused
+                } else if attribute as String == kAXValueAttribute {
+                    calls.append("value read")
+                    output.pointee = "hello" as CFString
+                } else {
+                    calls.append("range read")
+                    output.pointee = rangeValue
+                }
+                return .success
+            }
+        )
+        let snapshot = CaretContext.snapshot(frontmostPID: 123, reader: reader)
+        XCTAssertEqual(calls, ["app timeout", "focus read", "focused timeout", "value read", "range read"])
+        XCTAssertEqual(snapshot.value, "hello")
+        XCTAssertEqual(snapshot.location, 5)
+        XCTAssertEqual(snapshot.selectionLength, .readable(0))
+        XCTAssertEqual(snapshot.precedingChar, .known("o"))
+        XCTAssertFalse(snapshot.isUnknown)
+    }
+
+    func testSnapshot_unresponsiveAppReturnsUnknownAfterBoundedRead() {
+        var timeoutWasSet = false
+        let reader = CaretContext.AXReader(
+            setTimeout: { _, seconds in
+                XCTAssertEqual(seconds, CaretContext.messagingTimeoutSeconds)
+                timeoutWasSet = true
+                return .success
+            },
+            copyAttribute: { _, _, _ in
+                XCTAssertTrue(timeoutWasSet)
+                return .cannotComplete
+            }
+        )
+        XCTAssertEqual(CaretContext.snapshot(frontmostPID: 123, reader: reader), .unknown)
+    }
+
+    func testSnapshot_unresponsiveFocusedElementReturnsUnknownAfterBoundedRead() {
+        let focused = AXUIElementCreateApplication(456)
+        var boundedElements = 0
+        let reader = CaretContext.AXReader(
+            setTimeout: { _, _ in boundedElements += 1; return .success },
+            copyAttribute: { _, attribute, output in
+                if attribute as String == kAXFocusedUIElementAttribute {
+                    XCTAssertEqual(boundedElements, 1)
+                    output.pointee = focused
+                    return .success
+                }
+                XCTAssertEqual(boundedElements, 2)
+                return .cannotComplete
+            }
+        )
+        XCTAssertEqual(CaretContext.snapshot(frontmostPID: 123, reader: reader), .unknown)
+    }
+
     // MARK: - Known preceding character
 
     func testShouldPrependSpace_knownSentenceEnders() {

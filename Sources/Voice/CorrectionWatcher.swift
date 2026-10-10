@@ -64,7 +64,12 @@ final class CorrectionWatcher {
         )
         applyEffects(effects, now: now)
         installKeyTap()
-        installWorkspaceObserver()
+        installWorkspaceObserver { [weak self] in
+            guard let self else { return }
+            let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+            let effects = CorrectionWatcherLogic.frontmostChanged(state: &self.logicState, newPID: pid)
+            self.applyEffects(effects, now: Date())
+        }
     }
 
     func endWatchForNewRecording() {
@@ -217,23 +222,20 @@ final class CorrectionWatcher {
 
     // MARK: - Workspace
 
-    private func installWorkspaceObserver() {
+    func installWorkspaceObserver(onActivate: @escaping () -> Void) {
         removeWorkspaceObserver()
-        workspaceObserver = NotificationCenter.default.addObserver(
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
-            let effects = CorrectionWatcherLogic.frontmostChanged(state: &self.logicState, newPID: pid)
-            self.applyEffects(effects, now: Date())
+        ) { _ in
+            onActivate()
         }
     }
 
-    private func removeWorkspaceObserver() {
+    func removeWorkspaceObserver() {
         if let workspaceObserver {
-            NotificationCenter.default.removeObserver(workspaceObserver)
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
             self.workspaceObserver = nil
         }
     }
@@ -286,6 +288,6 @@ final class CorrectionWatcher {
     }
 
     deinit {
-        cancel()
+        tearDownInfrastructure()
     }
 }

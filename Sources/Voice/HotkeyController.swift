@@ -9,6 +9,17 @@ import os.log
 /// the clipboard with a transient notification.
 final class HotkeyController {
 
+    /// Session-only pause unregisters Carbon's global chord, allowing the OS
+    /// and other apps to receive it. Any transform already running continues.
+    var isPaused = false {
+        didSet {
+            guard oldValue != isPaused else { return }
+            isPaused ? stop() : start()
+        }
+    }
+
+    static func shouldRegisterHotkey(isPaused: Bool) -> Bool { !isPaused }
+
     private let logger = Logger(subsystem: "com.matt.voice-dictation", category: "hotkey")
 
     private var hotKeyRef: EventHotKeyRef?
@@ -35,6 +46,7 @@ final class HotkeyController {
     }
 
     func start() {
+        guard Self.shouldRegisterHotkey(isPaused: isPaused) else { return }
         guard hotKeyRef == nil else { return }
 
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))

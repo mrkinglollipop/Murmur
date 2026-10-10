@@ -167,7 +167,9 @@ enum SpokenCapitalization {
     private static func letterFromCommandWord(_ word: String) -> Character? {
         let core = peelEdgePunctuation(word).core.lowercased()
         if core.count == 1, let ch = core.first, ch.isLetter {
-            return Character(ch.uppercased())
+            let uppercase = ch.uppercased()
+            guard uppercase.count == 1 else { return nil }
+            return uppercase.first
         }
         return natoLetters[core]
     }

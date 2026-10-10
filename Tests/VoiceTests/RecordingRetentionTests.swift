@@ -152,6 +152,102 @@ final class RecordingRetentionTests: XCTestCase {
         XCTAssertNil(TranscriptionPipeline.streamedAudioPath(retained))
     }
 
+    func testRecordingsDirectoryIsExcludedFromBackup() throws {
+        let directory = RecordingRetention.recordingsDirectory
+        XCTAssertEqual(try directory.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
+    func testOversizedCaptureUsesTempUntilSuccessfulTranscriptionFinishes() throws {
+        try checkUnretainedCapture(failed: false, protectExisting: false)
+    }
+
+    func testProtectedBudgetUsesTempUntilFailedTranscriptionFinishes() throws {
+        try checkUnretainedCapture(failed: true, protectExisting: true)
+    }
+
+    private func checkUnretainedCapture(failed: Bool, protectExisting: Bool) throws {
+        let source = writeTempSource(named: "fallback.caf", bytes: protectExisting ? 128 : 512)
+        let protectedSource = writeTempSource(named: "protected.caf", bytes: 512)
+        let protectedURL = protectExisting
+            ? try XCTUnwrap(RecordingRetention.retain(from: protectedSource, maxBytes: 1024))
+            : nil
+        let pipeline = TranscriptionPipeline()
+        pipeline.markHoldAbandoned(42)
+        let history = HistoryStore(fileURL: tempRoot.appendingPathComponent("history.json"))
+        let finished = expectation(description: "transcription completed")
+        pipeline.onTranscriptionLogged = { text, engine, injected, audioPath, failed, _ in
+            history.append(text: text, engine: engine, injected: injected, audioPath: audioPath, failed: failed)
+        }
+        RecordingRetention.handoffForTranscription(
+            from: source, keepPaths: protectedURL.map { [$0.path] } ?? [], maxBytes: 256
+        ) { audioURL, retainedURL, cleanup in
+            XCTAssertEqual(audioURL, source)
+            XCTAssertNil(retainedURL)
+            XCTAssertEqual(try? Data(contentsOf: audioURL), Data(repeating: 0xAB, count: protectExisting ? 128 : 512))
+            pipeline.finishTranscription(
+                text: failed ? "" : "Recovered all the words.", hadExplicitTrailingNewline: false,
+                engineID: "test", audioPath: TranscriptionPipeline.historyAudioPath(
+                    audioURL: audioURL, audioIsTemporary: retainedURL == nil
+                ), replaceHistoryEntryID: nil, sessionHeldToken: 42,
+                sessionHeldSnapshot: nil, sessionHeldFrontmostPID: nil
+            ) { result in
+                XCTAssertEqual(result, failed ? .failed : .savedToHistory)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+                cleanup()
+                XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+                finished.fulfill()
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+        }
+        wait(for: [finished], timeout: 2)
+        if failed {
+            // A failed take with no retained audio has nothing to retry, so no row.
+            XCTAssertTrue(history.entries.isEmpty)
+        } else {
+            let entry = try XCTUnwrap(history.entries.first)
+            XCTAssertNil(entry.audioPath)
+            XCTAssertFalse(entry.failed)
+            XCTAssertEqual(entry.text, "Recovered all the words.")
+        }
+        if let protectedURL { XCTAssertTrue(FileManager.default.fileExists(atPath: protectedURL.path)) }
+    }
+
+    func testRetainedHandoffPreservesHistoryAudioAfterTempCleanup() throws {
+        let source = writeTempSource(named: "retained.caf", bytes: 128)
+        RecordingRetention.handoffForTranscription(from: source, maxBytes: 1024) { audioURL, retainedURL, cleanup in
+            XCTAssertEqual(audioURL, retainedURL)
+            XCTAssertNotEqual(audioURL, source)
+            XCTAssertEqual(TranscriptionPipeline.historyAudioPath(audioURL: audioURL, audioIsTemporary: false), audioURL.path)
+            cleanup()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+        }
+    }
+
+    func testDoNotLogOutcomesRemoveRetainedAudio() throws {
+        for (secureInput, insertResult) in [(true, TextInjector.InsertResult.failed), (false, .deduped)] {
+            let source = writeTempSource(named: "unlogged.caf", bytes: 128)
+            let retained = try XCTUnwrap(RecordingRetention.retain(from: source, maxBytes: 1024))
+            let outcome = TranscriptionPipeline.secureInputOutcome(secureInput: secureInput, insertResult: insertResult)
+            XCTAssertFalse(outcome.shouldLog)
+            TranscriptionPipeline.discardUnloggedAudio(audioPath: retained.path, shouldLog: outcome.shouldLog)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: retained.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+        }
+    }
+
+    func testLoggedOutcomesKeepRetainedAudio() throws {
+        let source = writeTempSource(named: "logged.caf", bytes: 128)
+        let retained = try XCTUnwrap(RecordingRetention.retain(from: source, maxBytes: 1024))
+        for insertResult in [TextInjector.InsertResult.inserted(deliveredText: "words"), .failed] {
+            let outcome = TranscriptionPipeline.secureInputOutcome(secureInput: false, insertResult: insertResult)
+            XCTAssertTrue(outcome.shouldLog)
+            TranscriptionPipeline.discardUnloggedAudio(audioPath: retained.path, shouldLog: outcome.shouldLog)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: retained.path))
+        }
+        TranscriptionPipeline.discardUnloggedAudio(audioPath: nil, shouldLog: false)
+    }
+
     func testExportZipPackagesAudioAndTranscripts() throws {
         let src = writeTempSource(named: "export-me.caf", bytes: 512)
         guard let retained = RecordingRetention.retain(
