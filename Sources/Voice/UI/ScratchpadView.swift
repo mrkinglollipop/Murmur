@@ -38,6 +38,7 @@ struct ScratchpadView: View {
                 emptyDetail
             }
         }
+        .saveFailureBanner(store.saveFailure, onDismiss: store.dismissSaveFailure)
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete note?",
@@ -93,7 +94,7 @@ struct ScratchpadView: View {
                 Text("New note")
                     .font(Theme.body(13, weight: .semibold))
             }
-            .foregroundColor(Theme.lavenderText)
+            .foregroundColor(Theme.ctaText)
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(.glassProminent)
@@ -118,12 +119,12 @@ struct ScratchpadView: View {
             if !preview.isEmpty {
                 Text(preview)
                     .font(Theme.body(11))
-                    .foregroundColor(Theme.textSecondary)
+                    .foregroundColor(isSelected ? Theme.selectedText : Theme.textSecondary)
                     .lineLimit(1)
             }
             Text(relativeDate(note.updatedAt))
                 .font(.system(size: 10))
-                .foregroundColor(Theme.textSecondary)
+                .foregroundColor(isSelected ? Theme.selectedText : Theme.textSecondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
@@ -160,7 +161,7 @@ struct ScratchpadView: View {
             Text("No notes yet")
                 .font(Theme.body(12))
                 .foregroundColor(Theme.textSecondary)
-            Text("Tap new note to start dictating here")
+            Text("Click New Note to start dictating here")
                 .font(Theme.body(11))
                 .foregroundColor(Theme.textSecondary)
             Spacer()
