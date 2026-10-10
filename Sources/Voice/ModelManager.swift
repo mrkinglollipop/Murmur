@@ -156,9 +156,13 @@ final class ModelManager: ObservableObject {
     ///
     /// Rules: only-old → move; empty/unusable new + old → remove empty new then
     /// move; both usable → new wins, leave legacy orphan; sibling vendor dirs
-    /// under `models/` are never touched.
+    /// under `models/` are never touched. Completion lives beside the repo so
+    /// deleting its last variant (or the repo itself) cannot reimport an orphan.
     nonisolated static func migrateWhisperKitModelsIfNeeded(from oldRepo: URL, to newRepo: URL) {
         let fm = FileManager.default
+        let completionURL = newRepo.deletingLastPathComponent()
+            .appendingPathComponent(".\(newRepo.lastPathComponent)-migration-complete")
+        guard !fm.fileExists(atPath: completionURL.path) else { return }
         var oldIsDir: ObjCBool = false
         var newIsDir: ObjCBool = false
         let oldExists = fm.fileExists(atPath: oldRepo.path, isDirectory: &oldIsDir) && oldIsDir.boolValue
@@ -166,6 +170,7 @@ final class ModelManager: ObservableObject {
 
         if newExists {
             if whisperKitRepoHasUsableContent(newRepo) {
+                recordWhisperKitMigrationCompletion(at: completionURL)
                 if oldExists {
                     migrationLogger.info(
                         "WhisperKit migration: new cache present; leaving legacy orphan at \(oldRepo.path, privacy: .public)"
@@ -191,10 +196,23 @@ final class ModelManager: ObservableObject {
         do {
             try fm.createDirectory(at: newParent, withIntermediateDirectories: true)
             try fm.moveItem(at: oldRepo, to: newRepo)
+            if whisperKitRepoHasUsableContent(newRepo) {
+                recordWhisperKitMigrationCompletion(at: completionURL)
+            }
             migrationLogger.info("WhisperKit migration: moved models to Application Support")
         } catch {
             migrationLogger.error(
                 "WhisperKit migration failed: \(error.localizedDescription, privacy: .public); leaving legacy cache"
+            )
+        }
+    }
+
+    private nonisolated static func recordWhisperKitMigrationCompletion(at url: URL) {
+        do {
+            try Data("1\n".utf8).write(to: url, options: .atomic)
+        } catch {
+            migrationLogger.error(
+                "WhisperKit migration: could not persist completion: \(error.localizedDescription, privacy: .public)"
             )
         }
     }

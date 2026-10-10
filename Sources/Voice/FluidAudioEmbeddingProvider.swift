@@ -23,6 +23,9 @@ final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
     }
 
     init(loader: @escaping () async throws -> DiarizerManager = {
+        try FluidAudioEmbeddingProvider.prepareModelCacheDirectory(
+            DiarizerModels.defaultModelsDirectory().deletingLastPathComponent()
+        )
         let models = try await DiarizerModels.downloadIfNeeded()
         let manager = DiarizerManager()
         manager.initialize(models: models)
@@ -30,6 +33,10 @@ final class FluidAudioEmbeddingProvider: SpeakerEmbeddingProviding {
     }) {
         self.loader = loader
         retryLoadingIfNeeded()
+    }
+
+    static func prepareModelCacheDirectory(_ directory: URL) throws {
+        try VoicePaths.prepareModelCacheDirectory(directory)
     }
 
     @discardableResult
