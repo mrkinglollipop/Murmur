@@ -54,11 +54,55 @@ final class TranscriptionPipeline {
     /// older `finishTranscription` cannot clear a newer session's held.
     private var heldCaretToken: UInt64 = 0
 
+    /// Selection intent captured with the AX snapshot at hold start. Values are
+    /// token-scoped so a rapid re-press cannot turn an older instruction into
+    /// ordinary dictation against the newer selection.
+    private enum VoiceEditIntent {
+        case edit(selection: String)
+        case selectionTooLong
+    }
+    private var voiceEditIntents: [UInt64: VoiceEditIntent] = [:]
+
     /// Active Style profile formality instruction for cleanup.
     var styleInstruction: String?
 
     /// Active cleanup backend, or `nil` if cleanup can't run right now.
     var cleanupService: TranscriptCleanupService?
+
+    /// Injectable transform operation; production preserves TransformRunner's
+    /// backend ordering, including the on-device-only privacy boundary.
+    var runVoiceEditTransform: (String, String, TransformCredentials) async throws -> String = { instruction, selection, credentials in
+        try await TransformRunner.run(prompt: instruction, over: selection, credentials: credentials)
+    }
+
+    /// Injection dependencies for edit verification without AX, CGEvents, or
+    /// the user's clipboard. Production uses the normal TextInjector lanes.
+    struct VoiceEditInjectionHooks {
+        let target: () -> TextInjector.InjectionTarget
+        let snapshot: () -> CaretContext.Snapshot
+        let insert: (String) -> TextInjector.InsertResult
+        let leaveOnClipboard: (String) -> Void
+    }
+    var voiceEditInjectionHooks: VoiceEditInjectionHooks?
+
+    private func injectionTarget(voiceEdit: Bool) -> TextInjector.InjectionTarget {
+        if voiceEdit, let hooks = voiceEditInjectionHooks { return hooks.target() }
+        let app = NSWorkspace.shared.frontmostApplication
+        return TextInjector.InjectionTarget(
+            secureInput: IsSecureEventInputEnabled(),
+            pid: app?.processIdentifier,
+            bundleIdentifier: app?.bundleIdentifier
+        )
+    }
+
+    /// Main-thread secure re-read protects clipboard fallback as well as typing.
+    private func leaveOnClipboardIfAllowed(_ text: String, voiceEdit: Bool) -> Bool {
+        if !voiceEdit { return Self.appSwitchAbortLeaveOnMain(text: text) }
+        guard !injectionTarget(voiceEdit: true).secureInput else { return true }
+        if let hooks = voiceEditInjectionHooks { hooks.leaveOnClipboard(text) }
+        else { TextInjector.leaveTranscriptOnClipboard(text) }
+        return false
+    }
 
     /// Dictionary-correction hook — applied BEFORE injection and history.
     var onTranscription: ((String, String) -> (String, [CorrectionRecord]))?
@@ -69,6 +113,10 @@ final class TranscriptionPipeline {
     /// History-logging hook with the final expanded text.
     /// Sixth arg is optional history entry ID to replace (retry path).
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)?
+
+    /// Edit history contains only the result and spoken instruction. Audio is
+    /// not retryable without the original selection, which is never stored.
+    var onVoiceEditLogged: ((String, String, String, Bool, Bool) -> Void)?
 
     /// History hook for a hold the HUD watchdog abandoned: text, engine id,
     /// audio path. Separate from `onTranscriptionLogged` because the row must
@@ -89,12 +137,29 @@ final class TranscriptionPipeline {
     /// recording-will-start. Replaces any prior hold and bumps the generation token.
     /// Reads frontmost PID once so AX snapshot and held PID cannot desync.
     @discardableResult
-    func holdCaretSnapshotFromRecordingWillStart() -> UInt64 {
+    func holdCaretSnapshotFromRecordingWillStart(
+        voiceEditEnabled: Bool = true,
+        shiftHeld: Bool = false
+    ) -> UInt64 {
         assert(Thread.isMainThread, "holdCaretSnapshotFromRecordingWillStart requires main thread")
         heldCaretToken &+= 1
         let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        heldCaretSnapshot = CaretContext.snapshot(frontmostPID: pid)
+        let snapshot = CaretContext.snapshot(frontmostPID: pid)
+        heldCaretSnapshot = snapshot
         heldFrontmostPID = pid
+        switch VoiceEditRouting.decide(
+            snapshot: snapshot,
+            enabled: voiceEditEnabled,
+            shiftHeld: shiftHeld
+        ) {
+        case .edit(let selection):
+            voiceEditIntents[heldCaretToken] = .edit(selection: selection)
+        case .selectionTooLong(let utf16Count):
+            voiceEditIntents[heldCaretToken] = .selectionTooLong
+            vlog("voice edit selection too long: \(utf16Count) UTF-16 units")
+        case .dictate:
+            break
+        }
         return heldCaretToken
     }
 
@@ -102,7 +167,12 @@ final class TranscriptionPipeline {
     /// When `matching` is set, clears only if the current token still matches
     /// that session — older finish/fail paths must not wipe a newer hold.
     func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
-        if let token, heldCaretToken != token { return }
+        if let token {
+            voiceEditIntents.removeValue(forKey: token)
+            if heldCaretToken != token { return }
+        } else {
+            voiceEditIntents.removeAll()
+        }
         heldCaretSnapshot = nil
         heldFrontmostPID = nil
     }
@@ -111,6 +181,14 @@ final class TranscriptionPipeline {
     var test_heldCaretToken: UInt64 { heldCaretToken }
     var test_heldCaretSnapshot: CaretContext.Snapshot? { heldCaretSnapshot }
     var test_heldFrontmostPID: pid_t? { heldFrontmostPID }
+
+    func isVoiceEditHold(_ token: UInt64) -> Bool {
+        voiceEditIntents[token] != nil
+    }
+
+    private func consumeVoiceEditIntent(matching token: UInt64) -> VoiceEditIntent? {
+        voiceEditIntents.removeValue(forKey: token)
+    }
 
     /// Hold tokens whose processing HUD was already dismissed by the
     /// recorder's watchdog. A late result for one of these is saved to History
@@ -148,6 +226,19 @@ final class TranscriptionPipeline {
         heldCaretSnapshot = snapshot
         heldFrontmostPID = frontmostPID
         return heldCaretToken
+    }
+
+    /// Test-only route seam; production capture always goes through the AX
+    /// snapshot path above.
+    @discardableResult
+    func test_holdVoiceEditSnapshot(_ snapshot: CaretContext.Snapshot, frontmostPID: pid_t? = nil) -> UInt64 {
+        let token = test_holdSnapshot(snapshot, frontmostPID: frontmostPID)
+        switch VoiceEditRouting.decide(snapshot: snapshot, enabled: true, shiftHeld: false) {
+        case .edit(let selection): voiceEditIntents[token] = .edit(selection: selection)
+        case .selectionTooLong: voiceEditIntents[token] = .selectionTooLong
+        case .dictate: break
+        }
+        return token
     }
 
     /// Copy held snapshot + PID when `token` still owns the slot.
@@ -359,8 +450,8 @@ final class TranscriptionPipeline {
                         model: cloudModel,
                         language: selector.selectedLanguage
                     )
-                    let cleaned = await self.applyCleanup(text)
-                    let transformed = await self.applyAutoTransform(cleaned.text)
+                    let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID)
+                    let transformed = cleaned.text
                     self.finishTranscription(
                         text: transformed,
                         hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
@@ -424,8 +515,8 @@ final class TranscriptionPipeline {
                 providedPID: providedPID
             )
         Task {
-            let cleaned = await self.applyCleanup(text)
-            let transformed = await self.applyAutoTransform(cleaned.text)
+            let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: nil)
+            let transformed = cleaned.text
             self.finishTranscription(
                 text: transformed,
                 hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
@@ -483,8 +574,8 @@ final class TranscriptionPipeline {
         Task {
             do {
                 let text = try await engine.transcribe(audioURL: audioURL)
-                let cleaned = await self.applyCleanup(text)
-                let transformed = await self.applyAutoTransform(cleaned.text)
+                let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceHistoryEntryID)
+                let transformed = cleaned.text
                 self.finishTranscription(
                     text: transformed,
                     hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline,
@@ -522,6 +613,14 @@ final class TranscriptionPipeline {
                 token: sessionHeldToken,
                 replaceHistoryEntryID: replaceHistoryEntryID
             )
+            if replaceHistoryEntryID == nil,
+               self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
+                self.clearHeldCaretSnapshot(matching: sessionHeldToken)
+                Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
+                if !abandoned { self.onFailure?(.voiceEditFailed) }
+                completion?(.failed)
+                return
+            }
             if replaceHistoryEntryID == nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
@@ -550,6 +649,27 @@ final class TranscriptionPipeline {
             punctuated,
             codeAware: codeAware,
             enabled: removeFillerWords
+        )
+    }
+
+    private func prepareTranscript(
+        _ text: String,
+        holdToken: UInt64,
+        replaceHistoryEntryID: UUID?
+    ) async -> PreprocessedTranscript {
+        let isEdit = await MainActor.run {
+            replaceHistoryEntryID == nil && self.isVoiceEditHold(holdToken)
+        }
+        if isEdit {
+            return PreprocessedTranscript(
+                text: Self.normalizeTranscriptForInjection(NonSpeechAnnotations.stripRecognizedTags(text)),
+                hadExplicitTrailingNewline: false
+            )
+        }
+        let cleaned = await applyCleanup(text)
+        return PreprocessedTranscript(
+            text: await applyAutoTransform(cleaned.text),
+            hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline
         )
     }
 
@@ -719,6 +839,21 @@ final class TranscriptionPipeline {
         return matched
     }
 
+    /// Failed edits have no usable result to retain. Their audio is an
+    /// instruction that cannot safely be retried without its original selection.
+    private func failVoiceEdit(
+        token: UInt64,
+        audioPath: String?,
+        failure: DictationFailure = .voiceEditFailed,
+        completion: ((InjectPipelineResult) -> Void)?
+    ) {
+        let abandoned = consumeAbandonedHold(token: token, replaceHistoryEntryID: nil)
+        clearHeldCaretSnapshot(matching: token)
+        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
+        if !abandoned { onFailure?(failure) }
+        completion?(.failed)
+    }
+
     func finishTranscription(
         text: String,
         hadExplicitTrailingNewline: Bool,
@@ -728,14 +863,56 @@ final class TranscriptionPipeline {
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
+        voiceEditInstruction: String? = nil,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         let trimmed = Self.normalizeTranscriptForInjection(text)
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 
-        guard !trimmed.isEmpty else {
-            DispatchQueue.main.async {
+        DispatchQueue.main.async {
+            if replaceHistoryEntryID == nil, voiceEditInstruction == nil,
+               let intent = self.consumeVoiceEditIntent(matching: sessionHeldToken) {
+                switch intent {
+                case .selectionTooLong:
+                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, failure: .voiceEditSelectionTooLong, completion: completion)
+                case .edit(let selection):
+                    guard !trimmed.isEmpty else {
+                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                        return
+                    }
+                    let credentials = self.engineSelector?.transformCredentialsProvider?() ?? .unavailable
+                    Task {
+                        do {
+                            let result = try await self.runVoiceEditTransform(trimmed, selection, credentials)
+                            guard VoiceEditRouting.resultLooksUsable(result, over: selection) else {
+                                DispatchQueue.main.async {
+                                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                                }
+                                return
+                            }
+                            self.finishTranscription(
+                                text: result,
+                                hadExplicitTrailingNewline: false,
+                                engineID: engineID,
+                                audioPath: audioPath,
+                                replaceHistoryEntryID: nil,
+                                sessionHeldToken: sessionHeldToken,
+                                sessionHeldSnapshot: sessionHeldSnapshot,
+                                sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                                voiceEditInstruction: trimmed,
+                                completion: completion
+                            )
+                        } catch {
+                            DispatchQueue.main.async {
+                                self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                            }
+                        }
+                    }
+                }
+                return
+            }
+            guard !trimmed.isEmpty else {
                 let abandoned = self.consumeAbandonedHold(
                     token: sessionHeldToken,
                     replaceHistoryEntryID: replaceHistoryEntryID
@@ -743,19 +920,18 @@ final class TranscriptionPipeline {
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if !abandoned { self.onFailure?(.transcriptionFailed) }
-                if let audioPath {
+                if !abandoned { self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed) }
+                if let audioPath, voiceEditInstruction == nil {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
                 completion?(.failed)
+                return
             }
-            return
-        }
-
-        DispatchQueue.main.async {
-            let (corrected, records) = self.onTranscription?(trimmed, engineID) ?? (trimmed, [])
+            let (corrected, records) = voiceEditInstruction == nil
+                ? (self.onTranscription?(trimmed, engineID) ?? (trimmed, []))
+                : (trimmed, [])
             if !records.isEmpty { self.onCorrectionsRecorded?(records) }
-            let expanded = self.onSnippetExpand?(corrected) ?? corrected
+            let expanded = voiceEditInstruction == nil ? (self.onSnippetExpand?(corrected) ?? corrected) : corrected
             let snippetExpansionOccurred = expanded != corrected
             let hasExplicitCustomTransform = self.engineSelector?.autoRunTransform != nil
             let abandoned = self.consumeAbandonedHold(
@@ -767,7 +943,7 @@ final class TranscriptionPipeline {
                 // History's search field or an unrelated app by the time ASR ends.
                 // An abandoned hold (HUD watchdog fired) is saved the same way:
                 // the user moved on, so nothing is typed into the focused app.
-                let saved = Self.prepareResolvedSnapshotTextForInjection(
+                let saved = voiceEditInstruction != nil ? expanded : Self.prepareResolvedSnapshotTextForInjection(
                     expanded: expanded,
                     snapshot: .unknown,
                     codeAware: self.codeAware,
@@ -778,7 +954,10 @@ final class TranscriptionPipeline {
                 if abandoned {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if abandoned, let onAbandonedHoldSaved = self.onAbandonedHoldSaved {
+                if let instruction = voiceEditInstruction {
+                    self.onVoiceEditLogged?(saved, instruction, engineID, false, true)
+                    Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
+                } else if abandoned, let onAbandonedHoldSaved = self.onAbandonedHoldSaved {
                     onAbandonedHoldSaved(saved, engineID, audioPath)
                 } else {
                     self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, replaceHistoryEntryID)
@@ -810,10 +989,8 @@ final class TranscriptionPipeline {
                 // Sample frontmost PID + secure **before** fresh AX / transforms
                 // so app-switch abort never drives wrong-app caret reads.
                 let (currentPID, liveSecureAtSample): (pid_t?, Bool) = DispatchQueue.main.sync {
-                    (
-                        NSWorkspace.shared.frontmostApplication?.processIdentifier,
-                        IsSecureEventInputEnabled()
-                    )
+                    let target = self.injectionTarget(voiceEdit: voiceEditInstruction != nil)
+                    return (target.pid, target.secureInput)
                 }
                 let axPlan = Self.injectAXPlan(
                     replaceHistoryEntryID: replaceID,
@@ -830,46 +1007,53 @@ final class TranscriptionPipeline {
                     textToInject = expanded
                     liveSecure = liveSecureAtSample
                 case .resolveWithOptionalFresh:
-                    let needsFresh: Bool = {
-                        if replaceID != nil { return true }
-                        guard let held = heldAtStart, !held.isUnknown else { return true }
-                        if case .readable(let n) = held.selectionLength, n > 0 { return false }
-                        return true
-                    }()
-                    let fresh: CaretContext.Snapshot
-                    if needsFresh {
-                        // Fresh AX read must hop to main — do not call AX only off utility.
-                        fresh = DispatchQueue.main.sync {
-                            CaretContext.snapshot()
+                    if voiceEditInstruction != nil {
+                        textToInject = expanded
+                        liveSecure = DispatchQueue.main.sync {
+                            self.injectionTarget(voiceEdit: true).secureInput
                         }
                     } else {
-                        fresh = .unknown
-                    }
-                    let resolved = CaretContext.resolveInjectSnapshot(
-                        held: heldAtStart,
-                        fresh: fresh,
-                        replaceHistoryEntryID: replaceID
-                    )
-                    // Re-sample secure immediately before transforms/gate (TOCTOU
-                    // vs the early PID sample). PID abort was already decided.
-                    liveSecure = DispatchQueue.main.sync {
-                        IsSecureEventInputEnabled()
-                    }
-                    textToInject = Self.applyInjectTransforms(
-                        expanded: Self.prepareResolvedSnapshotTextForInjection(
-                            expanded: expanded,
+                        let needsFresh: Bool = {
+                            if replaceID != nil { return true }
+                            guard let held = heldAtStart, !held.isUnknown else { return true }
+                            if case .readable(let n) = held.selectionLength, n > 0 { return false }
+                            return true
+                        }()
+                        let fresh: CaretContext.Snapshot
+                        if needsFresh {
+                            // Fresh AX read must hop to main — do not call AX only off utility.
+                            fresh = DispatchQueue.main.sync {
+                                CaretContext.snapshot()
+                            }
+                        } else {
+                            fresh = .unknown
+                        }
+                        let resolved = CaretContext.resolveInjectSnapshot(
+                            held: heldAtStart,
+                            fresh: fresh,
+                            replaceHistoryEntryID: replaceID
+                        )
+                        // Re-sample secure immediately before transforms/gate (TOCTOU
+                        // vs the early PID sample). PID abort was already decided.
+                        liveSecure = DispatchQueue.main.sync {
+                            IsSecureEventInputEnabled()
+                        }
+                        textToInject = Self.applyInjectTransforms(
+                            expanded: Self.prepareResolvedSnapshotTextForInjection(
+                                expanded: expanded,
+                                snapshot: resolved,
+                                codeAware: self.codeAware,
+                                hasExplicitCustomTransform: hasExplicitCustomTransform,
+                                snippetExpansionOccurred: snippetExpansionOccurred,
+                                hadExplicitTrailingNewline: hadExplicitTrailingNewline
+                            ),
                             snapshot: resolved,
+                            secureInput: liveSecure,
+                            smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
                             codeAware: self.codeAware,
-                            hasExplicitCustomTransform: hasExplicitCustomTransform,
-                            snippetExpansionOccurred: snippetExpansionOccurred,
-                            hadExplicitTrailingNewline: hadExplicitTrailingNewline
-                        ),
-                        snapshot: resolved,
-                        secureInput: liveSecure,
-                        smartLeadingSpaceEnabled: self.smartLeadingSpaceEnabled,
-                        codeAware: self.codeAware,
-                        capitalizedDictionaryTerms: capitalizedTerms
-                    )
+                            capitalizedDictionaryTerms: capitalizedTerms
+                        )
+                    }
                 }
 
                 // Secure input wins over app-switch abort: never put transcript
@@ -889,9 +1073,7 @@ final class TranscriptionPipeline {
                     // Live secure re-read before pasteboard — skip leave when secure.
                     DispatchQueue.main.sync {
                         Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
-                        abortLeaveBecameSecure = Self.appSwitchAbortLeaveOnMain(
-                            text: textToInject
-                        )
+                        abortLeaveBecameSecure = self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil)
                     }
                     insertResult = .failed
                     proceededToInsert = false
@@ -903,8 +1085,20 @@ final class TranscriptionPipeline {
                         case abort(becameSecure: Bool)
                     }
                     let late: LateInjectDecision = DispatchQueue.main.sync {
-                        let latePID =
-                            NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        let target = self.injectionTarget(voiceEdit: voiceEditInstruction != nil)
+                        let latePID = target.pid
+                        if voiceEditInstruction != nil {
+                            if target.secureInput { return .abort(becameSecure: true) }
+                            guard let heldPID, latePID == heldPID else {
+                                return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
+                            }
+                            let fresh = self.voiceEditInjectionHooks?.snapshot()
+                                ?? CaretContext.snapshot(frontmostPID: heldPID)
+                            guard sessionHeldToken == self.heldCaretToken,
+                                  VoiceEditRouting.selectionMatches(held: heldAtStart, fresh: fresh) else {
+                                return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
+                            }
+                        }
                         if Self.shouldAbortInjectAfterTransforms(
                             replaceHistoryEntryID: replaceID,
                             heldPID: heldPID,
@@ -912,7 +1106,7 @@ final class TranscriptionPipeline {
                         ) {
                             Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: latePID)
                             return .abort(
-                                becameSecure: Self.appSwitchAbortLeaveOnMain(text: textToInject)
+                                becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil)
                             )
                         }
                         return .insert
@@ -923,7 +1117,16 @@ final class TranscriptionPipeline {
                         insertResult = .failed
                         proceededToInsert = false
                     case .insert:
-                        insertResult = TextInjector().insert(textToInject)
+                        // Undo relies on the host's ⌘Z: replacement is one inject,
+                        // with no delete or select-all step in any lane.
+                        if voiceEditInstruction != nil, let hooks = self.voiceEditInjectionHooks {
+                            insertResult = hooks.insert(textToInject)
+                        } else {
+                            insertResult = TextInjector().insert(
+                                textToInject,
+                                expectedTargetPID: voiceEditInstruction == nil ? nil : heldPID
+                            )
+                        }
                         proceededToInsert = true
                     }
                 }
@@ -948,7 +1151,7 @@ final class TranscriptionPipeline {
                     }()
                     let liveSecureAfterInsert =
                         proceededToInsert && insertFailed
-                        ? IsSecureEventInputEnabled()
+                        ? self.injectionTarget(voiceEdit: voiceEditInstruction != nil).secureInput
                         : false
                     let outcomeSecure: Bool
                     if abortLeaveBecameSecure {
@@ -969,18 +1172,25 @@ final class TranscriptionPipeline {
                         // History matches inject intent (post-strip + leading space),
                         // not pasteboard bytes after TextInjector trailing-WS trim.
                         // Dedupe skips history (shouldLog false).
-                        self.onTranscriptionLogged?(
-                            textToInject,
-                            engineID,
-                            insertResult.wasInjectedForHistory,
-                            audioPath,
-                            false,
-                            replaceID
-                        )
+                        if let instruction = voiceEditInstruction {
+                            self.onVoiceEditLogged?(
+                                textToInject, instruction, engineID,
+                                insertResult.wasInjectedForHistory, false
+                            )
+                        } else {
+                            self.onTranscriptionLogged?(
+                                textToInject,
+                                engineID,
+                                insertResult.wasInjectedForHistory,
+                                audioPath,
+                                false,
+                                replaceID
+                            )
+                        }
                     }
                     // A retry's audio still belongs to the row being retried.
                     if replaceID == nil {
-                        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog)
+                        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
                     if let failure = outcome.failure {
                         self.onFailure?(failure)
