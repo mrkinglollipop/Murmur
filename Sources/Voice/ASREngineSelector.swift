@@ -49,9 +49,9 @@ final class ASREngineSelector {
     /// local engine rather than failing the dictation.
     var apiKeyProvider: ((CloudProvider) -> String?)?
 
-    /// OpenAI key for transform auto-run and other LLM paths that reuse the
-    /// cleanup Keychain account. Wired by `AppDelegate` to
-    /// `SettingsStore.cleanupKeyValue()`.
+    /// Configured cleanup backend and credentials, resolved fresh for saved
+    /// transforms and voice edits. Wired by `AppDelegate` to
+    /// `SettingsStore.transformCredentials()`.
     var transformCredentialsProvider: (() -> TransformCredentials)?
 
     /// BCP-47 language code for cloud/local ASR (e.g. `"en"`). Pushed by
@@ -249,6 +249,11 @@ final class ASREngineSelector {
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)? {
         get { pipeline.onTranscriptionLogged }
         set { pipeline.onTranscriptionLogged = newValue }
+    }
+
+    var onVoiceEditLogged: ((String, String, String, Bool, Bool) -> Void)? {
+        get { pipeline.onVoiceEditLogged }
+        set { pipeline.onVoiceEditLogged = newValue }
     }
 
     var onAbandonedHoldSaved: ((String, String, String?) -> Void)? {

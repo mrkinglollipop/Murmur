@@ -242,11 +242,27 @@ struct HistoryView: View {
                     .textSelection(.enabled)
             }
 
+            if let instruction = entry.instruction {
+                Text("Instruction: \(instruction)")
+                    .font(Theme.body(11))
+                    .foregroundColor(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
             HStack(spacing: 8) {
                 // Chip cluster in a container so adjacent glass capsules
                 // blend correctly.
                 GlassEffectContainer(spacing: 8) {
                     HStack(spacing: 8) {
+                        if entry.kind == .edit {
+                            Text(entry.kind.rawValue)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(Theme.textSecondary)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 3)
+                                .murmurGlassCapsule()
+                        }
                         engineChip(entry.engine)
 
                         if !entry.injected && !entry.failed {

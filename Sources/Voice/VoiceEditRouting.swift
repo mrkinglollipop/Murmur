@@ -1,7 +1,7 @@
 import Foundation
 
 /// Decides whether a hold with a focused selection is an edit instruction or
-/// ordinary dictation. Kept pure so AX reads stay at hold start and the safety
+/// ordinary dictation. Kept pure so AX reads stay at lifecycle boundaries and the safety
 /// boundary is covered without starting recording services in tests.
 enum VoiceEditRouting {
     static let maximumSelectionUTF16Length = 8_000

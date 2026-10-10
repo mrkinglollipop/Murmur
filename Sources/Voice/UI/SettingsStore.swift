@@ -496,7 +496,7 @@ final class SettingsStore: ObservableObject {
     }
 
     /// Holds with a readable selection become an edit instruction unless Shift
-    /// is held. UI exposure lands with the History/Settings slice.
+    /// is held. The preference applies to the next hold.
     @Published var voiceEditSelectedText: Bool {
         didSet {
             defaults.set(voiceEditSelectedText, forKey: Keys.voiceEditSelectedText)

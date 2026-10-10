@@ -114,6 +114,10 @@ final class TranscriptionPipeline {
     /// Sixth arg is optional history entry ID to replace (retry path).
     var onTranscriptionLogged: ((String, String, Bool, String?, Bool, UUID?) -> Void)?
 
+    /// Edit history contains only the result and spoken instruction. Audio is
+    /// not retryable without the original selection, which is never stored.
+    var onVoiceEditLogged: ((String, String, String, Bool, Bool) -> Void)?
+
     /// History hook for a hold the HUD watchdog abandoned: text, engine id,
     /// audio path. Separate from `onTranscriptionLogged` because the row must
     /// read "Saved in History" — nothing was typed or left on the clipboard.
@@ -939,7 +943,7 @@ final class TranscriptionPipeline {
                 // History's search field or an unrelated app by the time ASR ends.
                 // An abandoned hold (HUD watchdog fired) is saved the same way:
                 // the user moved on, so nothing is typed into the focused app.
-                let saved = Self.prepareResolvedSnapshotTextForInjection(
+                let saved = voiceEditInstruction != nil ? expanded : Self.prepareResolvedSnapshotTextForInjection(
                     expanded: expanded,
                     snapshot: .unknown,
                     codeAware: self.codeAware,
@@ -950,7 +954,10 @@ final class TranscriptionPipeline {
                 if abandoned {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if abandoned, let onAbandonedHoldSaved = self.onAbandonedHoldSaved {
+                if let instruction = voiceEditInstruction {
+                    self.onVoiceEditLogged?(saved, instruction, engineID, false, true)
+                    Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
+                } else if abandoned, let onAbandonedHoldSaved = self.onAbandonedHoldSaved {
                     onAbandonedHoldSaved(saved, engineID, audioPath)
                 } else {
                     self.onTranscriptionLogged?(saved, engineID, false, audioPath, false, replaceHistoryEntryID)
@@ -1165,18 +1172,25 @@ final class TranscriptionPipeline {
                         // History matches inject intent (post-strip + leading space),
                         // not pasteboard bytes after TextInjector trailing-WS trim.
                         // Dedupe skips history (shouldLog false).
-                        self.onTranscriptionLogged?(
-                            textToInject,
-                            engineID,
-                            insertResult.wasInjectedForHistory,
-                            audioPath,
-                            false,
-                            replaceID
-                        )
+                        if let instruction = voiceEditInstruction {
+                            self.onVoiceEditLogged?(
+                                textToInject, instruction, engineID,
+                                insertResult.wasInjectedForHistory, false
+                            )
+                        } else {
+                            self.onTranscriptionLogged?(
+                                textToInject,
+                                engineID,
+                                insertResult.wasInjectedForHistory,
+                                audioPath,
+                                false,
+                                replaceID
+                            )
+                        }
                     }
                     // A retry's audio still belongs to the row being retried.
                     if replaceID == nil {
-                        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog)
+                        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
                     if let failure = outcome.failure {
                         self.onFailure?(failure)

@@ -272,6 +272,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 replaceEntryID: replaceEntryID
             )
         }
+        activationController?.audioRecorder.asrSelector.onVoiceEditLogged = { [weak self] result, instruction, engineID, injected, savedWithoutInsertion in
+            self?.historyStore.append(
+                text: result,
+                engine: engineID,
+                injected: injected,
+                savedWithoutInsertion: savedWithoutInsertion,
+                kind: .edit,
+                instruction: instruction
+            )
+        }
         activationController?.audioRecorder.asrSelector.onAbandonedHoldSaved = { [weak self] text, engineID, audioPath in
             self?.historyStore.append(
                 text: text,

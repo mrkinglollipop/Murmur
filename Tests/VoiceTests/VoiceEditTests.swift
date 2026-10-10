@@ -196,6 +196,8 @@ final class VoiceEditTests: XCTestCase {
         XCTAssertTrue(store.voiceEditSelectedText)
         store.voiceEditSelectedText = false
         XCTAssertFalse(defaults.bool(forKey: "voice.settings.voiceEditSelectedText"))
+        let reloaded = SettingsStore(defaults: defaults, profileDirectory: directory, apiKeyLookup: { _ in nil })
+        XCTAssertFalse(reloaded.voiceEditSelectedText)
     }
     func testSelectionExtraction_rejectsBothSurrogateBoundariesAndOverflowingLengths() {
         for (location, length) in [(0, 1), (1, 1), (1, 2), (0, -1), (0, Int.max), (Int.max, 1)] {
@@ -254,6 +256,12 @@ final class VoiceEditTests: XCTestCase {
         var clipboard: String?
         var inserted: String?
         var failure: DictationFailure?
+        var history: [HistoryEntry] = []
+        pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in XCTFail("An edit must not be logged as dictation") }
+        pipeline.onVoiceEditLogged = { text, instruction, engine, injected, savedWithoutInsertion in
+            history.append(HistoryEntry(text: text, engine: engine, injected: injected,
+                savedWithoutInsertion: savedWithoutInsertion, kind: .edit, instruction: instruction))
+        }
         pipeline.voiceEditInjectionHooks = .init(
             target: { .init(secureInput: secureInput, pid: currentPID, bundleIdentifier: "fixture") },
             snapshot: { fresh ?? held },
@@ -290,6 +298,18 @@ final class VoiceEditTests: XCTestCase {
         XCTAssertEqual(failure, expectedFailure)
         XCTAssertEqual(clipboard, expectedClipboard)
         XCTAssertEqual(inserted, expectedInsert)
+        if expectedOutcome == .inserted || expectedFailure == .injectionFailed {
+            XCTAssertEqual(history.count, 1)
+            XCTAssertEqual(history.first?.text, result.trimmingCharacters(in: .whitespacesAndNewlines))
+            XCTAssertEqual(history.first?.instruction, "rewrite this")
+            XCTAssertEqual(history.first?.kind, .edit)
+            XCTAssertEqual(history.first?.injected, expectedOutcome == .inserted)
+            XCTAssertNil(history.first?.audioPath)
+            let encoded = try? JSONEncoder().encode(history)
+            XCTAssertFalse(encoded.flatMap { String(data: $0, encoding: .utf8) }?.contains("Old words here.") ?? true)
+        } else {
+            XCTAssertTrue(history.isEmpty)
+        }
         if startNewHold { XCTAssertEqual(pipeline.test_heldCaretSnapshot, held) }
         else { XCTAssertNil(pipeline.test_heldCaretSnapshot) }
     }
@@ -417,6 +437,100 @@ final class VoiceEditTests: XCTestCase {
         ))
         XCTAssertEqual(injector.insert("New words here.", expectedTargetPID: 42), .failed)
         XCTAssertEqual(pasteboard.string(forType: .string), "New words here.")
+    }
+
+    func testEditHistoryRoundTripStoresResultInstructionAndKind() throws {
+        let entry = HistoryEntry(date: Date(timeIntervalSince1970: 12_345), text: "Rewritten result.",
+            engine: "fixture", injected: true, kind: .edit, instruction: "Make this shorter")
+        let data = try JSONEncoder().encode(entry)
+        XCTAssertEqual(try JSONDecoder().decode(HistoryEntry.self, from: data), entry)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["kind"] as? String, "Edit")
+        XCTAssertEqual(object["text"] as? String, "Rewritten result.")
+        XCTAssertEqual(object["instruction"] as? String, "Make this shorter")
+    }
+
+    func testLegacyHistoryDecodesWithoutInstructionOrKind() throws {
+        let entry = HistoryEntry(date: Date(timeIntervalSince1970: 12_345), text: "Old dictation.",
+            engine: "fixture", injected: true)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+        object.removeValue(forKey: "instruction")
+        object.removeValue(forKey: "kind")
+        let decoded = try JSONDecoder().decode(HistoryEntry.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertNil(decoded.instruction)
+        XCTAssertEqual(decoded.kind, .dictation)
+        XCTAssertEqual(try JSONDecoder().decode(HistoryEntry.self, from: JSONEncoder().encode(decoded)), decoded)
+    }
+
+    @MainActor
+    func testEditHistoryPersistsInInjectedDirectoryAndCountsAsADictation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("history.json")
+        let store = HistoryStore(fileURL: fileURL)
+        store.append(text: "Dictated text", engine: "fixture", injected: true)
+        store.append(text: "New edited result", engine: "fixture", injected: false,
+            kind: .edit, instruction: "Rewrite this")
+        store.flush()
+        let reloaded = HistoryStore(fileURL: fileURL)
+        XCTAssertEqual(reloaded.entries.count, 2)
+        XCTAssertEqual(reloaded.entries.first?.kind, .edit)
+        XCTAssertEqual(reloaded.entries.first?.instruction, "Rewrite this")
+        XCTAssertEqual(reloaded.entries.first?.text, "New edited result")
+        XCTAssertNil(reloaded.entries.first?.audioPath)
+        XCTAssertEqual(reloaded.entries.reduce(0) { $0 + InsightsView.metricsWordCount($1.text) }, 5)
+    }
+
+    @MainActor
+    func testAbandonedEditSavesOnlyItsResultAndInstructionWithoutInjection() {
+        let pipeline = TranscriptionPipeline()
+        let held = snapshot(value: "Old words here.", location: 0, selectionLength: .readable(15))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        pipeline.markHoldAbandoned(token)
+        pipeline.runVoiceEditTransform = { _, _, _ in "New words here." }
+        pipeline.voiceEditInjectionHooks = .init(
+            target: { XCTFail("Abandoned edit must not sample an injection target"); return .init(secureInput: false, pid: 42, bundleIdentifier: "fixture") },
+            snapshot: { XCTFail("Abandoned edit must not re-read AX"); return held },
+            insert: { _ in XCTFail("Abandoned edit must not type"); return .failed },
+            leaveOnClipboard: { _ in XCTFail("Abandoned edit must not overwrite clipboard") }
+        )
+        pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in XCTFail("Edit must not log as dictation") }
+        pipeline.onAbandonedHoldSaved = { _, _, _ in XCTFail("Edit must use its typed history hook") }
+        let logged = expectation(description: "abandoned edit logged")
+        pipeline.onVoiceEditLogged = { result, instruction, engine, injected, savedWithoutInsertion in
+            XCTAssertEqual(result, "New words here.")
+            XCTAssertEqual(instruction, "rewrite this")
+            XCTAssertEqual(engine, "fixture")
+            XCTAssertFalse(injected)
+            XCTAssertTrue(savedWithoutInsertion)
+            logged.fulfill()
+        }
+        let completed = expectation(description: "abandoned edit completed")
+        pipeline.finishTranscription(text: "rewrite this", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: token, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 42,
+            completion: { XCTAssertEqual($0, .savedToHistory); completed.fulfill() })
+        wait(for: [logged, completed], timeout: 5)
+        XCTAssertNil(pipeline.test_heldCaretSnapshot)
+        XCTAssertFalse(pipeline.test_abandonedHoldTokens.contains(token))
+    }
+
+    @MainActor
+    func testEmptyEditInstructionDoesNotTransformInjectOrLog() {
+        let pipeline = TranscriptionPipeline()
+        let held = snapshot(value: "Old words here.", location: 0, selectionLength: .readable(15))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        pipeline.runVoiceEditTransform = { _, _, _ in XCTFail("Empty instruction must not reach a backend"); return "" }
+        pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in XCTFail("Empty instruction must not enter History") }
+        pipeline.onVoiceEditLogged = { _, _, _, _, _ in XCTFail("Empty instruction has no edit result to store") }
+        pipeline.onFailure = { XCTAssertEqual($0, .voiceEditFailed) }
+        let completed = expectation(description: "empty edit completed")
+        pipeline.finishTranscription(text: "  \n", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: token, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 42,
+            completion: { XCTAssertEqual($0, .failed); completed.fulfill() })
+        wait(for: [completed], timeout: 2)
     }
 
 }
