@@ -52,6 +52,8 @@ final class TextInjector {
 
     private let hooks: Hooks?
     private var preparedPasteboardChangeCount: Int?
+    /// Accessed only while the global insertion lock is held. Never hops to main.
+    private var selectionValidation: (() -> Bool)?
     private var pasteboard: NSPasteboard { hooks?.pasteboard ?? .general }
 
     init(hooks: Hooks? = nil) {
@@ -61,6 +63,7 @@ final class TextInjector {
     private enum InjectionAbort: Error {
         case secureInput
         case appSwitch
+        case selectionChanged
     }
 
     private func currentTarget() -> InjectionTarget {
@@ -76,9 +79,19 @@ final class TextInjector {
     private func checkInjectionAllowed(targetPID: pid_t?) throws {
         let current = currentTarget()
         guard !current.secureInput else { throw InjectionAbort.secureInput }
-        if TranscriptionPipeline.shouldAbortInjectForFrontmostMismatch(held: targetPID, current: current.pid) {
+        if let targetPID, current.pid != targetPID {
             throw InjectionAbort.appSwitch
         }
+    }
+
+    /// Check only before the first text event of each attempt: our own first
+    /// Unicode chunk changes the selection, so later chunks must not compare it.
+    private func checkSelectionAllowed(targetPID: pid_t?) throws {
+        guard let selectionValidation else { return }
+        let matches = selectionValidation()
+        // AX can block. Recheck focus and Secure Input after it returns.
+        try checkInjectionAllowed(targetPID: targetPID)
+        guard matches else { throw InjectionAbort.selectionChanged }
     }
 
     private static let dedupeLock = NSLock()
@@ -639,8 +652,9 @@ final class TextInjector {
     }
 
     @discardableResult
-    func insert(_ text: String, expectedTargetPID: pid_t? = nil) -> InsertResult {
-        let trimmed = Self.trimmingTrailingWhitespaceAndNewlines(text)
+    func insert(_ text: String, expectedTargetPID: pid_t? = nil,
+                validateSelection: (() -> Bool)? = nil, preserveBoundaryWhitespace: Bool = false) -> InsertResult {
+        let trimmed = preserveBoundaryWhitespace ? text : Self.trimmingTrailingWhitespaceAndNewlines(text)
         guard !trimmed.isEmpty,
               trimmed.contains(where: { !$0.isWhitespace && !$0.isNewline }) else { return .failed }
 
@@ -650,7 +664,7 @@ final class TextInjector {
             return .failed
         }
 
-        // Keep the selection's app anchored across the pipeline-to-inject gap.
+        // Keep the captured destination anchored across the pipeline-to-inject gap.
         if let expectedTargetPID, target.pid != expectedTargetPID {
             leaveOnClipboard(trimmed)
             return .failed
@@ -659,7 +673,11 @@ final class TextInjector {
         // Never synchronously hop to main while holding the dedupe lock: a
         // main-thread insertion may already be waiting for that same lock.
         Self.dedupeLock.lock()
-        defer { Self.dedupeLock.unlock() }
+        selectionValidation = validateSelection
+        defer {
+            selectionValidation = nil
+            Self.dedupeLock.unlock()
+        }
 
         let now = Date()
         if Self.shouldSuppressDuplicateInsert(
@@ -680,10 +698,11 @@ final class TextInjector {
             do {
                 result = try performInsert(trimmed, target: target)
             } catch {
-                if case InjectionAbort.appSwitch = error {
+                switch error {
+                case InjectionAbort.appSwitch, InjectionAbort.selectionChanged:
                     leaveOnClipboard(trimmed)
-                    Self.log("inject aborted — frontmost app changed")
-                } else {
+                    Self.log("inject aborted — destination or selection changed")
+                default:
                     Self.log("inject aborted — secure input enabled")
                 }
                 result = .failed
@@ -1034,7 +1053,11 @@ final class TextInjector {
     @discardableResult
     private func postPasteChord(targetPID: pid_t?, beforePost: () -> Bool = { true }) throws -> Bool {
         try checkInjectionAllowed(targetPID: targetPID)
-        if let hooks { return beforePost() && hooks.postPasteChord() }
+        if let hooks {
+            guard beforePost() else { return false }
+            try checkSelectionAllowed(targetPID: targetPID)
+            return hooks.postPasteChord()
+        }
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             Self.log("no CGEventSource")
             return false
@@ -1052,6 +1075,7 @@ final class TextInjector {
         keyDown.flags = .maskCommand
         try checkInjectionAllowed(targetPID: targetPID)
         guard beforePost() else { return false }
+        try checkSelectionAllowed(targetPID: targetPID)
         keyDown.post(tap: .cgSessionEventTap)
 
         guard let keyUp = CGEvent(
@@ -1125,7 +1149,11 @@ final class TextInjector {
     /// Posts unicode key events via the session tap. Returns UTF-16 units posted, or 0 on failure.
     private func insertViaUnicodeTyping(_ text: String, targetPID: pid_t?, beforePost: () -> Bool) throws -> Int {
         try checkInjectionAllowed(targetPID: targetPID)
-        if let hooks { return beforePost() ? hooks.postUnicode(text) : 0 }
+        if let hooks {
+            guard beforePost() else { return 0 }
+            try checkSelectionAllowed(targetPID: targetPID)
+            return hooks.postUnicode(text)
+        }
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             Self.log("no CGEventSource")
             return 0
@@ -1148,7 +1176,10 @@ final class TextInjector {
             keyDown.keyboardSetUnicodeString(stringLength: mutableChunk.count, unicodeString: &mutableChunk)
             keyDown.flags = Self.syntheticTypingFlags(inherited: keyDown.flags)
             try checkInjectionAllowed(targetPID: targetPID)
-            if index == 0, !beforePost() { return 0 }
+            if index == 0 {
+                guard beforePost() else { return 0 }
+                try checkSelectionAllowed(targetPID: targetPID)
+            }
             keyDown.post(tap: .cgSessionEventTap)
 
             if let keyUp = CGEvent(

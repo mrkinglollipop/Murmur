@@ -1136,27 +1136,16 @@ final class AudioRecorder {
         )
     }
 
-    /// Pure seam: re-anchor the session hold at hotkey release only when the
-    /// release-time frontmost is known AND differs from the start-time PID.
-    /// Same app (or unknown release identity) keeps the start-time hold, so
-    /// the long-verified same-app path is byte-for-byte unchanged.
+    /// A release-time app switch never authorizes changing a hold's destination.
     internal static func shouldRetargetSessionHoldAtRelease(
         startPID: pid_t?,
         releasePID: pid_t?
     ) -> Bool {
-        guard let releasePID else { return false }
-        return startPID != releasePID
+        false
     }
 
-    /// Release-time targeting: the app the user is in when the hotkey is
-    /// RELEASED is the inject destination, not the app the hold started in.
-    /// (2026-08-10 live abort: a hold began while switching away from
-    /// another app, so a perfectly good transcript landed on the clipboard
-    /// instead of the frontmost textbox.) Replaces the cached snapshot + PID
-    /// with a fresh same-moment sample so caret transforms can never mix
-    /// apps. The pre-insert TOCTOU guard in TranscriptionPipeline still
-    /// aborts if focus changes between release and insert (cloud finalize
-    /// can take seconds).
+    /// Keep the original PID and selection together through release. The late
+    /// pipeline and injector checks refuse delivery if that target loses focus.
     private func retargetedSessionHoldAtRelease(
         _ startHold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?)
     ) -> (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?) {

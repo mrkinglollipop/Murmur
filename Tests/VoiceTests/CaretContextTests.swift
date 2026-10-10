@@ -33,6 +33,7 @@ final class CaretContextTests: XCTestCase {
         )
         let snapshot = CaretContext.snapshot(frontmostPID: 123, reader: reader)
         XCTAssertEqual(calls, ["app timeout", "focus read", "focused timeout", "value read", "range read"])
+        XCTAssertTrue(snapshot.focusedElement.map { CFEqual($0, focused) } ?? false)
         XCTAssertEqual(snapshot.value, "hello")
         XCTAssertEqual(snapshot.location, 5)
         XCTAssertEqual(snapshot.selectionLength, .readable(0))

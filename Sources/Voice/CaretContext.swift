@@ -33,6 +33,9 @@ enum CaretContext {
         /// True when focused value/range could not be read at all.
         let isUnknown: Bool
 
+        /// Retained AX identity prevents equal text in another field impersonating this one.
+        var focusedElement: AXUIElement? = nil
+
         static let unknown = Snapshot(
             value: "",
             location: 0,
@@ -107,7 +110,8 @@ enum CaretContext {
             location: parsed.location,
             selectionLength: selectionLength,
             precedingChar: preceding,
-            isUnknown: false
+            isUnknown: false,
+            focusedElement: focused
         )
     }
 

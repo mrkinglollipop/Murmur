@@ -743,6 +743,21 @@ final class TranscriptionPipeline {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Model edge whitespace is incidental; selected boundary whitespace belongs
+    /// to the document and must survive the replacement.
+    static func prepareVoiceEditResult(_ text: String, selection: String?) -> String {
+        let body = normalizeTranscriptForInjection(text)
+        guard !body.isEmpty, let selection else { return body }
+        let leading = selection.prefix(while: { $0.isWhitespace })
+        let trailing = selection.dropFirst(leading.count).reversed().prefix(while: { $0.isWhitespace }).reversed()
+        return String(leading) + body + String(trailing)
+    }
+
+    /// A history retry has no live hold; pin it to its own late target sample.
+    static func expectedDeliveryPID(heldPID: pid_t?, isHistoryRetry: Bool, latePID: pid_t?) -> pid_t? {
+        isHistoryRetry ? latePID : heldPID
+    }
+
     private func applyAutoTransform(_ text: String) async -> String {
         guard let transform = engineSelector?.autoRunTransform else { return text }
         do {
@@ -866,7 +881,9 @@ final class TranscriptionPipeline {
         voiceEditInstruction: String? = nil,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
-        let trimmed = Self.normalizeTranscriptForInjection(text)
+        let trimmed = voiceEditInstruction == nil
+            ? Self.normalizeTranscriptForInjection(text)
+            : text
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 
@@ -892,7 +909,7 @@ final class TranscriptionPipeline {
                                 return
                             }
                             self.finishTranscription(
-                                text: result,
+                                text: Self.prepareVoiceEditResult(result, selection: selection),
                                 hadExplicitTrailingNewline: false,
                                 engineID: engineID,
                                 audioPath: audioPath,
@@ -1081,7 +1098,7 @@ final class TranscriptionPipeline {
                     // Re-sample frontmost immediately before insert (TOCTOU vs
                     // early PID). Late mismatch → same abort-leave as above.
                     enum LateInjectDecision {
-                        case insert
+                        case insert(pid: pid_t)
                         case abort(becameSecure: Bool)
                     }
                     let late: LateInjectDecision = DispatchQueue.main.sync {
@@ -1109,14 +1126,19 @@ final class TranscriptionPipeline {
                                 becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil)
                             )
                         }
-                        return .insert
+                        guard let deliveryPID = Self.expectedDeliveryPID(
+                            heldPID: heldPID, isHistoryRetry: replaceID != nil, latePID: latePID
+                        ) else {
+                            return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil))
+                        }
+                        return .insert(pid: deliveryPID)
                     }
                     switch late {
                     case .abort(let becameSecure):
                         abortLeaveBecameSecure = becameSecure
                         insertResult = .failed
                         proceededToInsert = false
-                    case .insert:
+                    case .insert(let deliveryPID):
                         // Undo relies on the host's ⌘Z: replacement is one inject,
                         // with no delete or select-all step in any lane.
                         if voiceEditInstruction != nil, let hooks = self.voiceEditInjectionHooks {
@@ -1124,7 +1146,14 @@ final class TranscriptionPipeline {
                         } else {
                             insertResult = TextInjector().insert(
                                 textToInject,
-                                expectedTargetPID: voiceEditInstruction == nil ? nil : heldPID
+                                expectedTargetPID: deliveryPID,
+                                validateSelection: voiceEditInstruction == nil ? nil : {
+                                    VoiceEditRouting.selectionMatches(
+                                        held: heldAtStart,
+                                        fresh: CaretContext.snapshot(frontmostPID: deliveryPID)
+                                    )
+                                },
+                                preserveBoundaryWhitespace: voiceEditInstruction != nil
                             )
                         }
                         proceededToInsert = true

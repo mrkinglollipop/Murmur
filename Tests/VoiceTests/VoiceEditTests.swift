@@ -14,8 +14,19 @@ final class VoiceEditTests: XCTestCase {
             location: location,
             selectionLength: selectionLength,
             precedingChar: .startOfField,
-            isUnknown: false
+            isUnknown: false,
+            focusedElement: AXUIElementCreateApplication(42)
         )
+    }
+
+    func testIdenticalSelectionInDifferentFocusedElementIsRejected() {
+        let held = snapshot(value: "same same", location: 0, selectionLength: .readable(4))
+        var otherField = held
+        otherField.focusedElement = AXUIElementCreateApplication(43)
+        XCTAssertFalse(VoiceEditRouting.selectionMatches(held: held, fresh: otherField))
+        var unknownField = held
+        unknownField.focusedElement = nil
+        XCTAssertFalse(VoiceEditRouting.selectionMatches(held: unknownField, fresh: unknownField))
     }
 
     func testRouting_editsReadableNonemptySelectionWhenEnabled() {
@@ -312,6 +323,52 @@ final class VoiceEditTests: XCTestCase {
         }
         if startNewHold { XCTAssertEqual(pipeline.test_heldCaretSnapshot, held) }
         else { XCTAssertNil(pipeline.test_heldCaretSnapshot) }
+    }
+
+    @MainActor
+    func testIdenticalContentInAnotherFieldOfSameAppDoesNotInject() {
+        var otherField = snapshot(value: "Old words here.", location: 0, selectionLength: .readable(15))
+        otherField.focusedElement = AXUIElementCreateApplication(43)
+        assertEditDelivery(fresh: otherField, currentPID: 42, expectedOutcome: .failed,
+            expectedFailure: .injectionFailed, expectedClipboard: "New words here.")
+    }
+
+    @MainActor
+    func testEditBoundaryWhitespaceSurvivesLiveHoldSnapshotFallback() {
+        let pipeline = TranscriptionPipeline()
+        let held = snapshot(value: "big cat sat", location: 0, selectionLength: .readable(8))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        var field = held.value
+        var inserts = 0
+        pipeline.runVoiceEditTransform = { _, selection, _ in
+            XCTAssertEqual(selection, "big cat ")
+            return "small cat"
+        }
+        pipeline.voiceEditInjectionHooks = .init(
+            target: { .init(secureInput: false, pid: 42, bundleIdentifier: "fixture") },
+            snapshot: { held },
+            insert: { text in
+                inserts += 1
+                field = (field as NSString).replacingCharacters(in: NSRange(location: 0, length: 8), with: text)
+                return .inserted(deliveredText: text)
+            },
+            leaveOnClipboard: { _ in XCTFail("Unchanged selection must inject") }
+        )
+        pipeline.onVoiceEditLogged = { text, _, _, injected, _ in
+            XCTAssertEqual(text, "small cat ")
+            XCTAssertTrue(injected)
+        }
+        let completed = expectation(description: "edit with live snapshot fallback")
+        pipeline.finishTranscription(text: "make it smaller", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: token, sessionHeldSnapshot: nil, sessionHeldFrontmostPID: 42,
+            completion: { result in
+                XCTAssertEqual(result, .inserted)
+                completed.fulfill()
+            })
+        wait(for: [completed], timeout: 5)
+        XCTAssertEqual(inserts, 1)
+        XCTAssertEqual(field, "small cat sat")
     }
 
     @MainActor
