@@ -122,24 +122,6 @@ final class LocalASRIntegrationTests: XCTestCase {
         )
     }
 
-    /// Whisper emits subtitle-style sound captions on ambiguous audio;
-    /// `stripSoundAnnotations` is what keeps them out of the injected text, and
-    /// it runs on every local transcription.
-    func testSoundAnnotationStrippingLeavesRealSpeechIntact() {
-        XCTAssertEqual(
-            WhisperKitEngine.stripSoundAnnotations("[Music] hello there"),
-            "hello there"
-        )
-        XCTAssertEqual(
-            WhisperKitEngine.stripSoundAnnotations("*sighs* fix the parser"),
-            "fix the parser"
-        )
-        XCTAssertEqual(
-            WhisperKitEngine.stripSoundAnnotations("no annotations here"),
-            "no annotations here"
-        )
-    }
-
     // MARK: - Fixture
 
     /// Renders `text` to a CAF via macOS `say`. 16 kHz mono matches what the

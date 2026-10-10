@@ -12,6 +12,7 @@ enum FrequencyList {
     static let words: [String] = uniqued(loadList("en-US-names") + loadList("en-US-frequency"))
 
     static let nameSet: Set<String> = Set(loadList("en-US-names"))
+    static let frequencySet = Set(frequencyOrder)
 
     private static func uniqued(_ words: [String]) -> [String] {
         var seen = Set<String>()
@@ -47,6 +48,17 @@ final class AutocorrectController {
     private let language = "en_US"
     private var lexiconWords: [String] = []
     private var userWords: [String] = []
+    private var splitLexicon: AutocorrectEngine.SplitLexicon?
+
+    private var currentSplitLexicon: AutocorrectEngine.SplitLexicon {
+        if let splitLexicon { return splitLexicon }
+        let built = AutocorrectEngine.SplitLexicon(
+            known: FrequencyList.words,
+            frequencyOrder: FrequencyList.frequencyOrder
+        )
+        splitLexicon = built
+        return built
+    }
     private var skipped = Set<String>()
     private(set) var displayed: [String] = []
     private(set) var quoted: Set<String> = []
@@ -66,10 +78,13 @@ final class AutocorrectController {
     }
 
     func setLexicon(_ lexicon: UILexicon?) {
-        lexiconWords = lexicon?.entries.compactMap { entry in
+        let words: [String] = lexicon?.entries.compactMap { entry in
             let text = entry.documentText.trimmingCharacters(in: .whitespacesAndNewlines)
             return text.isEmpty ? nil : text
         } ?? []
+        guard words != lexiconWords else { return }
+        lexiconWords = words
+        splitLexicon = nil
     }
 
     func ignore(_ word: String) {
@@ -89,7 +104,9 @@ final class AutocorrectController {
     }
 
     func setUserWords(_ words: [String]) {
+        guard words != userWords else { return }
         userWords = words
+        splitLexicon = nil
     }
 
     func suggestions(for span: String, beforeInput: String = "") -> [String] {
@@ -124,8 +141,7 @@ final class AutocorrectController {
         }
         if let split = AutocorrectEngine.splitWords(
             span,
-            known: FrequencyList.words,
-            frequencyOrder: FrequencyList.frequencyOrder
+            lexicon: currentSplitLexicon
         ) {
             seeds.append(split)
             quoted.remove(split.lowercased())
@@ -195,8 +211,7 @@ final class AutocorrectController {
         guard misspelled.location != NSNotFound else { return nil }
         if let split = AutocorrectEngine.forcedSplit(
             span,
-            known: FrequencyList.words,
-            frequencyOrder: FrequencyList.frequencyOrder
+            lexicon: currentSplitLexicon
         ) {
             return split
         }
@@ -209,7 +224,7 @@ final class AutocorrectController {
         guard AutocorrectEngine.shouldForceSpelling(
             span: span,
             guess: first,
-            frequencyOrder: FrequencyList.frequencyOrder,
+            frequency: FrequencyList.frequencySet,
             names: FrequencyList.nameSet
         ) else { return nil }
         return AutocorrectEngine.applyCase(template: span, correction: first)

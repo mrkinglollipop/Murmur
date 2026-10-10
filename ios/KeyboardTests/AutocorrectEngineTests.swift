@@ -1,6 +1,14 @@
 import XCTest
 
 final class AutocorrectEngineTests: XCTestCase {
+    func testPrecomputedSplitLexiconUsesItsCurrentMembership() {
+        let original = AutocorrectEngine.SplitLexicon(known: ["he", "the"])
+        XCTAssertEqual(AutocorrectEngine.splitWords("hethe", lexicon: original), "he the")
+        let updated = AutocorrectEngine.SplitLexicon(known: ["he", "the", "hethe"])
+        XCTAssertNil(AutocorrectEngine.splitWords("hethe", lexicon: updated))
+        XCTAssertEqual(AutocorrectEngine.splitWords("hethe", lexicon: original), "he the")
+    }
+
     func testWordSpanTakesTrailingLettersAndApostrophes() {
         XCTAssertEqual(AutocorrectEngine.wordSpan(beforeInput: "hello th"), "th")
         XCTAssertEqual(AutocorrectEngine.wordSpan(beforeInput: "it's"), "it's")

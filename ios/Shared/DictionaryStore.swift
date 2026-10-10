@@ -41,6 +41,7 @@ final class DictionaryStore: ObservableObject {
     @Published private(set) var entries: [DictionaryEntry] = []
 
     private let fileURL: URL
+    private var savedEntries: [DictionaryEntry] = []
     private let logger = Logger(subsystem: "com.matt.murmur.ios", category: "dictionary-store")
     private var variantRegexCache: [String: NSRegularExpression] = [:]
     private var saveWorkItem: DispatchWorkItem?
@@ -57,18 +58,32 @@ final class DictionaryStore: ObservableObject {
     }
 
     private func load() {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        do {
-            let decoded = try JSONDecoder().decode([DictionaryEntry].self, from: data)
-            let merged = Self.mergingDuplicateTerms(decoded)
-            entries = merged
-            if merged != decoded {
-                save()
-            }
-        } catch {
-            quarantineCorruptFile(error: error)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            entries = Self.mergingChanges(base: savedEntries, local: entries, current: [])
+            savedEntries = []
+            return
         }
+        var coordinationError: NSError?
+        var decoded: [DictionaryEntry]?
+        var readError: Error?
+        NSFileCoordinator().coordinate(readingItemAt: fileURL, options: [], error: &coordinationError) { url in
+            do {
+                decoded = try JSONDecoder().decode([DictionaryEntry].self, from: Data(contentsOf: url))
+            } catch {
+                readError = error
+            }
+        }
+        guard let decoded else {
+            if let readError = readError as? DecodingError {
+                quarantineCorruptFile(error: readError)
+            }
+            return
+        }
+        entries = Self.mergingDuplicateTerms(
+            Self.mergingChanges(base: savedEntries, local: entries, current: decoded)
+        )
+        savedEntries = decoded
+        if entries != decoded, saveWorkItem == nil { save() }
     }
 
     private func quarantineCorruptFile(error: Error) {
@@ -83,18 +98,69 @@ final class DictionaryStore: ObservableObject {
             logger.error("Failed to quarantine dictionary.json: \(error.localizedDescription)")
         }
         entries = []
+        savedEntries = []
     }
 
     private func save() {
+        var coordinationError: NSError?
+        var writeError: Error?
+        NSFileCoordinator().coordinate(writingItemAt: fileURL, options: [], error: &coordinationError) { url in
+            do {
+                let current: [DictionaryEntry]
+                if FileManager.default.fileExists(atPath: url.path) {
+                    current = try JSONDecoder().decode([DictionaryEntry].self, from: Data(contentsOf: url))
+                } else {
+                    current = []
+                }
+                let merged = Self.mergingDuplicateTerms(
+                    Self.mergingChanges(base: savedEntries, local: entries, current: current)
+                )
+                try JSONEncoder().encode(merged).write(to: url, options: .atomic)
+                savedEntries = merged
+                entries = merged
+            } catch {
+                writeError = error
+            }
+        }
+        if coordinationError != nil || writeError != nil {
+            logger.error("Failed to save dictionary.json")
+        }
         rebuildRegexCache()
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+    }
+
+    /// Apply only local changes since the last read. A concurrent deletion wins
+    /// over a stale edit; unchanged local entries never resurrect deleted IDs.
+    static func mergingChanges(
+        base: [DictionaryEntry],
+        local: [DictionaryEntry],
+        current: [DictionaryEntry]
+    ) -> [DictionaryEntry] {
+        let baseByID = Dictionary(base.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let localIDs = Set(local.map(\.id))
+        let deletedIDs = Set(base.map(\.id)).subtracting(localIDs)
+        var result = current.filter { !deletedIDs.contains($0.id) }
+        for entry in local {
+            guard let original = baseByID[entry.id] else {
+                if !result.contains(where: { $0.id == entry.id }) { result.append(entry) }
+                continue
+            }
+            guard entry != original,
+                  let index = result.firstIndex(where: { $0.id == entry.id }) else { continue }
+            if entry.term != original.term { result[index].term = entry.term }
+            if entry.variants != original.variants { result[index].variants = entry.variants }
+            if entry.isAutoLearned != original.isAutoLearned {
+                result[index].isAutoLearned = entry.isAutoLearned
+            }
+            result[index].fixCount += entry.fixCount - original.fixCount
+        }
+        return result
     }
 
     private func scheduleSave() {
         rebuildRegexCache()
         saveWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
+            self?.saveWorkItem = nil
             self?.save()
         }
         saveWorkItem = work

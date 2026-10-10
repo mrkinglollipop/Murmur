@@ -21,7 +21,26 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private let autocorrect = AutocorrectController()
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
     private let dictionary = DictionaryStore()
-    private var swipeCommittedWord: String?
+    private var insertOrigin: KeyboardInsertOrigin?
+    private var swipeCommittedWord: String? {
+        get { insertOrigin?.swipeWord }
+        set { insertOrigin = newValue.map(KeyboardInsertOrigin.swipe) }
+    }
+    private var dictationRequest: KeyboardDictationRequest?
+    private var gifInsertionTask: Task<Void, Never>?
+    private var observedDocument: KeyboardDocumentFingerprint?
+
+    private var documentFingerprint: KeyboardDocumentFingerprint {
+        KeyboardDocumentFingerprint(documentIdentifier: textDocumentProxy.documentIdentifier)
+    }
+
+    private var allowsAutocorrection: Bool {
+        KeyboardAutocorrectionPolicy.allowsReplacement(
+            autocorrectionType: textDocumentProxy.autocorrectionType,
+            keyboardType: textDocumentProxy.keyboardType,
+            isSecure: textDocumentProxy.isSecureTextEntry == true
+        )
+    }
     private var lexiconDocuments: [String] = []
 
     var enableInputClicksWhenVisible: Bool { true }
@@ -98,6 +117,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        gifInsertionTask?.cancel()
+        gifInsertionTask = nil
         pollTask?.cancel()
         pollTask = nil
         startTimeoutTask?.cancel()
@@ -151,6 +172,17 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func applyDocumentState() {
+        let document = documentFingerprint
+        if let observedDocument, observedDocument != document {
+            gifInsertionTask?.cancel()
+            gifInsertionTask = nil
+            insertOrigin = nil
+            lastBulkInsert = nil
+            lastSpaceTap = nil
+            autocorrect.clearUndo()
+            autocorrect.suppressUntilWhitespace = false
+        }
+        observedDocument = document
         if textDocumentProxy.isSecureTextEntry == true {
             waitingID = nil
             session = .idle
@@ -205,11 +237,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         // silently eat one character per keystroke. Collapse instead.
         guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
-        if AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: text),
-           swipeCommittedWord != nil,
-           context.last == " ",
-           selectedTextIsEmpty {
-            deleteCharacters(1)
+        let trailingDelete = insertOrigin?.trailingDeleteCount(beforeInserting: text, context: context) ?? 0
+        if trailingDelete > 0, selectedTextIsEmpty {
+            deleteCharacters(trailingDelete)
         }
         swipeCommittedWord = nil
         UIDevice.current.playInputClick()
@@ -311,7 +341,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         }
         if let word = swipeCommittedWord, !word.isEmpty {
             let context = textDocumentProxy.documentContextBeforeInput ?? ""
-            let allowed = AutocorrectEngine.allowedDeleteCount(span: word, inBeforeInput: context)
+            let allowed = insertOrigin?.backspaceCount(context: context) ?? 0
             if allowed > 0 {
                 UIDevice.current.playInputClick()
                 HandoffDiagnostics.record("keyboard.delete.swipeWord", detail: "count=\(allowed)")
@@ -370,7 +400,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func applyAutocorrectIfNeeded(beforeInserting text: String, context: String) {
-        guard phase != .secure, phase != .waiting else { return }
+        guard phase != .secure, phase != .waiting, allowsAutocorrection else { return }
         guard AutocorrectEngine.isCommitText(text) else { return }
         // Suppress is for the swipe/dictation token on its own trailing space,
         // not the next typed word. `noteIncomingText` already cleared it if
@@ -392,7 +422,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func applyCandidate(at index: Int) {
-        guard phase != .secure, phase != .waiting else { return }
+        guard phase != .secure, phase != .waiting, allowsAutocorrection else { return }
         let choices = autocorrect.displayed
         guard index >= 0, index < choices.count else { return }
         let chosen = choices[index]
@@ -400,7 +430,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.isPunctuationSuggestion(chosen) {
             let committed = AutocorrectEngine.committedSpan(beforeInput: context)
-            guard deleteCharacters(committed.trailing.count) else {
+            let deleteCount = recentBulkInsertText() == nil ? committed.trailing.count : 0
+            guard deleteCharacters(deleteCount) else {
                 HandoffDiagnostics.record("keyboard.candidate.abortedDelete", detail: "trailing=\(committed.trailing.count)")
                 return
             }
@@ -413,6 +444,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             refreshSuggestions()
             return
         }
+        guard recentBulkInsertText() == nil else { return }
         let active = AutocorrectEngine.wordSpan(beforeInput: context)
         let target: String
         let trailing: String
@@ -483,6 +515,11 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     private func refreshSuggestions() {
         guard phase != .secure, phase != .waiting else { return }
+        guard allowsAutocorrection else {
+            autocorrect.clearUndo()
+            root.setCandidates([], quoted: [])
+            return
+        }
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         let span = AutocorrectEngine.wordSpan(beforeInput: context)
         if let corrected = autocorrect.lastCorrected {
@@ -673,12 +710,16 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func insertGif(_ gif: GiphyClient.GIF) {
-        Task {
+        let document = documentFingerprint
+        gifInsertionTask?.cancel()
+        gifInsertionTask = Task {
             var pasted = false
             if hasFullAccess {
                 pasted = await copyGIFToPasteboard(from: gif.sendURL)
             }
             await MainActor.run {
+                guard document.allowsInsertion(into: self.documentFingerprint, isCancelled: Task.isCancelled),
+                      self.textDocumentProxy.isSecureTextEntry != true else { return }
                 self.insertPlain(gif.sendURL.absoluteString + " ")
                 HandoffDiagnostics.record(
                     "keyboard.gif.inserted",
@@ -695,7 +736,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private func copyGIFToPasteboard(from url: URL) async -> Bool {
         do {
             let data = try await GiphyClient.fetchData(from: url)
-            guard data.count > 16 else { return false }
+            guard !Task.isCancelled, data.count > 16 else { return false }
             await MainActor.run {
                 UIPasteboard.general.setItems(
                     [[
@@ -846,7 +887,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     @discardableResult
     private func adoptExistingSession() -> Bool {
-        guard let payload = DictationHandoff.read() else { return false }
+        guard let payload = DictationHandoff.read(),
+              payload.id == waitingID,
+              dictationRequest?.id == payload.id else { return false }
         switch payload.status {
         case .pending, .recording, .paused, .transcribing:
             waitingID = payload.id
@@ -890,6 +933,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             hostPID: hostPID
         ))
         waitingID = id
+        dictationRequest = KeyboardDictationRequest(id: id, document: documentFingerprint)
         session = .waiting
         HandoffDiagnostics.record(
             "keyboard.request.created",
@@ -922,6 +966,8 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         guard !gatedID.isEmpty else { return }
         guard let payload = DictationHandoff.read(),
               payload.id == gatedID,
+              payload.id == waitingID,
+              dictationRequest?.accepts(id: payload.id, document: documentFingerprint) == true,
               payload.status == .pending else { return }
         HandoffDiagnostics.record("keyboard.hostReady", detail: gatedID)
         DictationBridge.post(.hostReady)
@@ -980,19 +1026,24 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func consumeHandoffIfReady() {
-        guard let payload = DictationHandoff.read() else { return }
-        if waitingID == nil {
-            waitingID = payload.id
-        }
-        guard payload.id == waitingID else { return }
+        guard let payload = DictationHandoff.read(),
+              payload.id == waitingID,
+              let request = dictationRequest,
+              request.id == payload.id else { return }
         switch payload.status {
         case .pending, .recording, .paused, .transcribing:
             applyLiveStatus()
             return
         case .done:
             HandoffDiagnostics.record("keyboard.result.received", detail: payload.id)
+            let sameDocument = request.accepts(id: payload.id, document: documentFingerprint)
             finishWait()
-            if textDocumentProxy.isSecureTextEntry == true { return }
+            guard sameDocument, textDocumentProxy.isSecureTextEntry != true else {
+                if !payload.text.isEmpty { UIPasteboard.general.string = payload.text }
+                refreshChrome()
+                root.showError("Dictation copied to clipboard. The text field changed.")
+                return
+            }
             let text = AutocorrectEngine.preparedDictationInsert(
                 transcript: payload.text,
                 beforeInput: textDocumentProxy.documentContextBeforeInput ?? "",
@@ -1014,7 +1065,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                     textDocumentProxy.insertText(chunk)
                 }
                 lastBulkInsert = (text: text, at: ContinuousClock().now)
-                swipeCommittedWord = text
+                insertOrigin = .dictation
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()
                 HandoffDiagnostics.record(
@@ -1075,6 +1126,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     private func finishWait() {
         waitingID = nil
+        dictationRequest = nil
         session = .idle
         startTimeoutTask?.cancel()
         startTimeoutTask = nil

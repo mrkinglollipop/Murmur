@@ -34,6 +34,17 @@ xcodebuild test -scheme VoiceTests -destination 'platform=macOS' CODE_SIGNING_AL
 `Voice.xcodeproj` is generated and not tracked — run `xcodegen generate` after
 clone or any `project.yml` change.
 
+### Opt-in tests
+
+The default suite skips model- and provider-backed integration checks. To run
+local ASR, create `/tmp/.murmur-run-local-asr`, run only
+`VoiceTests/LocalASRIntegrationTests`, then remove the sentinel. To replay the
+live tail checks, write an absolute synthetic-audio fixture path into
+`/tmp/.murmur-run-tail-replay`, run only `VoiceTests/LiveTailReplayTests`, then
+remove that sentinel. The replay reads only copied credentials in the isolated
+`.TESTS` Keychain service without printing them; it never records a microphone
+or changes keys.
+
 Unsigned contributor builds should use `CODE_SIGNING_ALLOWED=NO`. Release and
 install scripts need a stable Developer ID — see the signing comments in
 [`project.yml`](project.yml) and [`scripts/README.md`](scripts/README.md).

@@ -86,6 +86,7 @@ still not a product pass until `oracle-dictation-start.sh` exits 0.
   `NSTemporaryDirectory()/voice-debug.log` (owner-only `0o600`). On macOS that
   is typically under `$(getconf DARWIN_USER_TEMP_DIR)voice-debug.log`.
   Transcript text is never logged — only counts and timing.
+  For Finder- or Sparkle-launched builds, run `launchctl setenv VOICE_DEBUG 1` before launching Murmur.
 - This repository intentionally has **no CI**. Local verification (above) is
   the gate — do not re-add a GitHub Actions workflow without an explicit
   maintainer decision.
