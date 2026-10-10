@@ -37,6 +37,17 @@ struct SettingsView: View {
     @ObservedObject var modelManager: ModelManager
 
     var onReplayOnboarding: () -> Void = {}
+    var permissionOverride: PermissionSnapshot?
+
+    init(settingsStore: SettingsStore, modelManager: ModelManager,
+         onReplayOnboarding: @escaping () -> Void = {},
+         initialSection: SettingsSection? = nil, permissionOverride: PermissionSnapshot? = nil) {
+        self.settingsStore = settingsStore
+        self.modelManager = modelManager
+        self.onReplayOnboarding = onReplayOnboarding
+        self.permissionOverride = permissionOverride
+        _selectedSection = State(initialValue: initialSection ?? SettingsSectionSession.selected)
+    }
 
     /// Local editing buffer for the currently-selected cloud model's API
     /// key field. Not written to Keychain until Save is tapped.
@@ -76,6 +87,7 @@ struct SettingsView: View {
 
     private var permissionSnapshot: PermissionSnapshot {
         _ = permissionRefreshTick
+        if let permissionOverride { return permissionOverride }
         return PermissionSnapshot(
             microphone: MicrophonePermission.isGranted(),
             accessibility: AXIsProcessTrusted(),
@@ -95,11 +107,8 @@ struct SettingsView: View {
         SettingsSection.contains(card, in: selectedSection)
     }
 
-    var body: some View {
-        HStack(spacing: 0) {
-            settingsRail
-            Divider().overlay(Theme.hairline)
-            ScrollView {
+    /// Shared content keeps offscreen renders at the scroll pane's actual width.
+    var sectionContent: some View {
             VStack(alignment: .leading, spacing: 20) {
                 Text(selectedSection.rawValue)
                     .font(Theme.serifTitle(26, weight: .medium))
@@ -438,6 +447,14 @@ struct SettingsView: View {
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            settingsRail
+            Divider().overlay(Theme.hairline)
+            ScrollView {
+                sectionContent
             }
         }
 
@@ -458,7 +475,6 @@ struct SettingsView: View {
             }
         }
         .onAppear {
-            selectedSection = SettingsSectionSession.selected
             settingsStore.refreshEnrolledVoiceProfile(autoEnableGatingIfPresent: false)
             settingsStore.refreshRecordingUsage()
             refreshPermissionStatus()
@@ -505,10 +521,6 @@ struct SettingsView: View {
     @ViewBuilder
     private var settingsRail: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Settings")
-                .font(Theme.body(11, weight: .semibold))
-                .foregroundColor(Theme.textSecondary)
-                .padding(.bottom, 8)
             ForEach(SettingsSection.allCases) { section in
                 Button {
                     withAnimation(Theme.easeOutOrNil()) {
@@ -516,16 +528,7 @@ struct SettingsView: View {
                         SettingsSectionSession.selected = section
                     }
                 } label: {
-                    Text(section.rawValue)
-                        .font(Theme.body(13, weight: selectedSection == section ? .semibold : .regular))
-                        .foregroundColor(selectedSection == section ? Theme.textPrimary : Theme.textSecondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .frame(height: 32)
-                        .murmurGlassCard(
-                            cornerRadius: Theme.cornerRadiusCompact,
-                            tint: selectedSection == section ? Theme.selectionTint : nil
-                        )
+                    settingsSectionLabel(section)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(section.rawValue) settings")
@@ -537,6 +540,21 @@ struct SettingsView: View {
         .frame(width: 154, alignment: .topLeading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Settings sections")
+    }
+
+    @ViewBuilder
+    private func settingsSectionLabel(_ section: SettingsSection) -> some View {
+        let label = Text(section.rawValue)
+            .font(Theme.body(13, weight: selectedSection == section ? .semibold : .regular))
+            .foregroundColor(selectedSection == section ? Theme.textPrimary : Theme.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+        if selectedSection == section {
+            label.murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact, tint: Theme.selectionTint)
+        } else {
+            label
+        }
     }
 
     private var permissionsSectionContent: some View {
@@ -663,10 +681,13 @@ struct SettingsView: View {
 
     static func storageSummary(fileCount: Int, usageBytes: Int64, budgetMB: Int) -> String {
         let files = "\(fileCount) \(fileCount == 1 ? "file" : "files")"
-        let budgetBytes = Int64(budgetMB) * 1_000_000
+        let budgetBytes = Int64(budgetMB) * 1024 * 1024
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
         let usage = usageBytes >= budgetBytes
             ? "\(budgetMB) MB, full"
-            : "\(SettingsStore.formatByteCount(usageBytes)) of \(budgetMB) MB"
+            : "\(formatter.string(fromByteCount: usageBytes)) of \(budgetMB) MB"
         return "Retained audio: \(files) · \(usage)"
     }
 
@@ -1008,17 +1029,21 @@ struct SettingsView: View {
     }
 
     private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(Theme.body(12, weight: .semibold))
-                .foregroundColor(Theme.textSecondary)
-                .textCase(.uppercase)
+        VStack(alignment: .leading, spacing: 6) {
+            // A one-card section's caption would only repeat the page title.
+            if title != selectedSection.rawValue {
+                Text(title)
+                    .font(Theme.body(12, weight: .semibold))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 14)
+            }
 
             content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .murmurGlassCard()
         }
-        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .murmurGlassCard()
     }
 
     // MARK: - Model management row

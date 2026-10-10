@@ -9,6 +9,14 @@ import CoreGraphics
 struct OnboardingView: View {
 
     var onComplete: () -> Void
+    var permissionOverride: PermissionSnapshot?
+
+    init(onComplete: @escaping () -> Void, initialStep: Int = 0,
+         permissionOverride: PermissionSnapshot? = nil) {
+        self.onComplete = onComplete
+        self.permissionOverride = permissionOverride
+        _stepIndex = State(initialValue: min(max(initialStep, 0), 3))
+    }
 
     @State private var stepIndex = 0
     @State private var permissionRefreshTick = 0
@@ -51,6 +59,7 @@ struct OnboardingView: View {
 
     private var permissionSnapshot: PermissionSnapshot {
         _ = permissionRefreshTick
+        if let permissionOverride { return permissionOverride }
         return PermissionSnapshot(
             microphone: MicrophonePermission.isGranted(),
             accessibility: AXIsProcessTrusted(),
@@ -63,7 +72,7 @@ struct OnboardingView: View {
             header
             Divider().overlay(Theme.hairline)
 
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 16) {
                 Group {
                     if isFinalStep {
                         finalStepContent
@@ -203,17 +212,20 @@ struct OnboardingView: View {
     private var finalStepContent: some View {
         Group {
             if !permissionSnapshot.allGranted {
-                VStack(alignment: .leading, spacing: 16) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 28))
-                    .foregroundColor(Theme.amberText)
-                    .frame(width: 40)
-                Text("Permissions need attention")
-                    .font(Theme.serifTitle(22, weight: .medium))
-                    .foregroundColor(Theme.textPrimary)
+                VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(Theme.amberText)
+                        .frame(width: 40)
+                    Text("Permissions need attention")
+                        .font(Theme.serifTitle(22, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                }
                 Text("Murmur needs these permissions before dictation can work everywhere.")
                     .font(Theme.body(13))
                     .foregroundColor(Theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
                 ForEach(permissionSnapshot.missing, id: \.self) { destination in
                     HStack {
                         Text(destination.title)

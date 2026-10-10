@@ -145,9 +145,44 @@ final class AuditFixTests: XCTestCase {
         XCTAssertFalse(SettingsSection.contains("Voice", in: .about))
     }
 
+    @MainActor
+    func testReview030SettingsRenderingDependenciesAreIsolated() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "murmur.ui030.dependencies.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let previous = RecordingRetention.recordingsDirectoryOverride
+        RecordingRetention.recordingsDirectoryOverride = directory
+        defer { RecordingRetention.recordingsDirectoryOverride = previous }
+        let store = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                  apiKeyLookup: { $0 == CloudProvider.xai.keychainAccount ? "fixture" : nil })
+        store.activationKeyOption = .rightOption
+        store.useCloudEngine = true
+        store.recordingBudgetMB = 50
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.activationKey"), "rightOption")
+        XCTAssertTrue(defaults.bool(forKey: "voice.settings.useCloudEngine"))
+        XCTAssertEqual(defaults.integer(forKey: "voice.settings.recordingBudgetMB"), 50)
+        XCTAssertTrue(store.hasAPIKey(for: .xai))
+        XCTAssertFalse(store.hasCleanupKey())
+        XCTAssertNil(store.enrolledVoiceProfile)
+        XCTAssertEqual(store.recordingFileCount, 0)
+        let models = ModelManager(loadDiskState: false)
+        XCTAssertTrue(models.state.isEmpty)
+        XCTAssertFalse(models.isDownloaded(.default))
+    }
+
+    func testReview030StorageFullUsesTheRetentionBudgetBoundary() {
+        let limit = Int64(200 * 1024 * 1024)
+        XCTAssertFalse(SettingsView.storageSummary(fileCount: 114, usageBytes: limit - 1, budgetMB: 200).contains("full"))
+        XCTAssertTrue(SettingsView.storageSummary(fileCount: 114, usageBytes: limit, budgetMB: 200).contains("200 MB, full"))
+        XCTAssertTrue(SettingsView.storageSummary(fileCount: 114, usageBytes: limit + 1, budgetMB: 200).contains("200 MB, full"))
+    }
+
     func testReview030StorageSummaryPluralAndFullCap() {
-        XCTAssertEqual(SettingsView.storageSummary(fileCount: 1, usageBytes: 10_000_000, budgetMB: 200), "Retained audio: 1 file · 10 MB of 200 MB")
-        XCTAssertEqual(SettingsView.storageSummary(fileCount: 114, usageBytes: 209_500_000, budgetMB: 200), "Retained audio: 114 files · 200 MB, full")
+        XCTAssertEqual(SettingsView.storageSummary(fileCount: 1, usageBytes: 10 * 1024 * 1024, budgetMB: 200), "Retained audio: 1 file · 10 MB of 200 MB")
+        XCTAssertEqual(SettingsView.storageSummary(fileCount: 114, usageBytes: 200 * 1024 * 1024, budgetMB: 200), "Retained audio: 114 files · 200 MB, full")
     }
 
     func testReview030PermissionSnapshotOnlyCompletesWhenAllThreeGranted() {

@@ -5,9 +5,7 @@ struct InsightsView: View {
     @ObservedObject var historyStore: HistoryStore
     @ObservedObject var dictionaryStore: DictionaryStore
     private let columns = [
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12),
+        GridItem(.adaptive(minimum: 132), spacing: 12),
     ]
 
     var body: some View {
@@ -93,11 +91,10 @@ struct InsightsView: View {
                 .foregroundColor(Theme.textSecondary)
             HStack(alignment: .top, spacing: 6) {
                 VStack(alignment: .trailing, spacing: 4) {
-                    Text("Mon").frame(height: 10)
-                    Spacer().frame(height: 18)
-                    Text("Wed").frame(height: 10)
-                    Spacer().frame(height: 18)
-                    Text("Fri").frame(height: 10)
+                    ForEach(0..<7, id: \.self) { day in
+                        Text([0: "Mon", 2: "Wed", 4: "Fri"][day] ?? "")
+                            .frame(height: 14)
+                    }
                 }
                 .font(Theme.body(10))
                 .foregroundColor(Theme.textSecondary)
@@ -106,9 +103,10 @@ struct InsightsView: View {
                         VStack(spacing: 4) {
                             ForEach(week, id: \.self) { day in
                                 let intensity = Self.heatmapIntensity(for: wordsByDay[day] ?? 0, positiveWordCounts: positives)
-                                RoundedRectangle(cornerRadius: 2)
+                                RoundedRectangle(cornerRadius: 3)
                                     .fill(heatmapColor(intensity: intensity))
-                                    .frame(width: 10, height: 10)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 14)
                                     .accessibilityHidden(true)
                             }
                         }
