@@ -1103,7 +1103,12 @@ final class ClipboardStoreTests: XCTestCase {
             XCTAssertEqual(reopened.entries.map(\.id), [entry.id])
             XCTAssertTrue(FileManager.default.fileExists(atPath: orphan.path))
             XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("blobs").appendingPathComponent(entry.id.uuidString).path))
-            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            // A re-save may re-seal the preview under a fresh nonce, so compare
+            // what a fresh launch reads rather than the ciphertext bytes.
+            XCTAssertEqual(try Data(contentsOf: url).count, bytes.count)
+            let relaunched = activated(ClipboardStore(directory: directory, crypto: crypto))
+            XCTAssertEqual(relaunched.entries.map(\.id), [entry.id])
+            XCTAssertEqual(relaunched.entries.first?.preview, entry.preview)
         }
     }
 
@@ -1120,7 +1125,8 @@ final class ClipboardStoreTests: XCTestCase {
             }
             try FileManager.default.removeItem(at: url)
         }
-        store = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256)), fileOperations: operations))
+        let crypto = ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        store = activated(ClipboardStore(directory: directory, crypto: crypto, fileOperations: operations))
         store.record(snapshot: textSnapshot("deletion refused"), sourceBundleID: nil)
         XCTAssertTrue(waitForEntries(store, count: 1))
         store.flush()
@@ -1137,7 +1143,10 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertFalse(store.isStorageUnavailable)
         XCTAssertTrue(store.canCapture)
         XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(blocked).path))
-        XCTAssertEqual(try Data(contentsOf: url), metadata)
+        XCTAssertEqual(try Data(contentsOf: url).count, metadata.count)
+        let relaunched = activated(ClipboardStore(directory: directory, crypto: crypto))
+        XCTAssertEqual(relaunched.entries.map(\.id), [entry.id])
+        XCTAssertEqual(relaunched.entries.first?.preview, entry.preview)
     }
 
     func testClearAllCancelsCaptureBeforeItsMetadataInsertion() throws {
