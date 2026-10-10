@@ -60,6 +60,39 @@ final class StuckProcessingHUDTests: XCTestCase {
             generation: 4, currentGeneration: 4, hudIsProcessing: false))
     }
 
+    // MARK: - Watchdog lifecycle
+
+    func testAbortedStartKeepsPreviousProcessingWatchdogArmed() {
+        // Secure input, denied permission, and release during the permission
+        // hop all exit after a request without announcing a recording start.
+        let action = AudioRecorder.processingWatchdogAction(
+            for: .startRequested, hudIsProcessing: true
+        )
+        XCTAssertEqual(action, .keep, "A request alone must not disarm the previous hold")
+        let generation: UInt64 = 4
+        let currentGeneration = action == .cancel ? generation + 1 : generation
+        XCTAssertTrue(AudioRecorder.shouldFireProcessingWatchdog(
+            generation: generation, currentGeneration: currentGeneration, hudIsProcessing: true
+        ))
+    }
+
+    func testAlreadyStoppingRefreshesProcessingWatchdog() {
+        XCTAssertEqual(AudioRecorder.processingWatchdogAction(
+            for: .alreadyStopping, hudIsProcessing: true
+        ), .rearm, "A repeated stop must restore the processing HUD's deadline")
+        XCTAssertEqual(AudioRecorder.processingWatchdogAction(
+            for: .alreadyStopping, hudIsProcessing: false
+        ), .keep, "A repeated stop must not arm a timer for a non-processing HUD")
+    }
+
+    func testStartedRecordingCancelsPreviousProcessingWatchdog() {
+        for hudIsProcessing in [true, false] {
+            XCTAssertEqual(AudioRecorder.processingWatchdogAction(
+                for: .recordingStarted, hudIsProcessing: hudIsProcessing
+            ), .cancel, "A confirmed recording start supersedes the previous hold's timer")
+        }
+    }
+
     // MARK: - Abandoned hold reaches History without insertion
 
     private struct Logged {

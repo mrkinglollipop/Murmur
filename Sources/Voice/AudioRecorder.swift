@@ -859,12 +859,40 @@ final class AudioRecorder {
         generation == currentGeneration && hudIsProcessing
     }
 
+    enum ProcessingWatchdogEvent {
+        case startRequested
+        case recordingStarted
+        case alreadyStopping
+    }
+
+    enum ProcessingWatchdogAction {
+        case keep
+        case cancel
+        case rearm
+    }
+
+    /// Lifecycle decisions are independent of microphone, permission, and HUD I/O.
+    static func processingWatchdogAction(
+        for event: ProcessingWatchdogEvent,
+        hudIsProcessing: Bool
+    ) -> ProcessingWatchdogAction {
+        switch event {
+        case .startRequested:
+            return .keep
+        case .recordingStarted:
+            return .cancel
+        case .alreadyStopping:
+            return hudIsProcessing ? .rearm : .keep
+        }
+    }
+
     /// Bumped whenever a processing watchdog is armed or cancelled, so a
     /// superseded timer callback no-ops instead of hiding a newer hold's HUD.
     private var processingWatchdogGeneration: UInt64 = 0
     /// Hold the armed watchdog belongs to, so a late finish for an older hold
     /// cannot cancel a newer hold's timer.
     private var processingWatchdogToken: UInt64?
+    private var processingWatchdogAudioDuration: TimeInterval = 0
 
     /// Tracks the most recent start/stop request. Guards against a stale
     /// permission-completion handler (fired after a later stopRecording())
@@ -1357,12 +1385,15 @@ final class AudioRecorder {
 
     func startRecording(heldCaretToken: UInt64? = nil) {
         pendingHeldCaretToken = heldCaretToken
-        // A newer hold owns the HUD now; the previous hold's watchdog must
-        // not hide it. `startRecording` can arrive off-main.
+        // A request can still bail at secure input or the permission hop.
+        // Keep the previous hold's watchdog until listening is announced.
+        // `startRecording` can arrive off-main.
         if Thread.isMainThread {
-            cancelProcessingWatchdog()
+            updateProcessingWatchdog(for: .startRequested)
         } else {
-            DispatchQueue.main.async { [weak self] in self?.cancelProcessingWatchdog() }
+            DispatchQueue.main.async { [weak self] in
+                self?.updateProcessingWatchdog(for: .startRequested)
+            }
         }
         // Freeze hold immediately while this token still owns the pipeline
         // slot — a rapid re-press can steal the live slot before stop samples.
@@ -2103,6 +2134,7 @@ final class AudioRecorder {
             }
         }
         if isStopping {
+            updateProcessingWatchdog(for: .alreadyStopping)
             invalidateSecureInputPollTimer()
             logger.info("doStop ignored — stop already in progress")
             vlog("doStop ignored — already stopping")
@@ -2151,9 +2183,24 @@ final class AudioRecorder {
         processingWatchdogGeneration &+= 1
         let generation = processingWatchdogGeneration
         processingWatchdogToken = sessionToken
+        processingWatchdogAudioDuration = audioDuration
         let bound = Self.processingHUDWatchdogBound(audioDuration: audioDuration)
         DispatchQueue.main.asyncAfter(deadline: .now() + bound) { [weak self] in
             self?.fireProcessingWatchdog(generation: generation, sessionToken: sessionToken)
+        }
+    }
+
+    private func updateProcessingWatchdog(for event: ProcessingWatchdogEvent) {
+        switch Self.processingWatchdogAction(for: event, hudIsProcessing: hud.isProcessing) {
+        case .keep:
+            break
+        case .cancel:
+            cancelProcessingWatchdog()
+        case .rearm:
+            armProcessingWatchdog(
+                sessionToken: processingWatchdogToken,
+                audioDuration: processingWatchdogAudioDuration
+            )
         }
     }
 
@@ -2992,6 +3039,7 @@ final class AudioRecorder {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.wantsRecording else { return }
+            self.updateProcessingWatchdog(for: .recordingStarted)
             if let label = self.activationKeyLabelProvider?() {
                 self.hud.setActivationKeyLabel(label)
             }
