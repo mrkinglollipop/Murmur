@@ -13,11 +13,12 @@ import Foundation
 /// File-sink writes are serialized: `TextInjector.log` and activation paths can
 /// call `vlog` concurrently; FileHandle seek+write is not thread-safe alone.
 private let vlogFileLock = NSLock()
+private let vlogEnabled = ProcessInfo.processInfo.environment["VOICE_DEBUG"] != nil
 
-func vlog(_ message: String) {
-    guard ProcessInfo.processInfo.environment["VOICE_DEBUG"] != nil else { return }
+func vlog(_ message: @autoclosure () -> String) {
+    guard vlogEnabled else { return }
     let ts = String(format: "%.3f", Date().timeIntervalSince1970)
-    let line = "[\(ts)] \(message)\n"
+    let line = "[\(ts)] \(message())\n"
     guard let data = line.data(using: .utf8) else { return }
     let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("voice-debug.log")
     vlogFileLock.lock()

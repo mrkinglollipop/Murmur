@@ -59,11 +59,11 @@ echo "==> What's New release notes wired into appcast item"
 if grep -q 'Resources/WhatsNew/releases\.json' "$SCRIPT" \
   && grep -q 'WhatsNew' "$SCRIPT" \
   && grep -q '<description><!\[CDATA\[' "$SCRIPT" \
-  && grep -q 'Built from commit {release_sha}' "$SCRIPT" \
+  && ! grep -q 'release_sha' "$SCRIPT" \
   && grep -q 'gh release edit "\$TAG" --repo "\$UPDATES_REPO" --notes "\$WHATSNEW_NOTES"' "$SCRIPT"; then
-  pass "releases.json, commit SHA, and CDATA description in publish-sparkle.sh"
+  pass "releases.json and CDATA description in publish-sparkle.sh; no commit SHA in public notes"
 else
-  fail "publish-sparkle.sh must update every release's notes from Resources/WhatsNew/releases.json with its commit SHA"
+  fail "publish-sparkle.sh must update every release's notes from Resources/WhatsNew/releases.json and keep the commit SHA out of them"
 fi
 
 echo "==> appcast description builder (python)"

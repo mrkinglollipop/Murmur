@@ -42,18 +42,6 @@ enum CaretContext {
         )
     }
 
-    /// Reads the character immediately left of the caret in the frontmost app's
-    /// focused UI element via the Accessibility API (AXFocusedUIElement ->
-    /// kAXValueAttribute + kAXSelectedTextRangeAttribute). Returns `.unknown`
-    /// when the element/value/range can't be read (common for Electron apps,
-    /// which frequently refuse AX value queries), `.startOfField` when the
-    /// caret sits at offset 0.
-    static func precedingCharacter(
-        frontmostPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier
-    ) -> PrecedingChar {
-        snapshot(frontmostPID: frontmostPID).precedingChar
-    }
-
     /// Single AX snapshot for strip + leading space (no dual fetch).
     static func snapshot(
         frontmostPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier,

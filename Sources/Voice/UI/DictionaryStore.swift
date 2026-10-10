@@ -112,6 +112,8 @@ struct BlockedPair: Codable, Hashable {
 /// find/replace correction — no LLM cleanup layer, per scope.
 final class DictionaryStore: ObservableObject {
 
+    @Published private(set) var saveFailure = SaveFailureNotice()
+
     @Published private(set) var entries: [DictionaryEntry] = []
     @Published private(set) var blocklist: Set<BlockedPair> = []
 
@@ -184,6 +186,7 @@ final class DictionaryStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else {
             dictionarySavesBlocked = true
+            reportSaveFailure()
             logger.error("dictionary.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -205,6 +208,7 @@ final class DictionaryStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: blocklistFileURL.path) else { return }
         guard let data = try? Data(contentsOf: blocklistFileURL) else {
             blocklistSavesBlocked = true
+            reportSaveFailure()
             logger.error("blocklist.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -228,23 +232,40 @@ final class DictionaryStore: ObservableObject {
             logger.error("Quarantined corrupt \(label) → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
             blockSaves()
+            reportSaveFailure()
             logger.error("Failed to quarantine corrupt \(label): \(error.localizedDescription)")
         }
         reset()
     }
 
+    private func reportSaveFailure() {
+        saveFailure.report("Dictionary changes could not be saved. Copy any changes you want to keep before quitting.")
+    }
+
+    func dismissSaveFailure() {
+        saveFailure.dismiss()
+    }
+
     private func save() {
         rebuildRegexCache()
         guard !dictionarySavesBlocked else { return }
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(entries)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     private func saveBlocklist() {
         guard !blocklistSavesBlocked else { return }
         let pairs = Array(blocklist)
-        guard let data = try? JSONEncoder().encode(pairs) else { return }
-        try? data.write(to: blocklistFileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(pairs)
+            try data.write(to: blocklistFileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     private func scheduleSave() {

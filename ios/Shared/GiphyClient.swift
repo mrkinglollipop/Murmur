@@ -19,7 +19,7 @@ enum GiphyClient {
 
     private static let host = "api.giphy.com"
     private static let maxLimit = 24
-    private static let maxDownloadBytes = 8 * 1024 * 1024
+    static let maxDownloadBytes = 8 * 1024 * 1024
 
     private static let session: URLSession = {
         let directory = FileManager.default.containerURL(
@@ -67,11 +67,27 @@ enum GiphyClient {
     }
 
     static func fetchData(from url: URL) async throws -> Data {
-        let (data, response) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (bytes, response) = try await session.bytes(for: request)
+        defer { bytes.task.cancel() }
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw ClientError.http(http.statusCode)
         }
-        guard data.count <= maxDownloadBytes else { throw ClientError.decode }
+        return try await boundedData(bytes, expectedLength: response.expectedContentLength)
+    }
+
+    static func boundedData<Bytes: AsyncSequence>(
+        _ bytes: Bytes,
+        expectedLength: Int64
+    ) async throws -> Data where Bytes.Element == UInt8 {
+        guard expectedLength <= Int64(maxDownloadBytes) else { throw ClientError.decode }
+        var data = Data()
+        for try await byte in bytes {
+            try Task.checkCancellation()
+            guard data.count < maxDownloadBytes else { throw ClientError.decode }
+            data.append(byte)
+        }
         return data
     }
 

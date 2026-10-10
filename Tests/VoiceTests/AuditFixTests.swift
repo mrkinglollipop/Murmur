@@ -165,12 +165,43 @@ final class AuditFixTests: XCTestCase {
         XCTAssertTrue(defaults.bool(forKey: "voice.settings.useCloudEngine"))
         XCTAssertEqual(defaults.integer(forKey: "voice.settings.recordingBudgetMB"), 50)
         XCTAssertTrue(store.hasAPIKey(for: .xai))
-        XCTAssertFalse(store.hasCleanupKey())
+        XCTAssertFalse(store.hasCleanupKey)
         XCTAssertNil(store.enrolledVoiceProfile)
         XCTAssertEqual(store.recordingFileCount, 0)
         let models = ModelManager(loadDiskState: false)
         XCTAssertTrue(models.state.isEmpty)
         XCTAssertFalse(models.isDownloaded(.default))
+    }
+
+    @MainActor
+    func testReview030DefaultSettingsAndKeychainAreTestIsolated() {
+        let store = SettingsStore()
+        XCTAssertFalse(store.defaults === UserDefaults.standard)
+        XCTAssertNotEqual(KeychainStore().service, KeychainStore.productionService)
+    }
+
+    @MainActor
+    func testReview030KeyPresenceCacheRefreshesAfterSaveAndRemove() throws {
+        let suite = "murmur.ui030.key-presence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let keychain = KeychainStore(service: "com.matt.voice-dictation.apikeys.TESTS.\(UUID().uuidString)")
+        defer {
+            keychain.deleteKey(for: CloudProvider.xai.keychainAccount)
+            keychain.deleteKey(for: "cleanup-openai")
+        }
+        let store = SettingsStore(defaults: defaults, keychain: keychain, apiKeyLookup: { keychain.key(for: $0) })
+
+        XCTAssertFalse(store.hasAPIKey(for: .xai))
+        XCTAssertFalse(store.hasCleanupKey)
+        XCTAssertTrue(store.saveAPIKey("test-key", for: .xai))
+        XCTAssertTrue(store.hasAPIKey(for: .xai))
+        XCTAssertTrue(store.saveCleanupKey("test-key"))
+        XCTAssertTrue(store.hasCleanupKey)
+        store.removeAPIKey(for: .xai)
+        store.removeCleanupKey()
+        XCTAssertFalse(store.hasAPIKey(for: .xai))
+        XCTAssertFalse(store.hasCleanupKey)
     }
 
     func testReview030StorageFullUsesTheRetentionBudgetBoundary() {

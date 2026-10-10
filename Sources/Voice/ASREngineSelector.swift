@@ -5,6 +5,9 @@ import os.log
 
 /// The set of available ASR backends.
 enum ASREngineID: String, CaseIterable {
+    /// Apple SpeechAnalyzer — on-device system speech assets.
+    case appleSpeech = "appleSpeech"
+
     /// WhisperKit — on-device CoreML Whisper. Default.
     case whisperKit = "whisperKit"
 
@@ -274,6 +277,9 @@ final class ASREngineSelector {
             if let wk = cached as? WhisperKitEngine {
                 wk.language = selectedLanguage
             }
+            if let apple = cached as? AppleSpeechEngine {
+                apple.language = selectedLanguage
+            }
             return cached
         }
         let engine = buildEngine(for: selectedModel)
@@ -400,6 +406,8 @@ final class ASREngineSelector {
     /// against that invariant being violated in the future.
     private func buildEngine(for model: LocalModel) -> any ASREngine {
         switch model.engineID {
+        case .appleSpeech:
+            return AppleSpeechEngine(language: selectedLanguage)
         case .whisperKit:
             let modelID = model.whisperKitModelID ?? {
                 logger.error("LocalModel \(model.rawValue) has engineID .whisperKit but no whisperKitModelID — falling back to base model.")

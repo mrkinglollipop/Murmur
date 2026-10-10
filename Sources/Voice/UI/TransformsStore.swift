@@ -28,9 +28,9 @@ final class TransformsStore: ObservableObject {
     @Published var autoRunTransformID: UUID? {
         didSet {
             if let id = autoRunTransformID {
-                UserDefaults.standard.set(id.uuidString, forKey: Keys.autoRunTransformID)
+                VoiceDefaults.shared.set(id.uuidString, forKey: Keys.autoRunTransformID)
             } else {
-                UserDefaults.standard.removeObject(forKey: Keys.autoRunTransformID)
+                VoiceDefaults.shared.removeObject(forKey: Keys.autoRunTransformID)
             }
             pushAutoRunTransform()
         }
@@ -53,7 +53,7 @@ final class TransformsStore: ObservableObject {
 
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? TransformsStore.defaultFileURL()
-        if let raw = UserDefaults.standard.string(forKey: Keys.autoRunTransformID),
+        if let raw = VoiceDefaults.shared.string(forKey: Keys.autoRunTransformID),
            let id = UUID(uuidString: raw) {
             autoRunTransformID = id
         }

@@ -5,8 +5,8 @@ import Foundation
 /// Pluggable speech-recognition backend.
 ///
 /// Each conforming type owns its own model loading / Python subprocess logic.
-/// The protocol is intentionally minimal — batch transcription only for now;
-/// streaming is a later slice.
+/// The protocol is intentionally minimal — file-based transcription only.
+/// Cloud streaming uses dedicated session types outside this protocol.
 protocol ASREngine {
     /// Short machine-readable identifier (e.g. "whisperKit", "parakeet").
     var id: String { get }

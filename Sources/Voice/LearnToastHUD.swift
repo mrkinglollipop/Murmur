@@ -78,6 +78,7 @@ final class LearnToastHUD {
         pendingBatches = plan.pending
 
         if plan.dismissCurrent {
+            AccessibilityAnnouncement.post("Learned corrections removed", element: panel)
             dismissWorkItem?.cancel()
             dismissWorkItem = nil
             rejectableBatch = nil
@@ -114,6 +115,7 @@ final class LearnToastHUD {
         let height = max(estimatedHeight, size.height)
         panel.setContentSize(NSSize(width: width, height: height))
         reposition()
+        AccessibilityAnnouncement.post(Self.learnedAnnouncement(count: batch.corrections.count), element: panel)
     }
 
     /// Repositions relative to RecordingHUD. Safe when toast is not showing.
@@ -160,6 +162,7 @@ final class LearnToastHUD {
         isShowing = true
         reposition()
         panel.orderFrontRegardless()
+        AccessibilityAnnouncement.post(Self.learnedAnnouncement(count: batch.corrections.count), element: panel)
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.15
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -180,6 +183,7 @@ final class LearnToastHUD {
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
         onReject?(batch)
+        AccessibilityAnnouncement.post("Learned corrections removed", element: panel)
         let generation = beginHide()
         isShowing = false
         hidePanel(generation: generation) { [weak self] in
@@ -201,7 +205,13 @@ final class LearnToastHUD {
             }
             self.presentNextPending()
         }
-        _ = userInitiated
+        if userInitiated {
+            AccessibilityAnnouncement.post("Learn notification dismissed", element: panel)
+        }
+    }
+
+    static func learnedAnnouncement(count: Int) -> String {
+        "Learned \(count) dictionary correction\(count == 1 ? "" : "s")"
     }
 
     private func presentNextPending() {
@@ -270,11 +280,10 @@ private struct LearnToastContent: View {
                 }
                 .buttonStyle(.plain)
                 .help("Dismiss")
+                .accessibilityLabel("Dismiss")
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-        .murmurGlassCard()
+        .modifier(MurmurToastSurface())
         .shadow(color: Color.black.opacity(0.35), radius: 10, x: 0, y: 4)
         .frame(maxWidth: 360)
         .preferredColorScheme(.dark)
@@ -309,5 +318,14 @@ private struct LearnToastContent: View {
                 .foregroundColor(Theme.textPrimary)
         }
         .font(Theme.body(12))
+    }
+}
+
+struct MurmurToastSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .murmurGlassCard()
     }
 }

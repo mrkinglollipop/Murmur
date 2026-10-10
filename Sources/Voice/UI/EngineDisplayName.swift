@@ -6,6 +6,8 @@ import Foundation
 enum EngineDisplayName {
     static func displayName(for storedID: String) -> String {
         switch storedID {
+        case "appleSpeech":
+            return "Apple"
         case "parakeet":
             return LocalModel.parakeetTDT06BV3.displayName
         case "cloud:elevenlabs-streaming":

@@ -3,6 +3,14 @@ import XCTest
 
 final class NonSpeechAnnotationsTests: XCTestCase {
 
+    /// This pure local-ASR cleanup rule must run in the default suite; only
+    /// model-backed transcription belongs behind the local-ASR sentinel.
+    func testWhisperSoundAnnotationStrippingLeavesRealSpeechIntact() {
+        XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("[Music] hello there"), "hello there")
+        XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("*sighs* fix the parser"), "fix the parser")
+        XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("no annotations here"), "no annotations here")
+    }
+
     func testWhisperCaptionCleanupPreservesContentAndCode() {
         XCTAssertEqual(WhisperKitEngine.stripSoundAnnotations("Keep [chapter three] and *important words* intact."),
                        "Keep [chapter three] and *important words* intact.")

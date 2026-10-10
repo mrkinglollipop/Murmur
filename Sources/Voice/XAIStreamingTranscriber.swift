@@ -1109,43 +1109,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         return tokens
     }
 
-    static func lastSentence(of text: String) -> String {
-        splitSentences(text).last ?? text
-    }
-
     static func shouldReplaceTail(left: String, right: String) -> Bool {
         nearDuplicateTailWindow(in: left, right: right) != nil
-    }
-
-    static func replaceLastSentence(in text: String, with replacement: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let repl = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let window = nearDuplicateTailWindow(in: trimmed, right: repl) {
-            return replaceTailWindow(in: trimmed, dropWordCount: window, with: repl)
-        }
-        var sentences = splitSentences(trimmed)
-        guard !sentences.isEmpty else { return repl }
-        if sentences.count >= 2 {
-            sentences[sentences.count - 1] = repl
-            return sentences.joined(separator: " ")
-        }
-        return trimmed + (trimmed.hasSuffix(" ") ? "" : " ") + repl
-    }
-
-    static func replaceOverlappingTail(in left: String, with right: String) -> String {
-        if let window = nearDuplicateTailWindow(in: left, right: right) {
-            return replaceTailWindow(in: left, dropWordCount: window, with: right)
-        }
-        let leftWords = left.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        let rightWords = right.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        guard !rightWords.isEmpty else { return left }
-        guard !leftWords.isEmpty else { return right }
-
-        if let merged = stitchWithWordOverlap(left, right), merged.count > left.count {
-            return merged
-        }
-
-        return left + (left.hasSuffix(" ") ? "" : " ") + right
     }
 
     static func collapseNearDuplicateWordTail(_ text: String) -> String {
