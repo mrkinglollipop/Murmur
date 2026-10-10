@@ -21,7 +21,7 @@ current setup and contribution guidance.
 | 007 | Spike: retry-from-history with engine picker | PARTIAL |
 | 008 | Spike: per-app Snippets / Dictionary / Transforms | TODO |
 | 009 | Spike: export / import settings bundle | TODO |
-| 010 | Cloud batch WAV transcode | TODO |
+| 010 | Cloud batch WAV transcode | DONE (`CloudAudioTranscoder` + tests in tree; index corrected 2026-10-10) |
 | 011 | AssemblyAI `speech_model` param | DEFERRED (engine retired from UI) |
 | 012 | ElevenLabs Scribe v2 Realtime | DONE |
 | 013 | Retire unused selectable ASR engines | DONE |
@@ -40,6 +40,8 @@ current setup and contribution guidance.
 | 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe bake-off gated) | PARTIAL — P0–P2 in tree; swipe is in the build (Settings toggle, default off), still bake-off gated; P2b Messages bubble is a device spike; **027 wins for look** (mic not Start/waveform; brighter caps + 1pt lip, not leftover UIGlassEffect-on-keys); **P0 space-bar trackpad cancelled by 027** |
 | 027 | iOS keyboard: Apple chrome polish + multi-iPhone sizing | SHIPPED (2026-08-13) — visual vs Apple unverified until Messages screenshot; **wins for look** vs 026 (mic not Start/waveform; brighter caps + 1pt lip); **cancels 026 P0 space-bar trackpad**; 026 still owns P0-host / GIF / swipe / dictation bounce |
 | 028 | Gemini 3.5 Transcribe as selectable cloud engine (Mac + iOS host) | SHIPPED (code 2026-08-26) — live WS handshake unverified; additive; default xAI |
+| 029 | Complete dictation audit (2026-09-08) | DONE (audit record; repairs shipped in 0.1.50–0.1.52) |
+| 030 | Full product review: findings register (2026-10-10) | AUDIT COMPLETE — plans not yet written; see its "Proposed plan set" |
 
 ## Notes for maintainers
 
