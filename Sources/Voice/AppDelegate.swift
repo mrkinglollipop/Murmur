@@ -502,9 +502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        if let button = statusItem?.button {
-            setMenuBarIcon(named: "mic", accessibilityDescription: "Murmur")
-        }
+        setMenuBarIcon(.idle)
         rebuildStatusMenu()
     }
 
@@ -578,16 +576,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isDictationPaused.toggle()
         activationController?.isPaused = isDictationPaused
         hotkeyController?.isPaused = isDictationPaused
-        setMenuBarIcon(
-            named: isDictationPaused ? "mic.slash" : "mic",
-            accessibilityDescription: isDictationPaused ? "Murmur, paused" : "Murmur"
-        )
+        setMenuBarIcon(isDictationPaused ? .paused : .idle)
         rebuildStatusMenu()
     }
 
-    private func setMenuBarIcon(named name: String, accessibilityDescription: String) {
-        statusItem?.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription)
-        statusItem?.button?.image?.isTemplate = true
+    private func setMenuBarIcon(_ icon: MenuBarIcon) {
+        statusItem?.button?.image = icon.image
     }
 
     // MARK: - Onboarding
@@ -670,25 +664,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // firing hide() well before the badge's own independent 3s clear) —
         // let setMenuBarErrorBadge(false) own that transition, unchanged.
         guard !isShowingMenuBarErrorBadge, !isDictationPaused else { return }
-        setMenuBarIcon(named: "mic", accessibilityDescription: "Murmur")
+        setMenuBarIcon(.idle)
     }
 
     private func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
-        let imageName: String
         switch state {
         case .listening:
-            imageName = "mic.fill"
+            setMenuBarIcon(.listening)
         case .processing:
-            imageName = NSImage(systemSymbolName: "mic.badge.ellipsis", accessibilityDescription: nil) != nil
-                ? "mic.badge.ellipsis"
-                : "ellipsis.circle"
+            setMenuBarIcon(.processing)
         case .success, .clipboardFlash:
-            imageName = "mic"
+            setMenuBarIcon(.idle)
         case .error:
             return
         }
-        setMenuBarIcon(named: imageName, accessibilityDescription: "Murmur")
     }
 
     func replayOnboarding() {
@@ -696,17 +686,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showOnboarding()
     }
 
-    /// Shows a red badge on the menu-bar mic icon when `show` is true.
+    /// Shows the error glyph in the menu bar when `show` is true.
     func setMenuBarErrorBadge(_ show: Bool) {
         guard statusItem?.button != nil else { return }
         if isDictationPaused {
-            setMenuBarIcon(named: "mic.slash", accessibilityDescription: "Murmur, paused")
+            setMenuBarIcon(.paused)
             return
         }
         if show {
-            setMenuBarIcon(named: "mic.badge.xmark", accessibilityDescription: "Murmur — error")
+            setMenuBarIcon(.error)
         } else {
-            setMenuBarIcon(named: "mic", accessibilityDescription: "Murmur")
+            setMenuBarIcon(.idle)
         }
     }
 }
