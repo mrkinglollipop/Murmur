@@ -19,7 +19,21 @@ enum VoicePaths {
 
     /// WhisperKit `downloadBase` — `Application Support/Voice/Models`.
     static var modelsDirectory: URL {
-        applicationSupportVoiceDirectory.appendingPathComponent("Models", isDirectory: true)
+        let directory = applicationSupportVoiceDirectory.appendingPathComponent("Models", isDirectory: true)
+        do {
+            try prepareModelCacheDirectory(directory)
+        } catch {
+            logger.error("Model cache preparation failed: \(error.localizedDescription, privacy: .public)")
+        }
+        return directory
+    }
+
+    static func prepareModelCacheDirectory(_ directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var cacheDirectory = directory
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try cacheDirectory.setResourceValues(values)
     }
 
     static var recordingsDirectory: URL {
