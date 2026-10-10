@@ -179,7 +179,7 @@ enum GrokCleanupSettings {
     static let defaultModelID = "grok-4.20-0309-non-reasoning"
 
     static var modelID: String {
-        let stored = UserDefaults.standard.string(forKey: userDefaultsKey)
+        let stored = VoiceDefaults.shared.string(forKey: userDefaultsKey)
         let trimmed = stored?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? defaultModelID : trimmed
     }

@@ -9,6 +9,10 @@ enum VoicePaths {
     private static var didChmodThisLaunch = false
 
     static var applicationSupportVoiceDirectory: URL {
+        if isTestHost {
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("Murmur-Tests-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return appSupport.appendingPathComponent("Voice", isDirectory: true)
     }

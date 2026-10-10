@@ -604,7 +604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func replayOnboarding() {
-        UserDefaults.standard.set(false, forKey: OnboardingStore.completeKey)
+        VoiceDefaults.shared.set(false, forKey: OnboardingStore.completeKey)
         showOnboarding()
     }
 

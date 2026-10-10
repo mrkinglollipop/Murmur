@@ -274,11 +274,6 @@ final class ModelManager: ObservableObject {
         downloaded[model] ?? false
     }
 
-    /// Cached on-disk footprint in bytes, or nil if unknown/not downloaded.
-    func diskSizeBytes(_ model: LocalModel) -> Int64? {
-        diskSize[model]
-    }
-
     /// Human-readable size string (e.g. "1.6 GB"), or nil if unknown.
     func diskSizeDisplay(_ model: LocalModel) -> String? {
         guard let bytes = diskSize[model], bytes > 0 else { return nil }

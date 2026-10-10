@@ -317,7 +317,7 @@ struct SettingsView: View {
 
                             if settingsStore.cleanupBackend == .xaiGrok {
                                 Divider().overlay(Theme.hairline)
-                                if settingsStore.hasXAIKey() {
+                                if settingsStore.hasXAIKey {
                                     Text("Uses your xAI API key from the Cloud Model section.")
                                         .font(Theme.body(11))
                                         .foregroundColor(Theme.textSecondary)
@@ -452,6 +452,7 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             settingsRail
+                .onAppear { settingsStore.refreshKeyPresence() }
             Divider().overlay(Theme.hairline)
             ScrollView {
                 sectionContent
@@ -870,7 +871,7 @@ struct SettingsView: View {
     /// selected cloud model (and therefore provider) changes.
     @ViewBuilder
     private func apiKeyEntry(for provider: CloudProvider) -> some View {
-        let hasKey = settingsStore.hasAPIKey(for: provider)
+        let hasKey = settingsStore.apiKeyPresence[provider.keychainAccount] == true
 
         VStack(alignment: .leading, spacing: 8) {
             Text("\(provider.displayName) API key")
@@ -957,7 +958,7 @@ struct SettingsView: View {
     /// (OpenAI) Keychain-backed API key. Mirrors `apiKeyEntry(for:)`'s shape.
     @ViewBuilder
     private func cleanupKeyEntry() -> some View {
-        let hasKey = settingsStore.hasCleanupKey()
+        let hasKey = settingsStore.hasCleanupKey
 
         VStack(alignment: .leading, spacing: 8) {
             Text("OpenAI API key")

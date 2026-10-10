@@ -11,14 +11,17 @@ import Security
 final class KeychainStore {
 
     /// Service name all Voice Dictation API-key items are stored under.
-    private let service: String
+    static let productionService = "com.matt.voice-dictation.apikeys"
+    static let defaultService = isTestHost ? productionService + ".TESTS" : productionService
+
+    let service: String
 
     /// The service is injectable ONLY so tests can isolate themselves in a
     /// throwaway service name. Production always uses the default: the user's
     /// real keys live under it, and a test writing/deleting through the real
     /// service OVERWRITES AND DELETES the user's actual API keys (this
     /// destroyed the live xAI key on 2026-07-09 — never again).
-    init(service: String = "com.matt.voice-dictation.apikeys") {
+    init(service: String = KeychainStore.defaultService) {
         self.service = service
     }
 

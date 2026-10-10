@@ -26,16 +26,6 @@ protocol CloudTranscriptionService {
     func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String
 }
 
-// MARK: - Shared helpers
-
-private enum CloudAudioFormat {
-    /// Upload format after `CloudAudioTranscoder` converts the on-disk CAF
-    /// capture to 16-bit/16kHz mono WAV. Do not upload raw CAF — xAI (and
-    /// other batch endpoints) reject it with HTTP 400 (plan 010).
-    static let mimeType = CloudAudioTranscoder.uploadMimeType
-    static let fileName = CloudAudioTranscoder.uploadFileName
-}
-
 /// Loads audio for cloud batch: always transcode to WAV first. Throws a
 /// `CloudTranscriptionError` naming the transcode step on failure — never
 /// fall back to raw CAF (proven dead for xAI).

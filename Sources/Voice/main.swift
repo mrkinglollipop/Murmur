@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 // Explicit entry point.
 //
@@ -19,6 +20,25 @@ let app = NSApplication.shared
 // stores backed by the signed-in user's data.
 let isTestHost = NSClassFromString("XCTestCase") != nil
     || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+
+private let voiceTestDefaultsSuiteName = "com.matt.voice-dictation.tests.\(UUID().uuidString)"
+
+private func removeVoiceTestDefaultsDomain() {
+    UserDefaults(suiteName: voiceTestDefaultsSuiteName)?.removePersistentDomain(forName: voiceTestDefaultsSuiteName)
+}
+
+/// Single test-host selector for stateful defaults. A unique suite prevents a
+/// hosted test run from reading or mutating the signed-in user's preferences.
+enum VoiceDefaults {
+    static let shared: UserDefaults = {
+        guard isTestHost else { return .standard }
+        let defaults = UserDefaults(suiteName: voiceTestDefaultsSuiteName)!
+        defaults.removePersistentDomain(forName: voiceTestDefaultsSuiteName)
+        atexit(removeVoiceTestDefaultsDomain)
+        return defaults
+    }()
+}
+
 let delegate: AppDelegate? = isTestHost ? nil : MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.setActivationPolicy(isTestHost ? .prohibited : .regular)

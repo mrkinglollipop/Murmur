@@ -3,13 +3,19 @@ import Security
 import XCTest
 @testable import Voice
 
-/// Opt-in service check. Supply a synthetic recording ending in "absolute joke"
-/// through MURMUR_TAIL_REPLAY_AUDIO. Never records the microphone or changes keys.
+/// Opt-in service check. Write the path to a synthetic recording ending in
+/// "absolute joke" to `/tmp/.murmur-run-tail-replay`. Never records the
+/// microphone or changes keys.
 final class LiveTailReplayTests: XCTestCase {
+    private static let sentinelPath = "/tmp/.murmur-run-tail-replay"
+
     private func fixture() throws -> URL {
-        guard let path = ProcessInfo.processInfo.environment["MURMUR_TAIL_REPLAY_AUDIO"] else {
-            throw XCTSkip("Live replay is opt-in; no audio was sent.")
+        guard FileManager.default.fileExists(atPath: Self.sentinelPath) else {
+            throw XCTSkip("Live replay is opt-in; create \(Self.sentinelPath) containing the fixture path.")
         }
+        let path = try String(contentsOfFile: Self.sentinelPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { throw XCTSkip("\(Self.sentinelPath) is empty.") }
         let url = URL(fileURLWithPath: path)
         let file = try AVAudioFile(forReading: url)
         XCTAssertGreaterThan(file.length, 0, "The replay fixture must contain audio.")
@@ -22,7 +28,7 @@ final class LiveTailReplayTests: XCTestCase {
         SecKeychainSetUserInteractionAllowed(false)
         defer { SecKeychainSetUserInteractionAllowed(true) }
         var query = KeychainStore.baseQuery(
-            service: "com.matt.voice-dictation.apikeys", account: provider.keychainAccount
+            service: KeychainStore.defaultService, account: provider.keychainAccount
         )
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
