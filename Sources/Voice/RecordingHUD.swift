@@ -48,6 +48,7 @@ final class RecordingHUD {
             case .processing: return "Transcribing"
             case .success: return "Dictation complete"
             case .clipboardFlash: return "Text copied to clipboard"
+            case .microphoneNoAudio(let device): return "No microphone audio from \(device)"
             case .error(let message): return "Dictation failed. \(message)"
             }
         }
