@@ -1,6 +1,6 @@
 # 032 — Apple SpeechAnalyzer as the zero-setup local engine
 
-**Status:** SCOPE, awaiting approval. No code.
+**Status:** APPROVED 2026-10-10 (Matt). Decision: Apple is the default only for fresh installs with no cloud key; existing users keep their engine. Slice A in progress.
 **Origin:** 030 peer comparison, gap 3 (VoiceInk and Yap ship it; every
 commercial peer works on first launch, Murmur does not).
 

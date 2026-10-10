@@ -1,6 +1,6 @@
 # 031 — Voice-edit the selection ("tell it what to change")
 
-**Status:** SCOPE, awaiting approval. No code.
+**Status:** APPROVED 2026-10-10 (Matt). Decisions: on by default, hold ⇧ dictates over a selection; edits go to History as "Edit" with the instruction stored. Build after 033 and 032.
 **Origin:** 030 peer comparison, gap 1 (Wispr Command Mode, Aqua Edit Mode, Typeless Ask Anything, VoiceInk all ship it).
 
 ## Goal

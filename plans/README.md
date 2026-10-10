@@ -42,9 +42,9 @@ current setup and contribution guidance.
 | 028 | Gemini 3.5 Transcribe as selectable cloud engine (Mac + iOS host) | SHIPPED (code 2026-08-26) — live WS handshake unverified; additive; default xAI |
 | 029 | Complete dictation audit (2026-09-08) | DONE (audit record; repairs shipped in 0.1.50–0.1.52) |
 | 030 | Full product review: findings register (2026-10-10) | AUDIT COMPLETE — plans not yet written; see its "Proposed plan set" |
-| 031 | Voice-edit the selection | SCOPE |
-| 032 | Apple SpeechAnalyzer local engine | SCOPE |
-| 033 | Mic health | SCOPE |
+| 031 | Voice-edit the selection | APPROVED |
+| 032 | Apple SpeechAnalyzer local engine | IN PROGRESS |
+| 033 | Mic health | IN PROGRESS |
 
 ## Notes for maintainers
 

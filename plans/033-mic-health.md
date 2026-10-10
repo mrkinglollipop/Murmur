@@ -1,6 +1,6 @@
 # 033 — Mic health: warn before a hold is lost
 
-**Status:** SCOPE, awaiting approval. No code.
+**Status:** APPROVED 2026-10-10 (Matt). Decision: no-audio hint after 1.5 s of silence, hold not interrupted. Slices A+B in progress.
 **Origin:** 030 peer comparison, gap 2 (Superwhisper, Wispr, Aqua). This is
 Murmur's own most-recorded failure class: Continuity/Jump Desktop
 fall-through, wedged input after an external voice app, zero-buffer taps.
