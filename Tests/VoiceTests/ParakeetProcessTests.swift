@@ -3,6 +3,10 @@ import XCTest
 @testable import Voice
 
 final class ParakeetProcessTests: XCTestCase {
+    // Interpreter startup can be delayed on a loaded Mac; shutdown latency is
+    // measured separately after the fixture publishes its PID.
+    private static let fixtureStartupTimeout: TimeInterval = 10
+
     func testRunnerReturnsNormalJSON() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -14,7 +18,7 @@ final class ParakeetProcessTests: XCTestCase {
             executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
             arguments: [script.path],
             interpreterDescription: "test python",
-            timeoutSeconds: 2,
+            timeoutSeconds: Self.fixtureStartupTimeout,
             terminationGraceSeconds: 0.1
         )
         XCTAssertEqual(text, "normal result")
@@ -28,12 +32,12 @@ final class ParakeetProcessTests: XCTestCase {
                 executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
                 arguments: [fixture.script.path, fixture.pidFile.path],
                 interpreterDescription: "test python",
-                timeoutSeconds: 5,
+                timeoutSeconds: Self.fixtureStartupTimeout + 5,
                 terminationGraceSeconds: 0.1,
                 temporaryDirectory: fixture.directory
             )
         }
-        let pids = try await readPIDs(from: fixture.pidFile)
+        let pids = try await readPIDs(from: fixture.pidFile, timeout: Self.fixtureStartupTimeout)
         let startedAt = Date()
         task.cancel()
         do {
@@ -219,8 +223,8 @@ while True:
         return url
     }
 
-    private func readPIDs(from url: URL) async throws -> [Int32] {
-        let deadline = Date().addingTimeInterval(2)
+    private func readPIDs(from url: URL, timeout: TimeInterval = 2) async throws -> [Int32] {
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let data = try? Data(contentsOf: url),
                let values = try? JSONDecoder().decode([Int32].self, from: data) {
