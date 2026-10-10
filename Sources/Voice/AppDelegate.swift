@@ -143,7 +143,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 switch state {
                 case .signedIn(let session):
-                    Task { await self.entitlementStore.refresh(session: session) }
+                    // A refreshed session re-enters here once; the preflight
+                    // then returns it unchanged, so this cannot loop.
+                    Task {
+                        await self.entitlementStore.refresh(session: session) {
+                            await self.authFlow.authenticatedSession()
+                        }
+                    }
                 case .signedOut:
                     self.entitlementStore.clear()
                 case .waitingForBrowser, .exchanging, .failed:
@@ -404,7 +410,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// required bouncing the app because sign-in was the only refresh trigger.
     func applicationDidBecomeActive(_ notification: Notification) {
         if case .signedIn(let session) = authFlow.state {
-            Task { await entitlementStore.refresh(session: session) }
+            Task {
+                await entitlementStore.refresh(session: session) {
+                    await self.authFlow.authenticatedSession()
+                }
+            }
         }
     }
 
