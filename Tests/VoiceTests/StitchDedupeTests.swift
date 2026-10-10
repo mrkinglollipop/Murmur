@@ -117,6 +117,23 @@ final class StitchDedupeTests: XCTestCase {
         XCTAssertEqual(merged, sentence + " " + sentence)
     }
 
+    func testNearDuplicateCollapsePreservesChangedContentWords() {
+        for (earlier, later) in [
+            ("The meeting is scheduled for Monday morning.", "The meeting is scheduled for Tuesday morning."),
+            ("Please check the dashboard before the launch tomorrow morning.", "Please check the billing before the launch tomorrow morning."),
+            ("Please send the report to Alex tomorrow morning.", "Please send the report to Sam tomorrow morning."),
+            ("The meeting is scheduled for 10 tomorrow morning.", "The meeting is scheduled for 11 tomorrow morning.")
+        ] {
+            let text = earlier + " " + later
+            XCTAssertFalse(XAIStreamingTranscriber.shouldCollapseNearDuplicateSentencePair(earlier: earlier, later: later))
+            XCTAssertNil(XAIStreamingTranscriber.nearDuplicateTailWindow(in: earlier, right: later))
+            XCTAssertEqual(XAIStreamingTranscriber.collapseNearDuplicateWordTail(text), text)
+            XCTAssertEqual(XAIStreamingTranscriber.collapseNearDuplicateTail(text), text)
+            XCTAssertEqual(XAIStreamingTranscriber.postProcessTranscript(text), text)
+            XCTAssertEqual(XAIStreamingTranscriber.mergeStreamingSegment(left: earlier, right: later), text)
+        }
+    }
+
     func testCollapseNearDuplicateTail() {
         let prefix = Self.mattParagraphPrefix + " "
         let duplicated = prefix + Self.mattClosingFireclaw + " " + Self.mattClosingFireCrawl

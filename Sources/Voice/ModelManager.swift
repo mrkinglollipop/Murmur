@@ -126,7 +126,8 @@ final class ModelManager: ObservableObject {
     private var downloadTasks: [LocalModel: Task<Void, Never>] = [:]
     private var downloadTickets = DownloadTicketBook()
 
-    init() {
+    init(loadDiskState: Bool = true) {
+        guard loadDiskState else { return }
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         Self.migrateWhisperKitModelsFromDocumentsIfNeeded()
         refreshAllStatus()

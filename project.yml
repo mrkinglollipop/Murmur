@@ -12,10 +12,10 @@ packages:
   WhisperKit:
     url: https://github.com/argmaxinc/argmax-oss-swift
     # MIT — WhisperKit product lives in the argmax-oss-swift monorepo (ex-WhisperKit).
-    from: "1.1.0"
+    exactVersion: "1.1.1"
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    from: "2.9.6"
+    exactVersion: "2.10.0"
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio
     # Apache-2.0 — 0.15.6 needs Float16; Apple Silicon only (see ARCHS / EXCLUDED_ARCHS).
@@ -82,8 +82,8 @@ targets:
         CFBundleDisplayName: Murmur
         CFBundleIconFile: AppIcon
         CFBundleIdentifier: com.matt.voice-dictation
-        CFBundleVersion: "55"
-        CFBundleShortVersionString: "0.1.54"
+        CFBundleVersion: "56"
+        CFBundleShortVersionString: "0.1.55"
         CFBundleExecutable: "$(EXECUTABLE_NAME)"
         CFBundlePackageType: APPL
         CFBundleSignature: "????"

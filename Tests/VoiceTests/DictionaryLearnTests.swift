@@ -6,7 +6,7 @@ final class DictionaryLearnTests: XCTestCase {
     private func makeStore() -> DictionaryStore {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("dict-test-\(UUID().uuidString).json")
-        return DictionaryStore(fileURL: url)
+        return DictionaryStore(fileURL: url, blocklistFileURL: url.appendingPathExtension("blocklist"))
     }
 
     func testUserInitiatedLearnsDissimilarWords() {
@@ -108,14 +108,14 @@ final class DictionaryLearnTests: XCTestCase {
         ]
         try JSONEncoder().encode(payload).write(to: url)
 
-        let store = DictionaryStore(fileURL: url)
+        let store = DictionaryStore(fileURL: url, blocklistFileURL: url.appendingPathExtension("blocklist"))
         XCTAssertEqual(store.entries.count, 1)
         let entry = try XCTUnwrap(store.entries.first)
         XCTAssertEqual(entry.id, keepuID)
         XCTAssertEqual(Set(entry.variants.map { $0.lowercased() }), ["keepu", "keefu"])
         XCTAssertEqual(entry.fixCount, 4)
 
-        let reloaded = DictionaryStore(fileURL: url)
+        let reloaded = DictionaryStore(fileURL: url, blocklistFileURL: url.appendingPathExtension("blocklist"))
         XCTAssertEqual(reloaded.entries.count, 1)
         XCTAssertEqual(reloaded.entries.first?.id, keepuID)
     }
@@ -190,7 +190,7 @@ final class DictionaryLearnTests: XCTestCase {
         ]
         try JSONEncoder().encode(payload).write(to: url)
 
-        let store = DictionaryStore(fileURL: url)
+        let store = DictionaryStore(fileURL: url, blocklistFileURL: url.appendingPathExtension("blocklist"))
         XCTAssertEqual(store.entries.count, 1)
         XCTAssertEqual(store.entries.first?.id, survivorID)
 
@@ -243,6 +243,51 @@ final class DictionaryLearnTests: XCTestCase {
         let store = makeStore()
         let learned = store.learn(from: "I think", to: "We think", userInitiated: true)
         XCTAssertTrue(learned.isEmpty)
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testSplitLearningRefusesSingleLetterNumericAndPronounVariants() {
+        let store = makeStore()
+        for (old, new) in [("x", "ex axis"), ("42", "forty two"), ("we", "the team"), ("I", "the speaker")] {
+            XCTAssertTrue(store.learn(from: old, to: new, userInitiated: true).isEmpty, old)
+        }
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testMergeLearningRefusesNumericAndProtectedPronounPhrases() {
+        let store = makeStore()
+        for (old, new) in [("12 34", "1234"), ("we are", "weare"), ("I am", "iam")] {
+            XCTAssertTrue(store.learn(from: old, to: new, userInitiated: true).isEmpty, old)
+        }
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testSplitLearningStillLearnsOrdinaryVariant() {
+        let store = makeStore()
+        let learned = store.learn(from: "gitignore", to: "git ignore", userInitiated: true)
+        XCTAssertEqual(learned.count, 1)
+        XCTAssertEqual(learned.first?.variant, "gitignore")
+        XCTAssertEqual(learned.first?.term, "git ignore")
+    }
+
+    func testRejectKeepsManuallyAdoptedEntryWithSoleLearnedVariant() throws {
+        let store = makeStore()
+        let learned = store.learn(from: "Keepu", to: "Khipu", userInitiated: true)
+        XCTAssertEqual(learned.count, 1)
+        store.add(term: "Khipu", variants: ["Keepu"])
+        store.rejectLearnedBatch(LearnBatch(corrections: learned))
+        let entry = try XCTUnwrap(store.entries.first)
+        XCTAssertEqual(entry.id, learned.first?.entryID)
+        XCTAssertEqual(entry.term, "Khipu")
+        XCTAssertFalse(entry.isAutoLearned)
+        XCTAssertTrue(entry.variants.isEmpty)
+    }
+
+    func testRejectStillDeletesUnadoptedLearnedEntry() {
+        let store = makeStore()
+        let learned = store.learn(from: "Keepu", to: "Khipu", userInitiated: true)
+        XCTAssertEqual(learned.count, 1)
+        store.rejectLearnedBatch(LearnBatch(corrections: learned))
         XCTAssertTrue(store.entries.isEmpty)
     }
 

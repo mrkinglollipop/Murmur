@@ -8,7 +8,7 @@
 
 It is built for people who dictate into real apps all day: local or cloud speech recognition, optional AI cleanup, a learned dictionary, snippets, and history you can search and export.
 
-**Requirements:** macOS 26 or later · Apple Silicon or Intel Mac with a supported CoreML stack for local models.
+**Requirements:** macOS 26 or later · Apple Silicon Mac with a supported CoreML stack for local models.
 
 **Appearance:** Murmur's interface is **dark by design** and does not follow the
 system light/dark setting. That is a deliberate product decision, not a missing
@@ -23,7 +23,7 @@ feature — the palette and Liquid Glass surfaces are tuned for a single look.
 - **Push-to-talk** — global activation (fn / Globe or Right Option) via a HID-level event tap
 - **Toggle-lock** — double-tap fn for hands-free recording
 - **Live HUD** — waveform feedback while you hold the key
-- **Local or cloud ASR** — WhisperKit on-device by default; optional BYO cloud keys (xAI, ElevenLabs, Gemini)
+- **Local or cloud ASR** — WhisperKit on-device by default; optional BYO cloud keys (xAI, ElevenLabs, Gemini, Meta Muse)
 - **Cleanup** — optional grammar / filler cleanup (on-device Apple Intelligence or cloud LLM)
 - **Dictionary & snippets** — corrections learned from edits; spoken phrase expansion
 - **History & Insights** — searchable dictation log, exports, and usage stats
@@ -112,9 +112,10 @@ Manage models in **Settings → Local Model**. Model files live under `~/Library
 |----------|-------|-------|
 | xAI | Grok Voice Transcribe 2.0 | Optional live WebSocket streaming |
 | ElevenLabs | Scribe v2 Realtime | Always streams (batch only as fallback) |
-| Google Gemini | Gemini 3.5 Transcribe Live | Always streams (batch only as fallback); Preview |
+| Google Gemini | Gemini 3.5 Transcribe | Always streams (batch only as fallback); Preview |
+| Meta | Meta Muse Voice Transcribe | Optional live WebSocket streaming |
 
-Keys are stored in the macOS Keychain (device-only). Without a key for the selected provider, Murmur falls back to the local engine.
+Keys are stored in the macOS login Keychain. They can migrate with the login-keychain database. Without a key for the selected provider, Murmur falls back to the local engine.
 
 ---
 
@@ -135,7 +136,7 @@ Configure under **Settings → Cleanup**.
 
 | Location | Contents |
 |----------|----------|
-| `~/Library/Application Support/Voice/` | History, dictionary, snippets, transforms, style |
+| `~/Library/Application Support/Voice/` | History, dictionary, snippets, transforms, style, `voice-profile.json`, `scratchpad.json`, `corrections-log.json`, and `blocklist.json` |
 | `~/Library/Application Support/Voice/Recordings/` | Short retained captures for retry |
 | `~/Library/Application Support/Voice/Models/` | WhisperKit cache |
 | Temporary directory | Ephemeral capture files (removed after success) |

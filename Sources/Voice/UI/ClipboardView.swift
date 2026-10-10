@@ -99,12 +99,12 @@ struct ClipboardView: View {
                     actionTitle: "Delete preserved history",
                     action: { showCorruptRecoveryConfirmation = true }
                 )
-            } else if store.isKeyUnavailable {
+            } else if store.isKeyUnavailable || store.isStorageUnavailable {
                 banner(
                     icon: "exclamationmark.triangle.fill",
                     tint: Theme.recordRed,
                     title: "Clipboard history is off",
-                    message: "Murmur couldn't create an encryption key in your Keychain, so nothing is being saved. Your clipboard itself is unaffected."
+                    message: "Murmur can’t access clipboard storage or its encryption key, so new copies are paused while existing history is preserved."
                 )
             } else if let skip = store.lastOversizedSkip {
                 banner(
@@ -120,7 +120,7 @@ struct ClipboardView: View {
                     icon: "lock.fill",
                     tint: Theme.amberBorder,
                     title: "History can't be opened",
-                    message: "\(store.entries.count) items were encrypted with a key that isn't on this Mac — most likely restored from a backup or another machine. New copies are being saved normally.",
+                    message: "\(store.entries.count) items can’t be opened with this Mac’s key, so new copies are paused.",
                     actionTitle: "Delete unreadable history",
                     action: { showClearAllConfirmation = true }
                 )
@@ -154,6 +154,7 @@ struct ClipboardView: View {
                 list
             }
         }
+        .onAppear { store.retryKeyIfUnavailable() }
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete clipboard item?",

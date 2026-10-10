@@ -2,6 +2,33 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum SettingsSection: String, CaseIterable, Identifiable {
+    case general = "General"
+    case engine = "Engine"
+    case text = "Text"
+    case storage = "Storage"
+    case permissions = "Permissions"
+    case about = "About"
+
+    var id: String { rawValue }
+
+    static func contains(_ card: String, in section: SettingsSection) -> Bool {
+        switch section {
+        case .general: return ["Activation", "System", "Voice"].contains(card)
+        case .engine: return ["Transcription Engine", "Language", "Local Model", "Cloud Model"].contains(card)
+        case .text: return ["Cleanup", "Dictation text"].contains(card)
+        case .storage: return card == "Storage"
+        case .permissions: return card == "Permissions"
+        case .about: return ["What's New", "Acknowledgements"].contains(card)
+        }
+    }
+}
+
+@MainActor
+private enum SettingsSectionSession {
+    static var selected: SettingsSection = .general
+}
+
 /// Settings: activation-key choice, ASR engine choice, and a read-only
 /// permissions note. Persists via `SettingsStore` (UserDefaults) and applies
 /// changes live to the running `ActivationController` / `ASREngineSelector`.
@@ -10,6 +37,20 @@ struct SettingsView: View {
     @ObservedObject var modelManager: ModelManager
 
     var onReplayOnboarding: () -> Void = {}
+    var permissionOverride: PermissionSnapshot?
+
+    init(settingsStore: SettingsStore, modelManager: ModelManager,
+         onReplayOnboarding: @escaping () -> Void = {},
+         authFlow: AuthFlowController, entitlementStore: EntitlementStore,
+         initialSection: SettingsSection? = nil, permissionOverride: PermissionSnapshot? = nil) {
+        self.settingsStore = settingsStore
+        self.modelManager = modelManager
+        self.authFlow = authFlow
+        self.entitlementStore = entitlementStore
+        self.onReplayOnboarding = onReplayOnboarding
+        self.permissionOverride = permissionOverride
+        _selectedSection = State(initialValue: initialSection ?? SettingsSectionSession.selected)
+    }
 
     /// PRO ONLY — account + entitlement. Wired from AppDelegate via RootView.
     @ObservedObject var authFlow: AuthFlowController
@@ -36,6 +77,9 @@ struct SettingsView: View {
     @State private var showCleanupKeyRemoveConfirmation = false
 
     @State private var exportStatus: String?
+    @State private var selectedSection: SettingsSection = SettingsSectionSession.selected
+    @State private var permissionRefreshTick = 0
+    @State private var permissionPollTimer: Timer?
 
     /// Non-nil only while the enrollment sheet is up — `.sheet(item:)` derives
     /// both presentation and content from this single value.
@@ -49,6 +93,16 @@ struct SettingsView: View {
         enrolledProfile != nil
     }
 
+    private var permissionSnapshot: PermissionSnapshot {
+        _ = permissionRefreshTick
+        if let permissionOverride { return permissionOverride }
+        return PermissionSnapshot(
+            microphone: MicrophonePermission.isGranted(),
+            accessibility: AXIsProcessTrusted(),
+            inputMonitoring: InputMonitoringPermission.isGranted()
+        )
+    }
+
     private var geminiLanguageCaption: String {
         let tag = SettingsStore.geminiLanguageSelection(from: settingsStore.selectedLanguage)
         if tag.isEmpty {
@@ -57,9 +111,18 @@ struct SettingsView: View {
         return "Uses Language above. Gemini is sent \(tag)."
     }
 
-    var body: some View {
-        ScrollView {
+    private func shows(_ card: String) -> Bool {
+        SettingsSection.contains(card, in: selectedSection)
+    }
+
+    /// Shared content keeps offscreen renders at the scroll pane's actual width.
+    var sectionContent: some View {
             VStack(alignment: .leading, spacing: 20) {
+                Text(selectedSection.rawValue)
+                    .font(Theme.serifTitle(26, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+
+                if shows("Transcription Engine") {
                 section(title: "Transcription Engine") {
                     Picker("Engine", selection: $settingsStore.useCloudEngine) {
                         Text("Local").tag(false)
@@ -69,6 +132,9 @@ struct SettingsView: View {
                     .labelsHidden()
                 }
 
+                }
+
+                if shows("Activation") {
                 section(title: "Activation") {
                     VStack(alignment: .leading, spacing: 10) {
                         Picker("Push-to-talk key", selection: $settingsStore.activationKeyOption) {
@@ -90,6 +156,9 @@ struct SettingsView: View {
                     }
                 }
 
+                }
+
+                if shows("Language") {
                 section(title: "Language") {
                     Picker("Dictation language", selection: $settingsStore.selectedLanguage) {
                         ForEach(SettingsStore.supportedLanguages, id: \.code) { lang in
@@ -100,6 +169,7 @@ struct SettingsView: View {
                     .labelsHidden()
                 }
 
+                if !settingsStore.useCloudEngine {
                 section(title: "Local Model") {
                     VStack(alignment: .leading, spacing: 12) {
                         Picker("Local model", selection: $settingsStore.selectedLocalModel) {
@@ -128,7 +198,9 @@ struct SettingsView: View {
                         }
                     }
                 }
+                }
 
+                if settingsStore.useCloudEngine {
                 section(title: "Cloud Model") {
                     VStack(alignment: .leading, spacing: 8) {
                         Picker("Cloud model", selection: $settingsStore.selectedCloudModel) {
@@ -211,7 +283,11 @@ struct SettingsView: View {
                         }
                     }
                 }
+                }
 
+                }
+
+                if shows("Cleanup") {
                 section(title: "Cleanup") {
                     VStack(alignment: .leading, spacing: 12) {
                         Toggle("Clean up dictation", isOn: $settingsStore.cleanupEnabled)
@@ -279,6 +355,9 @@ struct SettingsView: View {
                     }
                 }
 
+                }
+
+                if shows("System") {
                 section(title: "System") {
                     VStack(alignment: .leading, spacing: 12) {
                         Toggle("Launch at login", isOn: $settingsStore.launchAtLogin)
@@ -340,30 +419,36 @@ struct SettingsView: View {
                     }
                 }
 
+                }
+
+                if shows("Storage") {
                 section(title: "Storage") {
                     storageSectionContent
                 }
 
+                }
+
+                if shows("Voice") {
                 section(title: "Voice") {
                     voiceSectionContent
                 }
 
-                section(title: "Permissions") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label(
-                            "Murmur requires Input Monitoring (and, for fn suppression, Accessibility) access to detect the push-to-talk key globally. Grant these in System Settings → Privacy & Security if prompted.",
-                            systemImage: "info.circle"
-                        )
-                        .font(Theme.body(12))
-                        .foregroundColor(Theme.textSecondary)
-                    }
                 }
 
                 // PRO ONLY — must not merge to `main`.
+                if selectedSection == .general {
                 section(title: "Murmur Pro") {
                     proSectionContent
                 }
+                }
 
+                if shows("Permissions") {
+                section(title: "Permissions") {
+                    permissionsSectionContent
+                }
+                }
+
+                if shows("What's New") {
                 section(title: "What's New") {
                     WhatsNewSettingsSectionView()
                 }
@@ -371,10 +456,21 @@ struct SettingsView: View {
                 section(title: "Acknowledgements") {
                     AcknowledgementsSectionView()
                 }
+                }
 
                 Spacer(minLength: 0)
             }
             .padding(20)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            settingsRail
+            Divider().overlay(Theme.hairline)
+            ScrollView {
+                sectionContent
+            }
         }
 
         .sheet(item: $enrollmentCoordinator) { coordinator in
@@ -396,6 +492,15 @@ struct SettingsView: View {
         .onAppear {
             settingsStore.refreshEnrolledVoiceProfile(autoEnableGatingIfPresent: false)
             settingsStore.refreshRecordingUsage()
+            refreshPermissionStatus()
+            if selectedSection == .permissions { startPermissionPolling() }
+        }
+        .onChange(of: selectedSection) { _, section in
+            if section == .permissions { startPermissionPolling() } else { stopPermissionPolling() }
+        }
+        .onDisappear { stopPermissionPolling() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshPermissionStatus()
         }
         .onChange(of: enrollmentCoordinator?.id) { _, newID in
             // Sheet dismissed (any path) — refresh CTA from disk without
@@ -429,10 +534,131 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var settingsRail: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(SettingsSection.allCases) { section in
+                Button {
+                    withAnimation(Theme.easeOutOrNil()) {
+                        selectedSection = section
+                        SettingsSectionSession.selected = section
+                    }
+                } label: {
+                    settingsSectionLabel(section)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(section.rawValue) settings")
+                .accessibilityAddTraits(selectedSection == section ? .isSelected : [])
+            }
+            Spacer()
+        }
+        .padding(16)
+        .frame(width: 154, alignment: .topLeading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings sections")
+    }
+
+    @ViewBuilder
+    private func settingsSectionLabel(_ section: SettingsSection) -> some View {
+        let label = Text(section.rawValue)
+            .font(Theme.body(13, weight: selectedSection == section ? .semibold : .regular))
+            .foregroundColor(selectedSection == section ? Theme.textPrimary : Theme.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+        if selectedSection == section {
+            label.murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact, tint: Theme.selectionTint)
+        } else {
+            label
+        }
+    }
+
+    private var permissionsSectionContent: some View {
+        let snapshot = permissionSnapshot
+        return VStack(alignment: .leading, spacing: 0) {
+            permissionRow(
+                title: "Microphone",
+                detail: "Records while you hold the key.",
+                missingDetail: "Not granted. Murmur cannot record your voice.",
+                granted: snapshot.microphone,
+                settingsURL: PermissionDestination.microphone.url
+            )
+            Divider().overlay(Theme.hairline)
+            permissionRow(
+                title: "Accessibility",
+                detail: "Types the text into the app you are using.",
+                missingDetail: "Not granted. Murmur cannot type into other apps.",
+                granted: snapshot.accessibility,
+                settingsURL: PermissionDestination.accessibility.url
+            )
+            Divider().overlay(Theme.hairline)
+            permissionRow(
+                title: "Input Monitoring",
+                detail: "Lets Murmur see the push-to-talk key.",
+                missingDetail: "Not granted. Murmur cannot see the fn key.",
+                granted: snapshot.inputMonitoring,
+                settingsURL: PermissionDestination.inputMonitoring.url
+            )
+        }
+        .onAppear { refreshPermissionStatus() }
+    }
+
+    @ViewBuilder
+    private func permissionRow(
+        title: String,
+        detail: String,
+        missingDetail: String,
+        granted: Bool,
+        settingsURL: URL
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(Theme.body(12, weight: .medium)).foregroundColor(Theme.textPrimary)
+                Text(granted ? detail : missingDetail)
+                    .font(Theme.body(11)).foregroundColor(Theme.textSecondary)
+            }
+            Spacer()
+            if granted {
+                Label("Granted", systemImage: "checkmark.circle.fill")
+                    .font(Theme.body(11, weight: .medium))
+                    .foregroundColor(Theme.successGreen)
+                    .accessibilityLabel("\(title), granted")
+            } else {
+                Button("Open System Settings") { NSWorkspace.shared.open(settingsURL) }
+                    .buttonStyle(.glass)
+                    .font(Theme.body(11, weight: .medium))
+                    .foregroundColor(Theme.primary)
+                    .accessibilityLabel("Open System Settings for \(title)")
+            }
+        }
+        .padding(.vertical, 10)
+        .id(permissionRefreshTick)
+    }
+
+    private func refreshPermissionStatus() {
+        permissionRefreshTick += 1
+    }
+
+    private func startPermissionPolling() {
+        guard permissionPollTimer == nil else { return }
+        permissionPollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            refreshPermissionStatus()
+        }
+    }
+
+    private func stopPermissionPolling() {
+        permissionPollTimer?.invalidate()
+        permissionPollTimer = nil
+    }
+
+    @ViewBuilder
     private var storageSectionContent: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(
-                "Retained audio: \(settingsStore.recordingFileCount) file(s) · \(SettingsStore.formatByteCount(settingsStore.recordingUsageBytes)) of \(settingsStore.recordingBudgetMB) MB"
+                Self.storageSummary(
+                    fileCount: settingsStore.recordingFileCount,
+                    usageBytes: settingsStore.recordingUsageBytes,
+                    budgetMB: settingsStore.recordingBudgetMB
+                )
             )
             .font(Theme.body(12))
             .foregroundColor(Theme.textPrimary)
@@ -466,6 +692,18 @@ struct SettingsView: View {
                     .foregroundColor(Theme.textSecondary)
             }
         }
+    }
+
+    static func storageSummary(fileCount: Int, usageBytes: Int64, budgetMB: Int) -> String {
+        let files = "\(fileCount) \(fileCount == 1 ? "file" : "files")"
+        let budgetBytes = Int64(budgetMB) * 1024 * 1024
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        let usage = usageBytes >= budgetBytes
+            ? "\(budgetMB) MB, full"
+            : "\(formatter.string(fromByteCount: usageBytes)) of \(budgetMB) MB"
+        return "Retained audio: \(files) · \(usage)"
     }
 
     private func exportRecordingsAndTranscripts() {
@@ -860,16 +1098,21 @@ struct SettingsView: View {
     }
 
     private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(Theme.body(12, weight: .semibold))
-                .foregroundColor(Theme.textSecondary)
-                .textCase(.uppercase)
+        VStack(alignment: .leading, spacing: 6) {
+            // A one-card section's caption would only repeat the page title.
+            if title != selectedSection.rawValue {
+                Text(title)
+                    .font(Theme.body(12, weight: .semibold))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 14)
+            }
 
             content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .murmurGlassCard()
         }
-        .padding(14)
-        .murmurGlassCard()
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Model management row

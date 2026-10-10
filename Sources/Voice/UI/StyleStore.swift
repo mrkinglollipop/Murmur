@@ -77,12 +77,26 @@ final class StyleStore: ObservableObject {
     /// Records the activated app as the per-app assign target, skipping
     /// Murmur itself so opening the Style tab doesn't clobber the target.
     private func noteActivatedApp(_ app: NSRunningApplication) {
-        guard let bundleID = app.bundleIdentifier,
-              bundleID != Bundle.main.bundleIdentifier else { return }
-        let candidate = ExternalApp(bundleID: bundleID, name: app.localizedName ?? bundleID)
+        guard let candidate = Self.externalApp(
+            bundleID: app.bundleIdentifier,
+            name: app.localizedName,
+            activationPolicy: app.activationPolicy
+        ) else { return }
         if candidate != lastExternalApp {
             lastExternalApp = candidate
         }
+    }
+
+    static func externalApp(
+        bundleID: String?,
+        name: String?,
+        activationPolicy: NSApplication.ActivationPolicy,
+        ownBundleID: String? = Bundle.main.bundleIdentifier
+    ) -> ExternalApp? {
+        guard activationPolicy == .regular,
+              let bundleID,
+              bundleID != ownBundleID else { return nil }
+        return ExternalApp(bundleID: bundleID, name: name ?? bundleID)
     }
 
     /// Pushes the persisted selection onto the live selector. Call once after

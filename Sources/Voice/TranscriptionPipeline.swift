@@ -317,6 +317,7 @@ final class TranscriptionPipeline {
     ///   gaps. History-retry leaves them nil and keeps entry-sample behavior.
     func transcribeAndLog(
         audioURL: URL,
+        audioIsTemporary: Bool = false,
         replaceHistoryEntryID: UUID? = nil,
         sessionHeldToken providedToken: UInt64? = nil,
         sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
@@ -328,7 +329,7 @@ final class TranscriptionPipeline {
             return
         }
 
-        let audioPath = audioURL.path
+        let audioPath = Self.historyAudioPath(audioURL: audioURL, audioIsTemporary: audioIsTemporary)
         let replaceID = replaceHistoryEntryID
         // Prefer stop-sampled hold when provided; otherwise sample at entry
         // (history-retry / legacy callers). Entry sample still races a newer
@@ -399,6 +400,10 @@ final class TranscriptionPipeline {
         )
     }
 
+    static func historyAudioPath(audioURL: URL, audioIsTemporary: Bool) -> String? {
+        audioIsTemporary ? nil : audioURL.path
+    }
+
     /// Streaming entry point: takes text already produced by a live session.
     /// - Parameters sessionHeld*: when `sessionHeldToken` is non-nil, use that
     ///   stop-sampled triple (before streaming finalize Tasks) instead of
@@ -460,7 +465,7 @@ final class TranscriptionPipeline {
 
     private func transcribeLocally(
         audioURL: URL,
-        audioPath: String,
+        audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
@@ -507,7 +512,7 @@ final class TranscriptionPipeline {
 
     private func reportTranscriptionFailure(
         engineID: String,
-        audioPath: String,
+        audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
         completion: ((InjectPipelineResult) -> Void)?
@@ -636,11 +641,12 @@ final class TranscriptionPipeline {
     static func cleanupLooksSane(input: String, output: String) -> Bool {
         func words(_ s: String) -> [String] {
             s.lowercased()
-                .split { !$0.isLetter && !$0.isNumber }
-                .map(String.init)
+                .replacingOccurrences(of: "’", with: "'")
+                .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
+                .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
                 .filter { !$0.isEmpty }
         }
-        let inWords = Set(words(input))
+        let inWords = words(input)
         let outWords = words(output)
         // No words in the input leaves nothing to compare against.
         guard !inWords.isEmpty else { return true }
@@ -651,8 +657,66 @@ final class TranscriptionPipeline {
         // A symbol-only reply ("…", an emoji) is not a cleanup of spoken words.
         guard !outWords.isEmpty else { return false }
 
-        let newWords = outWords.filter { !inWords.contains($0) }
-        return Double(newWords.count) / Double(outWords.count) <= 0.4
+        let inSet = Set(inWords)
+        let newWords = outWords.filter { !inSet.contains($0) }
+        guard Double(newWords.count) / Double(outWords.count) <= 0.4 else { return false }
+
+        // Negations and digits carry the meaning; cleanup may not lose one.
+        let negations: Set<String> = ["not", "no", "never", "none", "nothing", "nobody", "neither", "nor", "cannot"]
+        func isNegation(_ w: String) -> Bool { negations.contains(w) || w.hasSuffix("n't") }
+        guard outWords.filter(isNegation).count >= inWords.filter(isNegation).count else { return false }
+        var outNumbers: [String: Int] = [:]
+        for w in outWords where w.contains(where: \.isNumber) { outNumbers[w, default: 0] += 1 }
+        for w in inWords where w.contains(where: \.isNumber) {
+            guard let left = outNumbers[w], left > 0 else { return false }
+            outNumbers[w] = left - 1
+        }
+
+        // The checks above cannot see a dropped sentence. Align the two word
+        // sequences in order and require every input sentence to survive at
+        // least by half.
+        let sentences = input
+            .replacingOccurrences(of: #"[.!?]\s+"#, with: "\n", options: .regularExpression)
+            .components(separatedBy: .newlines)
+            .map(words)
+            .filter { !$0.isEmpty }
+        guard sentences.count > 1 else { return true }
+        let kept = orderedMatches(inWords, outWords)
+        var offset = 0
+        for sentence in sentences {
+            let range = offset..<(offset + sentence.count)
+            offset = range.upperBound
+            guard sentence.count >= 3 else { continue }
+            let survived = kept[range].filter { $0 }.count
+            if survived * 2 < sentence.count { return false }
+        }
+        return true
+    }
+
+    /// Longest-common-subsequence alignment: which words of `a` survive, in
+    /// order, in `b`.
+    private static func orderedMatches(_ a: [String], _ b: [String]) -> [Bool] {
+        var matched = [Bool](repeating: false, count: a.count)
+        guard !a.isEmpty, !b.isEmpty else { return matched }
+        var table = [[Int]](repeating: [Int](repeating: 0, count: b.count + 1), count: a.count + 1)
+        for i in stride(from: a.count - 1, through: 0, by: -1) {
+            for j in stride(from: b.count - 1, through: 0, by: -1) {
+                table[i][j] = a[i] == b[j] ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
+            }
+        }
+        var i = 0, j = 0
+        while i < a.count, j < b.count {
+            if a[i] == b[j] {
+                matched[i] = true
+                i += 1
+                j += 1
+            } else if table[i + 1][j] >= table[i][j + 1] {
+                i += 1
+            } else {
+                j += 1
+            }
+        }
+        return matched
     }
 
     func finishTranscription(
@@ -914,6 +978,10 @@ final class TranscriptionPipeline {
                             replaceID
                         )
                     }
+                    // A retry's audio still belongs to the row being retried.
+                    if replaceID == nil {
+                        Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog)
+                    }
                     if let failure = outcome.failure {
                         self.onFailure?(failure)
                     }
@@ -981,6 +1049,11 @@ final class TranscriptionPipeline {
             snippetExpansionOccurred: snippetExpansionOccurred,
             hadExplicitTrailingNewline: hadExplicitTrailingNewline
         )
+    }
+
+    static func discardUnloggedAudio(audioPath: String?, shouldLog: Bool) {
+        guard !shouldLog, let audioPath else { return }
+        try? FileManager.default.removeItem(atPath: audioPath)
     }
 
     /// Pure decision seam for the secure-input / history-logging / HUD outcome

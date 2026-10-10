@@ -421,6 +421,7 @@ final class ASREngineSelector {
     /// completed dictation.
     func transcribeAndLog(
         audioURL: URL,
+        audioIsTemporary: Bool = false,
         replaceHistoryEntryID: UUID? = nil,
         sessionHeldToken: UInt64? = nil,
         sessionHeldSnapshot: CaretContext.Snapshot? = nil,
@@ -429,6 +430,7 @@ final class ASREngineSelector {
     ) {
         pipeline.transcribeAndLog(
             audioURL: audioURL,
+            audioIsTemporary: audioIsTemporary,
             replaceHistoryEntryID: replaceHistoryEntryID,
             sessionHeldToken: sessionHeldToken,
             sessionHeldSnapshot: sessionHeldSnapshot,

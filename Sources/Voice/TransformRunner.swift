@@ -51,13 +51,8 @@ enum TransformRunner {
     /// Runs `prompt` as the instruction over `text` and returns the rewritten
     /// result.
     ///
-    /// Honors `credentials.backend`. This previously tried on-device first
-    /// unconditionally, silently overriding a user who had deliberately selected
-    /// Cloud or xAI Grok, and left xAI unusable for Transforms even with a
-    /// working key stored. A selected backend that cannot run falls back to any
-    /// other configured one rather than failing outright — a Transform has no
-    /// "use the raw text" path of its own, so the caller must surface a hard
-    /// failure.
+    /// On-device selection never sends text to a cloud backend. Explicit cloud
+    /// selections may fall back to another configured cloud backend.
     static func run(prompt: String, over text: String, credentials: TransformCredentials) async throws -> String {
         guard !text.isEmpty else { return text }
 
@@ -96,13 +91,17 @@ enum TransformRunner {
         }
 
         logger.error("Transform run failed: no usable backend for the current settings")
+        if credentials.backend == .onDevice {
+            throw TransformRunnerError.onDeviceUnavailable
+        }
         throw TransformRunnerError.noBackendAvailable
     }
 
-    /// Preferred backend first, then the others as fallbacks. Pure so the
-    /// ordering is testable without a model or a key.
+    /// On-device stays local; cloud selections retain their configured fallbacks.
+    /// Pure so the ordering is testable without a model or a key.
     static func orderedBackends(preferring preferred: CleanupBackend) -> [CleanupBackend] {
-        [preferred] + CleanupBackend.allCases.filter { $0 != preferred }
+        guard preferred != .onDevice else { return [.onDevice] }
+        return [preferred] + CleanupBackend.allCases.filter { $0 != preferred }
     }
 
     /// Cloud path — the OpenAI-compatible chat-completions shape shared by both
@@ -153,12 +152,15 @@ enum TransformRunner {
 }
 
 enum TransformRunnerError: LocalizedError {
+    case onDeviceUnavailable
     case noBackendAvailable
     case requestFailed(status: Int)
     case emptyResponse
 
     var errorDescription: String? {
         switch self {
+        case .onDeviceUnavailable:
+            return "The on-device model is unavailable. This transform stayed on device; no text was sent to a cloud backend."
         case .noBackendAvailable:
             return "No on-device model or cloud key available to run this transform."
         case .requestFailed(let status):

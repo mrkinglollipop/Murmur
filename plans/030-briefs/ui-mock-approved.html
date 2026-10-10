@@ -1,0 +1,136 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  :root{--bg:#101014;--surface:rgba(255,255,255,.07);--hair:rgba(255,255,255,.10);--text:#f5f5f7;--muted:#a6a6ae;--coral:#F0997B;--fill:#B8431F;--green:#3CC498;--amber:#F2B880;--red:#F0706F}
+  body{font:14px/1.45 "Figtree",-apple-system,"SF Pro Text",system-ui,sans-serif;color:var(--foreground)}
+  h2{font:600 15px/1.3 inherit;margin:28px 0 4px}
+  h2:first-child{margin-top:0}
+  .why{color:var(--muted-foreground);margin:0 0 12px;max-width:62ch}
+  .mock{background:var(--bg);color:var(--text);border-radius:12px;padding:16px;overflow:hidden}
+  .serif{font-family:"EB Garamond",Georgia,"Times New Roman",serif}
+  .win{display:grid;grid-template-columns:148px 1fr;gap:20px}
+  .rail{display:flex;flex-direction:column;gap:2px}
+  .rail .cap{font-size:12px;color:var(--muted);padding:0 10px 6px}
+  .rail a{display:block;padding:7px 10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:500}
+  .rail a.on{background:rgba(216,90,48,.28);color:var(--text);box-shadow:inset 0 0 0 1px rgba(240,153,123,.35)}
+  .pane h3{font-size:26px;font-weight:500;margin:0 0 14px}
+  .grp{margin-bottom:20px}
+  .grp .cap{font-size:12px;color:var(--muted);padding:0 14px 6px}
+  .card{background:var(--surface);border-radius:10px;box-shadow:inset 0 0 0 1px var(--hair)}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:11px 14px}
+  .row+.row{border-top:1px solid var(--hair)}
+  .row .l{min-width:0}
+  .row .t{font-size:13px;font-weight:500}
+  .row .d{font-size:12px;color:var(--muted)}
+  .seg{display:inline-flex;background:rgba(255,255,255,.06);border-radius:8px;padding:2px;font-size:12px;flex-shrink:0}
+  .seg span{padding:4px 10px;border-radius:6px;color:var(--muted)}
+  .seg span.on{background:rgba(255,255,255,.14);color:var(--text)}
+  .val{font-size:12px;color:var(--muted);flex-shrink:0;font-variant-numeric:tabular-nums}
+  .btn{font:500 12px/1 inherit;color:var(--text);background:rgba(255,255,255,.10);border-radius:8px;padding:7px 11px;flex-shrink:0;white-space:nowrap}
+  .btn.cta{background:var(--fill)}
+  .st{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500;flex-shrink:0}
+  .st i{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .ok{color:var(--green)}.ok i{background:var(--green)}
+  .no{color:var(--amber)}.no i{background:var(--amber)}
+  .bar{height:6px;border-radius:3px;background:rgba(255,255,255,.10);margin-top:7px;width:220px;max-width:100%}
+  .bar b{display:block;height:100%;width:100%;border-radius:3px;background:var(--coral)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .menu{background:#26262b;border-radius:10px;padding:5px;width:236px;box-shadow:0 0 0 1px var(--hair),0 12px 28px rgba(0,0,0,.5);font-size:13px}
+  .menu div{display:flex;justify-content:space-between;padding:5px 10px;border-radius:6px}
+  .menu .dis{color:var(--muted)}
+  .menu .new{background:rgba(240,153,123,.14)}
+  .menu hr{border:0;border-top:1px solid var(--hair);margin:5px 8px}
+  .menu kbd{font:inherit;color:var(--muted)}
+  .lab{font-size:12px;color:var(--muted);margin-bottom:8px}
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .tile{background:var(--surface);border-radius:10px;box-shadow:inset 0 0 0 1px var(--hair);padding:12px 14px;display:flex;flex-direction:column;justify-content:space-between;min-height:74px}
+  .tile .k{font-size:12px;color:var(--muted)}
+  .tile .v{font-size:26px;line-height:1.1;font-variant-numeric:tabular-nums}
+  .heat{display:grid;grid-template-columns:28px repeat(8,1fr);gap:4px;margin-top:14px;align-items:center}
+  .heat span{font-size:11px;color:var(--muted)}
+  .heat i{height:16px;border-radius:4px;background:rgba(255,255,255,.06);display:block}
+  .heat i.a{background:rgba(240,153,123,.30)}.heat i.b{background:rgba(240,153,123,.58)}.heat i.c{background:rgba(240,153,123,.95)}
+  .leg{display:flex;align-items:center;gap:5px;justify-content:flex-end;font-size:11px;color:var(--muted);margin-top:8px}
+  .leg i{width:14px;height:14px;border-radius:4px;display:inline-block}
+  @media(max-width:560px){.win{grid-template-columns:1fr}.rail{flex-direction:row;flex-wrap:wrap}.rail .cap{display:none}.two{grid-template-columns:1fr}.tiles{grid-template-columns:1fr 1fr}}
+</style></head><body>
+
+<h2>1. Settings: six sections instead of one 2,700 pt scroll</h2>
+<p class="why">A section list replaces the single scroll of 15 cards. Every card spans the same width, and only the model card for the selected engine type is shown.</p>
+<div class="mock"><div class="win">
+  <nav class="rail" aria-label="Settings sections">
+    <div class="cap">Settings</div>
+    <a>General</a><a class="on" aria-current="page">Engine</a><a>Text</a><a>Storage</a><a>Permissions</a><a>About</a>
+  </nav>
+  <div class="pane">
+    <h3 class="serif">Engine</h3>
+    <div class="grp"><div class="cap">Where transcription runs</div>
+      <div class="card">
+        <div class="row"><div class="l"><div class="t">Engine</div><div class="d">Cloud needs your own API key. On-device needs a one-time download.</div></div><div class="seg"><span>On-device</span><span class="on">Cloud</span></div></div>
+        <div class="row"><div class="l"><div class="t">Language</div></div><div class="val">English ›</div></div>
+      </div>
+    </div>
+    <div class="grp"><div class="cap">Cloud model</div>
+      <div class="card">
+        <div class="row"><div class="l"><div class="t">xAI Grok</div><div class="d">Key saved</div></div><div class="st ok"><i></i>Active</div></div>
+        <div class="row"><div class="l"><div class="t">ElevenLabs Scribe</div><div class="d">Key saved</div></div><div class="btn">Use</div></div>
+        <div class="row"><div class="l"><div class="t">Gemini Transcribe</div><div class="d">No key</div></div><div class="btn">Add key</div></div>
+        <div class="row"><div class="l"><div class="t">Meta Muse</div><div class="d">No key</div></div><div class="btn">Add key</div></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+
+<h2>2. Permissions: live status with a fix button</h2>
+<p class="why">Today this is a static paragraph, and onboarding says "You're set" without checking. Each grant shows its real state; onboarding's last step waits for all three.</p>
+<div class="mock">
+  <div class="grp" style="margin:0"><div class="cap">Permissions</div>
+    <div class="card">
+      <div class="row"><div class="l"><div class="t">Microphone</div><div class="d">Records while you hold the key.</div></div><div class="st ok"><i></i>Granted</div></div>
+      <div class="row"><div class="l"><div class="t">Accessibility</div><div class="d">Types the text into the app you are using.</div></div><div class="st ok"><i></i>Granted</div></div>
+      <div class="row"><div class="l"><div class="t">Input Monitoring</div><div class="d">Not granted. Murmur cannot see the fn key.</div></div><div class="btn cta">Open System Settings</div></div>
+    </div>
+  </div>
+</div>
+
+<h2>3. Menu-bar menu and storage readout</h2>
+<p class="why">The menu gains a pause and an update check (highlighted rows are new). The storage line stops reading as over budget.</p>
+<div class="mock"><div class="two">
+  <div>
+    <div class="lab">Menu-bar menu</div>
+    <div class="menu">
+      <div class="dis">Murmur 0.1.54</div><hr>
+      <div>Open Murmur</div>
+      <div>Settings…<kbd>⌘,</kbd></div><hr>
+      <div class="new">Pause dictation</div>
+      <div class="new">Check for Updates…</div><hr>
+      <div>Quit Murmur<kbd>⌘Q</kbd></div>
+    </div>
+  </div>
+  <div>
+    <div class="lab">Storage card</div>
+    <div class="card">
+      <div class="row"><div class="l"><div class="t">Saved recordings</div><div class="d">114 files. Oldest are removed first.</div><div class="bar"><b></b></div></div><div class="val">200 MB, full</div></div>
+      <div class="row"><div class="l"><div class="t">Limit</div></div><div class="val">200 MB ›</div></div>
+    </div>
+  </div>
+</div></div>
+
+<h2>4. Insights: aligned tiles, formatted numbers, a real heatmap</h2>
+<p class="why">Tiles share one height, numbers get separators, and the heatmap gains intensity steps, weekday labels and a legend. The "(retained)" and "(last 1,000)" labels are gone.</p>
+<div class="mock">
+  <div class="tiles">
+    <div class="tile"><div class="k">Words dictated</div><div class="v serif">25,281</div></div>
+    <div class="tile"><div class="k">Dictations</div><div class="v serif">1,000</div></div>
+    <div class="tile"><div class="k">Words per minute</div><div class="v serif">142</div></div>
+    <div class="tile"><div class="k">Day streak</div><div class="v serif">0</div></div>
+  </div>
+  <div class="heat" role="img" aria-label="Words per day, last eight weeks">
+    <span>Mon</span><i class="a"></i><i></i><i class="b"></i><i class="c"></i><i class="a"></i><i class="b"></i><i></i><i class="c"></i>
+    <span>Wed</span><i></i><i class="b"></i><i class="a"></i><i></i><i class="c"></i><i class="a"></i><i class="b"></i><i class="a"></i>
+    <span>Fri</span><i class="c"></i><i class="a"></i><i></i><i class="b"></i><i></i><i class="c"></i><i class="a"></i><i></i>
+  </div>
+  <div class="leg">Fewer <i style="background:rgba(255,255,255,.06)"></i><i style="background:rgba(240,153,123,.30)"></i><i style="background:rgba(240,153,123,.58)"></i><i style="background:rgba(240,153,123,.95)"></i> More words</div>
+</div>
+
+</body></html>

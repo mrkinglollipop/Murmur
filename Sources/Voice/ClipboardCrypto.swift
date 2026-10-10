@@ -55,16 +55,11 @@ enum ClipboardKeyStore {
     static let service = "com.matt.voice-dictation.clipboard"
     static let account = "blob-encryption-key"
 
-    /// Returns the stored key, or `nil` when none has been created yet.
-    ///
-    /// `nil` is ambiguous on its own — it means either a fresh install or a
-    /// restored backup whose Keychain item did not come along. Callers must
-    /// disambiguate by checking whether blobs already exist on disk; treating
-    /// the second case as the first silently discards the user's history.
-    static func loadKey(keychain: KeychainStore) -> SymmetricKey? {
-        guard let encoded = keychain.key(for: account),
-              let raw = Data(base64Encoded: encoded) else {
-            return nil
+    /// Returns nil only when the Keychain definitively reports no item.
+    static func loadKey(keychain: KeychainStore) throws -> SymmetricKey? {
+        guard let encoded = try keychain.readKey(for: account) else { return nil }
+        guard let raw = Data(base64Encoded: encoded), raw.count == 32 else {
+            throw ClipboardCryptoError.keyUnavailable
         }
         return SymmetricKey(data: raw)
     }
@@ -74,13 +69,16 @@ enum ClipboardKeyStore {
     static func createKey(keychain: KeychainStore) throws -> SymmetricKey {
         let key = SymmetricKey(size: .bits256)
         let encoded = key.withUnsafeBytes { Data($0) }.base64EncodedString()
-        guard keychain.setKey(
+        if try keychain.addKeyIfAbsent(
             encoded,
             for: account,
             accessibility: kSecAttrAccessibleAfterFirstUnlock
-        ) else {
+        ) {
+            return key
+        }
+        guard let existing = try loadKey(keychain: keychain) else {
             throw ClipboardCryptoError.keyUnavailable
         }
-        return key
+        return existing
     }
 }
