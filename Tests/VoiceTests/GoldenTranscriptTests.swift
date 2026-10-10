@@ -60,7 +60,7 @@ final class GoldenTranscriptTests: XCTestCase {
         )
     }
 
-    func testMattFireclawFireCrawlGolden() {
+    func testMattFireclawFireCrawlPreservesBothSpellings() {
         let prefix =
             "I'm wondering if we need to do option C. The reason being is I don't think the local is even working anymore. I had so many issues with getting it to run. Go ahead and verify, audit it, et cetera."
         let chunks = [
@@ -68,8 +68,7 @@ final class GoldenTranscriptTests: XCTestCase {
             "If I recall correctly, the conclusion I came to is I was just better off using FireCrawl for all my searches."
         ]
         let stitched = stitchSequence(chunks)
-        let expected =
-            prefix + " If I recall correctly, the conclusion I came to is I was just better off using FireCrawl for all my searches."
+        let expected = chunks.joined(separator: " ")
         XCTAssertEqual(stitched, expected)
     }
 

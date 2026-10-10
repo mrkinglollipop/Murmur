@@ -3,6 +3,29 @@ import XCTest
 
 final class CleanupSanityTests: XCTestCase {
 
+    func testReversedRolesRejectedEvenInSingleSentence() {
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
+            input: "Alice paid Bob yesterday.",
+            output: "Bob paid Alice yesterday."
+        ))
+    }
+
+    func testDroppedShortSentencesRejected() {
+        for sentence in ["Call Alice.", "Wait.", "Call."] {
+            XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
+                input: "Send the report today. " + sentence,
+                output: "Send the report today."
+            ), sentence)
+        }
+    }
+
+    func testChangedShortClauseRejected() {
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
+            input: "Send the report today. Call Alice.",
+            output: "Send the report today. Call Bob."
+        ))
+    }
+
     func testLightCleanupAccepted() {
         let input = "um hello there how are you"
         let output = "Hello there, how are you?"
@@ -46,14 +69,13 @@ final class CleanupSanityTests: XCTestCase {
         XCTAssertFalse(ASREngineSelector.cleanupLooksSane(input: "Charge 12.50 to the client today.", output: "Charge 12 to the client today."))
     }
 
-    /// Styles rewrite tone through cleanup; a rephrase that keeps every
-    /// sentence, negation and number must still pass.
-    func testRephraseKeepingContentAccepted() {
-        XCTAssertTrue(ASREngineSelector.cleanupLooksSane(
+    /// These may be fillers or intentional words; uncertainty preserves them.
+    func testAmbiguousFillerAndRestartDeletionRejected() {
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
             input: "so like I think we should um ship it on Friday. I mean the tests don't fail anymore.",
             output: "I think we should ship it on Friday. The tests don't fail anymore."
         ))
-        XCTAssertTrue(ASREngineSelector.cleanupLooksSane(
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
             input: "I want to I want to go to the store",
             output: "I want to go to the store."
         ))

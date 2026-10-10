@@ -792,51 +792,20 @@ final class TranscriptionPipeline {
             outNumbers[w] = left - 1
         }
 
-        // The checks above cannot see a dropped sentence. Align the two word
-        // sequences in order and require every input sentence to survive at
-        // least by half.
-        let sentences = input
-            .replacingOccurrences(of: #"[.!?]\s+"#, with: "\n", options: .regularExpression)
-            .components(separatedBy: .newlines)
-            .map(words)
-            .filter { !$0.isEmpty }
-        guard sentences.count > 1 else { return true }
-        let kept = orderedMatches(inWords, outWords)
-        var offset = 0
-        for sentence in sentences {
-            let range = offset..<(offset + sentence.count)
-            offset = range.upperBound
-            guard sentence.count >= 3 else { continue }
-            let survived = kept[range].filter { $0 }.count
-            if survived * 2 < sentence.count { return false }
-        }
-        return true
-    }
-
-    /// Longest-common-subsequence alignment: which words of `a` survive, in
-    /// order, in `b`.
-    private static func orderedMatches(_ a: [String], _ b: [String]) -> [Bool] {
-        var matched = [Bool](repeating: false, count: a.count)
-        guard !a.isEmpty, !b.isEmpty else { return matched }
-        var table = [[Int]](repeating: [Int](repeating: 0, count: b.count + 1), count: a.count + 1)
-        for i in stride(from: a.count - 1, through: 0, by: -1) {
-            for j in stride(from: b.count - 1, through: 0, by: -1) {
-                table[i][j] = a[i] == b[j] ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
+        // Vocabulary overlap cannot prove meaning survived: swapping subject
+        // and object uses the same words. Preserve every word in order, even
+        // in short clauses, allowing only hesitation tokens to be omitted.
+        // Ambiguous fillers ("like", "I mean") and restarts stay in the text.
+        let hesitations: Set<String> = ["um", "uh"]
+        var nextOutput = 0
+        for word in inWords {
+            if nextOutput < outWords.count, word == outWords[nextOutput] {
+                nextOutput += 1
+            } else if !hesitations.contains(word) {
+                return false
             }
         }
-        var i = 0, j = 0
-        while i < a.count, j < b.count {
-            if a[i] == b[j] {
-                matched[i] = true
-                i += 1
-                j += 1
-            } else if table[i + 1][j] >= table[i][j + 1] {
-                i += 1
-            } else {
-                j += 1
-            }
-        }
-        return matched
+        return nextOutput == outWords.count
     }
 
     /// Failed edits have no usable result to retain. Their audio is an

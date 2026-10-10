@@ -3,6 +3,38 @@ import XCTest
 
 final class StitchDedupeTests: XCTestCase {
 
+    func testPostProcessPreservesNearbyWordsWithDifferentMeanings() {
+        for (earlier, later) in [
+            ("The dose should increase again this morning.", "The dose should decrease again this morning."),
+            ("The shipment was approved by the manager.", "The shipment was disproved by the manager.")
+        ] {
+            let text = earlier + " " + later
+            XCTAssertEqual(XAIStreamingTranscriber.postProcessTranscript(text), text)
+        }
+    }
+
+    func testDoneBeforeFinalizeDoesNotMergeStaleInterimAgain() async {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Turn left.","is_final":false}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":"Turn right at the traffic lights."}"#)
+
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "Turn right at the traffic lights.")
+        let result = await session.finalize()
+        XCTAssertEqual(result, "Turn right at the traffic lights.")
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+    }
+
+    func testEmptyOrShortDonePreservesUnfinalizedTail() async {
+        for done in ["", "First sentence."] {
+            let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+            session.handleServerEvent(#"{"type":"transcript.partial","text":"First sentence.","is_final":true}"#)
+            session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Alice.","is_final":false}"#)
+            session.handleServerEvent("{\"type\":\"transcript.done\",\"text\":\"\(done)\"}")
+            let result = await session.finalize()
+            XCTAssertEqual(result, "First sentence. Call Alice.")
+        }
+    }
+
     private static let mattParagraphPrefix =
         "I'm wondering if we need to do option C. The reason being is I don't think the local is even working anymore. I had so many issues with getting it to run. Go ahead and verify, audit it, et cetera."
 
@@ -78,12 +110,11 @@ final class StitchDedupeTests: XCTestCase {
 
     // MARK: - mergeStreamingSegment / near-dup tail
 
-    func testMergeStreamingSegmentFireclawFireCrawlGolden() {
+    func testMergeStreamingSegmentPreservesUnprovenSpellingChange() {
         let chunk1 = Self.mattParagraphPrefix + " " + Self.mattClosingFireclaw
         let chunk2 = Self.mattClosingFireCrawl
         let merged = XAIStreamingTranscriber.mergeStreamingSegment(left: chunk1, right: chunk2)
-        XCTAssertEqual(merged, Self.mattParagraphPrefix + " " + Self.mattClosingFireCrawl)
-        XCTAssertFalse(merged.contains("Fireclaw"))
+        XCTAssertEqual(merged, chunk1 + " " + chunk2)
     }
 
     func testMergeSegmentIntoConfirmedFallbackWhenWordsEmpty() {
@@ -98,7 +129,7 @@ final class StitchDedupeTests: XCTestCase {
             lastCommittedEnd: 0
         )
         accumulated = first.confirmedText
-        XCTAssertEqual(accumulated, Self.mattParagraphPrefix + " " + Self.mattClosingFireCrawl)
+        XCTAssertEqual(accumulated, chunk1 + " " + chunk2)
     }
 
     func testMergeStreamingSegmentPreservesIntentionalIdenticalRepeat() {
@@ -134,20 +165,20 @@ final class StitchDedupeTests: XCTestCase {
         }
     }
 
-    func testCollapseNearDuplicateTail() {
+    func testNearDuplicateTailPreservesUnprovenSpellingChange() {
         let prefix = Self.mattParagraphPrefix + " "
         let duplicated = prefix + Self.mattClosingFireclaw + " " + Self.mattClosingFireCrawl
         let collapsed = XAIStreamingTranscriber.collapseNearDuplicateTail(duplicated)
-        XCTAssertEqual(collapsed, prefix + Self.mattClosingFireCrawl)
+        XCTAssertEqual(collapsed, duplicated)
     }
 
-    func testResolveFinalTranscriptPrefersDoneWhenStitchDuplicated() {
+    func testResolveFinalTranscriptPreservesDifferentWordsInLongerStitch() {
         let prefix = Self.mattParagraphPrefix + " "
         let stitched = prefix + Self.mattClosingFireclaw + " " + Self.mattClosingFireCrawl
         let done = prefix + Self.mattClosingFireCrawl
         XCTAssertEqual(
             XAIStreamingTranscriber.resolveFinalTranscript(stitched: stitched, done: done),
-            done
+            stitched
         )
     }
 
@@ -160,11 +191,11 @@ final class StitchDedupeTests: XCTestCase {
         )
     }
 
-    func testReplaceOverlappingTailPreservesUnpunctuatedPrefix() {
+    func testDifferentTailWordsPreserveUnpunctuatedPrefixAndBothTails() {
         let prefix = Self.mattParagraphPrefix
         let left = prefix + " " + Self.mattClosingFireclaw
         let merged = XAIStreamingTranscriber.mergeStreamingSegment(left: left, right: Self.mattClosingFireCrawl)
-        XCTAssertEqual(merged, prefix + " " + Self.mattClosingFireCrawl)
+        XCTAssertEqual(merged, left + " " + Self.mattClosingFireCrawl)
         XCTAssertTrue(merged.hasPrefix(prefix))
     }
 
@@ -225,21 +256,20 @@ final class StitchDedupeTests: XCTestCase {
         XCTAssertEqual(XAIStreamingTranscriber.postProcessTranscript(text), text)
     }
 
-    func testDedupeStitchArtifactsCollapsesAppendedNearDuplicateClosing() {
+    func testDedupeStitchArtifactsPreservesAppendedDifferentClosing() {
         let prefix = Self.mattParagraphPrefix + " "
         let duplicated = prefix + Self.mattClosingFireclaw + " " + Self.mattClosingFireCrawl
         let cleaned = XAIStreamingTranscriber.dedupeStitchArtifacts(duplicated)
-        XCTAssertEqual(cleaned, prefix + Self.mattClosingFireCrawl)
+        XCTAssertEqual(cleaned, duplicated)
     }
 
-    func testNearDuplicateTailWindowFindsLongerLeftSuffix() {
+    func testNearDuplicateTailWindowRejectsUnprovenSpellingChange() {
         let prefix = Self.mattParagraphPrefix + " Some extra words at the boundary"
         let left = prefix + " " + Self.mattClosingFireclaw
         let window = XAIStreamingTranscriber.nearDuplicateTailWindow(in: left, right: Self.mattClosingFireCrawl)
-        XCTAssertNotNil(window)
+        XCTAssertNil(window)
         let merged = XAIStreamingTranscriber.mergeStreamingSegment(left: left, right: Self.mattClosingFireCrawl)
-        XCTAssertEqual(merged, prefix + " " + Self.mattClosingFireCrawl)
-        XCTAssertFalse(merged.contains("Fireclaw"))
+        XCTAssertEqual(merged, left + " " + Self.mattClosingFireCrawl)
     }
 
     // MARK: - extension / containment near-dup (Cursor from it)
