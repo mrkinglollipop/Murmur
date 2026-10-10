@@ -2,7 +2,7 @@ import XCTest
 import UIKit
 
 final class KeyboardDocumentStateTests: XCTestCase {
-    func testDictationBackspaceDeletesOnlyOneCharacter() {
+    func testDictationBackspaceRequestsOnlyOneCharacter() {
         let transcript = "A whole dictated sentence with several words "
         XCTAssertEqual(KeyboardInsertOrigin.dictation.backspaceCount(context: transcript), 1)
     }
@@ -17,11 +17,11 @@ final class KeyboardDocumentStateTests: XCTestCase {
         }
     }
 
-    func testSwipeWordKeepsWholeWordBackspaceAndTrailingSpaceRemoval() {
+    func testSwipeWordBackspaceCountKeepsPunctuationInsertOnly() {
         let origin = KeyboardInsertOrigin.swipe("hello ")
         XCTAssertEqual(origin.backspaceCount(context: "say hello "), 6)
-        XCTAssertEqual(origin.trailingDeleteCount(beforeInserting: ".", context: "say hello "), 1)
-        XCTAssertEqual(origin.trailingDeleteCount(beforeInserting: "\n", context: "say hello "), 1)
+        XCTAssertEqual(origin.trailingDeleteCount(beforeInserting: ".", context: "say hello "), 0)
+        XCTAssertEqual(origin.trailingDeleteCount(beforeInserting: "\n", context: "say hello "), 0)
     }
 
     func testDisabledAutocorrectionNeverReplaces() {

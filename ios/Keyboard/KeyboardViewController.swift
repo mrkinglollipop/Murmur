@@ -20,6 +20,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var lastSpaceTap: ContinuousClock.Instant?
     private let autocorrect = AutocorrectController()
     private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
+    private var textAfterBulkInsert = ""
     private let dictionary = DictionaryStore()
     private var insertOrigin: KeyboardInsertOrigin?
     private var swipeCommittedWord: String? {
@@ -178,6 +179,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             gifInsertionTask = nil
             insertOrigin = nil
             lastBulkInsert = nil
+            textAfterBulkInsert = ""
             lastSpaceTap = nil
             autocorrect.clearUndo()
             autocorrect.suppressUntilWhitespace = false
@@ -301,6 +303,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             UIDevice.current.playInputClick()
             return
         }
+        if let bulk = recentBulkInsertText() {
+            guard KeyboardBulkEditPolicy.allowsDeletion(
+                count: 1, beforeInput: textDocumentProxy.documentContextBeforeInput ?? "",
+                selected: textDocumentProxy.selectedText, recentBulkInsert: bulk,
+                textAfterBulkInsert: textAfterBulkInsert
+            ) else { return }
+        }
         if let selected = textDocumentProxy.selectedText, selected.count > 1 {
             let context = textDocumentProxy.documentContextBeforeInput ?? ""
             UIDevice.current.playInputClick()
@@ -388,7 +397,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             insertPlain(" ")
         }
         let trailing = phase == .secure ? "" : " "
-        insertPlain(first + trailing)
+        guard insertPlain(first + trailing) else { return }
+        lastBulkInsert = (text: first + trailing, at: ContinuousClock().now)
+        textAfterBulkInsert = ""
         swipeCommittedWord = first + trailing
         lastSpaceTap = trailing == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
         autocorrect.suppressUntilWhitespace = true
@@ -406,7 +417,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         // not the next typed word. `noteIncomingText` already cleared it if
         // this commit follows a new letter span (`i` + space after a swipe).
         guard !autocorrect.suppressUntilWhitespace else { return }
-        let span = AutocorrectEngine.wordSpan(beforeInput: context)
+        let span = AutocorrectEngine.autocorrectionSpan(beforeInput: context)
         let allowed = AutocorrectEngine.allowedDeleteCount(span: span, inBeforeInput: context)
         guard allowed > 0 else { return }
         guard selectedTextIsEmpty else { return }
@@ -430,7 +441,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.isPunctuationSuggestion(chosen) {
             let committed = AutocorrectEngine.committedSpan(beforeInput: context)
-            let deleteCount = recentBulkInsertText() == nil ? committed.trailing.count : 0
+            let deleteCount = KeyboardBulkEditPolicy.punctuationDeleteCount(
+                trailing: committed.trailing, recentBulkInsert: recentBulkInsertText()
+            )
             guard deleteCharacters(deleteCount) else {
                 HandoffDiagnostics.record("keyboard.candidate.abortedDelete", detail: "trailing=\(committed.trailing.count)")
                 return
@@ -444,18 +457,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             refreshSuggestions()
             return
         }
-        guard recentBulkInsertText() == nil else { return }
-        let active = AutocorrectEngine.wordSpan(beforeInput: context)
-        let target: String
-        let trailing: String
-        if !active.isEmpty {
-            target = active
-            trailing = ""
-        } else {
-            let committed = AutocorrectEngine.committedSpan(beforeInput: context)
-            target = committed.word
-            trailing = committed.trailing
-        }
+        guard let span = KeyboardBulkEditPolicy.candidateSpan(
+            beforeInput: context, recentBulkInsert: recentBulkInsertText(),
+            textAfterBulkInsert: textAfterBulkInsert
+        ) else { return }
+        let target = span.word
+        let trailing = span.trailing
         guard !target.isEmpty else { return }
         let removable = target + trailing
         let allowed = AutocorrectEngine.allowedDeleteCount(span: removable, inBeforeInput: context)
@@ -560,9 +567,9 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     }
 
     private func shouldReplaceSecondSpaceWithPeriod() -> Bool {
-        // SIMPLIFIED 2026-08-26: no double-space magic near a dictation take.
+        // SIMPLIFIED 2026-08-26: no double-space magic near a bulk insert.
         // Messages discards its provisional region when anything touches it;
-        // near a transcript a space is just a space. Failure mode: no period
+        // near a transcript or swipe a space is just a space. Failure mode: no period
         // appears — never a wipe, never a paste. "Near" = the 180-second
         // recentBulkInsertText window; generous on purpose, since the cost
         // of suppression is only a missing period.
@@ -616,7 +623,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         // Never overwrite a 1-char selection — collapse it. A phantom host
         // selection plus insertText is a silently eaten character.
         guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
         textDocumentProxy.insertText(text)
+        if recentBulkInsertText() != nil {
+            if !before.hasSuffix(textAfterBulkInsert) { textAfterBulkInsert = "" }
+            textAfterBulkInsert += text
+        }
         return true
     }
 
@@ -630,15 +642,21 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         let count = min(max(0, requested), AutocorrectEngine.maxDeleteLoop)
         guard count > 0 else { return false }
         guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
-        for _ in 0..<count {
+        for remaining in (1...count).reversed() {
             let before = textDocumentProxy.documentContextBeforeInput ?? ""
-            if before.isEmpty { return false }
+            guard KeyboardBulkEditPolicy.allowsDeletion(
+                count: remaining, beforeInput: before, selected: textDocumentProxy.selectedText,
+                recentBulkInsert: recentBulkInsertText(), textAfterBulkInsert: textAfterBulkInsert
+            ) else { return false }
             textDocumentProxy.deleteBackward()
             let after = textDocumentProxy.documentContextBeforeInput ?? ""
-            if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
+            if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count)
+                || (recentBulkInsertText() != nil && before.count - after.count != 1) {
+                textAfterBulkInsert = ""
                 restoreHiddenSelectionLoss(before: before, after: after)
                 return false
             }
+            if !textAfterBulkInsert.isEmpty { textAfterBulkInsert.removeLast() }
         }
         return true
     }
@@ -668,12 +686,19 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     /// The first host word-delete cannot be undone.
     private func deleteBackwardCheckingHostDrop() {
         let before = textDocumentProxy.documentContextBeforeInput ?? ""
-        guard !before.isEmpty else { return }
+        guard KeyboardBulkEditPolicy.allowsDeletion(
+            count: 1, beforeInput: before, selected: nil,
+            recentBulkInsert: recentBulkInsertText(), textAfterBulkInsert: textAfterBulkInsert
+        ) else { return }
         textDocumentProxy.deleteBackward()
         let after = textDocumentProxy.documentContextBeforeInput ?? ""
-        if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count) {
+        if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count)
+            || (recentBulkInsertText() != nil && before.count - after.count != 1) {
+            textAfterBulkInsert = ""
             restoreHiddenSelectionLoss(before: before, after: after)
+            return
         }
+        if !textAfterBulkInsert.isEmpty { textAfterBulkInsert.removeLast() }
     }
 
     private var supportsDoubleSpacePeriod: Bool {
@@ -1065,6 +1090,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                     textDocumentProxy.insertText(chunk)
                 }
                 lastBulkInsert = (text: text, at: ContinuousClock().now)
+                textAfterBulkInsert = ""
                 insertOrigin = .dictation
                 autocorrect.suppressUntilWhitespace = true
                 autocorrect.clearUndo()

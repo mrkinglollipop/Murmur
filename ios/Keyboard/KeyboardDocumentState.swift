@@ -11,10 +11,8 @@ enum KeyboardInsertOrigin: Equatable {
     }
 
     func trailingDeleteCount(beforeInserting text: String, context: String) -> Int {
-        guard swipeWord != nil,
-              AutocorrectEngine.shouldEatTrailingSwipeSpace(beforeInserting: text),
-              context.last == " " else { return 0 }
-        return 1
+        // Punctuation and whitespace never delete beside a bulk swipe insert.
+        return 0
     }
 
     func backspaceCount(context: String) -> Int {
@@ -54,5 +52,44 @@ enum KeyboardAutocorrectionPolicy {
         default:
             return true
         }
+    }
+}
+
+enum KeyboardBulkEditPolicy {
+    static func allowsDeletion(
+        count: Int, beforeInput: String, selected: String?,
+        recentBulkInsert: String?, textAfterBulkInsert: String
+    ) -> Bool {
+        guard count > 0, !beforeInput.isEmpty,
+              selected == nil || selected == "" else { return false }
+        guard recentBulkInsert != nil else { return true }
+        // A nil/empty selection is not proof that the host has released its
+        // provisional bulk region. Only a matching, locally typed suffix is safe.
+        // Spaces and punctuation alone do not establish a new typed token.
+        return textAfterBulkInsert.contains { !$0.isWhitespace && !$0.isPunctuation }
+            && count <= textAfterBulkInsert.count
+            && beforeInput.hasSuffix(textAfterBulkInsert)
+    }
+
+    static func candidateSpan(
+        beforeInput: String, recentBulkInsert: String?, textAfterBulkInsert: String
+    ) -> (word: String, trailing: String)? {
+        let active = AutocorrectEngine.wordSpan(beforeInput: beforeInput)
+        let span = active.isEmpty
+            ? AutocorrectEngine.committedSpan(beforeInput: beforeInput)
+            : (word: active, trailing: "")
+        let wordContext = String(beforeInput.dropLast(span.trailing.count))
+        guard !span.word.isEmpty,
+              AutocorrectEngine.autocorrectionSpan(beforeInput: wordContext) == span.word,
+              allowsDeletion(
+                count: span.word.count + span.trailing.count, beforeInput: beforeInput,
+                selected: nil, recentBulkInsert: recentBulkInsert,
+                textAfterBulkInsert: textAfterBulkInsert
+              ) else { return nil }
+        return span
+    }
+
+    static func punctuationDeleteCount(trailing: String, recentBulkInsert: String?) -> Int {
+        0
     }
 }

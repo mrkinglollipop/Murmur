@@ -30,6 +30,14 @@ enum AutocorrectEngine {
         return character.isWhitespace || character.isPunctuation || character.isNewline
     }
 
+    static func autocorrectionSpan(beforeInput: String) -> String {
+        guard let token = beforeInput.split(whereSeparator: \.isWhitespace).last else { return "" }
+        // Inspect the full token before wordSpan discards identifier/URL separators.
+        guard !shouldSkip(String(token)),
+              !token.contains(where: { "_@/\\:".contains($0) }) else { return "" }
+        return wordSpan(beforeInput: beforeInput)
+    }
+
     static func shouldSkip(_ word: String) -> Bool {
         let trimmed = word.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
