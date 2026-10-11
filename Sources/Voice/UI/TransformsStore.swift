@@ -22,6 +22,8 @@ struct Transform: Codable, Identifiable, Equatable {
 /// thread-hop approach). Seeds two defaults on first run only.
 final class TransformsStore: ObservableObject {
 
+    @Published private(set) var saveFailure = SaveFailureNotice()
+
     @Published private(set) var transforms: [Transform] = []
 
     /// When set, this transform runs automatically after cleanup on each dictation.
@@ -76,6 +78,7 @@ final class TransformsStore: ObservableObject {
         }
         guard let data = try? Data(contentsOf: fileURL) else {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("transforms.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -97,6 +100,7 @@ final class TransformsStore: ObservableObject {
             logger.error("Quarantined corrupt transforms.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("Failed to quarantine corrupt transforms.json: \(error.localizedDescription)")
         }
     }
@@ -120,10 +124,22 @@ final class TransformsStore: ObservableObject {
         save()
     }
 
+    private func reportSaveFailure() {
+        saveFailure.report("Transforms could not be saved. Copy any changes you want to keep before quitting.")
+    }
+
+    func dismissSaveFailure() {
+        saveFailure.dismiss()
+    }
+
     private func save() {
         guard !savesBlocked else { return }
-        guard let data = try? JSONEncoder().encode(transforms) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(transforms)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     private func scheduleSave() {
