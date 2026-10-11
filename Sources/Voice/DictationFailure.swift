@@ -4,6 +4,7 @@ import Foundation
 /// menu-bar badge. Each case maps to a short, actionable message.
 enum DictationFailure: Equatable {
     case transcriptionFailed
+    case speechModelDownloading
     case injectionFailed
     case audioWriteFailed
     case micStartFailed
@@ -15,6 +16,8 @@ enum DictationFailure: Equatable {
     /// User-facing copy for the HUD error pill.
     var message: String {
         switch self {
+        case .speechModelDownloading:
+            return "Speech model still downloading"
         case .transcriptionFailed:
             return "Transcription failed"
         case .injectionFailed:

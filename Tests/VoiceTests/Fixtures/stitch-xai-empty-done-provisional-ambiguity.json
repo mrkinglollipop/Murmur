@@ -1,0 +1,29 @@
+{
+  "name": "xai-empty-done-promotes-provisional-ambiguity",
+  "events": [
+    {
+      "type": "final",
+      "text": "First sentence.",
+      "speechFinal": false,
+      "words": [
+        { "text": "First", "start": 0, "end": 0.4 },
+        { "text": "sentence", "start": 0.4, "end": 1 }
+      ]
+    },
+    {
+      "type": "interim",
+      "text": "Second sentence.",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "First sentence. Second sentence.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

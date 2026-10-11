@@ -36,5 +36,6 @@
       "speechFinal": true
     }
   ],
-  "expected": "Call Alice. Call Bob."
+  "expected": "Call Alice. Call Bob.",
+  "requiresRecovery": false
 }

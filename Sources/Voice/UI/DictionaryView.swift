@@ -60,6 +60,7 @@ struct DictionaryView: View {
             }
         }
         .saveFailureBanner(store.saveFailure, onDismiss: store.dismissSaveFailure)
+        .saveFailureBanner(correctionsLog.saveFailure, onDismiss: correctionsLog.dismissSaveFailure)
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete dictionary term?",

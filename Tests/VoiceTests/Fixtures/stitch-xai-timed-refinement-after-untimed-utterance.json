@@ -1,0 +1,54 @@
+{
+  "name": "xai-timed-refinement-after-untimed-utterance",
+  "events": [
+    {
+      "type": "final",
+      "text": "Intro.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Call Alice",
+      "speechFinal": false,
+      "words": [
+        {
+          "text": "Call",
+          "start": 0,
+          "end": 0.4
+        },
+        {
+          "text": "Alice",
+          "start": 0.4,
+          "end": 1
+        }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "Call Alice.",
+      "speechFinal": true,
+      "words": [
+        {
+          "text": "Call",
+          "start": 0,
+          "end": 0.4
+        },
+        {
+          "text": "Alice",
+          "start": 0.4,
+          "end": 1
+        }
+      ]
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Intro. Call Alice.",
+  "requiresRecovery": false,
+  "verifyFinalize": true
+}

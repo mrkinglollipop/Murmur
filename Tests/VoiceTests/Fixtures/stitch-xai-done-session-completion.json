@@ -1,0 +1,36 @@
+{
+  "name": "xai-done-full-session-completion",
+  "events": [
+    {
+      "type": "final",
+      "text": "Call Alice.",
+      "speechFinal": true,
+      "words": [
+        { "text": "Call", "start": 0, "end": 0.4 },
+        { "text": "Alice", "start": 0.4, "end": 1 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "Call Bob.",
+      "speechFinal": true,
+      "words": [
+        { "text": "Call", "start": 2, "end": 2.4 },
+        { "text": "Bob", "start": 2.4, "end": 3 }
+      ]
+    },
+    {
+      "type": "done",
+      "text": "Call Alice. Call Bob.",
+      "speechFinal": false,
+      "words": [
+        { "text": "Call", "start": 0, "end": 0.4 },
+        { "text": "Alice", "start": 0.4, "end": 1 },
+        { "text": "Call", "start": 2, "end": 2.4 },
+        { "text": "Bob", "start": 2.4, "end": 3 }
+      ]
+    }
+  ],
+  "expected": "Call Alice. Call Bob.",
+  "requiresRecovery": false
+}

@@ -3,6 +3,105 @@ import os.log
 import Speech
 import WhisperKit
 
+/// Narrow system boundary so asset lifecycle tests never contact Apple's service.
+@MainActor
+protocol AppleSpeechAssetInventory {
+    func locale(for language: String) async throws -> Locale
+    func status(for locale: Locale) async -> AssetInventory.Status
+    func installationRequest(for locale: Locale) async throws -> AssetInstallationRequest?
+    var reservedLocales: [Locale] { get async }
+    func release(_ locale: Locale) async
+}
+
+@MainActor
+struct SystemAppleSpeechAssetInventory: AppleSpeechAssetInventory {
+    func locale(for language: String) async throws -> Locale {
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: language)) else {
+            throw AppleSpeechEngineError.unsupportedLanguage(language)
+        }
+        return locale
+    }
+
+    func status(for locale: Locale) async -> AssetInventory.Status {
+        await AssetInventory.status(forModules: [SpeechTranscriber(locale: locale, preset: .transcription)])
+    }
+
+    func installationRequest(for locale: Locale) async throws -> AssetInstallationRequest? {
+        try await AssetInventory.assetInstallationRequest(
+            supporting: [SpeechTranscriber(locale: locale, preset: .transcription)]
+        )
+    }
+
+    var reservedLocales: [Locale] { get async { await AssetInventory.reservedLocales } }
+
+    func release(_ locale: Locale) async {
+        await AssetInventory.release(reservedLocale: locale)
+    }
+}
+
+/// Serializes reservation release against transcription start. A lease belongs
+/// to the decoder operation, which can outlive the caller's timeout.
+actor AppleSpeechAssetUsage {
+    static let shared = AppleSpeechAssetUsage()
+    private var activeLanguages: [String: Int] = [:]
+    private var locked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    private func lock() async {
+        if !locked {
+            locked = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func unlock() {
+        if waiters.isEmpty {
+            locked = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+
+    func withTranscription(
+        language: String,
+        operation: @Sendable () async throws -> String
+    ) async throws -> String {
+        await lock()
+        activeLanguages[language, default: 0] += 1
+        unlock()
+        defer {
+            let remaining = activeLanguages[language, default: 1] - 1
+            activeLanguages[language] = remaining == 0 ? nil : remaining
+        }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    func releaseUnused(
+        inventory: any AppleSpeechAssetInventory,
+        selectedLanguage: @MainActor () -> String
+    ) async throws {
+        await lock()
+        defer { unlock() }
+        let reservations = await inventory.reservedLocales
+        for reserved in reservations {
+            // Resolve aliases through the same API as the transcription module.
+            // Re-read selection after suspension; Settings can change mid-scan.
+            let selected = await selectedLanguage()
+            var retained = Set<Locale>()
+            for language in Set(activeLanguages.keys).union([selected]) {
+                retained.insert(try await inventory.locale(for: language))
+            }
+            let canonical = try await inventory.locale(for: reserved.identifier)
+            guard await selectedLanguage() == selected else { return }
+            if !retained.contains(canonical) {
+                await inventory.release(reserved)
+            }
+        }
+    }
+}
+
 // MARK: - Per-model download / storage state
 
 /// Lifecycle state for an individual model's on-disk presence, published by
@@ -126,8 +225,16 @@ final class ModelManager: ObservableObject {
     private var systemAssetRequests: [LocalModel: AssetInstallationRequest] = [:]
     private var systemAssetProgressObservers: [LocalModel: NSKeyValueObservation] = [:]
     private var appleSpeechLanguage = "en"
+    private let appleSpeechInventory: any AppleSpeechAssetInventory
+    private let appleSpeechUsage: AppleSpeechAssetUsage
 
-    init(loadDiskState: Bool = true) {
+    init(
+        loadDiskState: Bool = true,
+        appleSpeechInventory: (any AppleSpeechAssetInventory)? = nil,
+        appleSpeechUsage: AppleSpeechAssetUsage = .shared
+    ) {
+        self.appleSpeechInventory = appleSpeechInventory ?? SystemAppleSpeechAssetInventory()
+        self.appleSpeechUsage = appleSpeechUsage
         guard loadDiskState else { return }
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         Self.migrateWhisperKitModelsFromDocumentsIfNeeded()
@@ -345,7 +452,7 @@ final class ModelManager: ObservableObject {
     /// Filesystem scan, off the main actor. Returns (present, totalBytes).
     private nonisolated static func scanDisk(for model: LocalModel) async -> (Bool, Int64?) {
         guard let folder = modelFolderURL(for: model) else {
-            // Parakeet — not a WhisperKit folder; best-effort via HF cache.
+            // Parakeet — not a WhisperKit folder; validate its HF snapshot.
             return parakeetCacheInfo()
         }
 
@@ -399,30 +506,37 @@ final class ModelManager: ObservableObject {
             .appendingPathComponent(variant, isDirectory: true)
     }
 
-    /// Parakeet is cached by `parakeet-mlx` in the standard HuggingFace CLI
-    /// cache (`~/.cache/huggingface/hub/`), not WhisperKit's folder. This is
-    /// best-effort: if the expected cache layout isn't found, we report "not
-    /// downloaded" rather than guessing — Parakeet acquisition is owned by
-    /// the Python sidecar itself, not this manager.
+    /// The sidecar loads mlx-community/parakeet-tdt-0.6b-v3 at revision main.
+    /// Only that revision's readable config and weights establish readiness;
+    /// other Parakeet repositories, stale snapshots and hub metadata do not.
     private nonisolated static func parakeetCacheInfo() -> (Bool, Int64?) {
-        let hfCache = VoicePaths.huggingFaceHubDirectory
-
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: hfCache,
-            includingPropertiesForKeys: nil
-        ) else {
+        let fm = FileManager.default
+        let parakeetDir = VoicePaths.huggingFaceHubDirectory
+            .appendingPathComponent("models--mlx-community--parakeet-tdt-0.6b-v3", isDirectory: true)
+        guard let ref = try? String(contentsOf: parakeetDir.appendingPathComponent("refs/main"), encoding: .utf8) else {
+            return (false, nil)
+        }
+        let revision = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard revision.count == 40, revision.allSatisfy({ "0123456789abcdef".contains($0) }) else {
             return (false, nil)
         }
 
-        // parakeet-mlx caches under a folder name containing "parakeet".
-        guard let parakeetDir = contents.first(where: {
-            $0.lastPathComponent.lowercased().contains("parakeet")
-        }) else {
+        let snapshot = parakeetDir.appendingPathComponent("snapshots/\(revision)", isDirectory: true)
+        for name in ["config.json", "model.safetensors"] {
+            // HF snapshots normally symlink to blobs; inspect the target so
+            // broken links and unfinished downloads never count as payload.
+            let file = snapshot.appendingPathComponent(name).resolvingSymlinksInPath()
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, (values.fileSize ?? 0) > 0,
+                  fm.isReadableFile(atPath: file.path) else {
+                return (false, nil)
+            }
+        }
+        guard let config = try? Data(contentsOf: snapshot.appendingPathComponent("config.json")),
+              (try? JSONSerialization.jsonObject(with: config)) is [String: Any] else {
             return (false, nil)
         }
-
-        let bytes = directorySize(parakeetDir)
-        return (bytes > 0, bytes)
+        return (true, directorySize(parakeetDir))
     }
 
     /// True for the Parakeet model — its storage is managed by the Python
@@ -446,25 +560,27 @@ final class ModelManager: ObservableObject {
         refreshStatus(.appleSpeech)
     }
 
-    /// Existing installs with a model already on disk keep their selected
-    /// engine. This is intentionally synchronous so SettingsStore can make its
-    /// first-run decision before ModelManager is constructed.
-    nonisolated static func hasAnyDownloadedModel() -> Bool {
+    /// Returns an available model in picker order without downloading anything.
+    /// Settings resolves before ModelManager migrates the legacy cache, so use
+    /// the same repository precedence as migration and retain the variant ID.
+    nonisolated static func firstDownloadedModel() -> LocalModel? {
         let newRepo = downloadBase.appendingPathComponent("models/\(repo)", isDirectory: true)
         let completion = newRepo.deletingLastPathComponent()
             .appendingPathComponent(".\(newRepo.lastPathComponent)-migration-complete")
-        // Settings resolves before migration. Count pending legacy downloads,
-        // but never revive an orphan after a completed migration and deletion.
+        let whisperRepo: URL
+        // A usable current cache wins; completed migrations must never revive
+        // a legacy orphan after the user deletes the current model.
         if !FileManager.default.fileExists(atPath: completion.path),
-           whisperKitRepoHasUsableContent(
-               legacyDocumentsHuggingFaceBase.appendingPathComponent("models/\(repo)", isDirectory: true)
-           ) {
-            return true
+           !whisperKitRepoHasUsableContent(newRepo) {
+            whisperRepo = legacyDocumentsHuggingFaceBase
+                .appendingPathComponent("models/\(repo)", isDirectory: true)
+        } else {
+            whisperRepo = newRepo
         }
-        return LocalModel.allCases.contains { model in
+        return LocalModel.allCases.first { model in
             guard model != .appleSpeech else { return false }
-            if let folder = modelFolderURL(for: model) {
-                return variantFolderHasModelPayload(folder)
+            if let variant = model.whisperKitModelID {
+                return variantFolderHasModelPayload(whisperRepo.appendingPathComponent(variant, isDirectory: true))
             }
             return parakeetCacheInfo().0
         }
@@ -475,8 +591,8 @@ final class ModelManager: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let transcriber = try await AppleSpeechEngine.transcriber(language: language)
-                let status = await AssetInventory.status(forModules: [transcriber])
+                let locale = try await self.appleSpeechInventory.locale(for: language)
+                let status = await self.appleSpeechInventory.status(for: locale)
                 guard self.appleSpeechLanguage == language else { return }
                 self.applyAppleSpeechAssetStatus(status, language: language)
             } catch {
@@ -531,8 +647,12 @@ final class ModelManager: ObservableObject {
         let task = Task { [weak self] in
             guard let self else { return }
             do {
-                let transcriber = try await AppleSpeechEngine.transcriber(language: language)
-                let currentStatus = await AssetInventory.status(forModules: [transcriber])
+                let locale = try await self.appleSpeechInventory.locale(for: language)
+                try await self.appleSpeechUsage.releaseUnused(
+                    inventory: self.appleSpeechInventory,
+                    selectedLanguage: { self.appleSpeechLanguage }
+                )
+                let currentStatus = await self.appleSpeechInventory.status(for: locale)
                 guard self.appleSpeechLanguage == language else {
                     self.finishAppleSpeechAssetRequest()
                     self.refreshAppleSpeechAssetStatus()
@@ -548,7 +668,7 @@ final class ModelManager: ObservableObject {
                 self.downloaded[model] = false
                 self.state[model] = .downloading
                 self.downloadProgress[model] = 0
-                guard let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else {
+                guard let request = try await self.appleSpeechInventory.installationRequest(for: locale) else {
                     self.downloadTasks[model] = nil
                     self.refreshAppleSpeechAssetStatus()
                     return
