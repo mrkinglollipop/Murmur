@@ -85,12 +85,8 @@ final class XAIIngestionCoverageTests: XCTestCase {
         session.handleServerEvent(#"{"type":"transcript.done","text":"Send invoice to Robert."}"#)
         let snapshot = session.joinedTranscriptSnapshot()
         let result = await session.finalize()
-        // R-56: transcript.done assigns confirmedText without clearing
-        // latestInterim, so the pre-resolved finalize path appends the old name.
-        XCTExpectFailure("R-56: corrected transcript.done retains stale interim text") {
-            XCTAssertEqual(snapshot, "Send invoice to Robert.")
-            XCTAssertEqual(result, "Send invoice to Robert.")
-        }
+        XCTAssertEqual(snapshot, "Send invoice to Robert.")
+        XCTAssertEqual(result, "Send invoice to Robert.")
     }
 
     func testParseWordsAcceptsNumericTimestampsAndSkipsMalformedEntries() {
