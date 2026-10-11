@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import Voice
 
@@ -47,11 +48,201 @@ final class XAIIngestionCoverageTests: XCTestCase {
         let session = XAIStreamingTranscriber(apiKey: "unused")
         session.handleServerEvent(try partial(" \n\t ", final: true, speechFinal: true))
         XCTAssertEqual(session.joinedTranscriptSnapshot().trimmingCharacters(in: .whitespacesAndNewlines), "")
-        // Bug: handleServerEvent marks everHadNonEmptyStreamText before
-        // trimming a final partial; whitespace can defeat the silence bypass.
-        XCTExpectFailure("Whitespace-only xAI final incorrectly counts as speech") {
-            XCTAssertFalse(session.hasEverHadNonEmptyStreamText)
+        XCTAssertFalse(session.hasEverHadNonEmptyStreamText)
+    }
+
+    private func whitespaceSession() throws -> XAIStreamingTranscriber {
+        let session = XAIStreamingTranscriber(apiKey: "unused", finalizeBudgetOverride: 0.01)
+        for text in [" \n\t ", "\r\n", "\u{00a0}\u{2003}"] {
+            session.handleServerEvent(try partial(text, final: true, speechFinal: true))
         }
+        return session
+    }
+
+    func testWhitespaceOnlyFinalsStayEmptyAcrossFinalizePaths() async throws {
+        for path in ["done", "timeout", "error", "sendFailure"] {
+            let session: XAIStreamingTranscriber
+            if path == "sendFailure" {
+                session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in
+                    throw URLError(.cannotConnectToHost)
+                })
+                session.handleServerEvent(try partial(" \n\t ", final: true))
+            } else {
+                session = try whitespaceSession()
+            }
+            if path == "done" {
+                session.handleServerEvent(#"{"type":"transcript.done","text":" \t\n "}"#)
+            } else if path == "error" {
+                session.handleServerEvent(#"{"type":"error","message":"fixture"}"#)
+            }
+            XCTAssertFalse(session.hasEverHadNonEmptyStreamText, path)
+            XCTAssertEqual(session.joinedTranscriptSnapshot().trimmingCharacters(in: .whitespacesAndNewlines), "", path)
+            let result = await session.finalize()
+            XCTAssertEqual(result, "", path)
+            XCTAssertFalse(session.hasEverHadNonEmptyStreamText, path)
+            XCTAssertEqual(session.joinedTranscriptSnapshot(), "", path)
+            let repeatedResult = await session.finalize()
+            XCTAssertEqual(repeatedResult, "", path)
+            XCTAssertEqual(session.requiresBufferedAudioRecovery, path != "done", path)
+        }
+    }
+
+    func testWhitespacePartialAndFinalPreserveRealInterim() async throws {
+        for final in [false, true] {
+            let session = XAIStreamingTranscriber(apiKey: "unused")
+            session.handleServerEvent(try partial("Keep these words"))
+            session.handleServerEvent(try partial(" \n\t ", final: final, speechFinal: final))
+            XCTAssertEqual(session.joinedTranscriptSnapshot(), "Keep these words")
+            XCTAssertTrue(session.hasEverHadNonEmptyStreamText)
+            session.handleServerEvent(#"{"type":"transcript.done"}"#)
+            let result = await session.finalize()
+            XCTAssertEqual(result, "Keep these words")
+        }
+    }
+
+    func testWhitespaceInterimDoesNotCreateSpeech() throws {
+        let session = XAIStreamingTranscriber(apiKey: "unused")
+        session.handleServerEvent(try partial(" \n\t "))
+        XCTAssertFalse(session.hasEverHadNonEmptyStreamText)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "")
+    }
+
+    private func audioBuffer(seconds: Double) throws -> AVAudioPCMBuffer {
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+        let frames = AVAudioFrameCount(16_000 * seconds)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames))
+        buffer.frameLength = frames
+        buffer.floatChannelData![0].initialize(repeating: 0, count: Int(frames))
+        return buffer
+    }
+
+    func testWhitespaceOnlyFinalsTakeSameTinyHoldSilencePathAsNoTranscript() async throws {
+        for seconds in [0.0, 0.33, StreamingCoordinator.silenceCancelMaxBufferedSeconds] {
+            for whitespace in [false, true] {
+                let session = whitespace ? try whitespaceSession() : XAIStreamingTranscriber(apiKey: "unused")
+                session.handleServerEvent(#"{"type":"transcript.done"}"#)
+                let coordinator = StreamingCoordinator(xaiSession: session)
+                let buffers = seconds == 0 ? [] : [try audioBuffer(seconds: seconds)]
+                let stopped = expectation(description: "empty tiny hold stopped")
+                var silences = 0
+                XCTAssertTrue(coordinator.handleStopXAI(
+                    context: .init(duration: seconds, hadSpeech: false, bufferedAudio: buffers, streamTextEver: false),
+                    onSilence: { silences += 1; stopped.fulfill() },
+                    onStreamSuccess: { _ in XCTFail("Whitespace must not be stream success"); stopped.fulfill() },
+                    onBatchFallback: { _, _ in XCTFail("Empty tiny holds must not enter batch"); stopped.fulfill() }
+                ))
+                await fulfillment(of: [stopped], timeout: 2)
+                XCTAssertEqual(silences, 1)
+                XCTAssertNil(coordinator.xaiSession)
+            }
+        }
+    }
+
+    private struct EmptyCloud: CloudTranscriptionService {
+        func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String {
+            try XAITranscriptionService.decodeTranscript(from: Data(#"{"text":" \t\n "}"#.utf8))
+        }
+    }
+
+    private struct LocalStub: ASREngine {
+        let id = "whitespace-local-stub"
+        let displayName = "Whitespace local stub"
+        let text: String
+        func transcribe(audioURL: URL) async throws -> String { text }
+    }
+
+    @MainActor
+    func testWhitespaceOnlyFinalsPreserveBatchRecoveryAndHistoryLikeNoTranscript() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent(".xai-whitespace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("audio.caf")
+        try Data([1, 2, 3, 4]).write(to: audioURL)
+        for recoveredText in [" \n\t ", "Recovered quiet speech."] {
+            for whitespace in [false, true] {
+                let historyURL = directory.appendingPathComponent("\(UUID().uuidString).json")
+                let history = HistoryStore(fileURL: historyURL)
+                let session = whitespace ? try whitespaceSession() : XAIStreamingTranscriber(apiKey: "unused")
+                session.handleServerEvent(#"{"type":"transcript.done"}"#)
+                XCTAssertFalse(session.hasEverHadNonEmptyStreamText)
+                let coordinator = StreamingCoordinator(xaiSession: session)
+                let selector = ASREngineSelector()
+                selector.cloudModel = .xaiGrokSTT
+                selector.apiKeyProvider = { _ in "dummy-test-key" }
+                let pipeline = selector.pipeline
+                pipeline.cleanupEnabled = false
+                pipeline.cloudServiceProvider = { _ in EmptyCloud() }
+                pipeline.localEngineProvider = { LocalStub(text: recoveredText) }
+                pipeline.onTranscriptionLogged = { text, engine, injected, path, failed, replacement in
+                    history.append(text: text, engine: engine, injected: injected, audioPath: path,
+                                   failed: failed, replaceEntryID: replacement)
+                }
+                pipeline.onAbandonedHoldSaved = { text, engine, path in
+                    history.append(text: text, engine: engine, injected: false, audioPath: path,
+                                   savedWithoutInsertion: true)
+                }
+                pipeline.onFailure = { _ in XCTFail("Empty batch recovery must stay quiet") }
+                pipeline.onTextInserted = { _ in XCTFail("Background recovery must not inject") }
+                let token = pipeline.test_holdSnapshot(.unknown)
+                let completed = expectation(description: "empty stream recovered through batch and History")
+                let buffer = try audioBuffer(seconds: 1.93)
+                var fallbacks = 0
+                XCTAssertTrue(coordinator.handleStopXAI(
+                    context: .init(duration: 1.93, hadSpeech: false, bufferedAudio: [buffer], streamTextEver: false),
+                    onSilence: { XCTFail("Quiet buffered audio must be rescued"); completed.fulfill() },
+                    onStreamSuccess: { _ in XCTFail("Whitespace must not reach stream success"); completed.fulfill() },
+                    onBatchFallback: { buffers, duration in
+                        fallbacks += 1
+                        XCTAssertEqual(buffers.count, 1)
+                        XCTAssertTrue(buffers.first === buffer)
+                        XCTAssertEqual(duration, 1.93)
+                        pipeline.transcribeAndLog(audioURL: audioURL, sessionHeldToken: token) { result in
+                            XCTAssertEqual(result, recoveredText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                           ? .failed : .savedToHistory)
+                            completed.fulfill()
+                        }
+                    }
+                ))
+                await fulfillment(of: [completed], timeout: 3)
+                XCTAssertEqual(fallbacks, 1)
+                XCTAssertNil(coordinator.xaiSession)
+                let entry = try XCTUnwrap(history.entries.first)
+                XCTAssertEqual(history.entries.count, 1)
+                XCTAssertFalse(entry.injected)
+                XCTAssertEqual(entry.audioPath, audioURL.path)
+                XCTAssertEqual(entry.failed, recoveredText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                XCTAssertEqual(entry.savedWithoutInsertion, !entry.failed)
+                XCTAssertEqual(entry.text, entry.failed ? HistoryEntry.failedPlaceholderText : recoveredText)
+                history.flush()
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = .sortedKeys
+                XCTAssertEqual(try encoder.encode(HistoryStore(fileURL: historyURL).entries),
+                               try encoder.encode(history.entries))
+            }
+        }
+    }
+
+    func testOtherRealtimeProvidersIgnoreWhitespaceFinals() {
+        let eleven = ElevenLabsRealtimeTranscriber(apiKey: "unused")
+        eleven.handleServerEvent(#"{"message_type":"committed_transcript","text":" \t\n "}"#)
+        XCTAssertFalse(eleven.hasEverHadNonEmptyStreamText)
+        XCTAssertEqual(eleven.joinedTranscriptSnapshot(), "")
+        eleven.cancel()
+
+        let gemini = GeminiLiveTranscriber(apiKey: "unused")
+        gemini.handleServerEvent(#"{"serverContent":{"inputTranscription":{"text":" \t\n "},"turnComplete":true}}"#)
+        XCTAssertFalse(gemini.hasEverHadNonEmptyStreamText)
+        XCTAssertEqual(gemini.joinedTranscriptSnapshot(), "")
+        gemini.cancel()
+
+        let muse = MuseLiveTranscriber(apiKey: "unused")
+        muse.handleServerEvent(#"{"type":"transcript","transcript":" \t\n ","final":true}"#)
+        muse.handleServerEvent(#"{"type":"speechComplete","transcript":" \t\n "}"#)
+        XCTAssertFalse(muse.hasEverHadNonEmptyStreamText)
+        XCTAssertEqual(muse.joinedTranscriptSnapshot(), "")
+        muse.cancel()
     }
 
     func testSpeechFinalCumulativeTextReplacesEarlierChunkWithoutDuplication() throws {

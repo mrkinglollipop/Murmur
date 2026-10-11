@@ -726,7 +726,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             let words = Self.parseWords(from: json)
 
             stateLock.lock()
-            if !partialText.isEmpty {
+            if !partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 latestInterim = partialText
                 latestInterimWords = words
                 everHadNonEmptyStreamText = true
