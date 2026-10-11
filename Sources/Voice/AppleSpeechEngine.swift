@@ -12,18 +12,28 @@ final class AppleSpeechEngine: ASREngine {
     /// updates this before every reuse.
     var language: String
 
-    init(language: String = "en") {
+    private let transcribeAudio: @Sendable (AVAudioFile, String) async throws -> String
+    private let deadline: LocalTranscriptionDeadline.Runner
+
+    init(
+        language: String = "en",
+        transcribeAudio: (@Sendable (AVAudioFile, String) async throws -> String)? = nil,
+        deadline: @escaping LocalTranscriptionDeadline.Runner = LocalTranscriptionDeadline.run
+    ) {
         self.language = language
+        self.transcribeAudio = transcribeAudio ?? Self.transcribe
+        self.deadline = deadline
     }
 
     func transcribe(audioURL: URL) async throws -> String {
         let audioFile = try AVAudioFile(forReading: audioURL)
         let language = language
-        return try await LocalTranscriptionDeadline.run(
-            seconds: LocalTranscriptionDeadline.seconds(for: audioFile),
-            engineName: displayName
+        let transcribeAudio = transcribeAudio
+        return try await deadline(
+            LocalTranscriptionDeadline.seconds(for: audioFile),
+            displayName
         ) {
-            try await Self.transcribe(audioFile: audioFile, language: language)
+            try await transcribeAudio(audioFile, language)
         }
     }
 
