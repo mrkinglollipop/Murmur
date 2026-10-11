@@ -14,8 +14,145 @@ final class VoiceEditTests: XCTestCase {
             location: location,
             selectionLength: selectionLength,
             precedingChar: .startOfField,
-            isUnknown: false
+            isUnknown: false,
+            focusedElement: AXUIElementCreateApplication(42)
         )
+    }
+
+    private final class DeliveryObserver: TextInjectionObserver {
+        var observedUTF16Units = 0
+        var observedPasteChordCount = 0
+        var keycodeZeroKeyDownCount = 0
+        var canaryObservedCount = 0
+        var wentBlind = false
+        func resetObservedCount() { observedUTF16Units = 0 }
+        func resetCanaryCount() { canaryObservedCount = 0 }
+        func stop() {}
+    }
+
+    /// The pipeline and injector stay real; only AX reads and OS event emission
+    /// are replaced. Synthetic AX objects stand for fields, independent of PID.
+    @MainActor
+    private func assertBoundDelivery(
+        edit: Bool = false,
+        heldIdentityAvailable: Bool = true,
+        heldUnknown: Bool = false,
+        switchBeforeDelivery: Bool = false,
+        switchAfterFirstChunk: Bool = false,
+        loseIdentityBeforeDelivery: Bool = false,
+        bundleIdentifier: String = "fixture",
+        expectedChunks: Int,
+        expectedOutcome: TranscriptionPipeline.InjectPipelineResult
+    ) {
+        TextInjector.resetDedupeStateForTesting()
+        defer { TextInjector.resetDedupeStateForTesting() }
+        let board = NSPasteboard(name: .init("murmur.bound-delivery.\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        let text = edit ? String(repeating: "x", count: 33) : "text"
+        var held = heldUnknown ? CaretContext.Snapshot.unknown : snapshot(
+            value: edit ? String(repeating: "a", count: 33) : "",
+            location: 0, selectionLength: .readable(edit ? 33 : 0)
+        )
+        if !heldIdentityAvailable { held.focusedElement = nil }
+        var fresh = held
+        if switchBeforeDelivery { fresh.focusedElement = AXUIElementCreateApplication(43) }
+        if loseIdentityBeforeDelivery { fresh.focusedElement = nil }
+        let pipeline = TranscriptionPipeline()
+        pipeline.smartLeadingSpaceEnabled = false
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        XCTAssertEqual(pipeline.isVoiceEditHold(token), edit)
+        pipeline.runVoiceEditTransform = { _, _, _ in text }
+        let observer = DeliveryObserver()
+        var chunks: [[UniChar]] = []
+        var pastePosts = 0
+        pipeline.deliveryHooks = .init(
+            injector: .init(
+                pasteboard: board,
+                target: { .init(secureInput: false, pid: 42, bundleIdentifier: bundleIdentifier) },
+                createObserver: { observer },
+                postUnicode: { _ in XCTFail("Must exercise the production chunk loop"); return 0 },
+                postPasteChord: { pastePosts += 1; return false },
+                postCanary: { XCTFail("Confirmed chunks must not need a canary"); return false },
+                waitForConfirmation: { _, _ in observer.observedUTF16Units },
+                postUnicodeChunk: { units in
+                    chunks.append(units)
+                    observer.observedUTF16Units += units.count
+                    // The injector itself changes the original selection. That
+                    // must not invalidate subsequent chunks in the same field.
+                    fresh = CaretContext.Snapshot(
+                        value: String(decoding: chunks.flatMap { $0 }, as: UTF16.self),
+                        location: observer.observedUTF16Units,
+                        selectionLength: .readable(0), precedingChar: .known("x"),
+                        isUnknown: false, focusedElement: fresh.focusedElement
+                    )
+                    if switchAfterFirstChunk, chunks.count == 1 {
+                        fresh.focusedElement = AXUIElementCreateApplication(43)
+                    }
+                }
+            ),
+            snapshot: { fresh }
+        )
+        let completed = expectation(description: "bound delivery completed")
+        pipeline.finishTranscription(
+            text: edit ? "rewrite this" : text,
+            hadExplicitTrailingNewline: false, engineID: "fixture", audioPath: nil,
+            replaceHistoryEntryID: nil, sessionHeldToken: token,
+            sessionHeldSnapshot: held, sessionHeldFrontmostPID: 42,
+            completion: { outcome in
+                XCTAssertEqual(outcome, expectedOutcome)
+                completed.fulfill()
+            }
+        )
+        wait(for: [completed], timeout: 10)
+        XCTAssertEqual(chunks.count, expectedChunks)
+        XCTAssertEqual(pastePosts, 0)
+        XCTAssertEqual(chunks.flatMap { $0 }, Array(text.utf16.prefix(expectedChunks == 1 && edit ? 16 : expectedChunks * 16)))
+    }
+
+    @MainActor
+    func testOrdinaryDictationRejectsAnotherFieldUnderSamePIDThroughPipeline() {
+        assertBoundDelivery(switchBeforeDelivery: true, expectedChunks: 0, expectedOutcome: .failed)
+    }
+
+    @MainActor
+    func testOrdinaryDictationKeepsCapturedFieldThroughPipeline() {
+        assertBoundDelivery(expectedChunks: 1, expectedOutcome: .inserted)
+    }
+
+    @MainActor
+    func testOrdinaryDictationUsesPIDFallbackWithoutAXIdentityThroughPipeline() {
+        for bundle in ["com.todesktop.230313mzl4w4u92", "com.google.Chrome", "com.apple.Terminal"] {
+            assertBoundDelivery(heldIdentityAvailable: false, bundleIdentifier: bundle,
+                expectedChunks: 1, expectedOutcome: .inserted)
+            assertBoundDelivery(heldIdentityAvailable: false, heldUnknown: true, bundleIdentifier: bundle,
+                expectedChunks: 1, expectedOutcome: .inserted)
+        }
+    }
+
+    @MainActor
+    func testOrdinaryDictationRejectsLostCapturedIdentityThroughPipeline() {
+        assertBoundDelivery(loseIdentityBeforeDelivery: true, expectedChunks: 0, expectedOutcome: .failed)
+    }
+
+    @MainActor
+    func testLongVoiceEditStopsAfterFieldSwitchInProductionChunkLoop() {
+        assertBoundDelivery(edit: true, switchAfterFirstChunk: true,
+            expectedChunks: 1, expectedOutcome: .failed)
+    }
+
+    @MainActor
+    func testLongVoiceEditContinuesAfterItsOwnSelectionMutation() {
+        assertBoundDelivery(edit: true, expectedChunks: 3, expectedOutcome: .inserted)
+    }
+
+    func testIdenticalSelectionInDifferentFocusedElementIsRejected() {
+        let held = snapshot(value: "same same", location: 0, selectionLength: .readable(4))
+        var otherField = held
+        otherField.focusedElement = AXUIElementCreateApplication(43)
+        XCTAssertFalse(VoiceEditRouting.selectionMatches(held: held, fresh: otherField))
+        var unknownField = held
+        unknownField.focusedElement = nil
+        XCTAssertFalse(VoiceEditRouting.selectionMatches(held: unknownField, fresh: unknownField))
     }
 
     func testRouting_editsReadableNonemptySelectionWhenEnabled() {
@@ -313,6 +450,52 @@ final class VoiceEditTests: XCTestCase {
         }
         if startNewHold { XCTAssertEqual(pipeline.test_heldCaretSnapshot, held) }
         else { XCTAssertNil(pipeline.test_heldCaretSnapshot) }
+    }
+
+    @MainActor
+    func testIdenticalContentInAnotherFieldOfSameAppDoesNotInject() {
+        var otherField = snapshot(value: "Old words here.", location: 0, selectionLength: .readable(15))
+        otherField.focusedElement = AXUIElementCreateApplication(43)
+        assertEditDelivery(fresh: otherField, currentPID: 42, expectedOutcome: .failed,
+            expectedFailure: .injectionFailed, expectedClipboard: "New words here.")
+    }
+
+    @MainActor
+    func testEditBoundaryWhitespaceSurvivesLiveHoldSnapshotFallback() {
+        let pipeline = TranscriptionPipeline()
+        let held = snapshot(value: "big cat sat", location: 0, selectionLength: .readable(8))
+        let token = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 42)
+        var field = held.value
+        var inserts = 0
+        pipeline.runVoiceEditTransform = { _, selection, _ in
+            XCTAssertEqual(selection, "big cat ")
+            return "small cat"
+        }
+        pipeline.voiceEditInjectionHooks = .init(
+            target: { .init(secureInput: false, pid: 42, bundleIdentifier: "fixture") },
+            snapshot: { held },
+            insert: { text in
+                inserts += 1
+                field = (field as NSString).replacingCharacters(in: NSRange(location: 0, length: 8), with: text)
+                return .inserted(deliveredText: text)
+            },
+            leaveOnClipboard: { _ in XCTFail("Unchanged selection must inject") }
+        )
+        pipeline.onVoiceEditLogged = { text, _, _, injected, _ in
+            XCTAssertEqual(text, "small cat ")
+            XCTAssertTrue(injected)
+        }
+        let completed = expectation(description: "edit with live snapshot fallback")
+        pipeline.finishTranscription(text: "make it smaller", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: token, sessionHeldSnapshot: nil, sessionHeldFrontmostPID: 42,
+            completion: { result in
+                XCTAssertEqual(result, .inserted)
+                completed.fulfill()
+            })
+        wait(for: [completed], timeout: 5)
+        XCTAssertEqual(inserts, 1)
+        XCTAssertEqual(field, "small cat sat")
     }
 
     @MainActor
