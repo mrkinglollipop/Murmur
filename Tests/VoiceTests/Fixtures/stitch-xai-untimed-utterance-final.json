@@ -1,0 +1,25 @@
+{
+  "name": "xai-untimed-utterance-final-owns-chunk",
+  "events": [
+    {
+      "type": "final",
+      "text": "Please send the report tomorrow",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Please send the report tomorrow.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Please send the report tomorrow.",
+  "requiresRecovery": false
+}

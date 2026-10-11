@@ -1,0 +1,82 @@
+{
+  "name": "xai-distinct-utterances-remain-distinct",
+  "events": [
+    {
+      "type": "final",
+      "text": "The dose should increase again this morning.",
+      "speechFinal": true,
+      "words": [
+        { "text": "The", "start": 0, "end": 0.1 },
+        { "text": "dose", "start": 0.1, "end": 0.3 },
+        { "text": "should", "start": 0.3, "end": 0.5 },
+        { "text": "increase", "start": 0.5, "end": 0.8 },
+        { "text": "again", "start": 0.8, "end": 1.0 },
+        { "text": "this", "start": 1.0, "end": 1.1 },
+        { "text": "morning", "start": 1.1, "end": 1.4 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "The dose should decrease again this morning.",
+      "speechFinal": true,
+      "words": [
+        { "text": "The", "start": 0, "end": 0.1 },
+        { "text": "dose", "start": 0.1, "end": 0.3 },
+        { "text": "should", "start": 0.3, "end": 0.5 },
+        { "text": "decrease", "start": 0.5, "end": 0.8 },
+        { "text": "again", "start": 0.8, "end": 1.0 },
+        { "text": "this", "start": 1.0, "end": 1.1 },
+        { "text": "morning", "start": 1.1, "end": 1.4 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "I will send the report.",
+      "speechFinal": true,
+      "words": [
+        { "text": "I", "start": 0, "end": 0.1 },
+        { "text": "will", "start": 0.1, "end": 0.3 },
+        { "text": "send", "start": 0.3, "end": 0.5 },
+        { "text": "the", "start": 0.5, "end": 0.6 },
+        { "text": "report", "start": 0.6, "end": 0.9 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "I will send the report only after approval.",
+      "speechFinal": true,
+      "words": [
+        { "text": "I", "start": 0, "end": 0.1 },
+        { "text": "will", "start": 0.1, "end": 0.3 },
+        { "text": "send", "start": 0.3, "end": 0.5 },
+        { "text": "the", "start": 0.5, "end": 0.6 },
+        { "text": "report", "start": 0.6, "end": 0.9 },
+        { "text": "only", "start": 0.9, "end": 1.1 },
+        { "text": "after", "start": 1.1, "end": 1.3 },
+        { "text": "approval", "start": 1.3, "end": 1.6 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "Repeat after me.",
+      "speechFinal": true,
+      "words": [
+        { "text": "Repeat", "start": 0, "end": 0.3 },
+        { "text": "after", "start": 0.3, "end": 0.5 },
+        { "text": "me", "start": 0.5, "end": 0.7 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "Repeat after me.",
+      "speechFinal": true,
+      "words": [
+        { "text": "Repeat", "start": 0, "end": 0.3 },
+        { "text": "after", "start": 0.3, "end": 0.5 },
+        { "text": "me", "start": 0.5, "end": 0.7 }
+      ]
+    }
+  ],
+  "expected": "The dose should increase again this morning. The dose should decrease again this morning. I will send the report. I will send the report only after approval. Repeat after me. Repeat after me.",
+  "requiresRecovery": false
+}

@@ -32,5 +32,7 @@
       "speechFinal": false
     }
   ],
-  "expected": "Yes. Call Alice."
+  "expected": "Yes. Call Alice.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
 }

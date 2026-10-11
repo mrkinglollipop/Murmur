@@ -1,0 +1,25 @@
+{
+  "name": "xai-done-replaces-owned-interim",
+  "events": [
+    {
+      "type": "interim",
+      "text": "Please send the report tomorrow.",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "Please send the report tomorrow.",
+      "speechFinal": false,
+      "words": [
+        { "text": "Please", "start": 0, "end": 0.2 },
+        { "text": "send", "start": 0.2, "end": 0.4 },
+        { "text": "the", "start": 0.4, "end": 0.5 },
+        { "text": "report", "start": 0.5, "end": 0.8 },
+        { "text": "tomorrow", "start": 0.8, "end": 1.1 }
+      ]
+    }
+  ],
+  "expected": "Please send the report tomorrow.",
+  "requiresRecovery": false
+}

@@ -269,7 +269,7 @@ final class XAIIngestionCoverageTests: XCTestCase {
         XCTAssertEqual(result, "first words another tail")
         XCTAssertEqual(session.joinedTranscriptSnapshot(), "")
         XCTAssertFalse(session.hasEverHadNonEmptyStreamText)
-        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery, "Ambiguous untimed final and interim require recovery after reset.")
     }
 
     func testCorrectedDoneDoesNotReappendStaleInterim() async throws {
@@ -280,6 +280,55 @@ final class XAIIngestionCoverageTests: XCTestCase {
         let result = await session.finalize()
         XCTAssertEqual(snapshot, "Send invoice to Robert.")
         XCTAssertEqual(result, "Send invoice to Robert.")
+    }
+
+    func testAmbiguousDoneHandsConservativeTextToBufferedRecovery() async throws {
+        let session = XAIStreamingTranscriber(apiKey: "unused")
+        session.handleServerEvent(try partial("I will send the report tomorrow.", final: true, speechFinal: true,
+                                              words: [["text": "I", "start": 0, "end": 0.1],
+                                                      ["text": "will", "start": 0.1, "end": 0.3],
+                                                      ["text": "send", "start": 0.3, "end": 0.5],
+                                                      ["text": "the", "start": 0.5, "end": 0.6],
+                                                      ["text": "report", "start": 0.6, "end": 0.9],
+                                                      ["text": "tomorrow", "start": 0.9, "end": 1.2]]))
+        session.handleServerEvent(#"{"type":"transcript.done","text":"I will send the report only after approval."}"#)
+        let conservative = "I will send the report tomorrow."
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), conservative)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+
+        let coordinator = StreamingCoordinator(xaiSession: session)
+        let buffer = try audioBuffer(seconds: 1.0)
+        let handedOff = expectation(description: "ambiguous done handed to buffered recovery")
+        XCTAssertTrue(coordinator.handleStopXAI(
+            context: .init(duration: 1.0, hadSpeech: true, bufferedAudio: [buffer], streamTextEver: true),
+            onSilence: { XCTFail("Nonempty conservative text must not be discarded") },
+            onStreamSuccess: { _ in XCTFail("Ambiguous done must not be delivered as stream success") },
+            onBatchFallback: { buffers, duration in
+                XCTAssertEqual(buffers.count, 1)
+                XCTAssertTrue(buffers.first === buffer)
+                XCTAssertEqual(duration, 1.0)
+                handedOff.fulfill()
+            }
+        ))
+        await fulfillment(of: [handedOff], timeout: 2)
+        XCTAssertNil(coordinator.xaiSession)
+    }
+
+    func testAmbiguousDoneFinalizePreservesConservativeText() async throws {
+        let session = XAIStreamingTranscriber(apiKey: "unused")
+        session.handleServerEvent(try partial("I will send the report tomorrow.", final: true, speechFinal: true,
+                                              words: [["text": "I", "start": 0, "end": 0.1],
+                                                      ["text": "will", "start": 0.1, "end": 0.3],
+                                                      ["text": "send", "start": 0.3, "end": 0.5],
+                                                      ["text": "the", "start": 0.5, "end": 0.6],
+                                                      ["text": "report", "start": 0.6, "end": 0.9],
+                                                      ["text": "tomorrow", "start": 0.9, "end": 1.2]]))
+        session.handleServerEvent(#"{"type":"transcript.done","text":"I will send the report only after approval."}"#)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "I will send the report tomorrow.")
+        XCTAssertTrue(session.requiresBufferedAudioRecovery, "Reset must not clear the recovery latch.")
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "")
     }
 
     func testParseWordsAcceptsNumericTimestampsAndSkipsMalformedEntries() {

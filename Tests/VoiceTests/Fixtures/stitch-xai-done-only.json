@@ -1,0 +1,13 @@
+{
+  "name": "xai-done-only-full-session",
+  "events": [
+    {
+      "type": "done",
+      "text": "Please send the report tomorrow.",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Please send the report tomorrow.",
+  "requiresRecovery": false
+}
