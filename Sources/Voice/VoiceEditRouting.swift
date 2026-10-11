@@ -60,11 +60,16 @@ enum VoiceEditRouting {
         return (0.4...2.0).contains(ratio)
     }
 
+    static func fieldMatches(held: AXUIElement, fresh: AXUIElement?) -> Bool {
+        guard let fresh else { return false }
+        return CFEqual(held, fresh)
+    }
+
     /// Element identity, field value, and range must all match the hold-start
     /// snapshot. Another field with identical content is not the same selection.
     static func selectionMatches(held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot) -> Bool {
         guard let held, let heldElement = held.focusedElement,
-              let freshElement = fresh.focusedElement, CFEqual(heldElement, freshElement),
+              fieldMatches(held: heldElement, fresh: fresh.focusedElement),
               let selected = selectedText(in: held),
               selectedText(in: fresh) == selected else { return false }
         return held.value == fresh.value && held.location == fresh.location

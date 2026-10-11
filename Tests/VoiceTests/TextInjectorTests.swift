@@ -176,6 +176,45 @@ final class TextInjectorTests: XCTestCase {
         }
     }
 
+    func testSafariPasteRejectsClipboardOverwriteDuringSelectionValidation() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.bundleIdentifier = "com.apple.Safari"
+        harness.onWait = { _ in 1 }
+        XCTAssertEqual(harness.injector().insert("replacement longer than one chunk", expectedTargetPID: 123,
+            validateSelection: {
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("foreign payload", forType: .string)
+                return true
+            }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0, "No chord may consume the foreign payload")
+        XCTAssertEqual(harness.unicodePosts, 0)
+    }
+
+    func testBlindPasteRejectsClipboardOverwriteDuringSelectionValidation() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.observerAvailable = false
+        XCTAssertEqual(harness.injector().insert("replacement", expectedTargetPID: 123,
+            validateSelection: {
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("foreign payload", forType: .string)
+                return true
+            }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0, "No blind chord may consume the foreign payload")
+    }
+
+    func testPasteFallbackRejectsClipboardOverwriteDuringSelectionValidation() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.onWait = { _ in 1 }
+        XCTAssertEqual(harness.injector().insert("replacement", expectedTargetPID: 123,
+            validateSelection: {
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("foreign payload", forType: .string)
+                return true
+            }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0, "No fallback chord may consume the foreign payload")
+    }
+
     func testEditSelectionChangedAfterEntryPostsNoText() {
         let harness = InjectionHarness(pasteboard: testPasteboard)
         var selectionMatches = true

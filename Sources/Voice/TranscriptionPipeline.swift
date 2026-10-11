@@ -85,7 +85,24 @@ final class TranscriptionPipeline {
     }
     var voiceEditInjectionHooks: VoiceEditInjectionHooks?
 
+    /// Runs the real delivery pipeline with isolated AX and event dependencies.
+    struct DeliveryHooks {
+        let injector: TextInjector.Hooks
+        let snapshot: () -> CaretContext.Snapshot
+    }
+    var deliveryHooks: DeliveryHooks?
+
+    private func deliverySnapshot(frontmostPID: pid_t?) -> CaretContext.Snapshot {
+        deliveryHooks?.snapshot() ?? CaretContext.snapshot(frontmostPID: frontmostPID)
+    }
+
+    private func deliveryFocusedElement(frontmostPID: pid_t) -> AXUIElement? {
+        if let hooks = deliveryHooks { return hooks.snapshot().focusedElement }
+        return CaretContext.focusedElement(frontmostPID: frontmostPID)
+    }
+
     private func injectionTarget(voiceEdit: Bool) -> TextInjector.InjectionTarget {
+        if let hooks = deliveryHooks { return hooks.injector.target() }
         if voiceEdit, let hooks = voiceEditInjectionHooks { return hooks.target() }
         let app = NSWorkspace.shared.frontmostApplication
         return TextInjector.InjectionTarget(
@@ -97,6 +114,12 @@ final class TranscriptionPipeline {
 
     /// Main-thread secure re-read protects clipboard fallback as well as typing.
     private func leaveOnClipboardIfAllowed(_ text: String, voiceEdit: Bool) -> Bool {
+        if let hooks = deliveryHooks {
+            guard !hooks.injector.target().secureInput else { return true }
+            hooks.injector.pasteboard.clearContents()
+            hooks.injector.pasteboard.setString(text, forType: .string)
+            return false
+        }
         if !voiceEdit { return Self.appSwitchAbortLeaveOnMain(text: text) }
         guard !injectionTarget(voiceEdit: true).secureInput else { return true }
         if let hooks = voiceEditInjectionHooks { hooks.leaveOnClipboard(text) }
@@ -1040,7 +1063,7 @@ final class TranscriptionPipeline {
                         if needsFresh {
                             // Fresh AX read must hop to main — do not call AX only off utility.
                             fresh = DispatchQueue.main.sync {
-                                CaretContext.snapshot()
+                                self.deliveryHooks?.snapshot() ?? CaretContext.snapshot()
                             }
                         } else {
                             fresh = .unknown
@@ -1053,7 +1076,7 @@ final class TranscriptionPipeline {
                         // Re-sample secure immediately before transforms/gate (TOCTOU
                         // vs the early PID sample). PID abort was already decided.
                         liveSecure = DispatchQueue.main.sync {
-                            IsSecureEventInputEnabled()
+                            self.deliveryHooks?.injector.target().secureInput ?? IsSecureEventInputEnabled()
                         }
                         textToInject = Self.applyInjectTransforms(
                             expanded: Self.prepareResolvedSnapshotTextForInjection(
@@ -1110,7 +1133,7 @@ final class TranscriptionPipeline {
                                 return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
                             }
                             let fresh = self.voiceEditInjectionHooks?.snapshot()
-                                ?? CaretContext.snapshot(frontmostPID: heldPID)
+                                ?? self.deliverySnapshot(frontmostPID: heldPID)
                             guard sessionHeldToken == self.heldCaretToken,
                                   VoiceEditRouting.selectionMatches(held: heldAtStart, fresh: fresh) else {
                                 return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
@@ -1144,14 +1167,20 @@ final class TranscriptionPipeline {
                         if voiceEditInstruction != nil, let hooks = self.voiceEditInjectionHooks {
                             insertResult = hooks.insert(textToInject)
                         } else {
-                            insertResult = TextInjector().insert(
+                            insertResult = TextInjector(hooks: self.deliveryHooks?.injector).insert(
                                 textToInject,
                                 expectedTargetPID: deliveryPID,
                                 validateSelection: voiceEditInstruction == nil ? nil : {
                                     VoiceEditRouting.selectionMatches(
                                         held: heldAtStart,
-                                        fresh: CaretContext.snapshot(frontmostPID: deliveryPID)
+                                        fresh: self.deliverySnapshot(frontmostPID: deliveryPID)
                                     )
+                                },
+                                validateField: heldAtStart?.focusedElement.map { heldElement in
+                                    {
+                                        VoiceEditRouting.fieldMatches(held: heldElement,
+                                            fresh: self.deliveryFocusedElement(frontmostPID: deliveryPID))
+                                    }
                                 },
                                 preserveBoundaryWhitespace: voiceEditInstruction != nil
                             )
