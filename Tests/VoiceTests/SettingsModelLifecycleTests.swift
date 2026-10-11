@@ -17,6 +17,75 @@ final class SettingsModelLifecycleTests: XCTestCase {
     }
 
     @MainActor
+    func testLegacyDefaultWhisperSelectionSurvivesMigrationAndRelaunch() throws {
+        let suite = "murmur-model-upgrade-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let oldRepo = VoicePaths.legacyWhisperKitDirectory
+            .appendingPathComponent("models/argmaxinc/whisperkit-coreml")
+        let newRepo = ModelManager.downloadBase
+            .appendingPathComponent("models/argmaxinc/whisperkit-coreml")
+        let completion = newRepo.deletingLastPathComponent()
+            .appendingPathComponent(".whisperkit-coreml-migration-complete")
+        let fm = FileManager.default
+        for path in [oldRepo, newRepo, completion, VoicePaths.huggingFaceHubDirectory] {
+            XCTAssertTrue(path.path.hasPrefix(VoicePaths.applicationSupportVoiceDirectory.path))
+            _ = try XCTUnwrap(fm.fileExists(atPath: path.path) ? nil : true,
+                              "Requires an empty isolated model cache: \(path.path)")
+        }
+        let previous = RecordingRetention.recordingsDirectoryOverride
+        RecordingRetention.recordingsDirectoryOverride = directory
+        defer {
+            RecordingRetention.recordingsDirectoryOverride = previous
+            defaults.removePersistentDomain(forName: suite)
+            for path in [oldRepo, newRepo, completion] where fm.fileExists(atPath: path.path) {
+                try? fm.removeItem(at: path)
+            }
+        }
+        let variantName = try XCTUnwrap(LocalModel.default.whisperKitModelID)
+        let variant = oldRepo.appendingPathComponent(variantName)
+        try fm.createDirectory(at: variant, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: variant.appendingPathComponent("config.json"))
+        let metadataOnly = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                         apiKeyLookup: { _ in nil })
+        XCTAssertEqual(metadataOnly.selectedLocalModel, .appleSpeech)
+        try Data("weights".utf8).write(to: variant.appendingPathComponent("weights.bin"))
+
+        let explicitApple = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                          apiKeyLookup: { _ in nil })
+        XCTAssertEqual(explicitApple.selectedLocalModel, .appleSpeech)
+        defaults.removePersistentDomain(forName: suite)
+
+        // Use the production cache lookup before the manager's launch-time migration.
+        let store = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                  apiKeyLookup: { _ in nil })
+        XCTAssertEqual(store.selectedLocalModel, .default)
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), LocalModel.default.rawValue)
+
+        ModelManager.migrateWhisperKitModelsIfNeeded(from: oldRepo, to: newRepo)
+        XCTAssertFalse(fm.fileExists(atPath: oldRepo.path))
+        XCTAssertEqual(try Data(contentsOf: newRepo.appendingPathComponent("\(variantName)/weights.bin")),
+                       Data("weights".utf8))
+
+        let reloaded = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                     apiKeyLookup: { _ in nil })
+        XCTAssertEqual(reloaded.selectedLocalModel, .default)
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), LocalModel.default.rawValue)
+
+        // A completed migration must not make a deleted model look downloaded
+        // merely because an old cache remains (the both-caches-present case).
+        try fm.copyItem(at: newRepo, to: oldRepo)
+        try fm.removeItem(at: newRepo)
+        let afterDeletion = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                          apiKeyLookup: { _ in nil })
+        XCTAssertEqual(afterDeletion.selectedLocalModel, .default)
+        defaults.removePersistentDomain(forName: suite)
+        let fresh = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                  apiKeyLookup: { _ in nil })
+        XCTAssertEqual(fresh.selectedLocalModel, .appleSpeech)
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), LocalModel.appleSpeech.rawValue)
+    }
+
+    @MainActor
     func testFreshAppleSelectionSurvivesCloudToggleAndRelaunch() throws {
         let suite = "murmur-model-lifecycle-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
