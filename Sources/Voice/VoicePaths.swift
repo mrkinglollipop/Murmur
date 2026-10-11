@@ -28,6 +28,20 @@ enum VoicePaths {
         return directory
     }
 
+    static var legacyWhisperKitDirectory: URL {
+        let documents = isTestHost
+            ? applicationSupportVoiceDirectory.appendingPathComponent("Documents", isDirectory: true)
+            : FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return documents.appendingPathComponent("huggingface", isDirectory: true)
+    }
+
+    static var huggingFaceHubDirectory: URL {
+        let home = isTestHost
+            ? applicationSupportVoiceDirectory
+            : FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+    }
+
     static func prepareModelCacheDirectory(_ directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var cacheDirectory = directory
