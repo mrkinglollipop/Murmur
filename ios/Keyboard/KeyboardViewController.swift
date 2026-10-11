@@ -123,6 +123,13 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
+        invalidateTypedSuffixOwnership()
+        applyDocumentState()
+    }
+
+    override func selectionDidChange(_ textInput: UITextInput?) {
+        super.selectionDidChange(textInput)
+        invalidateTypedSuffixOwnership()
         applyDocumentState()
     }
 

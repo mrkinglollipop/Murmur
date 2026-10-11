@@ -123,6 +123,13 @@ protocol KeyboardEditing: AnyObject {
 }
 
 extension KeyboardEditing {
+    /// Host text/selection notifications invalidate position-based ownership.
+    /// Identical text at a different caret is not the keyboard's typed suffix.
+    /// Keep the bulk-insert window armed; unknown ownership must deny deletion.
+    func invalidateTypedSuffixOwnership() {
+        textAfterBulkInsert = ""
+    }
+
     func insertFromKeyboard(_ text: String) {
         if handleGifTyping(text) {
             playInputClick()

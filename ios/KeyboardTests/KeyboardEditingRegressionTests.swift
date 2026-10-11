@@ -3,6 +3,82 @@ import UIKit
 
 @MainActor
 final class KeyboardEditingRegressionTests: XCTestCase {
+    func testCorrectionUndoAtIdenticalDictatedSuffixDoesNotDelete() throws {
+        for clumpsBulkInserts in [false, true] {
+            let keyboard = TestKeyboard()
+            keyboard.proxy.clumpsBulkInserts = clumpsBulkInserts
+            keyboard.insertDictationText("keep the ")
+            keyboard.type("teh ")
+            XCTAssertEqual(keyboard.proxy.text, "keep the the ")
+            XCTAssertEqual(keyboard.textAfterBulkInsert, "the ")
+            let undo = try XCTUnwrap(keyboard.autocorrect.displayed.firstIndex(of: "teh"))
+            let deletes = keyboard.proxy.deleteCalls
+
+            keyboard.proxy.caret = "keep the ".count
+            keyboard.hostTextDidChange()
+            XCTAssertEqual(keyboard.autocorrect.displayed.firstIndex(of: "teh"), undo)
+            keyboard.applyCandidate(at: undo)
+
+            XCTAssertEqual(keyboard.proxy.deleteCalls, deletes)
+            XCTAssertEqual(keyboard.proxy.text, "keep the the ")
+            XCTAssertEqual(keyboard.textAfterBulkInsert, "")
+        }
+    }
+
+    func testBackspaceAtIdenticalDictatedSuffixCannotAuthorizeAutomaticCorrection() {
+        let keyboard = TestKeyboard()
+        keyboard.insertDictationText("keep tehx ")
+        keyboard.type("tehx")
+        let deletes = keyboard.proxy.deleteCalls
+
+        keyboard.proxy.caret = "keep tehx".count
+        keyboard.hostTextDidChange()
+        keyboard.deleteFromKeyboard()
+        keyboard.type(" ")
+
+        XCTAssertEqual(keyboard.proxy.deleteCalls, deletes + 1)
+        XCTAssertEqual(keyboard.proxy.text, "keep teh  tehx")
+        XCTAssertEqual(keyboard.textAfterBulkInsert, " ")
+    }
+
+    func testReturningCaretToIdenticalContextDoesNotRestoreOwnership() throws {
+        let keyboard = TestKeyboard()
+        keyboard.insertDictationText("keep the ")
+        keyboard.type("teh ")
+        let undo = try XCTUnwrap(keyboard.autocorrect.displayed.firstIndex(of: "teh"))
+        let deletes = keyboard.proxy.deleteCalls
+
+        keyboard.proxy.caret = "keep the ".count
+        keyboard.hostSelectionDidChange()
+        keyboard.proxy.caret = keyboard.proxy.text.count
+        keyboard.hostSelectionDidChange()
+        XCTAssertEqual(keyboard.autocorrect.displayed.firstIndex(of: "teh"), undo)
+        keyboard.applyCandidate(at: undo)
+
+        XCTAssertEqual(keyboard.proxy.deleteCalls, deletes)
+        XCTAssertEqual(keyboard.proxy.text, "keep the the ")
+        XCTAssertEqual(keyboard.textAfterBulkInsert, "")
+    }
+
+    func testClearingSelectionDoesNotRestoreTypedSuffixOwnership() throws {
+        let keyboard = TestKeyboard()
+        keyboard.insertDictationText("keep the ")
+        keyboard.type("teh ")
+        let undo = try XCTUnwrap(keyboard.autocorrect.displayed.firstIndex(of: "teh"))
+        let deletes = keyboard.proxy.deleteCalls
+
+        keyboard.proxy.selection = 9..<12
+        keyboard.hostSelectionDidChange()
+        keyboard.proxy.selection = nil
+        keyboard.hostSelectionDidChange()
+        XCTAssertEqual(keyboard.autocorrect.displayed.firstIndex(of: "teh"), undo)
+        keyboard.applyCandidate(at: undo)
+
+        XCTAssertEqual(keyboard.proxy.deleteCalls, deletes)
+        XCTAssertEqual(keyboard.proxy.text, "keep the the ")
+        XCTAssertEqual(keyboard.textAfterBulkInsert, "")
+    }
+
     func testBackspaceAtMovedCaretCannotAuthorizeCorrectionInsideDictation() {
         let keyboard = TestKeyboard()
         keyboard.insertDictationText("tehy ")
@@ -189,6 +265,14 @@ private final class TestKeyboard: KeyboardEditing {
     func choose(_ text: String) throws {
         let index = try XCTUnwrap(autocorrect.displayed.firstIndex(of: text))
         applyCandidate(at: index)
+    }
+    func hostTextDidChange() {
+        invalidateTypedSuffixOwnership()
+        refreshSuggestions()
+    }
+    func hostSelectionDidChange() {
+        invalidateTypedSuffixOwnership()
+        refreshSuggestions()
     }
     func handleGifTyping(_ text: String) -> Bool { false }
     func handleEmojiTyping(_ text: String) -> Bool { false }
