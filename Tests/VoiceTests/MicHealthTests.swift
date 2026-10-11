@@ -9,13 +9,33 @@ final class MicHealthTests: XCTestCase {
     private struct CapturedSpeechEngine: ASREngine {
         let id = "captured-speech-fixture"
         let displayName = "Captured speech fixture"
+        var started: XCTestExpectation? = nil
+        var gate: RecoveryGate? = nil
         func transcribe(audioURL: URL) async throws -> String {
             let file = try AVAudioFile(forReading: audioURL)
             let audio = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 160))
             try file.read(into: audio)
             XCTAssertEqual(audio.frameLength, 160)
             XCTAssertEqual(audio.floatChannelData![0][159], 0.0001, accuracy: 0.000001)
+            started?.fulfill()
+            await gate?.wait()
             return "Recovered speech."
+        }
+    }
+
+    private actor RecoveryGate {
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func release() {
+            released = true
+            continuation?.resume()
+            continuation = nil
         }
     }
 
@@ -31,7 +51,8 @@ final class MicHealthTests: XCTestCase {
     }
 
     @MainActor
-    func testTerminalRecoveryHandsCapturedSpeechToDeliveryOrHistoryExactlyOnce() async throws {
+    func testTerminalRecoverySavesCapturedSpeechWithoutInjectingAfterSelectionChanges() async throws {
+        XCTAssertTrue(isTestHost, "Recorder defaults must use the isolated test data directory")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mic-recovery-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let previous = RecordingRetention.recordingsDirectoryOverride
@@ -48,7 +69,10 @@ final class MicHealthTests: XCTestCase {
                 let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
                 let recorder = AudioRecorder(micCaptureTestHooks: hooks)
                 let pipeline = recorder.asrSelector.pipeline
-                pipeline.localEngineProvider = { CapturedSpeechEngine() }
+                let started = expectation(description: "Recovery ASR started")
+                let gate = RecoveryGate()
+                pipeline.localEngineProvider = { CapturedSpeechEngine(started: started, gate: gate) }
+                let history = HistoryStore(fileURL: directory.appendingPathComponent("history-\(UUID().uuidString).json"))
                 let held = CaretContext.Snapshot(value: "", location: 0, selectionLength: .readable(0),
                     precedingChar: .startOfField, isUnknown: false,
                     focusedElement: AXUIElementCreateApplication(42))
@@ -57,8 +81,11 @@ final class MicHealthTests: XCTestCase {
                 recorder.test_seedCachedSessionHold(token: token, snapshot: held, pid: 42)
                 let board = NSPasteboard(name: .init("mic-recovery-\(UUID().uuidString)"))
                 defer { board.releaseGlobally() }
+                board.setString("Existing clipboard", forType: .string)
                 let observer = RecoveryObserver()
                 var delivered = ""
+                var liveSnapshot = held
+                var snapshotReads = 0
                 pipeline.deliveryHooks = .init(injector: .init(
                     pasteboard: board,
                     target: { .init(secureInput: false, pid: switchedTarget ? 43 : 42, bundleIdentifier: "fixture") },
@@ -70,7 +97,7 @@ final class MicHealthTests: XCTestCase {
                     postUnicodeChunk: { units in
                         delivered += String(decoding: units, as: UTF16.self)
                         observer.observedUTF16Units += units.count
-                    }), snapshot: { held })
+                    }), snapshot: { snapshotReads += 1; return liveSnapshot })
                 var failures: [DictationFailure] = []
                 recorder.asrSelector.onFailure = { failures.append($0) }
                 var rows = 0
@@ -78,10 +105,18 @@ final class MicHealthTests: XCTestCase {
                 pipeline.onTranscriptionLogged = { text, engine, injected, path, failed, _ in
                     XCTAssertEqual(text, "Recovered speech.")
                     XCTAssertEqual(engine, "captured-speech-fixture")
-                    XCTAssertEqual(injected, !switchedTarget)
+                    XCTAssertFalse(injected, "Terminal recovery must never replace the user's selection")
                     XCTAssertFalse(failed)
                     XCTAssertNotNil(path)
                     XCTAssertTrue(path.map { FileManager.default.fileExists(atPath: $0) } ?? false)
+                    history.append(text: text, engine: engine, injected: injected, audioPath: path, failed: failed)
+                    rows += 1
+                    logged.fulfill()
+                }
+                pipeline.onAbandonedHoldSaved = { text, engine, path in
+                    XCTAssertEqual(text, "Recovered speech.")
+                    XCTAssertEqual(engine, "captured-speech-fixture")
+                    history.append(text: text, engine: engine, injected: false, audioPath: path, savedWithoutInsertion: true)
                     rows += 1
                     logged.fulfill()
                 }
@@ -99,9 +134,30 @@ final class MicHealthTests: XCTestCase {
                 XCTAssertTrue(recorder.micCaptureStateForTesting.stopping)
                 XCTAssertEqual(failures, [.micDeliveredNoAudio])
                 recorder.stopRecording() // Physical release after terminal failure must not duplicate delivery.
+                await fulfillment(of: [started], timeout: 3)
+                XCTAssertTrue(pipeline.test_abandonedHoldTokens.contains(token), "Abandon before handing audio to asynchronous ASR")
+                recorder.hud.hide()
+                liveSnapshot = CaretContext.Snapshot(value: "Unrelated text", location: 0,
+                    selectionLength: .readable(14), precedingChar: .startOfField,
+                    isUnknown: false, focusedElement: held.focusedElement)
+                await gate.release()
                 await fulfillment(of: [logged], timeout: 3)
                 XCTAssertEqual(rows, 1)
-                XCTAssertEqual(delivered, switchedTarget ? "" : "Recovered speech.")
+                XCTAssertEqual(delivered, "")
+                XCTAssertEqual(snapshotReads, 0, "Abandoned recovery must bypass delivery entirely")
+                XCTAssertEqual(board.string(forType: .string), "Existing clipboard")
+                XCTAssertFalse(pipeline.test_abandonedHoldTokens.contains(token), "Completion consumes the abandoned token")
+                let entry = try XCTUnwrap(history.entries.first)
+                XCTAssertEqual(history.entries.count, 1)
+                XCTAssertEqual(entry.text, "Recovered speech.")
+                XCTAssertFalse(entry.injected)
+                XCTAssertTrue(entry.savedWithoutInsertion)
+                XCTAssertFalse(entry.failed)
+                let audioPath = try XCTUnwrap(entry.audioPath)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: audioPath))
+                let audio = try AVAudioFile(forReading: URL(fileURLWithPath: audioPath))
+                XCTAssertEqual(audio.length, 160)
+                XCTAssertTrue(recorder.test_cachedSessionHoldTokens.isEmpty)
                 recorder.hud.hide()
             }
         }

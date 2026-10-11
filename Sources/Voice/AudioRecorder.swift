@@ -2222,9 +2222,10 @@ final class AudioRecorder {
         let hasCapturedAudio = pcmBuffersLock.withLock {
             micCaptureBeganThisHold && !pcmBuffers.isEmpty
         }
-        if sessionHold.token != nil, hasCapturedAudio {
-            // The failed tap cannot resume, but its earlier audio still owns
-            // the original delivery target and the normal retained-file path.
+        if let recoveredToken = sessionHold.token, hasCapturedAudio {
+            // A terminal microphone error ends delivery for this hold.
+            // Retain its earlier audio for History without late injection.
+            asrSelector.pipeline.markHoldAbandoned(recoveredToken)
             stopFileBasedCapture(
                 sessionHeldToken: sessionHold.token,
                 sessionHeldSnapshot: sessionHold.snapshot,
