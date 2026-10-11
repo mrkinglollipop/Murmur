@@ -40,7 +40,11 @@ final class VoiceEditTests: XCTestCase {
         switchBeforeDelivery: Bool = false,
         switchAfterFirstChunk: Bool = false,
         loseIdentityBeforeDelivery: Bool = false,
+        transientIdentityUnavailableDuringDelivery: Bool = false,
         bundleIdentifier: String = "fixture",
+        bodyText: String? = nil,
+        expectedMaximumFieldReads: Int? = nil,
+        expectedMaximumSimulatedFieldReadMilliseconds: Int? = nil,
         expectedChunks: Int,
         expectedOutcome: TranscriptionPipeline.InjectPipelineResult
     ) {
@@ -48,7 +52,7 @@ final class VoiceEditTests: XCTestCase {
         defer { TextInjector.resetDedupeStateForTesting() }
         let board = NSPasteboard(name: .init("murmur.bound-delivery.\(UUID().uuidString)"))
         defer { board.releaseGlobally() }
-        let text = edit ? String(repeating: "x", count: 33) : "text"
+        let text = bodyText ?? (edit ? String(repeating: "x", count: 33) : "text")
         var held = heldUnknown ? CaretContext.Snapshot.unknown : snapshot(
             value: edit ? String(repeating: "a", count: 33) : "",
             location: 0, selectionLength: .readable(edit ? 33 : 0)
@@ -65,6 +69,8 @@ final class VoiceEditTests: XCTestCase {
         let observer = DeliveryObserver()
         var chunks: [[UniChar]] = []
         var pastePosts = 0
+        var snapshotReads = 0
+        var simulatedFieldReadMilliseconds = 0
         pipeline.deliveryHooks = .init(
             injector: .init(
                 pasteboard: board,
@@ -90,7 +96,18 @@ final class VoiceEditTests: XCTestCase {
                     }
                 }
             ),
-            snapshot: { fresh }
+            snapshot: {
+                snapshotReads += 1
+                // The first read is transform context. Subsequent reads are
+                // destination validation in the production chunk loop.
+                if snapshotReads > 1 { simulatedFieldReadMilliseconds += 100 }
+                if transientIdentityUnavailableDuringDelivery, snapshotReads == 2 {
+                    var unavailable = fresh
+                    unavailable.focusedElement = nil
+                    return unavailable
+                }
+                return fresh
+            }
         )
         let completed = expectation(description: "bound delivery completed")
         pipeline.finishTranscription(
@@ -107,6 +124,12 @@ final class VoiceEditTests: XCTestCase {
         XCTAssertEqual(chunks.count, expectedChunks)
         XCTAssertEqual(pastePosts, 0)
         XCTAssertEqual(chunks.flatMap { $0 }, Array(text.utf16.prefix(expectedChunks == 1 && edit ? 16 : expectedChunks * 16)))
+        if let expectedMaximumFieldReads {
+            XCTAssertLessThanOrEqual(snapshotReads - 1, expectedMaximumFieldReads)
+        }
+        if let expectedMaximumSimulatedFieldReadMilliseconds {
+            XCTAssertLessThanOrEqual(simulatedFieldReadMilliseconds, expectedMaximumSimulatedFieldReadMilliseconds)
+        }
     }
 
     @MainActor
@@ -130,14 +153,41 @@ final class VoiceEditTests: XCTestCase {
     }
 
     @MainActor
-    func testOrdinaryDictationRejectsLostCapturedIdentityThroughPipeline() {
-        assertBoundDelivery(loseIdentityBeforeDelivery: true, expectedChunks: 0, expectedOutcome: .failed)
+    func testOrdinaryDictationAllowsUnavailableCapturedIdentityThroughPipeline() {
+        assertBoundDelivery(loseIdentityBeforeDelivery: true, expectedChunks: 1, expectedOutcome: .inserted)
+    }
+
+    @MainActor
+    func testOrdinaryDictationContinuesWhenOneFieldIdentityReadIsUnavailable() {
+        assertBoundDelivery(
+            transientIdentityUnavailableDuringDelivery: true,
+            bodyText: String(repeating: "a", count: 32),
+            expectedChunks: 2,
+            expectedOutcome: .inserted
+        )
+    }
+
+    @MainActor
+    func testOrdinaryDictationBoundsFieldValidationForSixteenKilobytes() {
+        assertBoundDelivery(
+            bodyText: String(repeating: "a", count: 16_000),
+            expectedMaximumFieldReads: 5,
+            expectedMaximumSimulatedFieldReadMilliseconds: 500,
+            expectedChunks: 1_000,
+            expectedOutcome: .inserted
+        )
     }
 
     @MainActor
     func testLongVoiceEditStopsAfterFieldSwitchInProductionChunkLoop() {
         assertBoundDelivery(edit: true, switchAfterFirstChunk: true,
             expectedChunks: 1, expectedOutcome: .failed)
+    }
+
+    @MainActor
+    func testVoiceEditRejectsUnavailableFieldIdentityThroughPipeline() {
+        assertBoundDelivery(edit: true, loseIdentityBeforeDelivery: true,
+            expectedChunks: 0, expectedOutcome: .failed)
     }
 
     @MainActor

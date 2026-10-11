@@ -96,6 +96,7 @@ final class AudioRecorder {
         self.streamingCoordinator = streamingCoordinator
         self.voiceGateProfileStore = voiceProfileStore ?? VoiceProfileStore()
         self.hud = hud
+        self.asrSelector.pipeline.presentedHoldToken = { [weak hud] in hud?.holdToken }
         if observeInputDevices {
             registerEngineConfigObserver()
             registerDefaultInputDeviceListener()
@@ -170,6 +171,26 @@ final class AudioRecorder {
     var test_bufferCount: Int { pcmBuffersLock.withLock { pcmBuffers.count } }
     func test_bufferAudio(_ buffer: AVAudioPCMBuffer) {
         pcmBuffersLock.withLock { pcmBuffers.append(buffer) }
+    }
+    func test_seedCachedSessionHold(
+        token: UInt64,
+        snapshot: CaretContext.Snapshot? = nil,
+        pid: pid_t? = nil
+    ) {
+        cachedSessionHolds[token] = (snapshot, pid)
+    }
+    var test_cachedSessionHoldTokens: Set<UInt64> { Set(cachedSessionHolds.keys) }
+    /// Invokes the same file-handoff completion used after background recovery.
+    func test_completeFileTranscriptionHandoff(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        sessionHeldToken: UInt64?,
+        releasedHUD: Bool,
+        cleanup: @escaping () -> Void
+    ) {
+        completeFileTranscriptionHandoff(
+            result: result, sessionHeldToken: sessionHeldToken,
+            releasedHUD: releasedHUD, cleanup: cleanup
+        )
     }
     func test_armProcessingDeadline(token: UInt64) -> () -> Void {
         armProcessingWatchdog(sessionToken: token, audioDuration: 0)
@@ -2184,6 +2205,7 @@ final class AudioRecorder {
     }
 
     private func terminateFailedMicCapture() {
+        let failedHoldToken = activeHeldCaretToken ?? pendingHeldCaretToken
         wantsRecording = false
         isStopping = true
         // Bind/start failures can leave the graph unusable for the next hold.
@@ -2195,7 +2217,7 @@ final class AudioRecorder {
         clearHeldCaretSnapshotMatchingSession(activeHeldCaretToken)
         clearPendingHeldCaretSnapshot()
         micHealthMonitor = nil
-        cancelProcessingWatchdog()
+        cancelProcessingWatchdog(forToken: failedHoldToken)
         onTerminalCaptureFailure?()
     }
 
@@ -3272,14 +3294,16 @@ final class AudioRecorder {
                                 )
                             }
                         ) { [weak self] result in
-                            cleanup()
-                            // Background recovery must not dismiss a newer hold's HUD.
-                            if !releasedHUD {
-                                self?.finishHUDAfterPipeline(
-                                    result: result,
-                                    sessionHeldToken: sessionHeldToken
-                                )
+                            guard let self else {
+                                cleanup()
+                                return
                             }
+                            self.completeFileTranscriptionHandoff(
+                                result: result,
+                                sessionHeldToken: sessionHeldToken,
+                                releasedHUD: releasedHUD,
+                                cleanup: cleanup
+                            )
                         }
                     }
                 }
@@ -3304,6 +3328,25 @@ final class AudioRecorder {
     }
 
     // MARK: - Feedback sound
+
+    /// Shared terminal handoff for file-backed transcription. The recovery
+    /// callback releases a HUD only when it still owns presentation; its audio
+    /// cleanup always remains terminal.
+    private func completeFileTranscriptionHandoff(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        sessionHeldToken: UInt64?,
+        releasedHUD: Bool,
+        cleanup: @escaping () -> Void
+    ) {
+        cleanup()
+        if let sessionHeldToken {
+            clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        }
+        // Background recovery must not dismiss a newer hold's HUD.
+        if !releasedHUD {
+            finishHUDAfterPipeline(result: result, sessionHeldToken: sessionHeldToken)
+        }
+    }
 
     /// Inserted → success checkmark. Dedupe → neutral hide (no fake success).
     /// Failed → hide only when still `.processing` (onFailure may already flash).

@@ -160,6 +160,16 @@ final class TranscriptionPipeline {
     /// Terminal failure hook (transcription, injection, audio capture).
     var onFailure: ((DictationFailure) -> Void)?
 
+    /// Presentation ownership lives with the recorder HUD, not this pipeline's
+    /// latest lifecycle token. A newer startup can advance that token and then
+    /// abort before it ever presents, leaving an older processing hold entitled
+    /// to its terminal failure.
+    var presentedHoldToken: (() -> UInt64?)?
+
+    private func shouldNotifyFailure(for token: UInt64) -> Bool {
+        token == heldCaretToken || presentedHoldToken?() == token
+    }
+
     /// Capture caret AX context + frontmost PID on the main thread at
     /// recording-will-start. Replaces any prior hold and bumps the generation token.
     /// Reads frontmost PID once so AX snapshot and held PID cannot desync.
@@ -1010,7 +1020,7 @@ final class TranscriptionPipeline {
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if !abandoned, sessionHeldToken == self.heldCaretToken {
+                if !abandoned, self.shouldNotifyFailure(for: sessionHeldToken) {
                     self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed)
                 }
                 if voiceEditInstruction == nil, audioPath != nil || saveWithoutInsertion {
@@ -1230,8 +1240,10 @@ final class TranscriptionPipeline {
                                 },
                                 validateField: heldAtStart?.focusedElement.map { heldElement in
                                     {
-                                        VoiceEditRouting.fieldMatches(held: heldElement,
-                                            fresh: self.deliveryFocusedElement(frontmostPID: deliveryPID))
+                                        guard let fresh = self.deliveryFocusedElement(frontmostPID: deliveryPID) else {
+                                            return voiceEditInstruction == nil ? nil : false
+                                        }
+                                        return VoiceEditRouting.fieldMatches(held: heldElement, fresh: fresh)
                                     }
                                 },
                                 preserveBoundaryWhitespace: voiceEditInstruction != nil
@@ -1302,7 +1314,7 @@ final class TranscriptionPipeline {
                     if replaceID == nil {
                         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
-                    if let failure = outcome.failure, sessionHeldToken == self.heldCaretToken {
+                    if let failure = outcome.failure, self.shouldNotifyFailure(for: sessionHeldToken) {
                         self.onFailure?(failure)
                     }
 

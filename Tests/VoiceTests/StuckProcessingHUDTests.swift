@@ -704,6 +704,43 @@ final class StuckProcessingHUDTests: XCTestCase {
 
 /// Production stop, notification, and deadline paths with hardware/network I/O replaced.
 final class HoldOwnershipRegressionTests: XCTestCase {
+    private actor CloudGate {
+        private var began = false
+        private var beganContinuation: CheckedContinuation<Void, Never>?
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func awaitRequest() async {
+            if began { return }
+            await withCheckedContinuation { beganContinuation = $0 }
+        }
+
+        func emptyAfterRelease(provider: CloudProvider) async throws -> String {
+            began = true
+            beganContinuation?.resume()
+            beganContinuation = nil
+            await withCheckedContinuation { releaseContinuation = $0 }
+            throw CloudTranscriptionError.emptyTranscript(provider: provider)
+        }
+
+        func releaseEmptyResponse() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
+    private struct PausedEmptyCloud: CloudTranscriptionService {
+        let gate: CloudGate
+        func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String {
+            try await gate.emptyAfterRelease(provider: model.provider)
+        }
+    }
+
+    private struct LocalRecovery: ASREngine {
+        let id = "local-recovery"
+        let displayName = "Local recovery"
+        func transcribe(audioURL: URL) async throws -> String { "Recovered A" }
+    }
+
     @MainActor
     private func recorder(_ coordinator: StreamingCoordinator = StreamingCoordinator()) -> AudioRecorder {
         AudioRecorder(
@@ -733,7 +770,7 @@ final class HoldOwnershipRegressionTests: XCTestCase {
     @MainActor
     func test01EverySettledStopDetachesCloudBeforeLocalAudio() async throws {
         // Includes the early return after tearing down a re-armed in-flight start.
-        for path in ["pending", "inFlight", "rearmedInFlight", "active", "secure"] {
+        for path in ["pending", "inFlight", "rearmedInFlight", "active", "secure", "failedStart"] {
             let frames = Frames()
             let sent = expectation(description: "connected cloud receives its own audio: \(path)")
             let session = XAIStreamingTranscriber(apiKey: "fixture", messageSender: { message in
@@ -758,6 +795,9 @@ final class HoldOwnershipRegressionTests: XCTestCase {
             recorder.test_bufferAudio(buffer)
             if path == "secure" {
                 recorder.test_abortForSecureInput()
+            } else if path == "failedStart" {
+                recorder.test_failMicStart()
+                await drainMainQueue()
             } else {
                 recorder.stopRecording()
                 if path == "rearmedInFlight" {
@@ -786,6 +826,148 @@ final class HoldOwnershipRegressionTests: XCTestCase {
             XCTAssertEqual(frames.count, 1, "Local audio leaked through \(path)")
             session.cancel()
         }
+    }
+
+    @MainActor
+    func test01FailedMicStartDetachesCloudBeforeRearmedStopCanReturn() async throws {
+        let frames = Frames()
+        let sent = expectation(description: "connected xAI receives only pre-failure audio")
+        let session = XAIStreamingTranscriber(apiKey: "fixture", messageSender: { message in
+            frames.record(message)
+            if frames.count == 1 { sent.fulfill() }
+        })
+        try await session.start(beforeReadiness: {
+            session.handleServerEvent(#"{"type":"transcript.created"}"#)
+        })
+        let coordinator = StreamingCoordinator(xaiSession: session)
+        let recorder = recorder(coordinator)
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160))
+        buffer.frameLength = 160
+        for index in 0..<160 { buffer.floatChannelData![0][index] = 0.1 }
+
+        let old = recorder.asrSelector.pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: old, active: true)
+        recorder.test_receiveAudio(buffer)
+        await fulfillment(of: [sent], timeout: 2)
+
+        recorder.test_failMicStart() // Production failure: terminal capture teardown owns the cloud session.
+        recorder.stopRecording() // Queued A stop.
+        let next = recorder.asrSelector.pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: next, active: true) // B re-arms before A's doStop drains.
+        await drainMainQueue()
+        XCTAssertTrue(recorder.micCaptureStateForTesting.wanted)
+        XCTAssertNil(coordinator.xaiSession, "failed capture must detach xAI before stale doStop returns")
+
+        recorder.test_receiveAudio(buffer) // Local B audio must have no retained A stream.
+        session.handleServerEvent(#"{"type":"transcript.done"}"#)
+        _ = await session.finalize()
+        XCTAssertEqual(frames.count, 1, "post-failure local audio leaked into xAI")
+        session.cancel()
+    }
+
+    @MainActor
+    func test02UnpresentedReplacementDoesNotSuppressOlderFailure() async {
+        let recorder = recorder()
+        let pipeline = recorder.asrSelector.pipeline
+        let hud = recorder.hud
+        let old = pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: old, active: true)
+        hud.claimHold(old)
+        hud.show()
+        hud.setProcessing()
+        let replacement = pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: replacement) // B enters permission startup but never owns presentation.
+        recorder.stopRecording() // B is released before permission resolves; production doStop aborts pending startup.
+        await drainMainQueue()
+        var failures: [DictationFailure] = []
+        var rows = 0
+        recorder.asrSelector.onFailure = { failure in
+            failures.append(failure)
+            hud.showError(failure.message)
+        }
+        pipeline.onTranscriptionLogged = { _, _, _, _, failed, _ in
+            XCTAssertTrue(failed)
+            rows += 1
+        }
+        let done = expectation(description: "older empty hold completes")
+        pipeline.finishTranscription(
+            text: " ", hadExplicitTrailingNewline: false, engineID: "fixture", audioPath: #filePath,
+            replaceHistoryEntryID: nil, sessionHeldToken: old, sessionHeldSnapshot: nil,
+            sessionHeldFrontmostPID: nil
+        ) { result in
+            XCTAssertEqual(result, .failed)
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 2)
+        XCTAssertEqual(failures, [.transcriptionFailed], "a B that never owned presentation cannot silence A")
+        XCTAssertEqual(rows, 1)
+        XCTAssertEqual(hud.holdToken, old)
+        XCTAssertEqual(hud.currentState, .error(DictationFailure.transcriptionFailed.message))
+        hud.hide()
+    }
+
+    @MainActor
+    func test03BackgroundRecoveryClearsOnlyConsumedCachedHoldAfterHUDRelease() async throws {
+        let recorder = recorder()
+        let pipeline = recorder.asrSelector.pipeline
+        recorder.asrSelector.cloudModel = .elevenLabsScribeV2Realtime
+        recorder.asrSelector.apiKeyProvider = { _ in "fixture" }
+        let gate = CloudGate()
+        pipeline.cloudServiceProvider = { _ in PausedEmptyCloud(gate: gate) }
+        pipeline.localEngineProvider = { LocalRecovery() }
+        let audio = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
+        try Data([1, 2, 3]).write(to: audio)
+        let heldA = CaretContext.Snapshot(
+            value: "A field", location: 7, selectionLength: .readable(0),
+            precedingChar: .known("d"), isUnknown: false,
+            focusedElement: AXUIElementCreateApplication(401)
+        )
+        let old = pipeline.test_holdSnapshot(heldA, frontmostPID: 401)
+        recorder.test_prepareHold(token: old, active: true)
+        recorder.test_seedCachedSessionHold(token: old, snapshot: heldA, pid: 401)
+        recorder.hud.claimHold(old)
+        recorder.hud.show()
+        recorder.hud.setProcessing()
+        var releasedHUD = false
+        var rows = 0
+        pipeline.onAbandonedHoldSaved = { text, engine, path in
+            XCTAssertEqual(text, "Recovered A")
+            XCTAssertEqual(engine, "local-recovery")
+            XCTAssertNil(path)
+            rows += 1
+        }
+        let done = expectation(description: "A local recovery completes after B starts")
+        pipeline.transcribeAndLog(
+            audioURL: audio, audioIsTemporary: true, sessionHeldToken: old,
+            sessionHeldSnapshot: heldA, sessionHeldFrontmostPID: 401,
+            onHoldAbandoned: { releasedHUD = true }
+        ) { result in
+            XCTAssertEqual(result, .savedToHistory)
+            recorder.test_completeFileTranscriptionHandoff(
+                result: result, sessionHeldToken: old, releasedHUD: releasedHUD,
+                cleanup: { try? FileManager.default.removeItem(at: audio) }
+            )
+            done.fulfill()
+        }
+        await gate.awaitRequest()
+        let heldB = CaretContext.Snapshot(
+            value: "B field", location: 7, selectionLength: .readable(0),
+            precedingChar: .known("d"), isUnknown: false,
+            focusedElement: AXUIElementCreateApplication(402)
+        )
+        let newer = pipeline.test_holdSnapshot(heldB, frontmostPID: 402)
+        recorder.test_prepareHold(token: newer, active: true)
+        recorder.test_seedCachedSessionHold(token: newer, snapshot: heldB, pid: 402)
+        recorder.hud.claimHold(newer)
+        recorder.hud.show()
+        await gate.releaseEmptyResponse()
+        await fulfillment(of: [done], timeout: 2)
+        XCTAssertTrue(releasedHUD)
+        XCTAssertEqual(rows, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+        XCTAssertFalse(recorder.test_cachedSessionHoldTokens.contains(old), "A must clear even when B owns the HUD")
+        XCTAssertTrue(recorder.test_cachedSessionHoldTokens.contains(newer), "B cache must survive")
     }
 
     @MainActor

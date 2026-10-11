@@ -56,7 +56,7 @@ final class TextInjector {
     private var preparedPasteboardChangeCount: Int?
     /// Accessed only while the global insertion lock is held. Never hops to main.
     private var selectionValidation: (() -> Bool)?
-    private var fieldValidation: (() -> Bool)?
+    private var fieldValidation: (() -> Bool?)?
     private var pasteboard: NSPasteboard { hooks?.pasteboard ?? .general }
 
     init(hooks: Hooks? = nil) {
@@ -101,6 +101,7 @@ final class TextInjector {
         guard let fieldValidation else { return }
         let matches = fieldValidation()
         try checkInjectionAllowed(targetPID: targetPID)
+        guard let matches else { return }
         guard matches else { throw InjectionAbort.selectionChanged }
     }
 
@@ -663,7 +664,7 @@ final class TextInjector {
 
     @discardableResult
     func insert(_ text: String, expectedTargetPID: pid_t? = nil,
-                validateSelection: (() -> Bool)? = nil, validateField: (() -> Bool)? = nil,
+                validateSelection: (() -> Bool)? = nil, validateField: (() -> Bool?)? = nil,
                 preserveBoundaryWhitespace: Bool = false) -> InsertResult {
         let trimmed = preserveBoundaryWhitespace ? text : Self.trimmingTrailingWhitespaceAndNewlines(text)
         guard !trimmed.isEmpty,
@@ -1187,6 +1188,9 @@ final class TextInjector {
         let chunks = Self.chunkUTF16Units(text)
         guard !chunks.isEmpty else { return 0 }
 
+        // Four bounded AX checks cover even a long dictation; every chunk
+        // still rechecks PID and Secure Input before it posts.
+        let fieldValidationStride = max(1, Int(ceil(Double(chunks.count) / 4)))
         for (index, chunk) in chunks.enumerated() {
             let keyDown: CGEvent?
             if let source {
@@ -1210,7 +1214,9 @@ final class TextInjector {
                 guard beforePost() else { return 0 }
                 try checkSelectionAllowed(targetPID: targetPID)
             }
-            try checkFieldAllowed(targetPID: targetPID)
+            if index.isMultiple(of: fieldValidationStride) {
+                try checkFieldAllowed(targetPID: targetPID)
+            }
             if let postChunk = hooks?.postUnicodeChunk {
                 postChunk(chunk)
             } else {
