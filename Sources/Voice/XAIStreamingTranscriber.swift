@@ -935,7 +935,16 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         segments: [AudioSegment]? = nil
     ) -> (confirmedText: String, committedWords: [TranscriptWord], lastCommittedEnd: Double, segments: [AudioSegment]) {
         var current = segments ?? (confirmed.isEmpty ? [] : [AudioSegment(text: confirmed, words: committedWords)])
-        let incoming = AudioSegment(text: incomingText.trimmingCharacters(in: .whitespacesAndNewlines), words: incomingWords)
+        let textTokens = normalizedEquivalenceTokens(incomingText)
+        let freshWords = incomingWords.filter { $0.start >= lastCommittedEnd }
+        // Some payloads include prior-audio metadata absent from their text.
+        // Ignore it only when the remaining words fully align with the payload;
+        // phantom overlap must not authorize replacing confirmed speech.
+        let wordsMatchText = incomingWords.flatMap { normalizedEquivalenceTokens($0.text) } == textTokens
+        let freshWordsMatchText = freshWords.flatMap { normalizedEquivalenceTokens($0.text) } == textTokens
+        let alignedWords = !textTokens.isEmpty && !wordsMatchText && freshWordsMatchText
+            ? freshWords : incomingWords
+        let incoming = AudioSegment(text: incomingText.trimmingCharacters(in: .whitespacesAndNewlines), words: alignedWords)
         if !incoming.text.isEmpty {
             if let interval = incoming.interval {
                 var replaced: [AudioSegment] = []
