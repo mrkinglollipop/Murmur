@@ -298,6 +298,10 @@ final class XAITranscriptionService: CloudTranscriptionService {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .xai, body: String(data: data, encoding: .utf8))
         }
+        return try Self.decodeTranscript(from: data)
+    }
+
+    static func decodeTranscript(from data: Data) throws -> String {
         guard let decoded = try? JSONDecoder().decode(Response.self, from: data) else {
             throw CloudTranscriptionError(provider: .xai, message: "No transcript in response")
         }

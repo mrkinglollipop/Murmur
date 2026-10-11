@@ -2913,18 +2913,32 @@ final class AudioRecorder {
                 ) { audioURL, retainedURL, cleanup in
                     DispatchQueue.main.async {
                         self.asrSelector.setLastRetainedRecordingURL(retainedURL)
-                        self.asrSelector.transcribeAndLog(
+                        var releasedHUD = false
+                        self.asrSelector.pipeline.transcribeAndLog(
                             audioURL: audioURL,
                             audioIsTemporary: retainedURL == nil,
                             sessionHeldToken: sessionHeldToken,
                             sessionHeldSnapshot: sessionHeldSnapshot,
-                            sessionHeldFrontmostPID: sessionHeldFrontmostPID
+                            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                            onHoldAbandoned: { [weak self] in
+                                releasedHUD = true
+                                guard let self,
+                                      self.processingWatchdogToken == sessionHeldToken,
+                                      !self.wantsRecording else { return }
+                                self.finishHUDAfterPipeline(
+                                    result: .deduped,
+                                    sessionHeldToken: sessionHeldToken
+                                )
+                            }
                         ) { [weak self] result in
                             cleanup()
-                            self?.finishHUDAfterPipeline(
-                                result: result,
-                                sessionHeldToken: sessionHeldToken
-                            )
+                            // Background recovery must not dismiss a newer hold's HUD.
+                            if !releasedHUD {
+                                self?.finishHUDAfterPipeline(
+                                    result: result,
+                                    sessionHeldToken: sessionHeldToken
+                                )
+                            }
                         }
                     }
                 }

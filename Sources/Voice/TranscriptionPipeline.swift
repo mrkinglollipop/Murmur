@@ -29,6 +29,10 @@ final class TranscriptionPipeline {
     /// Resolves engines and cloud settings from the owning selector.
     weak var engineSelector: ASREngineSelector?
 
+    /// Injectable ASR boundaries keep pipeline tests offline and model-free.
+    var cloudServiceProvider: (CloudModel) -> any CloudTranscriptionService = CloudTranscriberFactory.service
+    var localEngineProvider: (() -> any ASREngine)?
+
     /// Master on/off for the AI cleanup pass.
     var cleanupEnabled: Bool = false
 
@@ -406,6 +410,8 @@ final class TranscriptionPipeline {
     ///   is non-nil, use that triple (sampled at recording-stop) instead of
     ///   reading `heldCaret*` at entry — avoids poisoning across async IO/ASR
     ///   gaps. History-retry leaves them nil and keeps entry-sample behavior.
+    /// `onHoldAbandoned` releases live HUD ownership on main without completing
+    /// transcription. `completion` remains terminal so temporary audio stays alive.
     func transcribeAndLog(
         audioURL: URL,
         audioIsTemporary: Bool = false,
@@ -413,6 +419,7 @@ final class TranscriptionPipeline {
         sessionHeldToken providedToken: UInt64? = nil,
         sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
         sessionHeldFrontmostPID providedPID: pid_t? = nil,
+        onHoldAbandoned: (() -> Void)? = nil,
         completion: ((InjectPipelineResult) -> Void)? = nil
     ) {
         guard let selector = engineSelector else {
@@ -439,7 +446,7 @@ final class TranscriptionPipeline {
 
             Task {
                 do {
-                    let service = CloudTranscriberFactory.service(for: cloudModel)
+                    let service = self.cloudServiceProvider(cloudModel)
                     if let gemini = service as? GeminiTranscriptionService {
                         gemini.smartMode = selector.removeFillerWordsEnabled
                         gemini.vocabulary = selector.geminiVocabularyProvider?() ?? []
@@ -450,6 +457,9 @@ final class TranscriptionPipeline {
                         model: cloudModel,
                         language: selector.selectedLanguage
                     )
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw CloudTranscriptionError.emptyTranscript(provider: cloudModel.provider)
+                    }
                     let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID)
                     let transformed = cleaned.text
                     self.finishTranscription(
@@ -464,23 +474,21 @@ final class TranscriptionPipeline {
                         completion: completion
                     )
                 } catch {
-                    if !Self.shouldFallBackToLocal(after: error) {
-                        vlog("cloud empty transcript [\(engineTag)] chars=0")
-                        self.finishTranscription(
-                            text: "",
-                            hadExplicitTrailingNewline: false,
-                            engineID: engineTag,
-                            audioPath: audioPath,
-                            replaceHistoryEntryID: replaceID,
-                            sessionHeldToken: sessionHeldToken,
-                            sessionHeldSnapshot: sessionHeldSnapshot,
-                            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
-                            completion: completion
-                        )
-                        return
+                    let emptyResponse = (error as? CloudTranscriptionError)?.isEmptyTranscript == true
+                    let recoverInBackground = await MainActor.run {
+                        guard emptyResponse, replaceID == nil,
+                              !self.isVoiceEditHold(sessionHeldToken) else { return false }
+                        self.markHoldAbandoned(sessionHeldToken)
+                        // Completion still owns audio cleanup and must wait for local ASR.
+                        onHoldAbandoned?()
+                        return true
                     }
-                    self.logger.error("Cloud transcription failed [\(engineTag)]: \(error.localizedDescription)")
-                    vlog("cloud transcription error [\(engineTag)]: \(error.localizedDescription) — falling back to local")
+                    if emptyResponse {
+                        vlog("cloud empty transcript [\(engineTag)] — recovering locally")
+                    } else {
+                        self.logger.error("Cloud transcription failed [\(engineTag)]: \(error.localizedDescription)")
+                        vlog("cloud transcription error [\(engineTag)]: \(error.localizedDescription) — falling back to local")
+                    }
                     self.transcribeLocally(
                         audioURL: audioURL,
                         audioPath: audioPath,
@@ -488,6 +496,7 @@ final class TranscriptionPipeline {
                         sessionHeldToken: sessionHeldToken,
                         sessionHeldSnapshot: sessionHeldSnapshot,
                         sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                        saveWithoutInsertion: recoverInBackground,
                         completion: completion
                     )
                 }
@@ -504,10 +513,6 @@ final class TranscriptionPipeline {
             sessionHeldFrontmostPID: sessionHeldFrontmostPID,
             completion: completion
         )
-    }
-
-    static func shouldFallBackToLocal(after error: Error) -> Bool {
-        (error as? CloudTranscriptionError)?.heardNothing != true
     }
 
     static func historyAudioPath(audioURL: URL, audioIsTemporary: Bool) -> String? {
@@ -580,6 +585,8 @@ final class TranscriptionPipeline {
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
+        // Survives eviction from the bounded watchdog token set during slow recovery.
+        saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)? = nil
     ) {
         guard let selector = engineSelector else {
@@ -587,7 +594,7 @@ final class TranscriptionPipeline {
             return
         }
 
-        let engine = selector.makeEngine()
+        let engine = localEngineProvider?() ?? selector.makeEngine()
         logger.info("Transcribing \(audioURL.lastPathComponent) with engine '\(engine.id)'")
 
         Task {
@@ -604,6 +611,7 @@ final class TranscriptionPipeline {
                     sessionHeldToken: sessionHeldToken,
                     sessionHeldSnapshot: sessionHeldSnapshot,
                     sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                    saveWithoutInsertion: saveWithoutInsertion,
                     completion: completion
                 )
             } catch {
@@ -614,6 +622,7 @@ final class TranscriptionPipeline {
                     audioPath: audioPath,
                     replaceHistoryEntryID: replaceHistoryEntryID,
                     sessionHeldToken: sessionHeldToken,
+                    saveWithoutInsertion: saveWithoutInsertion,
                     completion: completion
                 )
             }
@@ -625,13 +634,14 @@ final class TranscriptionPipeline {
         audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
+        saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         DispatchQueue.main.async {
             let abandoned = self.consumeAbandonedHold(
                 token: sessionHeldToken,
                 replaceHistoryEntryID: replaceHistoryEntryID
-            )
+            ) || saveWithoutInsertion
             if replaceHistoryEntryID == nil,
                self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
@@ -883,6 +893,7 @@ final class TranscriptionPipeline {
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
         voiceEditInstruction: String? = nil,
+        saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         let trimmed = Self.normalizeTranscriptForInjection(text)
@@ -935,12 +946,12 @@ final class TranscriptionPipeline {
                 let abandoned = self.consumeAbandonedHold(
                     token: sessionHeldToken,
                     replaceHistoryEntryID: replaceHistoryEntryID
-                )
+                ) || saveWithoutInsertion
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
                 if !abandoned { self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed) }
-                if let audioPath, voiceEditInstruction == nil {
+                if voiceEditInstruction == nil, audioPath != nil || saveWithoutInsertion {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
                 completion?(.failed)
@@ -956,7 +967,7 @@ final class TranscriptionPipeline {
             let abandoned = self.consumeAbandonedHold(
                 token: sessionHeldToken,
                 replaceHistoryEntryID: replaceHistoryEntryID
-            )
+            ) || saveWithoutInsertion
             if replaceHistoryEntryID != nil || abandoned {
                 // Retrying a recording is a History operation. Focus may be on
                 // History's search field or an unrelated app by the time ASR ends.
