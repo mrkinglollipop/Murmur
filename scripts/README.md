@@ -32,7 +32,21 @@ appearing after preflight also cannot be deleted. The appcast and stable
 
 `ALLOW_UNNOTARIZED=1` remains local-only and always builds a fresh artifact.
 Run `bash scripts/test-publish-guards.sh` for the offline, shared-lock guard
-oracle. Its private command stubs never build, sign, notarize or upload.
+oracle, and `bash scripts/test-publish-sparkle-helpers.sh` for the helper and
+execution-order checks. Both use the same shared lock and private command
+stubs; they never build, sign, notarize or upload. The guard oracle injects
+harmless exported command wrappers and a `BASH_ENV` fixture to verify that
+inherited functions and startup hooks cannot bypass the stubs in child shells.
+As with any Bash script, a caller's initial `BASH_ENV` runs before the script
+can clear it; only use a trusted startup environment to launch the oracles.
+
+Source status explicitly includes all untracked files, even when Git's
+configuration hides them. Status and the reported SHA use the build checkout,
+with inherited Git repository-selection variables cleared. Regression cases
+exercise the production publish path against stubbed Git responses and
+temporary Swift inputs. Execution-order checks run `publish_main` with fixture
+files and stubbed external commands, including the local-only path and icon
+and team-preflight failures; they do not infer runtime order from line numbers.
 
 ## Signing (`DEVELOPMENT_TEAM`)
 
