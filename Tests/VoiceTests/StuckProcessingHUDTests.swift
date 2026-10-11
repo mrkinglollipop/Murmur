@@ -1,3 +1,4 @@
+import ApplicationServices
 import AVFoundation
 import XCTest
 @testable import Voice
@@ -827,7 +828,8 @@ final class HoldOwnershipRegressionTests: XCTestCase {
             let pipeline = TranscriptionPipeline()
             let hud = RecordingHUD(presentsWindows: false)
             let held = CaretContext.Snapshot(value: "Old words", location: 0,
-                selectionLength: .readable(9), precedingChar: .startOfField, isUnknown: false)
+                selectionLength: .readable(9), precedingChar: .startOfField, isUnknown: false,
+                focusedElement: AXUIElementCreateApplication(101))
             let old = pipeline.test_holdSnapshot(held, frontmostPID: 101)
             hud.claimHold(old)
             hud.show()
