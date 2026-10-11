@@ -13,7 +13,7 @@ current setup and contribution guidance.
 | Plan | Title | Status |
 |------|-------|--------|
 | 001 | Secure-input boundary | DONE |
-| 002 | Fixture-driven stitch replay harness | TODO |
+| 002 | Fixture-driven stitch replay harness | DONE — full VoiceTests suite verified (968 tests, 16 skipped, 0 failures) |
 | 003 | CLAUDE.md for agent sessions | DONE |
 | 004 | Small-fixes bundle (races, logs, cleanup) | DONE |
 | 005 | Docs & deps batch | PARTIAL — only the Parakeet pin remains open |

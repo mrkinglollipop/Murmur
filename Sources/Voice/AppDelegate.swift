@@ -11,6 +11,10 @@ import Sparkle
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem?
+    var menuBarButton: NSStatusBarButton?
+    var scheduleMenuBarErrorBadgeExpiry: (@escaping () -> Void) -> Void = { expiry in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: expiry)
+    }
     private var activationController: ActivationController?
     private var hotkeyController: HotkeyController?
     private var updaterController: SPUStandardUpdaterController?
@@ -20,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// True while the menu-bar error badge (`mic.badge.xmark`) is showing —
     /// guards `resetMenuBarIconToIdle()` from clobbering it early.
     private var isShowingMenuBarErrorBadge = false
+    private var menuBarErrorBadgeGeneration = 0
 
     // MARK: - Main window + UI stores
 
@@ -531,6 +536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        menuBarButton = statusItem?.button
 
         setMenuBarIcon(.idle)
         rebuildStatusMenu()
@@ -611,7 +617,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setMenuBarIcon(_ icon: MenuBarIcon) {
-        statusItem?.button?.image = icon.image
+        guard let button = menuBarButton else { return }
+        button.image = icon.image
+        button.setAccessibilityLabel(icon.accessibilityDescription)
     }
 
     // MARK: - Onboarding
@@ -643,7 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func handleDictationFailure(_ failure: DictationFailure) {
+    func handleDictationFailure(_ failure: DictationFailure) {
         switch failure {
         case .injectionFailed:
             activationController?.audioRecorder.hud.showClipboardFlashThenHide()
@@ -651,10 +659,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             activationController?.audioRecorder.hud.showError(failure.message)
             activationController?.audioRecorder.playFailureSound()
             isShowingMenuBarErrorBadge = true
+            menuBarErrorBadgeGeneration &+= 1
+            let generation = menuBarErrorBadgeGeneration
             setMenuBarErrorBadge(true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                self?.isShowingMenuBarErrorBadge = false
-                self?.setMenuBarErrorBadge(false)
+            scheduleMenuBarErrorBadgeExpiry { [weak self] in
+                guard let self, self.menuBarErrorBadgeGeneration == generation else { return }
+                self.isShowingMenuBarErrorBadge = false
+                self.setMenuBarErrorBadge(false)
             }
         }
     }
@@ -697,10 +708,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setMenuBarIcon(.idle)
     }
 
-    private func updateMenuBarIcon(for state: RecordingHUD.State) {
+    func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
         switch state {
         case .listening, .editingSelection, .microphoneNoAudio:
+            menuBarErrorBadgeGeneration &+= 1
+            isShowingMenuBarErrorBadge = false
             setMenuBarIcon(.listening)
         case .processing:
             setMenuBarIcon(.processing)
@@ -718,7 +731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Shows the error glyph in the menu bar when `show` is true.
     func setMenuBarErrorBadge(_ show: Bool) {
-        guard statusItem?.button != nil else { return }
+        guard menuBarButton != nil else { return }
         if isDictationPaused {
             setMenuBarIcon(.paused)
             return

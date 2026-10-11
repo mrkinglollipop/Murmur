@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import os.log
 import WhisperKit
@@ -40,12 +41,21 @@ final class WhisperKitEngine: ASREngine {
     /// ISO 639-1 language code passed to WhisperKit decoding options.
     var language: String
 
-    init(modelID: String, displayName: String, localModel: LocalModel, language: String = "en") {
+    private let transcribeAudio: (@Sendable (URL, String) async throws -> String)?
+    private let deadline: LocalTranscriptionDeadline.Runner
+
+    init(
+        modelID: String, displayName: String, localModel: LocalModel, language: String = "en",
+        transcribeAudio: (@Sendable (URL, String) async throws -> String)? = nil,
+        deadline: @escaping LocalTranscriptionDeadline.Runner = LocalTranscriptionDeadline.run
+    ) {
         self.modelID = modelID
         self.id = "whisperKit:\(modelID)"
         self.displayName = displayName
         self.localModel = localModel
         self.language = language
+        self.transcribeAudio = transcribeAudio
+        self.deadline = deadline
     }
 
     // WhisperKit instance — lazily initialised on first transcription.
@@ -65,8 +75,7 @@ final class WhisperKitEngine: ASREngine {
     /// (observed 2026-08-09: a cloud→local fallback whose load never returned —
     /// no error, no thread, model resident — leaving the dictation hung forever).
     /// Timing out turns that into a visible failure with the audio retained for
-    /// retry. The transcription itself is NOT bounded — long audio legitimately
-    /// takes long.
+    /// retry. Decode has a separate budget scaled to the recording's duration.
     static let modelLoadTimeout: TimeInterval = 120
 
     /// Races `operation` against a deadline. On timeout cancellation is requested
@@ -86,6 +95,25 @@ final class WhisperKitEngine: ASREngine {
     }
 
     func transcribe(audioURL: URL) async throws -> String {
+        let decode = try await prepareDecode(audioURL: audioURL)
+        let inferStart = Date()
+        let audioFile = try AVAudioFile(forReading: audioURL)
+        let text = try await deadline(
+            LocalTranscriptionDeadline.seconds(for: audioFile),
+            displayName,
+            decode
+        )
+        vlog("inference \(String(format: "%.2f", Date().timeIntervalSince(inferStart)))s")
+
+        return WhisperKitEngine.stripSoundAnnotations(text)
+    }
+
+    private func prepareDecode(audioURL: URL) async throws -> LocalTranscriptionDeadline.Operation {
+        if let transcribeAudio {
+            let language = language
+            return { try await transcribeAudio(audioURL, language) }
+        }
+
         loadLock.lock()
         let wasWarm = whisper != nil
         loadLock.unlock()
@@ -108,18 +136,14 @@ final class WhisperKitEngine: ASREngine {
         options.skipSpecialTokens = true
         options.suppressBlank = true
 
-        let inferStart = Date()
-        let results = try await wk.transcribe(audioPath: audioURL.path, decodeOptions: options)
-        vlog("inference \(String(format: "%.2f", Date().timeIntervalSince(inferStart)))s")
-
-        // `transcribe` returns [TranscriptionResult]; join all segments, then
-        // strip Whisper's non-speech sound captions (see stripSoundAnnotations).
-        let text = results
-            .compactMap { $0.text }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespaces)
-
-        return WhisperKitEngine.stripSoundAnnotations(text)
+        let decodeOptions = options
+        return {
+            let results = try await wk.transcribe(audioPath: audioURL.path, decodeOptions: decodeOptions)
+            return results
+                .compactMap { $0.text }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+        }
     }
 
     /// Caption removal must not delete arbitrary brackets or Markdown emphasis:

@@ -1,0 +1,80 @@
+{
+  "name": "regression-short-clause-extension",
+  "events": [
+    {
+      "type": "final",
+      "text": "How do I attach ribbons?",
+      "speechFinal": false,
+      "words": [
+        {
+          "text": "How",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "do",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "I",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "attach",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "ribbons?",
+          "start": 1.2,
+          "end": 1.5
+        }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "How do I attach ribbons onto lanterns?",
+      "speechFinal": true,
+      "words": [
+        {
+          "text": "How",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "do",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "I",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "attach",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "ribbons",
+          "start": 1.2,
+          "end": 1.5
+        },
+        {
+          "text": "onto",
+          "start": 1.5,
+          "end": 1.8
+        },
+        {
+          "text": "lanterns?",
+          "start": 1.8,
+          "end": 2.1
+        }
+      ]
+    }
+  ],
+  "expected": "How do I attach ribbons onto lanterns?"
+}
