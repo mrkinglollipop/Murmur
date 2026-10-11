@@ -739,8 +739,9 @@ final class HoldOwnershipRegressionTests: XCTestCase {
                 frames.record(message)
                 if frames.count == 1 { sent.fulfill() }
             })
-            session.handleServerEvent(#"{"type":"transcript.created"}"#)
-            try await session.start()
+            try await session.start(beforeReadiness: {
+                session.handleServerEvent(#"{"type":"transcript.created"}"#)
+            })
             let coordinator = StreamingCoordinator(xaiSession: session)
             let recorder = recorder(coordinator)
             let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
