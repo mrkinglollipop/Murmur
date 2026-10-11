@@ -79,6 +79,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// Feeds ready-to-send JSON `input_audio_chunk` frames (already encoded
     /// as a string) from `send(_:)` (audio-tap thread, synchronous,
     /// non-blocking) to the single sender `Task`.
+    private let frameStream: AsyncStream<String>
     private var frameContinuation: AsyncStream<String>.Continuation?
 
     /// Lazily built on the first `send(_:)` call once the input buffer's
@@ -128,7 +129,9 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// Resolved exactly once by the receive loop when `session_started` arrives.
     private var readyContinuation: CheckedContinuation<Void, Error>?
-    private var readyResolved = false
+    // The first outcome also belongs to waiters registered after it resolves.
+    private var readyResult: Result<Void, Error>?
+    private var readyResolved: Bool { readyResult != nil }
     /// Set once `start()` has begun. With `readyResolved` still false, the
     /// server has not sent `session_started`, so the commit frame would reach
     /// the socket ahead of any audio.
@@ -195,6 +198,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         self.keyterms = keyterms
         self.realtimeOptions = realtimeOptions.clamped()
         self.injectedMessageSender = messageSender
+        // Capture may begin as soon as this session is published, before start().
+        let (stream, frames) = AsyncStream<String>.makeStream()
+        self.frameStream = stream
+        self.frameContinuation = frames
         super.init()
     }
 
@@ -250,17 +257,16 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         // Buffer frames captured during the handshake (unbounded AsyncStream)
         // so the leading audio of the utterance survives socket-open latency;
         // the sender only starts draining once `session_started` arrives.
-        let (stream, frames) = AsyncStream<String>.makeStream()
+        let stream = frameStream
         let (readiness, readySignal) = AsyncStream<Void>.makeStream()
-        // Publish the buffer and its gated consumer atomically: finalize must
-        // always have a sender to drain, even before start resumes from readiness.
+        // Install the gated consumer under the finalize lock so finalize can
+        // drain the prepared queue even before start resumes from readiness.
         stateLock.lock()
         guard !tornDown else {
             stateLock.unlock()
             tearDownSocket()
             throw CancellationError()
         }
-        frameContinuation = frames
         senderReadyContinuation = readySignal
         senderTask = Task {
             var readyIterator = readiness.makeAsyncIterator()
@@ -288,9 +294,9 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             group.addTask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     self.stateLock.lock()
-                    if self.readyResolved {
+                    if let result = self.readyResult {
                         self.stateLock.unlock()
-                        continuation.resume()
+                        continuation.resume(with: result)
                         return
                     }
                     self.readyContinuation = continuation
@@ -311,7 +317,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
                     streamIntegrityFailed = true
                     senderReadyContinuation?.finish()
                     senderReadyContinuation = nil
-                    readyResolved = true
+                    readyResult = .failure(error)
                     readyContinuation = nil
                 }
                 stateLock.unlock()
@@ -329,7 +335,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// Converts one captured buffer to 16kHz mono PCM16, base64-encodes it,
     /// and enqueues the JSON frame payload for sending. Called from the
     /// realtime audio-tap thread — returns quickly, never blocks on the
-    /// network. No-op until started and before finalize/cancel.
+    /// network. Buffers before start; no-op after finalize/cancel.
     func send(_ buffer: AVAudioPCMBuffer) {
         stateLock.lock()
         let continuation = frameContinuation
@@ -527,6 +533,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// Hard stop, no read-back. Cancels the socket and sender.
     func cancel() {
+        let error = CloudTranscriptionError(provider: .elevenLabs, message: "cancelled")
         stateLock.lock()
         if tornDown {
             stateLock.unlock()
@@ -547,7 +554,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         if !readyResolved {
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         // Extract any pending finalize()-side continuation before discarding
@@ -560,7 +567,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         let accumulated = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         resetTranscriptState()
         stateLock.unlock()
-        pendingReady?.resume(throwing: CloudTranscriptionError(provider: .elevenLabs, message: "cancelled"))
+        pendingReady?.resume(throwing: error)
         pendingDone?.resume(returning: accumulated)
 
         tearDownSocket()
@@ -632,6 +639,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// than let it block on the 5s timeout, so the caller falls back to the
     /// file/batch path promptly. No-op once ready has resolved.
     private func failReadyIfPending(_ reason: String) {
+        let error = CloudTranscriptionError(provider: .elevenLabs, message: reason)
         stateLock.lock()
         socketClosed = true
         let cont = readyResolved ? nil : readyContinuation
@@ -639,11 +647,11 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             streamIntegrityFailed = true
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         stateLock.unlock()
-        cont?.resume(throwing: CloudTranscriptionError(provider: .elevenLabs, message: reason))
+        cont?.resume(throwing: error)
     }
 
     // MARK: - Receive loop
@@ -712,11 +720,11 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             stateLock.lock()
             let continuation = readyResolved ? nil : readyContinuation
             if !readyResolved {
+                readyResult = .success(())
                 senderReadyContinuation?.yield(())
             }
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
             readyContinuation = nil
             stateLock.unlock()
             continuation?.resume()

@@ -29,6 +29,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// Opens only on a successful handshake; finishing without a value aborts sending.
     private var senderReadyContinuation: AsyncStream<Void>.Continuation?
 
+    private let frameStream: AsyncStream<String>
     private var frameContinuation: AsyncStream<String>.Continuation?
 
     private var converter: AVAudioConverter?
@@ -60,7 +61,9 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     private var readyContinuation: CheckedContinuation<Void, Error>?
-    private var readyResolved = false
+    // The first outcome also belongs to waiters registered after it resolves.
+    private var readyResult: Result<Void, Error>?
+    private var readyResolved: Bool { readyResult != nil }
     /// Set once `start()` has begun. With `readyResolved` still false, the
     /// socket has not yet accepted setup, so anything sent now would be wasted.
     private var startInvoked = false
@@ -110,6 +113,10 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.readinessTimeoutSeconds = readinessTimeoutSeconds
         self.finalizeBudgetOverride = finalizeBudgetOverride
         self.now = now
+        // Capture may begin as soon as this session is published, before start().
+        let (stream, frames) = AsyncStream<String>.makeStream()
+        self.frameStream = stream
+        self.frameContinuation = frames
         super.init()
     }
 
@@ -153,17 +160,16 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
         self.sessionStartTime = now()
 
-        let (stream, frames) = AsyncStream<String>.makeStream()
+        let stream = frameStream
         let (readiness, readySignal) = AsyncStream<Void>.makeStream()
-        // Publish the buffer and its gated consumer atomically: finalize must
-        // always have a sender to drain, even before start resumes from readiness.
+        // Install the gated consumer under the finalize lock so finalize can
+        // drain the prepared queue even before start resumes from readiness.
         stateLock.lock()
         guard !tornDown else {
             stateLock.unlock()
             tearDownSocket()
             throw CancellationError()
         }
-        frameContinuation = frames
         senderReadyContinuation = readySignal
         senderTask = Task { [weak self] in
             guard let self else { return }
@@ -235,9 +241,9 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     private func awaitReady() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             stateLock.lock()
-            if readyResolved {
+            if let result = readyResult {
                 stateLock.unlock()
-                continuation.resume()
+                continuation.resume(with: result)
                 return
             }
             readyContinuation = continuation
@@ -254,7 +260,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             streamIntegrityFailed = true
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         stateLock.unlock()
@@ -460,6 +466,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     func cancel() {
+        let error = CloudTranscriptionError(provider: .gemini, message: "cancelled")
         stateLock.lock()
         if tornDown {
             stateLock.unlock()
@@ -478,7 +485,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         if !readyResolved {
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         let pendingDone = doneResolved ? nil : doneContinuation
@@ -487,7 +494,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         let accumulated = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         resetTranscriptState()
         stateLock.unlock()
-        pendingReady?.resume(throwing: CloudTranscriptionError(provider: .gemini, message: "cancelled"))
+        pendingReady?.resume(throwing: error)
         pendingDone?.resume(returning: accumulated)
 
         tearDownSocket()
@@ -551,6 +558,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func failReadyIfPending(_ reason: String) {
+        let error = CloudTranscriptionError(provider: .gemini, message: reason)
         stateLock.lock()
         socketClosed = true
         let cont = readyResolved ? nil : readyContinuation
@@ -558,7 +566,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             streamIntegrityFailed = true
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         let pendingDone = doneResolved ? nil : doneContinuation
@@ -568,7 +576,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             doneContinuation = nil
         }
         stateLock.unlock()
-        cont?.resume(throwing: CloudTranscriptionError(provider: .gemini, message: reason))
+        cont?.resume(throwing: error)
         pendingDone?.resume(returning: accumulated)
     }
 
@@ -640,11 +648,11 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             stateLock.lock()
             let continuation = readyResolved ? nil : readyContinuation
             if !readyResolved {
+                readyResult = .success(())
                 senderReadyContinuation?.yield(())
             }
             senderReadyContinuation?.finish()
             senderReadyContinuation = nil
-            readyResolved = true
             readyContinuation = nil
             stateLock.unlock()
             continuation?.resume()
