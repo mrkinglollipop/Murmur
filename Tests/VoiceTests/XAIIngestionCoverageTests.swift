@@ -56,7 +56,9 @@ final class XAIIngestionCoverageTests: XCTestCase {
 
     func testSpeechFinalCumulativeTextReplacesEarlierChunkWithoutDuplication() throws {
         let session = XAIStreamingTranscriber(apiKey: "unused")
-        session.handleServerEvent(try partial("hello world", final: true))
+        session.handleServerEvent(try partial("hello world", final: true,
+                                              words: [["text": "hello", "start": 0, "end": 0.5],
+                                                      ["text": "world", "start": 0.5, "end": 1]]))
         session.handleServerEvent(try partial("Hello world again", final: true, speechFinal: true,
                                               words: [["text": "Hello", "start": 0, "end": 0.5],
                                                       ["text": "world", "start": 0.5, "end": 1],
