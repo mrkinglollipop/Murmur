@@ -50,6 +50,19 @@ final class FnActivationLogicTests: XCTestCase {
 
     // MARK: - §2 scenarios
 
+    func testFailedOrdinaryHoldRequiresPhysicalReleaseBeforeRestart() {
+        var state = FnActivationLogic.State()
+        XCTAssertEqual(down(&state, toggleLock: false, at: 0), [.startRecording])
+        FnActivationLogic.resetAfterCaptureFailure(state: &state)
+        XCTAssertTrue(state.fnPhysicallyDown)
+        XCTAssertEqual(down(&state, toggleLock: false, at: 0.5), [], "Shift down while Fn stays held")
+        XCTAssertEqual(down(&state, toggleLock: false, at: 0.6), [], "Shift up while Fn stays held")
+        XCTAssertFalse(state.isRecording)
+        XCTAssertEqual(up(&state, toggleLock: false, at: 0.7), [])
+        XCTAssertEqual(down(&state, toggleLock: false, at: 0.8), [.startRecording])
+        XCTAssertEqual(up(&state, toggleLock: false, at: 1), [.stopRecording])
+    }
+
     func testHoldToTalk_toggleLockOff() {
         var state = FnActivationLogic.State()
 

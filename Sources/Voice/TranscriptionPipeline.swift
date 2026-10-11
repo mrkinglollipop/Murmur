@@ -681,7 +681,7 @@ final class TranscriptionPipeline {
                self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
-                if !abandoned, sessionHeldToken == self.heldCaretToken { self.onFailure?(.voiceEditFailed) }
+                if !abandoned, self.shouldNotifyFailure(for: sessionHeldToken) { self.onFailure?(.voiceEditFailed) }
                 completion?(.failed)
                 return
             }
@@ -689,7 +689,7 @@ final class TranscriptionPipeline {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
             // The user already saw this hold dismissed; no late error pill.
-            if !abandoned, sessionHeldToken == self.heldCaretToken {
+            if !abandoned, self.shouldNotifyFailure(for: sessionHeldToken) {
                 let failure: DictationFailure
                 if let appleError = error as? AppleSpeechEngineError,
                    case .assetNotInstalled = appleError {
@@ -953,7 +953,7 @@ final class TranscriptionPipeline {
         let abandoned = consumeAbandonedHold(token: token, replaceHistoryEntryID: nil)
         clearHeldCaretSnapshot(matching: token)
         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
-        if !abandoned, token == heldCaretToken { onFailure?(failure) }
+        if !abandoned, shouldNotifyFailure(for: token) { onFailure?(failure) }
         completion?(.failed)
     }
 
