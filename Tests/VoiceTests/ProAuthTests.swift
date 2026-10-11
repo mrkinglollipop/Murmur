@@ -745,6 +745,47 @@ final class ProAuthTests: XCTestCase {
     }
 
     @MainActor
+    func testCorruptStoredTokenNeverRetriesOnForeground() async {
+        var reads = 0
+        let keychain = KeychainStore(
+            service: "murmur-auth-memory-test",
+            operations: KeychainOperations(
+                read: { query in
+                    XCTAssertEqual(query[kSecAttrAccount as String] as? String, AuthFlowController.keychainAccount)
+                    reads += 1
+                    return (errSecSuccess, Data([0xff]))
+                },
+                add: { _ in XCTFail("Unexpected Keychain write"); return errSecSuccess },
+                update: { _, _ in XCTFail("Unexpected Keychain update"); return errSecSuccess },
+                delete: { _ in XCTFail("Corrupt credential must be preserved"); return errSecSuccess }
+            )
+        )
+        let controller = AuthFlowController(
+            keychain: keychain,
+            exchangeCode: { _, _ in
+                XCTFail("Unexpected code exchange")
+                throw SupabaseAuthClient.AuthError.invalidRefreshToken
+            },
+            refreshToken: { _ in
+                XCTFail("Corrupt credential must not reach refresh")
+                throw SupabaseAuthClient.AuthError.invalidRefreshToken
+            },
+            openBrowser: { _ in XCTFail("Unexpected browser launch") }
+        )
+
+        await controller.restoreSessionIfAvailable()
+        XCTAssertEqual(reads, 1)
+        let first = await controller.sessionForForegroundActivation()
+        let second = await controller.sessionForForegroundActivation()
+
+        XCTAssertNil(first)
+        XCTAssertNil(second)
+        XCTAssertEqual(reads, 1, "Permanent credential corruption must not retry on activation")
+        XCTAssertEqual(controller.state, .signedOut)
+        XCTAssertTrue(controller.lastError?.contains("Please sign in again") == true)
+    }
+
+    @MainActor
     func testKeychainReadDenialRetriesLaunchAndPendingForegroundRestore() async {
         for failNetworkFirst in [false, true] {
             let restored = session(refreshToken: "rotated")

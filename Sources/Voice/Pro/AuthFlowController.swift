@@ -411,6 +411,9 @@ final class AuthFlowController: ObservableObject {
             state = .signedIn(session)
             persistRenewedToken(session.refreshToken)
             vlog("auth: session restored from stored refresh token")
+        } catch KeychainReadError.invalidData {
+            guard generation == sessionGeneration else { return }
+            lastError = "Murmur couldn't read your saved sign-in because its data is invalid. Please sign in again."
         } catch let error as SupabaseAuthClient.AuthError where error == .invalidRefreshToken {
             guard generation == sessionGeneration else { return }
             endSessionAfterInvalidRefresh()
