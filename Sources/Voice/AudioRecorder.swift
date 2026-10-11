@@ -19,6 +19,10 @@ final class AudioRecorder {
     private var engine = AVAudioEngine()
     private var pcmBuffers: [AVAudioPCMBuffer] = []
     private let pcmBuffersLock = NSLock()
+    /// Guarded by `pcmBuffersLock`; retained audio from a prior tap must not
+    /// make a silent replacement tap look healthy.
+    private var bufferDeliveryGeneration: UInt64 = 0
+    private var buffersDeliveredThisGeneration = 0
     /// Guarded by `pcmBuffersLock`. `pcmBuffers` is only cleared when a hold's
     /// mic capture begins, so buffers seen at stop while this is false belong
     /// to an earlier hold and must never be transcribed again.
@@ -83,6 +87,53 @@ final class AudioRecorder {
     /// while the first ~200ms of speech hit a dying or not-yet-started tap.
     private var didAnnounceListeningThisTake = false
 
+    /// Main-thread notification for activation state after capture terminates.
+    var onTerminalCaptureFailure: (() -> Void)?
+
+    #if DEBUG
+    /// Replaces hardware and wall-clock boundaries only; recovery and teardown
+    /// still execute the same recorder methods as a live capture.
+    final class MicCaptureTestHooks {
+        var boundDeviceID: AudioDeviceID? = 81
+        var engineRunning = false
+        var successfulStarts = 0
+        var receiveBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        let schedule: MicHealthWarningMonitor.Schedule
+        let now: () -> Date
+
+        init(schedule: @escaping MicHealthWarningMonitor.Schedule, now: @escaping () -> Date) {
+            self.schedule = schedule
+            self.now = now
+        }
+    }
+    private var micCaptureTestHooks: MicCaptureTestHooks?
+
+    init(micCaptureTestHooks: MicCaptureTestHooks, streamingCoordinator: StreamingCoordinator = StreamingCoordinator()) {
+        self.micCaptureTestHooks = micCaptureTestHooks
+        self.streamingCoordinator = streamingCoordinator
+    }
+
+    func beginMicCaptureForTesting() {
+        precondition(micCaptureTestHooks != nil)
+        wantsRecording = true
+        isStopping = false
+        startTime = micCaptureTestHooks!.now()
+        micHealthGeneration &+= 1
+        startMicHealthMonitoring()
+        startMicCapture()
+    }
+
+    func microphoneConfigurationChangedForTesting() {
+        precondition(micCaptureTestHooks != nil)
+        handleEngineConfigurationChange()
+    }
+
+    var micCaptureStateForTesting: (wanted: Bool, stopping: Bool, tapInstalled: Bool, buffers: [AVAudioPCMBuffer], maxRMS: Float) {
+        (wantsRecording, isStopping, isSetUp, pcmBuffersLock.withLock { pcmBuffers }, levelLock.withLock { maxLevelObserved })
+    }
+    #endif
+
     init() {
         registerEngineConfigObserver()
         registerDefaultInputDeviceListener()
@@ -137,22 +188,15 @@ final class AudioRecorder {
             }
             return
         }
-        let currentDefault = Self.halDefaultInputDeviceID()
+        let route = micInputRoute()
         let preferredUID = preferredInputDeviceUIDProvider?()
-        let boundUID = lastBoundInputDeviceID.map {
-            Self.audioDeviceCFString($0, kAudioDevicePropertyDeviceUID)
-        }
-        let boundIsHealthy = lastBoundInputDeviceID.map {
-            Self.isAudioDeviceAlive($0) && !Self.audioDeviceInputFormatLooksDead($0)
-                && !(excludedInputDeviceUIDsProvider?() ?? []).contains(boundUID ?? "")
-        } ?? false
         let action = MicHealth.inputRerouteAction(
             lastBound: lastBoundInputDeviceID,
-            currentDefault: currentDefault,
-            boundUID: boundUID,
+            currentDefault: route.defaultID,
+            boundUID: route.boundUID,
             preferredUID: preferredUID,
-            boundIsHealthy: boundIsHealthy,
-            engineRunning: engine.isRunning
+            boundIsHealthy: route.boundIsHealthy,
+            engineRunning: micEngineIsRunning
         )
         guard case .rebuild(let failedID) = action else {
             vlog("audio engine configuration change MID-HOLD — keeping live tap")
@@ -174,6 +218,9 @@ final class AudioRecorder {
     }
 
     private func registerDefaultInputDeviceListener() {
+        #if DEBUG
+        guard micCaptureTestHooks == nil else { return }
+        #endif
         guard defaultInputListenerBlock == nil else { return }
         var address = Self.defaultInputPropertyAddress
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -223,6 +270,12 @@ final class AudioRecorder {
     /// input format. A new `AVAudioEngine()` rebinds to the *current default*,
     /// which can still be a ghost Bluetooth ID after unplug — that is not enough.
     private func bindAliveInputDevice(excluding failedDeviceID: AudioDeviceID? = nil) -> AudioDeviceID? {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            lastBoundInputDeviceID = hooks.boundDeviceID
+            return hooks.boundDeviceID
+        }
+        #endif
         let defaultID = Self.halDefaultInputDeviceID()
         let defaultAlive = defaultID.map(Self.isAudioDeviceAlive) ?? false
         let defaultFormatDead = defaultID.map(Self.audioDeviceInputFormatLooksDead) ?? true
@@ -593,6 +646,12 @@ final class AudioRecorder {
     /// Returns the bound device ID, or nil when bind failed (fail closed).
     @discardableResult
     private func rebuildEngine(excluding failedDeviceID: AudioDeviceID? = nil) -> AudioDeviceID? {
+        #if DEBUG
+        if micCaptureTestHooks != nil {
+            engineNeedsRebuild = false
+            return bindAliveInputDevice(excluding: failedDeviceID)
+        }
+        #endif
         engine.stop()
         engine = AVAudioEngine()
         registerEngineConfigObserver()
@@ -987,7 +1046,7 @@ final class AudioRecorder {
     private static let speechRMSThreshold: Float = 0.007
 
     /// xAI / WhisperKit streaming session state and start/stop decisions.
-    private let streamingCoordinator = StreamingCoordinator()
+    private var streamingCoordinator = StreamingCoordinator()
 
     /// Off-main queue for concatenating buffers, writing CAF, and retention copy.
     private let audioIOQueue = DispatchQueue(label: "com.matt.voice-dictation.audio-io", qos: .userInitiated)
@@ -1639,6 +1698,10 @@ final class AudioRecorder {
             watchdogRetriedThisTake = false
         }
         captureGeneration &+= 1
+        pcmBuffersLock.lock()
+        bufferDeliveryGeneration = captureGeneration
+        buffersDeliveredThisGeneration = 0
+        pcmBuffersLock.unlock()
 
         vlog("startMicCapture — AVAudioEngine begins capture")
         // A recovery restart continues the SAME hold — the audio captured
@@ -1684,7 +1747,7 @@ final class AudioRecorder {
 
         // A device mid-transition can report a dead format; a tap installed
         // against it never fires. Rebuild once, excluding the failed ID.
-        let probeFormat = engine.inputNode.outputFormat(forBus: 0)
+        let probeFormat = micInputFormat()
         if Self.inputFormatLooksDead(
             sampleRate: probeFormat.sampleRate,
             channelCount: probeFormat.channelCount
@@ -1701,7 +1764,7 @@ final class AudioRecorder {
                 failMicStart(reason: "bind failed after excluding format-dead device \(ghostID ?? 0)")
                 return
             }
-            let retryFormat = engine.inputNode.outputFormat(forBus: 0)
+            let retryFormat = micInputFormat()
             if Self.shouldFailClosedAfterDeadFormatFallback(
                 formatStillDead: Self.inputFormatLooksDead(
                     sampleRate: retryFormat.sampleRate,
@@ -1719,13 +1782,18 @@ final class AudioRecorder {
             }
         }
 
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+        let format = micInputFormat()
 
         // Avoid double-installing a tap
         if !isSetUp {
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            let tapGeneration = captureGeneration
+            installMicTap(format: format) { [weak self] buffer, _ in
                 guard let self = self else { return }
+                self.pcmBuffersLock.lock()
+                if self.bufferDeliveryGeneration == tapGeneration {
+                    self.buffersDeliveredThisGeneration += 1
+                }
+                self.pcmBuffersLock.unlock()
 
                 // Realtime-thread safe: compute smoothed RMS amplitude and
                 // publish it for the HUD waveform. Only a Float + a lock — no
@@ -1811,6 +1879,16 @@ final class AudioRecorder {
     /// occupy its attempt queue until HAL returns; that must not starve the
     /// next hold's new engine.
     private func startEngineOffMain(isWatchdogRetry: Bool) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.engineRunning = true
+            hooks.successfulStarts += 1
+            handleEngineStartFinished(token: engineStartToken, generation: captureGeneration,
+                                      engineToStart: engine, result: .success(()),
+                                      isWatchdogRetry: isWatchdogRetry)
+            return
+        }
+        #endif
         engineStartToken &+= 1
         let token = engineStartToken
         let generation = captureGeneration
@@ -1981,31 +2059,39 @@ final class AudioRecorder {
     private func failMicStart(reason: String) {
         logger.error("mic start failed — \(reason)")
         vlog("failMicStart — \(reason)")
-        // Next hold's startMicCapture only rebuilds when this is set.
-        // Bind/start failures can leave the graph unusable.
-        engineNeedsRebuild = true
-        invalidateSecureInputPollTimer()
-        teardownMicEngine()
-        endVoiceGateRecordingSession()
-        clearPendingHeldCaretSnapshot()
-        DispatchQueue.main.async { [weak self] in
+        terminateFailedMicCapture()
+        scheduleMicHealthCheck(after: 0) { [weak self] in
             // onFailure flashes the error pill. hide() here would cancel it.
             self?.asrSelector.onFailure?(.micStartFailed)
         }
     }
 
+    private func terminateFailedMicCapture() {
+        wantsRecording = false
+        isStopping = true
+        // Bind/start failures can leave the graph unusable for the next hold.
+        engineNeedsRebuild = true
+        invalidateSecureInputPollTimer()
+        teardownMicEngine()
+        endVoiceGateRecordingSession()
+        streamingCoordinator.cancelAll()
+        clearHeldCaretSnapshotMatchingSession(activeHeldCaretToken)
+        clearPendingHeldCaretSnapshot()
+        micHealthMonitor = nil
+        cancelProcessingWatchdog()
+        onTerminalCaptureFailure?()
+    }
+
     /// Detects the silent-wedge case the config-change notification can miss:
     /// `engine.start()` returned success but the tap never fires. One rebuild
-    /// + restart per hold; the tap's always-on pcmBuffers copy is the buffer
-    /// counter, so this works identically in streaming and file modes.
+    /// + restart per hold; delivery is counted per tap generation in both
+    /// streaming and file modes, independently of retained recovery audio.
     private func armZeroBufferWatchdog() {
         let generation = captureGeneration
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + Self.zeroBufferWatchdogDelay
-        ) { [weak self] in
+        scheduleMicHealthCheck(after: Self.zeroBufferWatchdogDelay) { [weak self] in
             guard let self else { return }
             self.pcmBuffersLock.lock()
-            let buffersSeen = self.pcmBuffers.count
+            let buffersSeen = self.buffersDeliveredThisGeneration
             self.pcmBuffersLock.unlock()
 
             let action = MicHealth.zeroBufferAction(
@@ -2020,17 +2106,7 @@ final class AudioRecorder {
                 return
             case .fail:
                 vlog("mic watchdog: still zero buffers after rebuild — ending capture")
-                self.wantsRecording = false
-                self.isStopping = true
-                self.engineNeedsRebuild = true
-                self.invalidateSecureInputPollTimer()
-                self.teardownMicEngine()
-                self.endVoiceGateRecordingSession()
-                self.streamingCoordinator.cancelAll()
-                self.clearHeldCaretSnapshotMatchingSession(self.activeHeldCaretToken)
-                self.clearPendingHeldCaretSnapshot()
-                self.micHealthMonitor = nil
-                self.cancelProcessingWatchdog()
+                self.terminateFailedMicCapture()
                 // The existing failure path replaces Listening with the error
                 // pill and auto-hides it; hide() here would cancel that pill.
                 self.asrSelector.onFailure?(.micDeliveredNoAudio)
@@ -2049,6 +2125,9 @@ final class AudioRecorder {
     }
 
     private func startSecureInputPollTimer() {
+        #if DEBUG
+        guard micCaptureTestHooks == nil else { return }
+        #endif
         invalidateSecureInputPollTimer()
         let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -2676,6 +2755,14 @@ final class AudioRecorder {
         engineStartToken &+= 1
         engineStartInFlight = false
         guard isSetUp else { return }
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.engineRunning = false
+            hooks.receiveBuffer = nil
+            isSetUp = false
+            return
+        }
+        #endif
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         isSetUp = false
@@ -2732,6 +2819,64 @@ final class AudioRecorder {
         }
     }
 
+    private func micInputRoute() -> (defaultID: AudioDeviceID?, boundUID: String?, boundIsHealthy: Bool) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            return (hooks.boundDeviceID, "test-microphone", hooks.boundDeviceID != nil)
+        }
+        #endif
+        let currentDefault = Self.halDefaultInputDeviceID()
+        let boundUID = lastBoundInputDeviceID.map {
+            Self.audioDeviceCFString($0, kAudioDevicePropertyDeviceUID)
+        }
+        let boundIsHealthy = lastBoundInputDeviceID.map {
+            Self.isAudioDeviceAlive($0) && !Self.audioDeviceInputFormatLooksDead($0)
+                && !(excludedInputDeviceUIDsProvider?() ?? []).contains(boundUID ?? "")
+        } ?? false
+        return (currentDefault, boundUID, boundIsHealthy)
+    }
+
+    private var micEngineIsRunning: Bool {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks { return hooks.engineRunning }
+        #endif
+        return engine.isRunning
+    }
+
+    private func micInputFormat() -> AVAudioFormat {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks { return hooks.format }
+        #endif
+        return engine.inputNode.outputFormat(forBus: 0)
+    }
+
+    private func installMicTap(format: AVAudioFormat, receive: @escaping AVAudioNodeTapBlock) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.receiveBuffer = receive
+            return
+        }
+        #endif
+        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format, block: receive)
+    }
+
+    private func scheduleMicHealthCheck(after delay: TimeInterval, action: @escaping () -> Void) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.schedule(delay, action)
+            return
+        }
+        #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
+    }
+
+    private var micHealthNow: Date {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks { return hooks.now() }
+        #endif
+        return Date()
+    }
+
     private func startMicHealthMonitoring() {
         let generation = micHealthGeneration
         micHealthMonitor = MicHealthWarningMonitor(
@@ -2743,18 +2888,24 @@ final class AudioRecorder {
                 self.levelLock.unlock()
                 guard isCurrent else { return nil }
                 return MicHealthWarningMonitor.Snapshot(
-                    elapsed: self.startTime.map { Date().timeIntervalSince($0) } ?? 0,
+                    elapsed: self.startTime.map { self.micHealthNow.timeIntervalSince($0) } ?? 0,
                     maxRMS: maxLevel,
-                    engineRunning: self.engine.isRunning,
+                    engineRunning: self.micEngineIsRunning,
                     deviceName: self.lastBoundInputDeviceName
                 )
             },
             warning: { [weak self] deviceName in
+                #if DEBUG
+                if self?.micCaptureTestHooks != nil { return }
+                #endif
                 if let deviceName {
                     self?.hud.showMicrophoneNoAudio(deviceName)
                 } else {
                     self?.hud.clearMicrophoneNoAudio()
                 }
+            },
+            schedule: { [weak self] delay, action in
+                self?.scheduleMicHealthCheck(after: delay, action: action)
             }
         )
     }
@@ -3028,6 +3179,9 @@ final class AudioRecorder {
     /// Tink + HUD after the mic is actually capturing. Once per hold so a
     /// real HAL reroute restart does not chirp twice.
     private func announceListeningIfNeeded() {
+        #if DEBUG
+        guard micCaptureTestHooks == nil else { return }
+        #endif
         guard !didAnnounceListeningThisTake else { return }
         didAnnounceListeningThisTake = true
         playFeedbackSound(named: "Tink")

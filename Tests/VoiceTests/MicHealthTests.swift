@@ -1,47 +1,112 @@
 import XCTest
 import Foundation
+import AVFoundation
 @testable import Voice
 
 final class MicHealthTests: XCTestCase {
 
-    func testTwoSuccessfulStartsWithoutBuffersEndCaptureWithoutARelease() {
+    @MainActor
+    func testRecoveryWithoutReplacementBuffersFailsAndPreservesEarlierSpeech() throws {
         let clock = MicHealthTestClock()
-        var wantsRecording = true
-        var tapInstalled = true
-        var alreadyRetried = false
-        var successfulStarts = 1
-        var actions: [MicHealth.ZeroBufferAction] = []
-
-        func fireWatchdog() {
-            let action = MicHealth.zeroBufferAction(
-                generationMatches: true, stillWanted: wantsRecording,
-                tapInstalled: tapInstalled, buffersSeen: 0,
-                alreadyRetried: alreadyRetried
-            )
-            actions.append(action)
-            switch action {
-            case .ignore:
-                break
-            case .restart:
-                alreadyRetried = true
-                successfulStarts += 1
-                clock.schedule(after: 0.4, action: fireWatchdog)
-            case .fail:
-                wantsRecording = false
-                tapInstalled = false
-            }
-        }
-
-        clock.schedule(after: 0.4, action: fireWatchdog)
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks)
+        var failures: [String] = []
+        recorder.asrSelector.onFailure = { failures.append($0.message) }
+        recorder.beginMicCaptureForTesting()
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: hooks.format, frameCapacity: 160))
+        buffer.frameLength = 160
+        for frame in 0..<160 { buffer.floatChannelData![0][frame] = 0.1 }
+        let receive = try XCTUnwrap(hooks.receiveBuffer)
+        receive(buffer, AVAudioTime(sampleTime: 0, atRate: 16_000))
         clock.advance(to: 0.4)
-        XCTAssertEqual(successfulStarts, 2)
-        XCTAssertTrue(wantsRecording)
-        // A toggle-locked hold sends no stop request when Fn is released.
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertEqual(recorder.micCaptureStateForTesting.buffers.count, 1)
+
+        hooks.engineRunning = false
+        recorder.microphoneConfigurationChangedForTesting()
+        XCTAssertEqual(hooks.successfulStarts, 2)
         clock.advance(to: 0.8)
-        XCTAssertEqual(actions, [.restart, .fail])
-        XCTAssertFalse(wantsRecording)
-        XCTAssertFalse(tapInstalled)
-        XCTAssertEqual(clock.pendingCount, 0)
+
+        XCTAssertEqual(failures.count, 1, "Replacement tap delivered no buffers for 400 ms")
+        XCTAssertFalse(recorder.micCaptureStateForTesting.wanted)
+        let saved = try XCTUnwrap(AudioRecorder.combine(buffers: recorder.micCaptureStateForTesting.buffers))
+        XCTAssertEqual(saved.frameLength, 160)
+        XCTAssertEqual(saved.floatChannelData![0][159], 0.1, accuracy: 0.0001)
+        XCTAssertGreaterThan(recorder.micCaptureStateForTesting.maxRMS, 0.09)
+    }
+
+    @MainActor
+    func testExhaustedToggleCaptureAllowsNextOrdinaryHold() {
+        let clock = MicHealthTestClock()
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks)
+        let activation = ActivationController(recorder: recorder)
+        lockToggle(activation, clock: clock)
+        recorder.beginMicCaptureForTesting()
+        clock.advance(to: 0.8)
+        XCTAssertEqual(hooks.successfulStarts, 2)
+        XCTAssertFalse(recorder.micCaptureStateForTesting.wanted)
+        XCTAssertFalse(activation.fnStateForTesting.isToggleLocked)
+        XCTAssertFalse(activation.fnStateForTesting.isRecording)
+        XCTAssertTrue(activation.fnStateForTesting.fnPhysicallyDown, "Failure must preserve physical key state")
+        XCTAssertNil(activation.fnStateForTesting.firstTapAnchor)
+        XCTAssertNil(activation.fnStateForTesting.holdDeadline)
+        XCTAssertEqual(activation.fnTransitionForTesting(down: true, now: clock.date), [], "Repeated down is not a new press")
+        _ = activation.fnTransitionForTesting(down: false, now: clock.date)
+        clock.advance(to: 1)
+        let effects = activation.fnTransitionForTesting(down: true, now: clock.date)
+        XCTAssertEqual(effects, [.scheduleHoldTimer(deadline: clock.date.addingTimeInterval(FnActivationLogic.holdThreshold))])
+        clock.advance(to: 1.2)
+        let timerEffects = activation.fnHoldTimerForTesting(now: clock.date)
+        XCTAssertEqual(timerEffects, [.startRecording])
+        if timerEffects.contains(.startRecording) { recorder.beginMicCaptureForTesting() }
+        XCTAssertEqual(hooks.successfulStarts, 3)
+        XCTAssertTrue(recorder.micCaptureStateForTesting.wanted)
+        // Leave the controller idle so deinit cannot enter a real stop pipeline.
+        _ = activation.fnTransitionForTesting(down: false, now: clock.date)
+    }
+
+    @MainActor
+    func testRecoveryBindFailureEndsCloudToggleCaptureAndWarningPolling() {
+        let clock = MicHealthTestClock()
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let session = XAIStreamingTranscriber(apiKey: "dummy", messageSender: { _ in XCTFail("No network frames expected") })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"earlier speech","is_final":false}"#)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "earlier speech")
+        let streaming = StreamingCoordinator(xaiSession: session)
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks, streamingCoordinator: streaming)
+        let activation = ActivationController(recorder: recorder)
+        lockToggle(activation, clock: clock)
+        var failures: [String] = []
+        recorder.asrSelector.onFailure = { failures.append($0.message) }
+        recorder.beginMicCaptureForTesting()
+        hooks.boundDeviceID = nil
+        clock.advance(to: 0.4)
+
+        XCTAssertEqual(hooks.successfulStarts, 1)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertFalse(recorder.micCaptureStateForTesting.wanted)
+        XCTAssertTrue(recorder.micCaptureStateForTesting.stopping)
+        XCTAssertFalse(recorder.micCaptureStateForTesting.tapInstalled)
+        XCTAssertNil(streaming.xaiSession)
+        XCTAssertEqual(session.joinedTranscriptSnapshot(), "", "Cancellation must reach the retained cloud session")
+        XCTAssertFalse(activation.fnStateForTesting.isToggleLocked)
+        clock.advance(to: 2)
+        XCTAssertEqual(clock.pendingCount, 0, "Terminal failure must stop the warning poll")
+        XCTAssertEqual(failures.count, 1)
+        _ = activation.fnTransitionForTesting(down: false, now: clock.date)
+        _ = activation.fnTransitionForTesting(down: true, now: clock.date)
+        _ = activation.fnTransitionForTesting(down: false, now: clock.date)
+        // Baseline failures must not leave a real stop/network operation in deinit.
+        session.cancel()
+    }
+
+    @MainActor
+    private func lockToggle(_ activation: ActivationController, clock: MicHealthTestClock) {
+        _ = activation.fnTransitionForTesting(down: true, now: clock.date.addingTimeInterval(-0.2))
+        _ = activation.fnTransitionForTesting(down: false, now: clock.date.addingTimeInterval(-0.1))
+        XCTAssertTrue(activation.fnTransitionForTesting(down: true, now: clock.date).contains(.startRecording))
+        XCTAssertTrue(activation.fnStateForTesting.isToggleLocked)
     }
 
     func testZeroBufferWatchdogIgnoresStaleStoppedOrUntappedCapture() {
@@ -312,6 +377,7 @@ final class MicHealthTests: XCTestCase {
 
 private final class MicHealthTestClock {
     private(set) var now: TimeInterval = 0
+    var date: Date { Date(timeIntervalSince1970: now) }
     private var pending: [(deadline: TimeInterval, action: () -> Void)] = []
     var pendingCount: Int { pending.count }
 
