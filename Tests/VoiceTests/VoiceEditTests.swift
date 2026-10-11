@@ -298,7 +298,8 @@ final class VoiceEditTests: XCTestCase {
         XCTAssertEqual(failure, expectedFailure)
         XCTAssertEqual(clipboard, expectedClipboard)
         XCTAssertEqual(inserted, expectedInsert)
-        if expectedOutcome == .inserted || expectedFailure == .injectionFailed {
+        // Clipboard recovery still logs history when a newer hold suppresses notification.
+        if expectedOutcome == .inserted || expectedClipboard != nil {
             XCTAssertEqual(history.count, 1)
             XCTAssertEqual(history.first?.text, result.trimmingCharacters(in: .whitespacesAndNewlines))
             XCTAssertEqual(history.first?.instruction, "rewrite this")
@@ -359,8 +360,8 @@ final class VoiceEditTests: XCTestCase {
     }
 
     @MainActor
-    func testOlderEditCannotInjectOverANewerHold() {
-        assertEditDelivery(expectedOutcome: .failed, expectedFailure: .injectionFailed,
+    func testOlderEditCannotInjectOrNotifyOverANewerHold() {
+        assertEditDelivery(expectedOutcome: .failed, expectedFailure: nil,
             expectedClipboard: "New words here.", startNewHold: true)
     }
 

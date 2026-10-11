@@ -629,7 +629,7 @@ final class TranscriptionPipeline {
         }
     }
 
-    private func reportTranscriptionFailure(
+    func reportTranscriptionFailure(
         engineID: String,
         audioPath: String?,
         replaceHistoryEntryID: UUID?,
@@ -646,7 +646,7 @@ final class TranscriptionPipeline {
                self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
-                if !abandoned { self.onFailure?(.voiceEditFailed) }
+                if !abandoned, sessionHeldToken == self.heldCaretToken { self.onFailure?(.voiceEditFailed) }
                 completion?(.failed)
                 return
             }
@@ -654,7 +654,7 @@ final class TranscriptionPipeline {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
             // The user already saw this hold dismissed; no late error pill.
-            if !abandoned { self.onFailure?(.transcriptionFailed) }
+            if !abandoned, sessionHeldToken == self.heldCaretToken { self.onFailure?(.transcriptionFailed) }
             self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
             completion?(.failed)
         }
@@ -899,7 +899,7 @@ final class TranscriptionPipeline {
         let abandoned = consumeAbandonedHold(token: token, replaceHistoryEntryID: nil)
         clearHeldCaretSnapshot(matching: token)
         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
-        if !abandoned { onFailure?(failure) }
+        if !abandoned, token == heldCaretToken { onFailure?(failure) }
         completion?(.failed)
     }
 
@@ -970,7 +970,9 @@ final class TranscriptionPipeline {
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if !abandoned { self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed) }
+                if !abandoned, sessionHeldToken == self.heldCaretToken {
+                    self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed)
+                }
                 if voiceEditInstruction == nil, audioPath != nil || saveWithoutInsertion {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
@@ -1242,7 +1244,7 @@ final class TranscriptionPipeline {
                     if replaceID == nil {
                         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
-                    if let failure = outcome.failure {
+                    if let failure = outcome.failure, sessionHeldToken == self.heldCaretToken {
                         self.onFailure?(failure)
                     }
 
