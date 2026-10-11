@@ -81,11 +81,14 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var receiveLoopTask: Task<Void, Never>?
     private var senderTask: Task<Void, Never>?
+    /// Opens only on a successful handshake; finishing without a value aborts sending.
+    private var senderReadyContinuation: AsyncStream<Void>.Continuation?
 
     /// Feeds captured/converted PCM16 frames from `send(_:)` (audio-tap
     /// thread, synchronous, non-blocking) to the single sender `Task` (which
     /// awaits the actual network write). This is what lets `send(_:)` return
     /// immediately without ever touching `await`.
+    private let frameStream: AsyncStream<Data>
     private var frameContinuation: AsyncStream<Data>.Continuation?
 
     /// Lazily built on the first `send(_:)` call once we know the input
@@ -146,7 +149,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// arrives. Guarded separately from `readyResolved` below by the same
     /// lock since both are set from the receive-loop task.
     private var readyContinuation: CheckedContinuation<Void, Error>?
-    private var readyResolved = false
+    // The first outcome also belongs to waiters registered after it resolves.
+    private var readyResult: Result<Void, Error>?
+    private var readyResolved: Bool { readyResult != nil }
     /// Set once `start()` has begun. With `readyResolved` still false, the
     /// server has not sent `transcript.created`, so anything sent now would be wasted.
     private var startInvoked = false
@@ -186,6 +191,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.endpointingMs = Self.clampEndpointingMs(endpointingMs)
         self.injectedMessageSender = messageSender
         self.finalizeBudgetOverride = finalizeBudgetOverride
+        // Capture may begin as soon as this session is published, before start().
+        let (stream, frames) = AsyncStream<Data>.makeStream()
+        self.frameStream = stream
+        self.frameContinuation = frames
         super.init()
     }
 
@@ -208,7 +217,11 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
 
     /// Opens the socket and awaits `transcript.created`. Throws on
     /// connection/auth failure or if readiness doesn't arrive within ~5s.
-    func start() async throws {
+    // Lifecycle hooks let offline tests hold start at the readiness boundary.
+    func start(
+        beforeReadiness: (() -> Void)? = nil,
+        afterReadiness: (() async -> Void)? = nil
+    ) async throws {
         vlog("xai-stream: starting session")
         stateLock.lock()
         startInvoked = true
@@ -244,35 +257,48 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             if let task { try await task.send(message) } else { try await sendMessage(message) }
         }
 
-        // Create the frame stream + continuation BEFORE resuming so frames
-        // captured during the connection handshake are BUFFERED (AsyncStream's
-        // default policy is unbounded) rather than dropped — the leading audio
-        // of a push-to-talk utterance must survive the ~100-300ms socket open.
-        // The consumer that DRAINS this stream is started only after
-        // `transcript.created` (below): the protocol forbids sending audio
-        // before the server is ready, so buffered frames wait, then flush in
-        // capture order once the sender starts.
-        let stream = AsyncStream<Data> { continuation in
-            self.stateLock.lock()
-            self.frameContinuation = continuation
-            self.stateLock.unlock()
+        // Consume the queue prepared before publication. Audio must wait for
+        // transcript.created before it can be sent to the server.
+        let stream = frameStream
+        let (readiness, readySignal) = AsyncStream<Void>.makeStream()
+        // Install the gated consumer under the finalize lock so finalize can
+        // drain the prepared queue even before start resumes from readiness.
+        stateLock.lock()
+        guard !tornDown else {
+            stateLock.unlock()
+            tearDownSocket()
+            throw CancellationError()
         }
+        senderReadyContinuation = readySignal
+        senderTask = Task {
+            var readyIterator = readiness.makeAsyncIterator()
+            guard await readyIterator.next() != nil, !Task.isCancelled else { return }
+            for await frame in stream {
+                do {
+                    try await sendFrame(.data(frame))
+                } catch {
+                    self.markStreamIntegrityFailed()
+                    vlog("xai-stream: send failed, stopping sender: \(error.localizedDescription)")
+                    break
+                }
+            }
+        }
+        stateLock.unlock()
 
         receiveLoopTask = Task { [weak self] in
             await self?.runReceiveLoop()
         }
 
         task?.resume()
+        beforeReadiness?()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     self.stateLock.lock()
-                    if self.readyResolved {
-                        // transcript.created already arrived between resume()
-                        // and here (unlikely but possible) — resolve immediately.
+                    if let result = self.readyResult {
                         self.stateLock.unlock()
-                        continuation.resume()
+                        continuation.resume(with: result)
                         return
                     }
                     self.readyContinuation = continuation
@@ -300,7 +326,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                 stateLock.lock()
                 let pending = readyResolved ? nil : readyContinuation
                 if !readyResolved {
-                    readyResolved = true
+                    streamIntegrityFailed = true
+                    senderReadyContinuation?.finish()
+                    senderReadyContinuation = nil
+                    readyResult = .failure(error)
                     readyContinuation = nil
                 }
                 stateLock.unlock()
@@ -310,27 +339,14 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             }
         }
 
-        // Ready: now safe to stream audio. A single consumer drains the
-        // buffered + live frames so network writes stay in capture order even
-        // though each `task.send` is async.
-        senderTask = Task {
-            for await frame in stream {
-                do {
-                    try await sendFrame(.data(frame))
-                } catch {
-                    self.markStreamIntegrityFailed()
-                    vlog("xai-stream: send failed, stopping sender: \(error.localizedDescription)")
-                    break
-                }
-            }
-        }
+        await afterReadiness?()
 
         vlog("xai-stream: session ready")
     }
 
     /// Converts one captured buffer to 16kHz mono PCM16 and enqueues it for
     /// sending. Called from the realtime audio-tap thread — returns quickly
-    /// and never blocks on the network. No-op until started and before
+    /// and never blocks on the network. Buffers before start; no-op after
     /// finalize/cancel (frameContinuation is nil/finished in those states).
     func send(_ buffer: AVAudioPCMBuffer) {
         stateLock.lock()
@@ -370,9 +386,14 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let framesToFinish = frameContinuation
         frameContinuation = nil
+        let senderToDrain = senderTask
+        if startInvoked && !readyResolved {
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+        }
         stateLock.unlock()
         framesToFinish?.finish()
-        let senderToDrain = senderTask
         do {
             try await AsyncDeadline.run(
                 seconds: max(0, finalizeDeadline.timeIntervalSinceNow),
@@ -388,7 +409,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             stateLock.unlock()
             return text
         }
+        stateLock.lock()
         senderTask = nil
+        stateLock.unlock()
 
         // If the socket already failed/closed, don't send audio.done or wait on
         // transcript.done — return what we accumulated instead of hanging on
@@ -499,6 +522,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// Resumes any pending `start()`/`finalize()` continuations so callers
     /// cannot hang after cancel (mirrors `ElevenLabsRealtimeTranscriber.cancel`).
     func cancel() {
+        let error = CloudTranscriptionError(provider: .xai, message: "cancelled")
         stateLock.lock()
         if tornDown {
             stateLock.unlock()
@@ -515,7 +539,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.lock()
         let pendingReady = readyResolved ? nil : readyContinuation
         if !readyResolved {
-            readyResolved = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         // Extract any pending finalize()-side continuation before discarding
@@ -527,7 +553,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         let accumulated = mergeConfirmedWithInterim()
         resetTranscriptState()
         stateLock.unlock()
-        pendingReady?.resume(throwing: CloudTranscriptionError(provider: .xai, message: "cancelled"))
+        pendingReady?.resume(throwing: error)
         pendingDone?.resume(returning: accumulated)
 
         tearDownSocket()
@@ -548,11 +574,14 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private func tearDownSocket() {
         stateLock.lock()
         intentionalSocketShutdown = true
+        let senderToCancel = senderTask
+        senderTask = nil
+        senderReadyContinuation?.finish()
+        senderReadyContinuation = nil
         stateLock.unlock()
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
-        senderTask?.cancel()
-        senderTask = nil
+        senderToCancel?.cancel()
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -594,15 +623,19 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// than letting it block on the 5s timeout) so `AudioRecorder` falls back
     /// to the file/batch path promptly. No-op once ready has resolved.
     private func failReadyIfPending(_ reason: String) {
+        let error = CloudTranscriptionError(provider: .xai, message: reason)
         stateLock.lock()
         socketClosed = true
         let cont = readyResolved ? nil : readyContinuation
         if !readyResolved {
-            readyResolved = true
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         stateLock.unlock()
-        cont?.resume(throwing: CloudTranscriptionError(provider: .xai, message: reason))
+        cont?.resume(throwing: error)
     }
 
     // MARK: - Receive loop
@@ -652,7 +685,12 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         case "transcript.created":
             stateLock.lock()
             let continuation = readyResolved ? nil : readyContinuation
-            readyResolved = true
+            if !readyResolved {
+                readyResult = .success(())
+                senderReadyContinuation?.yield(())
+            }
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
             readyContinuation = nil
             stateLock.unlock()
             continuation?.resume()

@@ -585,3 +585,342 @@ final class StreamIntegrityTests: XCTestCase {
         return buffer
     }
 }
+
+/// Exercises the real sender and finalize paths with no socket or provider.
+final class StreamingSenderOrderingTests: XCTestCase {
+    private enum TerminalSent: Error { case stop }
+
+    private actor Barrier {
+        private var opened = false
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            if opened { return }
+            await withCheckedContinuation { waiter = $0 }
+        }
+
+        func open() {
+            opened = true
+            waiter?.resume()
+            waiter = nil
+        }
+    }
+
+    private final class Frames: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frames: [String] = []
+        private var payloads: [Data] = []
+
+        var audio: [Data] { lock.withLock { payloads } }
+        var all: [String] { lock.withLock { frames } }
+
+        func send(_ message: URLSessionWebSocketTask.Message) throws {
+            let kind: String
+            var audio: Data?
+            switch message {
+            case .data(let data):
+                audio = data
+                kind = "audio"
+            case .string(let text):
+                let json = try JSONSerialization.jsonObject(with: Data(text.utf8)) as! [String: Any]
+                if json["commit"] as? Bool == true || json["type"] as? String == "audio.done"
+                    || json["type"] as? String == "endStream" {
+                    kind = "terminal"
+                } else if let realtime = json["realtimeInput"] as? [String: Any] {
+                    if realtime["activityEnd"] != nil || realtime["audioStreamEnd"] != nil {
+                        kind = "terminal"
+                    } else if realtime["activityStart"] != nil {
+                        kind = "activityStart"
+                    } else {
+                        kind = "audio"
+                        let payload = realtime["audio"] as? [String: Any]
+                        audio = (payload?["data"] as? String).flatMap { Data(base64Encoded: $0) }
+                    }
+                } else if let base64 = json["audio_base_64"] as? String {
+                    kind = "audio"
+                    audio = Data(base64Encoded: base64)
+                } else {
+                    kind = "setup"
+                }
+            @unknown default:
+                kind = "unknown"
+            }
+            lock.withLock {
+                frames.append(kind)
+                if let audio { payloads.append(audio) }
+            }
+            // End the test's finalize immediately; ordering is independent of
+            // provider transcript responses and the production timeout budget.
+            if kind == "terminal" { throw TerminalSent.stop }
+        }
+    }
+
+    func testElevenLabsFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        let frames = Frames()
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"message_type":"session_started"}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames
+        )
+    }
+
+    func testXAIFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        let frames = Frames()
+        let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"type":"transcript.created"}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames
+        )
+    }
+
+    func testGeminiFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        try await assertGeminiOrdering(manual: false)
+    }
+
+    func testGeminiManualFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        try await assertGeminiOrdering(manual: true)
+    }
+
+    private func assertGeminiOrdering(manual: Bool) async throws {
+        let frames = Frames()
+        var options = GeminiLiveOptions.defaults
+        options.vadMode = manual ? .manual : .automatic
+        let session = GeminiLiveTranscriber(apiKey: "offline", liveOptions: options,
+                                           messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"setupComplete":{}}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames,
+            prefix: manual ? ["setup", "activityStart"] : ["setup"]
+        )
+    }
+
+    func testMuseFinalizeDrainsAudioWhileStartIsPausedAfterReadiness() async throws {
+        let frames = Frames()
+        let session = MuseLiveTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOrdering(
+            start: { try await session.start(beforeReadiness: $0, afterReadiness: $1) },
+            send: session.send,
+            ready: { session.handleServerEvent(#"{"sessionId":"offline"}"#) },
+            finalize: { _ = await session.finalize() }, frames: frames, prefix: ["setup"]
+        )
+    }
+
+    func testXAIPreservesOpeningAudioSentBeforeStart() async throws {
+        let frames = Frames()
+        let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOpeningAudio(
+            start: { try await session.start(beforeReadiness: { session.handleServerEvent(#"{"type":"transcript.created"}"#) }) },
+            send: session.send, finalize: { _ = await session.finalize() },
+            frames: frames, prefix: []
+        )
+    }
+
+    func testElevenLabsPreservesOpeningAudioSentBeforeStart() async throws {
+        let frames = Frames()
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOpeningAudio(
+            start: { try await session.start(beforeReadiness: { session.handleServerEvent(#"{"message_type":"session_started"}"#) }) },
+            send: session.send, finalize: { _ = await session.finalize() },
+            frames: frames, prefix: []
+        )
+    }
+
+    func testGeminiPreservesOpeningAudioSentBeforeStart() async throws {
+        let frames = Frames()
+        let session = GeminiLiveTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOpeningAudio(
+            start: { try await session.start(beforeReadiness: { session.handleServerEvent(#"{"setupComplete":{}}"#) }) },
+            send: session.send, finalize: { _ = await session.finalize() },
+            frames: frames, prefix: ["setup", "activityStart"]
+        )
+    }
+
+    func testMusePreservesOpeningAudioSentBeforeStart() async throws {
+        let frames = Frames()
+        let session = MuseLiveTranscriber(apiKey: "offline", messageSender: { try frames.send($0) })
+        try await assertOpeningAudio(
+            start: { try await session.start(beforeReadiness: { session.handleServerEvent(#"{"sessionId":"offline"}"#) }) },
+            send: session.send, finalize: { _ = await session.finalize() },
+            frames: frames, prefix: ["setup"]
+        )
+    }
+
+    private func assertOpeningAudio(
+        start: () async throws -> Void,
+        send: (AVAudioPCMBuffer) -> Void,
+        finalize: () async -> Void,
+        frames: Frames,
+        prefix: [String],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
+                                   channels: 1, interleaved: true)!
+        func buffer(_ sample: Int16) -> AVAudioPCMBuffer {
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!
+            buffer.frameLength = 160
+            for index in 0..<160 { buffer.int16ChannelData![0][index] = sample }
+            return buffer
+        }
+        func bytes(_ sample: Int16) -> Data {
+            Array(repeating: sample, count: 160).withUnsafeBytes { Data($0) }
+        }
+        send(buffer(1024))
+        XCTAssertTrue(frames.audio.isEmpty, "audio escaped before start", file: file, line: line)
+        try await start()
+        send(buffer(-2048))
+        await finalize()
+        XCTAssertEqual(frames.all, prefix + ["audio", "audio", "terminal"], file: file, line: line)
+        XCTAssertEqual(frames.audio, [bytes(1024), bytes(-2048)], file: file, line: line)
+    }
+
+    func testXAIRejectsSocketClosureBeforeReadinessWaiter() async {
+        for lateAcknowledgement in [false, true] {
+            let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+            defer { session.cancel() }
+            do {
+                try await session.start(beforeReadiness: {
+                    session.noteSocketClosed(closeCode: .abnormalClosure)
+                    if lateAcknowledgement { session.handleServerEvent(#"{"type":"transcript.created"}"#) }
+                })
+                XCTFail("start succeeded after the socket closed before waiter registration")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("closed code 1006"), "Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testXAIRejectsCancellationBeforeReadinessWaiter() async {
+        let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        defer { session.cancel() }
+        do {
+            try await session.start(beforeReadiness: { session.cancel() })
+            XCTFail("start succeeded after cancellation before waiter registration")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cancelled"), "Unexpected error: \(error)")
+        }
+    }
+
+    func testElevenLabsRejectsSocketClosureBeforeReadinessWaiter() async {
+        for lateAcknowledgement in [false, true] {
+            let session = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+            defer { session.cancel() }
+            do {
+                try await session.start(beforeReadiness: {
+                    session.noteSocketClosed(closeCode: .abnormalClosure)
+                    if lateAcknowledgement { session.handleServerEvent(#"{"message_type":"session_started"}"#) }
+                })
+                XCTFail("start succeeded after the socket closed before waiter registration")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("closed code 1006"), "Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testElevenLabsRejectsCancellationBeforeReadinessWaiter() async {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+        defer { session.cancel() }
+        do {
+            try await session.start(beforeReadiness: { session.cancel() })
+            XCTFail("start succeeded after cancellation before waiter registration")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cancelled"), "Unexpected error: \(error)")
+        }
+    }
+
+    func testGeminiRejectsSocketClosureBeforeReadinessWaiter() async {
+        for lateAcknowledgement in [false, true] {
+            let session = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+            defer { session.cancel() }
+            do {
+                try await session.start(beforeReadiness: {
+                    session.noteSocketClosed(closeCode: .abnormalClosure)
+                    if lateAcknowledgement { session.handleServerEvent(#"{"setupComplete":{}}"#) }
+                })
+                XCTFail("start succeeded after the socket closed before waiter registration")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("closed code 1006"), "Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testGeminiRejectsCancellationBeforeReadinessWaiter() async {
+        let session = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        defer { session.cancel() }
+        do {
+            try await session.start(beforeReadiness: { session.cancel() })
+            XCTFail("start succeeded after cancellation before waiter registration")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cancelled"), "Unexpected error: \(error)")
+        }
+    }
+
+    func testMuseRejectsSocketClosureBeforeReadinessWaiter() async {
+        for lateAcknowledgement in [false, true] {
+            let session = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+            defer { session.cancel() }
+            do {
+                try await session.start(beforeReadiness: {
+                    session.noteSocketClosed(closeCode: .abnormalClosure)
+                    if lateAcknowledgement { session.handleServerEvent(#"{"sessionId":"offline"}"#) }
+                })
+                XCTFail("start succeeded after the socket closed before waiter registration")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("closed code 1006"), "Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testMuseRejectsCancellationBeforeReadinessWaiter() async {
+        let session = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        defer { session.cancel() }
+        do {
+            try await session.start(beforeReadiness: { session.cancel() })
+            XCTFail("start succeeded after cancellation before waiter registration")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cancelled"), "Unexpected error: \(error)")
+        }
+    }
+
+    private typealias Start = (@escaping () -> Void, @escaping () async -> Void) async throws -> Void
+
+    private func assertOrdering(
+        start: @escaping Start,
+        send: @escaping (AVAudioPCMBuffer) -> Void,
+        ready: @escaping () -> Void,
+        finalize: () async -> Void,
+        frames: Frames,
+        prefix: [String] = [],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let paused = expectation(description: "start paused after handshake")
+        let barrier = Barrier()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!
+        buffer.frameLength = 160
+        for index in 0..<160 { buffer.floatChannelData![0][index] = 0.1 }
+        let starting = Task {
+            try await start({
+                send(buffer)
+                send(buffer)
+                XCTAssertFalse(frames.all.contains("audio"), "audio escaped before readiness", file: file, line: line)
+                ready()
+            }, {
+                paused.fulfill()
+                await barrier.wait()
+            })
+        }
+        await fulfillment(of: [paused], timeout: 5)
+        await finalize()
+        XCTAssertEqual(frames.all, prefix + ["audio", "audio", "terminal"], file: file, line: line)
+        await barrier.open()
+        try await starting.value
+    }
+}
