@@ -849,14 +849,14 @@ final class AudioRecorder {
         processingHUDWatchdogBaseSeconds + (audioDuration.isFinite ? max(0, audioDuration) : 0)
     }
 
-    /// Only the watchdog armed for the current hold may fire, and only while
-    /// the HUD is still showing processing.
+    /// Expiry follows the armed lifecycle, not presentation: an error pill
+    /// must not allow a timed-out result to replace selected text.
     static func shouldFireProcessingWatchdog(
         generation: UInt64,
         currentGeneration: UInt64,
         hudIsProcessing: Bool
     ) -> Bool {
-        generation == currentGeneration && hudIsProcessing
+        generation == currentGeneration
     }
 
     enum ProcessingWatchdogEvent {
@@ -936,15 +936,55 @@ final class AudioRecorder {
     /// Read-only seam so tests can assert on the short-hold base constant.
     internal static var postReleaseCaptureGraceForTesting: TimeInterval { postReleaseCaptureGraceBase }
 
-    /// Bumped whenever a post-release capture grace is scheduled or flushed
-    /// early, so a stale `asyncAfter` callback from a superseded grace never
-    /// runs `finishStop` twice.
-    private var stopGraceGeneration: UInt64 = 0
+    /// Main-thread deferred stop, shared with deterministic lifecycle tests.
+    final class StopGrace {
+        private(set) var generation: UInt64 = 0
+        private var finalize: (() -> Void)?
 
-    /// The deferred finalize body for the currently-pending capture grace,
-    /// if any. Non-nil only between `scheduleStopGrace` and whichever of
-    /// `runStopGraceIfCurrent` / `flushPendingStopGrace` runs it.
-    private var stopGraceFinalize: (() -> Void)?
+        @discardableResult
+        func schedule(_ finalize: @escaping () -> Void) -> UInt64 {
+            generation &+= 1
+            self.finalize = finalize
+            return generation
+        }
+
+        func run(_ capturedGeneration: UInt64) {
+            guard AudioRecorder.shouldRunStopGrace(
+                generation: capturedGeneration, currentGeneration: generation
+            ), let finalize else { return }
+            self.finalize = nil
+            finalize()
+        }
+
+        func flush() {
+            guard let finalize else { return }
+            self.finalize = nil
+            generation &+= 1
+            finalize()
+        }
+    }
+
+    enum RecordingStartPhase { case request, capture }
+
+    static func shouldSettleStopGrace(at phase: RecordingStartPhase) -> Bool {
+        phase == .request
+    }
+
+    static func heldCaretTokensAtStartRequest(
+        active: UInt64?, pending: UInt64?
+    ) -> (active: UInt64?, pending: UInt64?) {
+        // The previous capture has settled; its eventual completion retains
+        // its frozen token, but it must never be sampled by this request's stop.
+        (nil, pending)
+    }
+
+    private var recordingStartGeneration: UInt64 = 0
+
+    static func isCurrentStartCallback(generation: UInt64, currentGeneration: UInt64) -> Bool {
+        generation == currentGeneration
+    }
+
+    private let stopGrace = StopGrace()
 
     /// Release-time app-targeting context, sampled once at `doStop` and
     /// carried through the capture grace into `finishStop`.
@@ -1384,25 +1424,32 @@ final class AudioRecorder {
     // MARK: - Public interface
 
     func startRecording(heldCaretToken: UInt64? = nil) {
-        pendingHeldCaretToken = heldCaretToken
-        // A request can still bail at secure input or the permission hop.
-        // Keep the previous hold's watchdog until listening is announced.
-        // `startRecording` can arrive off-main.
-        if Thread.isMainThread {
-            updateProcessingWatchdog(for: .startRequested)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.updateProcessingWatchdog(for: .startRequested)
-            }
+        // Settlement and ownership transfer are atomic with main-queue stop
+        // callbacks, including when activation originates on the event tap.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.sync { self.startRecording(heldCaretToken: heldCaretToken) }
+            return
         }
-        // Freeze hold immediately while this token still owns the pipeline
-        // slot — a rapid re-press can steal the live slot before stop samples.
+        if Self.shouldSettleStopGrace(at: .request) { flushPendingStopGrace() }
+        recordingStartGeneration &+= 1
+        let generation = recordingStartGeneration
+        let ownership = Self.heldCaretTokensAtStartRequest(
+            active: activeHeldCaretToken, pending: heldCaretToken
+        )
+        activeHeldCaretToken = ownership.active
+        pendingHeldCaretToken = ownership.pending
+        // Aborted requests retain the previous processing deadline.
+        updateProcessingWatchdog(for: .startRequested)
         cacheHoldForAssignedToken(heldCaretToken)
         if IsSecureEventInputEnabled() {
             logger.info("Secure input active — refusing to start capture.")
             clearPendingHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in
-                self?.asrSelector.onFailure?(.secureInputBlocked)
+                guard let self, Self.isCurrentStartCallback(
+                    generation: generation, currentGeneration: self.recordingStartGeneration
+                ) else { return }
+                self.hud.claimHold(heldCaretToken)
+                self.asrSelector.onFailure?(.secureInputBlocked)
             }
             return
         }
@@ -1413,16 +1460,18 @@ final class AudioRecorder {
         pcmBuffersLock.unlock()
         vlog("AudioRecorder.startRecording — requesting mic permission")
         requestMicrophonePermissionIfNeeded { [weak self] granted in
-            vlog("mic permission callback — granted=\(granted)")
-            guard let self = self, granted else {
-                self?.logger.error("Microphone permission denied.")
-                self?.clearPendingHeldCaretSnapshot()
-                DispatchQueue.main.async {
-                    self?.asrSelector.onFailure?(.micStartFailed)
-                }
-                return
-            }
             DispatchQueue.main.async {
+                guard let self, Self.isCurrentStartCallback(
+                    generation: generation, currentGeneration: self.recordingStartGeneration
+                ) else { return }
+                vlog("mic permission callback — granted=\(granted)")
+                guard granted else {
+                    self.logger.error("Microphone permission denied.")
+                    self.clearPendingHeldCaretSnapshot()
+                    self.hud.claimHold(heldCaretToken)
+                    self.asrSelector.onFailure?(.micStartFailed)
+                    return
+                }
                 guard self.wantsRecording else {
                     self.logger.info("Mic permission resolved after stopRecording() — skipping start.")
                     self.clearPendingHeldCaretSnapshot()
@@ -1564,11 +1613,8 @@ final class AudioRecorder {
             clearPendingHeldCaretSnapshot()
             return
         }
-        // A fast re-press can land while the previous hold's post-release
-        // capture grace (Self.postReleaseCaptureGrace) is still pending —
-        // end it now, before touching the mic engine / streaming sessions
-        // below, so the new hold never overlaps the old one's tap/session.
-        flushPendingStopGrace()
+        // Grace settlement belongs to the request, even if capture is skipped.
+        if Self.shouldSettleStopGrace(at: .capture) { flushPendingStopGrace() }
         isStopping = false
         streamingCoordinator.resetStreamTextLatch()
         didAnnounceListeningThisTake = false
@@ -2140,6 +2186,12 @@ final class AudioRecorder {
             vlog("doStop ignored — already stopping")
             return
         }
+        // A released request whose start was skipped owns no capture. In
+        // particular, it must not stop or retarget the preceding hold again.
+        guard activeHeldCaretToken != nil else {
+            clearPendingHeldCaretSnapshot()
+            return
+        }
         isStopping = true
         invalidateSecureInputPollTimer()
         // Belt-and-suspenders: a late doStart/startMicCapture that lost the
@@ -2150,6 +2202,7 @@ final class AudioRecorder {
             endVoiceGateRecordingSession()
         }
 
+        hud.claimHold(activeHeldCaretToken)
         playFeedbackSound(named: "Pop")
         hud.clearInterimText()
         // Flip to processing immediately at fn-release so the pill shows
@@ -2157,7 +2210,7 @@ final class AudioRecorder {
         // For the streaming path this is normally near-instant (the ASR
         // already ran during the hold) — still set for visual consistency
         // and to cover the brief finalize step.
-        DispatchQueue.main.async { [weak self] in self?.hud.setProcessing() }
+        hud.setProcessing()
 
         // Capture hold before streaming finalize / file-IO Tasks so a rapid
         // re-press cannot poison inject with a newer will-start snapshot.
@@ -2226,7 +2279,7 @@ final class AudioRecorder {
         if let sessionToken {
             asrSelector.pipeline.markHoldAbandoned(sessionToken)
         }
-        hud.hide()
+        if hud.ownsHold(sessionToken) { hud.hide() }
     }
 
     /// Schedules `finishStop` to run after `postReleaseCaptureGrace(forHoldDuration:)`,
@@ -2235,10 +2288,8 @@ final class AudioRecorder {
     /// the active cloud transcriber. A fast re-press ends this early via
     /// `flushPendingStopGrace()` instead of waiting out the delay.
     private func scheduleStopGrace(sessionHold: SessionHold, holdDuration: TimeInterval?) {
-        stopGraceGeneration &+= 1
-        let generation = stopGraceGeneration
         let grace = Self.postReleaseCaptureGrace(forHoldDuration: holdDuration ?? 0)
-        stopGraceFinalize = { [weak self] in
+        let generation = stopGrace.schedule { [weak self] in
             self?.finishStop(sessionHold: sessionHold, holdDuration: holdDuration)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
@@ -2248,7 +2299,7 @@ final class AudioRecorder {
 
     /// Pure guard for the scheduled `asyncAfter` grace callback: only the
     /// generation that scheduled it may run it. `flushPendingStopGrace` and
-    /// a fresh `scheduleStopGrace` both bump `stopGraceGeneration`, so a
+    /// a fresh `scheduleStopGrace` both bump the grace generation, so a
     /// superseded or already-flushed callback finds its generation stale
     /// and no-ops instead of double-running `finishStop`.
     internal static func shouldRunStopGrace(generation: UInt64, currentGeneration: UInt64) -> Bool {
@@ -2258,12 +2309,7 @@ final class AudioRecorder {
     /// Runs the deferred finalize only if nothing already flushed it early
     /// (a fast re-press) and no newer stop superseded it.
     private func runStopGraceIfCurrent(_ generation: UInt64) {
-        guard
-            Self.shouldRunStopGrace(generation: generation, currentGeneration: stopGraceGeneration),
-            let finalize = stopGraceFinalize
-        else { return }
-        stopGraceFinalize = nil
-        finalize()
+        stopGrace.run(generation)
     }
 
     /// Ends a pending post-release capture grace immediately, running its
@@ -2271,10 +2317,7 @@ final class AudioRecorder {
     /// Call this before a new recording starts so a fast re-press can never
     /// overlap two live holds on the same mic engine / streaming session.
     private func flushPendingStopGrace() {
-        guard let finalize = stopGraceFinalize else { return }
-        stopGraceFinalize = nil
-        stopGraceGeneration &+= 1 // invalidate the still-pending timer callback
-        finalize()
+        stopGrace.flush()
     }
 
     /// The stop/finalize sequence proper — unchanged from before the capture
@@ -2645,6 +2688,7 @@ final class AudioRecorder {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.cancelProcessingWatchdog(forToken: sessionHeldToken)
+            guard self.hud.ownsHold(sessionHeldToken) else { return }
             self.hud.hide()
         }
     }
@@ -2681,6 +2725,7 @@ final class AudioRecorder {
                 true,
                 nil
             )
+            guard self.hud.ownsHold(sessionHeldToken) else { return }
             if deadMic {
                 // Routes through the standard failure path: error pill,
                 // failure sound, menu-bar badge.
@@ -2928,6 +2973,7 @@ final class AudioRecorder {
                         true,
                         nil
                     )
+                    guard self.hud.ownsHold(sessionHeldToken) else { return }
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
@@ -2987,6 +3033,7 @@ final class AudioRecorder {
                         true,
                         nil
                     )
+                    guard self.hud.ownsHold(sessionHeldToken) else { return }
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
@@ -3004,15 +3051,17 @@ final class AudioRecorder {
         result: TranscriptionPipeline.InjectPipelineResult,
         sessionHeldToken: UInt64?
     ) {
-        clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        if let sessionHeldToken {
+            clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        }
         cancelProcessingWatchdog(forToken: sessionHeldToken)
-        switch result {
-        case .inserted:
-            hud.showSuccessThenHide()
-        case .savedToHistory, .deduped, .failed:
-            if hud.isProcessing {
-                hud.hide()
-            }
+        switch RecordingHUD.pipelineCompletionAction(
+            result: result, token: sessionHeldToken, owner: hud.holdToken,
+            isProcessing: hud.isProcessing
+        ) {
+        case .success: hud.showSuccessThenHide()
+        case .hide: hud.hide()
+        case .none: break
         }
     }
 
@@ -3036,9 +3085,13 @@ final class AudioRecorder {
         guard !didAnnounceListeningThisTake else { return }
         didAnnounceListeningThisTake = true
         playFeedbackSound(named: "Tink")
+        let generation = recordingStartGeneration
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, Self.isCurrentStartCallback(
+                generation: generation, currentGeneration: self.recordingStartGeneration
+            ) else { return }
             guard self.wantsRecording else { return }
+            self.hud.claimHold(self.activeHeldCaretToken)
             self.updateProcessingWatchdog(for: .recordingStarted)
             if let label = self.activationKeyLabelProvider?() {
                 self.hud.setActivationKeyLabel(label)

@@ -6,6 +6,170 @@ import XCTest
 /// upload + local fallback) with no History row.
 final class StuckProcessingHUDTests: XCTestCase {
 
+    func test01UnstartedReplacementCannotRetargetPendingGrace() {
+        let grace = AudioRecorder.StopGrace()
+        var deliveries: [(UInt64, Int32)] = []
+        let timerA = grace.schedule { deliveries.append((1, 101)) }
+        if AudioRecorder.shouldSettleStopGrace(at: .request) { grace.flush() }
+        var slots = AudioRecorder.heldCaretTokensAtStartRequest(active: 1, pending: 2)
+        // B releases before its queued start; the skipped start clears B.
+        slots.pending = nil
+        if let sampled = AudioRecorder.preferredSessionHoldToken(active: slots.active, pending: slots.pending) {
+            grace.schedule { deliveries.append((sampled, 202)) }
+        }
+        grace.run(timerA)
+        grace.run(grace.generation)
+        grace.flush()
+        XCTAssertEqual(deliveries.map { $0.0 }, [1])
+        XCTAssertEqual(deliveries.map { $0.1 }, [101], "B must not redirect A into app Y")
+    }
+
+    func test02OldCompletionCannotHideNewListeningOrProcessingHold() {
+        for processing in [false, true] {
+            for result: TranscriptionPipeline.InjectPipelineResult in [.inserted, .savedToHistory, .deduped, .failed] {
+                var state: RecordingHUD.State = processing ? .processing : .listening
+                var visible = true
+                var hideCallbacks = 0
+                var hideTimer: (() -> Void)?
+                switch RecordingHUD.pipelineCompletionAction(result: result, token: 1, owner: 2, isProcessing: processing) {
+                case .success:
+                    state = .success
+                    hideTimer = { visible = false; hideCallbacks += 1 }
+                case .hide:
+                    visible = false
+                    hideCallbacks += 1
+                case .none: break
+                }
+                hideTimer?()
+                XCTAssertEqual(state, processing ? .processing : .listening)
+                XCTAssertTrue(visible)
+                XCTAssertEqual(hideCallbacks, 0, "A must not reset B's menu icon")
+            }
+        }
+    }
+
+    @MainActor
+    func test03OldTransformFailureCannotDisarmNewEditsDeadline() {
+        let pipeline = TranscriptionPipeline()
+        let held = CaretContext.Snapshot(value: "Old words here.", location: 0,
+            selectionLength: .readable(15), precedingChar: .startOfField, isUnknown: false)
+        let tokenA = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 101)
+        var tokenB: UInt64 = 0
+        var state: RecordingHUD.State = .processing
+        var failures = 0
+        var inserted = 0
+        var saved = 0
+        pipeline.onFailure = { _ in failures += 1; state = .error("Try rephrasing") }
+        pipeline.voiceEditInjectionHooks = .init(
+            target: { .init(secureInput: false, pid: 101, bundleIdentifier: "fixture") },
+            snapshot: { held }, insert: { _ in inserted += 1; return .inserted(deliveredText: "New words here.") },
+            leaveOnClipboard: { _ in XCTFail("Timed-out edit must be History-only") }
+        )
+        pipeline.onVoiceEditLogged = { _, _, _, injected, historyOnly in
+            if historyOnly { saved += 1 }
+            XCTAssertFalse(injected)
+        }
+        pipeline.runVoiceEditTransform = { _, _, _ in
+            await MainActor.run {
+                tokenB = pipeline.test_holdVoiceEditSnapshot(held, frontmostPID: 101)
+                state = .processing
+            }
+            throw TransformRunnerError.emptyResponse
+        }
+        let failedA = expectation(description: "A's pending transform fails after B releases")
+        pipeline.finishTranscription(text: "rewrite this", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: tokenA, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 101,
+            completion: { XCTAssertEqual($0, .failed); failedA.fulfill() })
+        wait(for: [failedA], timeout: 5)
+        XCTAssertEqual(failures, 0)
+        XCTAssertEqual(state, .processing)
+        if AudioRecorder.shouldFireProcessingWatchdog(generation: 2, currentGeneration: 2,
+                                                       hudIsProcessing: state == .processing) {
+            pipeline.markHoldAbandoned(tokenB)
+        }
+        let completedB = expectation(description: "B completes after its deadline")
+        pipeline.finishTranscription(text: "New words here.", hadExplicitTrailingNewline: false,
+            engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+            sessionHeldToken: tokenB, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 101,
+            voiceEditInstruction: "rewrite this",
+            completion: { XCTAssertEqual($0, .savedToHistory); completedB.fulfill() })
+        wait(for: [completedB], timeout: 5)
+        XCTAssertEqual(inserted, 0)
+        XCTAssertEqual(saved, 1)
+    }
+
+    @MainActor
+    func test04OldTranscriptionFailuresKeepNewHoldAndStillComplete() {
+        for edit in [false, true] {
+            let pipeline = TranscriptionPipeline()
+            let held = CaretContext.Snapshot(value: "Old words here.", location: 0,
+                selectionLength: .readable(15), precedingChar: .startOfField, isUnknown: false)
+            let old = edit ? pipeline.test_holdVoiceEditSnapshot(held) : pipeline.test_holdSnapshot(held)
+            let current = pipeline.test_holdSnapshot(held)
+            var failures = 0
+            var logs = 0
+            pipeline.onFailure = { _ in failures += 1 }
+            pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in logs += 1 }
+            let completed = expectation(description: "obsolete transcription failure completes")
+            pipeline.reportTranscriptionFailure(engineID: "fixture", audioPath: nil,
+                replaceHistoryEntryID: nil, sessionHeldToken: old,
+                completion: { XCTAssertEqual($0, .failed); completed.fulfill() })
+            wait(for: [completed], timeout: 5)
+            XCTAssertEqual(failures, 0)
+            XCTAssertEqual(logs, edit ? 0 : 1)
+            XCTAssertEqual(pipeline.test_heldCaretToken, current)
+            XCTAssertEqual(pipeline.test_heldCaretSnapshot, held)
+        }
+    }
+
+    func testSettledGraceCannotFireAgainAfterNewGraceIsScheduled() {
+        let grace = AudioRecorder.StopGrace()
+        var finalized: [Int] = []
+        let oldTimer = grace.schedule { finalized.append(1) }
+        grace.flush()
+        let newTimer = grace.schedule { finalized.append(2) }
+        grace.run(oldTimer)
+        XCTAssertEqual(finalized, [1])
+        grace.run(newTimer)
+        grace.run(newTimer)
+        grace.flush()
+        XCTAssertEqual(finalized, [1, 2])
+    }
+
+    @MainActor
+    func testCurrentTranscriptionFailureStillNotifies() {
+        let pipeline = TranscriptionPipeline()
+        let token = pipeline.test_holdSnapshot(.unknown)
+        var failures = 0
+        pipeline.onFailure = { _ in failures += 1 }
+        let completed = expectation(description: "current failure delivered")
+        pipeline.reportTranscriptionFailure(engineID: "fixture", audioPath: nil,
+            replaceHistoryEntryID: nil, sessionHeldToken: token,
+            completion: { XCTAssertEqual($0, .failed); completed.fulfill() })
+        wait(for: [completed], timeout: 5)
+        XCTAssertEqual(failures, 1)
+    }
+
+    func testCurrentCompletionStillShowsSuccessAndHidesProcessing() {
+        XCTAssertEqual(RecordingHUD.pipelineCompletionAction(
+            result: .inserted, token: 2, owner: 2, isProcessing: true), .success)
+        for result: TranscriptionPipeline.InjectPipelineResult in [.savedToHistory, .deduped, .failed] {
+            XCTAssertEqual(RecordingHUD.pipelineCompletionAction(
+                result: result, token: 2, owner: 2, isProcessing: true), .hide)
+            XCTAssertEqual(RecordingHUD.pipelineCompletionAction(
+                result: result, token: 2, owner: 2, isProcessing: false), .none)
+        }
+        XCTAssertFalse(RecordingHUD.holdOwnsPresentation(token: nil, owner: 2))
+        XCTAssertFalse(RecordingHUD.holdOwnsPresentation(token: 1, owner: 2))
+        XCTAssertTrue(RecordingHUD.holdOwnsPresentation(token: 2, owner: 2))
+    }
+
+    func testOldPermissionAndListeningCallbacksCannotClaimNewRequest() {
+        XCTAssertFalse(AudioRecorder.isCurrentStartCallback(generation: 1, currentGeneration: 2))
+        XCTAssertTrue(AudioRecorder.isCurrentStartCallback(generation: 2, currentGeneration: 2))
+    }
+
     // MARK: - Accidental tap
 
     func testAccidentalTapTruthTable() {
@@ -49,14 +213,15 @@ final class StuckProcessingHUDTests: XCTestCase {
 
     // MARK: - Watchdog firing
 
-    func testWatchdogFiresOnlyForCurrentGenerationWhileProcessing() {
+    func testWatchdogFiresOnlyForCurrentGenerationRegardlessOfPresentation() {
         XCTAssertTrue(AudioRecorder.shouldFireProcessingWatchdog(
             generation: 4, currentGeneration: 4, hudIsProcessing: true))
         // Cancelled on normal completion / superseded by a newer hold.
         XCTAssertFalse(AudioRecorder.shouldFireProcessingWatchdog(
             generation: 4, currentGeneration: 5, hudIsProcessing: true))
-        // HUD already left processing (failure pill, success, newer hold).
-        XCTAssertFalse(AudioRecorder.shouldFireProcessingWatchdog(
+        // Presentation cannot disable an armed deadline; lifecycle cancellation
+        // advances the generation when completion or a newer capture settles it.
+        XCTAssertTrue(AudioRecorder.shouldFireProcessingWatchdog(
             generation: 4, currentGeneration: 4, hudIsProcessing: false))
     }
 

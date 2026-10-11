@@ -34,6 +34,36 @@ struct HUDTransitionToken: Equatable {
 
 final class RecordingHUD {
 
+    private(set) var holdToken: UInt64?
+
+    /// Ownership changes invalidate flash timers and fade completions from
+    /// the preceding hold before presenting the new hold's state.
+    func claimHold(_ token: UInt64?) {
+        holdToken = token
+        _ = beginTransition()
+    }
+
+    func ownsHold(_ token: UInt64?) -> Bool {
+        Self.holdOwnsPresentation(token: token, owner: holdToken)
+    }
+
+    static func holdOwnsPresentation(token: UInt64?, owner: UInt64?) -> Bool {
+        token == owner
+    }
+
+    enum PipelineCompletionAction { case success, hide, none }
+
+    static func pipelineCompletionAction(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        token: UInt64?, owner: UInt64?, isProcessing: Bool
+    ) -> PipelineCompletionAction {
+        guard holdOwnsPresentation(token: token, owner: owner) else { return .none }
+        switch result {
+        case .inserted: return .success
+        case .savedToHistory, .deduped, .failed: return isProcessing ? .hide : .none
+        }
+    }
+
     enum State: Equatable {
         case listening
         case editingSelection
