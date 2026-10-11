@@ -321,5 +321,6 @@
       ]
     }
   ],
-  "expected": "The imaginary observatory needs a fresh map. Several paper stars have fallen off the wall. Please arrange the remaining constellations before the parade. After reviewing the fictional atlas, the explorers decided they would be better off using StarCrawl for every imaginary expedition."
+  "expected": "The imaginary observatory needs a fresh map. Several paper stars have fallen off the wall. Please arrange the remaining constellations before the parade. After reviewing the fictional atlas, the explorers decided they would be better off using StarCrawl for every imaginary expedition.",
+  "requiresRecovery": false
 }

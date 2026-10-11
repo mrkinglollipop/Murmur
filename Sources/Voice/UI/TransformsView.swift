@@ -113,6 +113,7 @@ struct TransformsView: View {
             }
             .padding(16)
         }
+        .saveFailureBanner(store.saveFailure, onDismiss: store.dismissSaveFailure)
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete transform?",

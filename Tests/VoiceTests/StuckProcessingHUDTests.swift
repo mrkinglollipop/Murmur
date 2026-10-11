@@ -704,6 +704,62 @@ final class StuckProcessingHUDTests: XCTestCase {
 
 /// Production stop, notification, and deadline paths with hardware/network I/O replaced.
 final class HoldOwnershipRegressionTests: XCTestCase {
+    private struct ThrowingVisibleHoldEngine: ASREngine {
+        let id = "throwing-visible-hold"
+        let displayName = "Throwing fixture"
+        func transcribe(audioURL: URL) async throws -> String {
+            throw NSError(domain: "VisibleHoldFixture", code: 1)
+        }
+    }
+
+    @MainActor
+    func testVisibleOlderHoldReportsThrownASRAndVoiceEditFailures() async {
+        for mode in ["dictation", "editASR", "editTransform"] {
+            let recorder = recorder()
+            let pipeline = recorder.asrSelector.pipeline
+            let held = CaretContext.Snapshot(value: "Old words here.", location: 0,
+                selectionLength: .readable(15), precedingChar: .startOfField, isUnknown: false)
+            let old = mode == "dictation" ? pipeline.test_holdSnapshot(held)
+                : pipeline.test_holdVoiceEditSnapshot(held)
+            recorder.test_prepareHold(token: old, active: true)
+            recorder.hud.claimHold(old)
+            recorder.hud.show()
+            recorder.hud.setProcessing()
+            let replacement = pipeline.test_holdSnapshot(.unknown)
+            recorder.test_prepareHold(token: replacement)
+            recorder.stopRecording()
+            await drainMainQueue()
+            var failures: [DictationFailure] = []
+            pipeline.onFailure = { failure in
+                failures.append(failure)
+                recorder.hud.showError(failure.message)
+            }
+            pipeline.localEngineProvider = { ThrowingVisibleHoldEngine() }
+            pipeline.runVoiceEditTransform = { _, _, _ in throw TransformRunnerError.emptyResponse }
+            let done = expectation(description: "Visible A fails after unpresented B: \(mode)")
+            let complete: (TranscriptionPipeline.InjectPipelineResult) -> Void = { result in
+                XCTAssertEqual(result, .failed)
+                done.fulfill()
+            }
+            if mode == "editTransform" {
+                pipeline.finishTranscription(text: "rewrite this", hadExplicitTrailingNewline: false,
+                    engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+                    sessionHeldToken: old, sessionHeldSnapshot: held, sessionHeldFrontmostPID: nil,
+                    completion: complete)
+            } else {
+                pipeline.transcribeAndLog(audioURL: URL(fileURLWithPath: #filePath),
+                    audioIsTemporary: true, sessionHeldToken: old,
+                    sessionHeldSnapshot: held, completion: complete)
+            }
+            await fulfillment(of: [done], timeout: 2)
+            let expected: DictationFailure = mode == "dictation" ? .transcriptionFailed : .voiceEditFailed
+            XCTAssertEqual(failures, [expected], mode)
+            XCTAssertEqual(recorder.hud.holdToken, old)
+            XCTAssertEqual(recorder.hud.currentState, .error(expected.message), mode)
+            recorder.hud.hide()
+        }
+    }
+
     private actor CloudGate {
         private var began = false
         private var beganContinuation: CheckedContinuation<Void, Never>?

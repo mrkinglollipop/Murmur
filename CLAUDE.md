@@ -55,8 +55,10 @@ xcodebuild test -scheme VoiceTests -destination 'platform=macOS' CODE_SIGNING_AL
 **Product oracle (AudioRecorder / HAL / `engine.start` / `bindInputNode`):**
 VoiceTests went green twice on 2026-08-17 while every dictation hold either
 SIGABRT'd (`prepare()` before CurrentDevice) or HUD-failed (0-ch graph bound
-Continuity iPhone). After those files change: `install-local.sh`, one fn-hold,
-then:
+Continuity iPhone). The oracle accepts only audio events from the running installed copy at
+`/Applications/Murmur.app`, matching its PID and image path, at or after that
+process's launch time. VoiceTests host logs and events before launch cannot pass.
+After those files change: `install-local.sh`, one fn-hold, then:
 
 ```bash
 bash scripts/oracle-dictation-start.sh

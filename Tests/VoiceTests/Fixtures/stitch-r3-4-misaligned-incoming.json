@@ -36,5 +36,7 @@
       "speechFinal": false
     }
   ],
-  "expected": "Do not send. Wait."
+  "expected": "Do not send. Wait.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
 }

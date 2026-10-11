@@ -67,6 +67,8 @@ struct CorrectionGroup: Identifiable, Equatable {
 /// and learn-time accept/reject outcomes.
 final class CorrectionsLog: ObservableObject {
 
+    @Published private(set) var saveFailure = SaveFailureNotice()
+
     /// App-owned instance wired from `AppDelegate`; `DictionaryView` reads this
     /// when constructed without an explicit `correctionsLog` argument.
     static weak var liveInstance: CorrectionsLog?
@@ -98,6 +100,7 @@ final class CorrectionsLog: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("corrections-log.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -118,15 +121,28 @@ final class CorrectionsLog: ObservableObject {
             logger.error("Quarantined corrupt corrections-log.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("Failed to quarantine corrupt corrections-log.json: \(error.localizedDescription)")
         }
         records = []
     }
 
+    private func reportSaveFailure() {
+        saveFailure.report("Corrections could not be saved. Copy any changes you want to keep before quitting.")
+    }
+
+    func dismissSaveFailure() {
+        saveFailure.dismiss()
+    }
+
     private func save() {
         guard !savesBlocked else { return }
-        guard let data = try? JSONEncoder().encode(records) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(records)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     private func scheduleSave() {

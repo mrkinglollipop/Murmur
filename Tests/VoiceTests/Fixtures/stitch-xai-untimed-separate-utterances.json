@@ -1,0 +1,25 @@
+{
+  "name": "xai-untimed-separate-utterances-remain-distinct",
+  "events": [
+    {
+      "type": "final",
+      "text": "Repeat after me.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Repeat after me.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Repeat after me. Repeat after me.",
+  "requiresRecovery": false
+}

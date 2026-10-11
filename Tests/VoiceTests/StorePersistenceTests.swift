@@ -21,6 +21,162 @@ final class StorePersistenceTests: XCTestCase {
         return url
     }
 
+    // MARK: - R-24 save failures
+
+    private func saveFailureDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("murmur-r24-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        tempURLs.append(directory)
+        return directory
+    }
+
+    private func makeReadOnly(_ directory: URL) throws {
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        addTeardownBlock {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+    }
+
+    @MainActor
+    func testR24SnippetsFailedEditWarnsAndRetainsChangesForRetry() throws {
+        let directory = try saveFailureDirectory()
+        let url = directory.appendingPathComponent("snippets.json")
+        let store = SnippetsStore(fileURL: url)
+        store.add(trigger: "signature", expansion: "Original")
+        store.flush()
+        let original = try Data(contentsOf: url)
+        var snippet = try XCTUnwrap(store.snippets.first)
+        snippet.expansion = "Keep this edit"
+        store.update(snippet)
+        try makeReadOnly(directory)
+        store.flush()
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(store.snippets.first?.expansion, "Keep this edit")
+        XCTAssertEqual(store.expand("signature"), "Keep this edit")
+        XCTAssertEqual(store.saveFailure.message,
+                       "Snippets could not be saved. Copy any changes you want to keep before quitting.")
+        store.dismissSaveFailure()
+        XCTAssertNil(store.saveFailure.message)
+        store.flush()
+        XCTAssertNil(store.saveFailure.message, "Warnings stay dismissed for the session")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        store.flush()
+        XCTAssertNil(store.saveFailure.message)
+        XCTAssertEqual(SnippetsStore(fileURL: url).snippets, store.snippets)
+    }
+
+    @MainActor
+    func testR24TransformsFailedEditWarnsAndRetainsChangesForRetry() throws {
+        let directory = try saveFailureDirectory()
+        let url = directory.appendingPathComponent("transforms.json")
+        try Data("[]".utf8).write(to: url)
+        let store = TransformsStore(fileURL: url)
+        store.add(name: "Polish", prompt: "Original")
+        store.flush()
+        let original = try Data(contentsOf: url)
+        var transform = try XCTUnwrap(store.transforms.first)
+        transform.prompt = "Keep this edit"
+        store.update(transform)
+        try makeReadOnly(directory)
+        store.flush()
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(store.transforms.first?.prompt, "Keep this edit")
+        XCTAssertEqual(store.saveFailure.message,
+                       "Transforms could not be saved. Copy any changes you want to keep before quitting.")
+        store.dismissSaveFailure()
+        XCTAssertNil(store.saveFailure.message)
+        store.flush()
+        XCTAssertNil(store.saveFailure.message, "Warnings stay dismissed for the session")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        store.flush()
+        XCTAssertNil(store.saveFailure.message)
+        XCTAssertEqual(TransformsStore(fileURL: url).transforms, store.transforms)
+    }
+
+    @MainActor
+    func testR24CorrectionsFailedRemovalWarnsAndRetainsChangesForRetry() throws {
+        let directory = try saveFailureDirectory()
+        let url = directory.appendingPathComponent("corrections-log.json")
+        let store = CorrectionsLog(fileURL: url)
+        let record = CorrectionRecord(heard: "murmer", replaced: "Murmur", source: .dictionary)
+        store.append([record])
+        store.flush()
+        let original = try Data(contentsOf: url)
+        store.remove(id: record.id)
+        try makeReadOnly(directory)
+        store.flush()
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertTrue(store.records.isEmpty)
+        XCTAssertEqual(store.saveFailure.message,
+                       "Corrections could not be saved. Copy any changes you want to keep before quitting.")
+        store.dismissSaveFailure()
+        XCTAssertNil(store.saveFailure.message)
+        store.flush()
+        XCTAssertNil(store.saveFailure.message, "Warnings stay dismissed for the session")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        store.flush()
+        XCTAssertNil(store.saveFailure.message)
+        XCTAssertTrue(CorrectionsLog(fileURL: url).records.isEmpty)
+    }
+
+    @MainActor
+    func testR24TransformsFailedFirstRunSeedWarns() throws {
+        let directory = try saveFailureDirectory()
+        try makeReadOnly(directory)
+        let url = directory.appendingPathComponent("transforms.json")
+        let store = TransformsStore(fileURL: url)
+        XCTAssertEqual(store.transforms.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertNotNil(store.saveFailure.message)
+    }
+
+    @MainActor
+    func testR24UnreadableStoresWarnAndKeepSavesBlocked() throws {
+        let directory = try saveFailureDirectory()
+        let snippets = SnippetsStore(fileURL: directory)
+        let transforms = TransformsStore(fileURL: directory)
+        let corrections = CorrectionsLog(fileURL: directory)
+        snippets.add(trigger: "signature", expansion: "Keep")
+        transforms.add(name: "Keep", prompt: "Keep")
+        corrections.append([CorrectionRecord(heard: "a", replaced: "b", source: .dictionary)])
+        snippets.flush()
+        transforms.flush()
+        corrections.flush()
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertNotNil(snippets.saveFailure.message)
+        XCTAssertNotNil(transforms.saveFailure.message)
+        XCTAssertNotNil(corrections.saveFailure.message)
+    }
+
+    @MainActor
+    func testR24FailedQuarantineWarnsAndPreservesOriginalFiles() throws {
+        let directory = try saveFailureDirectory()
+        let urls = ["snippets.json", "transforms.json", "corrections-log.json"].map {
+            directory.appendingPathComponent($0)
+        }
+        let original = Data("recoverable corrupt data".utf8)
+        for url in urls { try original.write(to: url) }
+        try makeReadOnly(directory)
+        let snippets = SnippetsStore(fileURL: urls[0])
+        let transforms = TransformsStore(fileURL: urls[1])
+        let corrections = CorrectionsLog(fileURL: urls[2])
+        XCTAssertTrue(transforms.transforms.isEmpty, "Failed quarantine must not seed defaults")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        snippets.add(trigger: "signature", expansion: "Keep")
+        transforms.add(name: "Keep", prompt: "Keep")
+        corrections.append([CorrectionRecord(heard: "a", replaced: "b", source: .dictionary)])
+        snippets.flush()
+        transforms.flush()
+        corrections.flush()
+        for url in urls { XCTAssertEqual(try Data(contentsOf: url), original) }
+        XCTAssertNotNil(snippets.saveFailure.message)
+        XCTAssertNotNil(transforms.saveFailure.message)
+        XCTAssertNotNil(corrections.saveFailure.message)
+    }
+
     // MARK: - HistoryStore
 
     @MainActor
