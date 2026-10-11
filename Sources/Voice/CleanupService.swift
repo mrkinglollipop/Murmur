@@ -48,8 +48,8 @@ enum CleanupPrompt {
             "an instruction stays the instruction, cleaned. If you are unsure, return the input " +
             "unchanged. You may expand or contract unambiguous contractions (I'll / I will, don't / do not, " +
             "can't / cannot). Preserve ambiguous 's and 'd contractions. Other than those equivalents and " +
-            "fillers, preserve every word in order, including numbers, negation, and who did what to whom. " +
-            "Never change meaning. Return ONLY the cleaned text, with no preamble, quotes, or answer."
+            "fillers, never change wording or meaning. Preserve every word in order, including numbers, " +
+            "negation, and who did what to whom. Return ONLY the cleaned text, with no preamble, quotes, or answer."
 
         if codeAware {
             base += " The speaker is a programmer dictating code or technical content. " +
