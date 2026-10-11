@@ -149,7 +149,33 @@ final class ActivationController {
     /// Retained pointer to self — released if tap creation fails.
     private var selfPtr: Unmanaged<ActivationController>?
 
-    private let recorder = AudioRecorder()
+    private let recorder: AudioRecorder
+
+    init(recorder: AudioRecorder = AudioRecorder()) {
+        self.recorder = recorder
+        recorder.onTerminalCaptureFailure = { [weak self] in
+            self?.resetAfterCaptureFailure()
+        }
+    }
+
+    private func resetAfterCaptureFailure() {
+        holdTimer?.cancel()
+        holdTimer = nil
+        FnActivationLogic.resetAfterCaptureFailure(state: &fnLogicState)
+    }
+
+    #if DEBUG
+    /// Exercises the controller-owned latch without installing a global HID tap.
+    func fnTransitionForTesting(down: Bool, now: Date) -> [FnActivationLogic.Effect] {
+        FnActivationLogic.handle(state: &fnLogicState, fnDown: down, useToggleLock: true, now: now)
+    }
+
+    func fnHoldTimerForTesting(now: Date) -> [FnActivationLogic.Effect] {
+        FnActivationLogic.handleHoldTimerFired(state: &fnLogicState, useToggleLock: true, now: now)
+    }
+
+    var fnStateForTesting: FnActivationLogic.State { fnLogicState }
+    #endif
 
     /// Read-only access to the underlying recorder (and, via it, the ASR
     /// selector) for UI wiring — e.g. Settings needs to reach the live
