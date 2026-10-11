@@ -14,7 +14,39 @@
 | `generate-app-icon.sh` | Regenerate iconset + `AppIcon.icns` from source PNG | After changing icon artwork |
 | `test-app-icon-helpers.sh` | Offline oracle for icon geometry / drift | After editing icon assets or generator |
 
-**Release path:** `make-dmg.sh` → `publish-sparkle.sh`.
+## Public release
+
+`publish-sparkle.sh` builds its own fresh DMG with `make-dmg.sh`, then mounts
+that exact artifact to check app identity, versions, notarization and signing.
+`DERIVED` can locate Sparkle tools but never selects the app to validate.
+
+Public publishing rejects `SKIP_MAKE_DMG=1`: a reused artifact has no
+authenticated binding to the committed source revision. Git status errors and
+dirty working trees both stop publication before artifact work.
+
+Versioned DMGs are immutable. `ALLOW_REPUBLISH_VERSION=1` no longer permits
+replacement, including after an interrupted publish. Bump both version numbers
+before publishing again. Versioned uploads never use `--clobber`, so an asset
+appearing after preflight also cannot be deleted. The appcast and stable
+`Murmur.dmg` alias retain their existing replacement behavior.
+
+`ALLOW_UNNOTARIZED=1` remains local-only and always builds a fresh artifact.
+Run `bash scripts/test-publish-guards.sh` for the offline, shared-lock guard
+oracle, and `bash scripts/test-publish-sparkle-helpers.sh` for the helper and
+execution-order checks. Both use the same shared lock and private command
+stubs; they never build, sign, notarize or upload. The guard oracle injects
+harmless exported command wrappers and a `BASH_ENV` fixture to verify that
+inherited functions and startup hooks cannot bypass the stubs in child shells.
+As with any Bash script, a caller's initial `BASH_ENV` runs before the script
+can clear it; only use a trusted startup environment to launch the oracles.
+
+Source status explicitly includes all untracked files, even when Git's
+configuration hides them. Status and the reported SHA use the build checkout,
+with inherited Git repository-selection variables cleared. Regression cases
+exercise the production publish path against stubbed Git responses and
+temporary Swift inputs. Execution-order checks run `publish_main` with fixture
+files and stubbed external commands, including the local-only path and icon
+and team-preflight failures; they do not infer runtime order from line numbers.
 
 ## Signing (`DEVELOPMENT_TEAM`)
 

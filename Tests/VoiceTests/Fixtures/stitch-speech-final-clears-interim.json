@@ -1,0 +1,27 @@
+{
+  "name": "speech-final-clears-interim",
+  "events": [
+    {
+      "type": "final",
+      "text": "silver lantern",
+      "speechFinal": false,
+      "words": [],
+      "expectedAfter": "silver lantern"
+    },
+    {
+      "type": "interim",
+      "text": "irrelevant interim tail",
+      "speechFinal": false,
+      "words": [],
+      "expectedAfter": "silver lantern irrelevant interim tail"
+    },
+    {
+      "type": "final",
+      "text": "glows at dusk",
+      "speechFinal": true,
+      "words": [],
+      "expectedAfter": "silver lantern glows at dusk"
+    }
+  ],
+  "expected": "silver lantern glows at dusk"
+}

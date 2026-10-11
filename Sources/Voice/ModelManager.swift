@@ -111,10 +111,7 @@ final class ModelManager: ObservableObject {
 
     private nonisolated static let repo = "argmaxinc/whisperkit-coreml"
 
-    private nonisolated static let legacyDocumentsHuggingFaceBase: URL = {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return documents.appendingPathComponent("huggingface", isDirectory: true)
-    }()
+    private nonisolated static let legacyDocumentsHuggingFaceBase = VoicePaths.legacyWhisperKitDirectory
 
     private nonisolated static let migrationLogger = Logger(
         subsystem: "com.matt.voice-dictation",
@@ -156,9 +153,13 @@ final class ModelManager: ObservableObject {
     ///
     /// Rules: only-old → move; empty/unusable new + old → remove empty new then
     /// move; both usable → new wins, leave legacy orphan; sibling vendor dirs
-    /// under `models/` are never touched.
+    /// under `models/` are never touched. Completion lives beside the repo so
+    /// deleting its last variant (or the repo itself) cannot reimport an orphan.
     nonisolated static func migrateWhisperKitModelsIfNeeded(from oldRepo: URL, to newRepo: URL) {
         let fm = FileManager.default
+        let completionURL = newRepo.deletingLastPathComponent()
+            .appendingPathComponent(".\(newRepo.lastPathComponent)-migration-complete")
+        guard !fm.fileExists(atPath: completionURL.path) else { return }
         var oldIsDir: ObjCBool = false
         var newIsDir: ObjCBool = false
         let oldExists = fm.fileExists(atPath: oldRepo.path, isDirectory: &oldIsDir) && oldIsDir.boolValue
@@ -166,6 +167,7 @@ final class ModelManager: ObservableObject {
 
         if newExists {
             if whisperKitRepoHasUsableContent(newRepo) {
+                recordWhisperKitMigrationCompletion(at: completionURL)
                 if oldExists {
                     migrationLogger.info(
                         "WhisperKit migration: new cache present; leaving legacy orphan at \(oldRepo.path, privacy: .public)"
@@ -191,10 +193,23 @@ final class ModelManager: ObservableObject {
         do {
             try fm.createDirectory(at: newParent, withIntermediateDirectories: true)
             try fm.moveItem(at: oldRepo, to: newRepo)
+            if whisperKitRepoHasUsableContent(newRepo) {
+                recordWhisperKitMigrationCompletion(at: completionURL)
+            }
             migrationLogger.info("WhisperKit migration: moved models to Application Support")
         } catch {
             migrationLogger.error(
                 "WhisperKit migration failed: \(error.localizedDescription, privacy: .public); leaving legacy cache"
+            )
+        }
+    }
+
+    private nonisolated static func recordWhisperKitMigrationCompletion(at url: URL) {
+        do {
+            try Data("1\n".utf8).write(to: url, options: .atomic)
+        } catch {
+            migrationLogger.error(
+                "WhisperKit migration: could not persist completion: \(error.localizedDescription, privacy: .public)"
             )
         }
     }
@@ -390,8 +405,7 @@ final class ModelManager: ObservableObject {
     /// downloaded" rather than guessing — Parakeet acquisition is owned by
     /// the Python sidecar itself, not this manager.
     private nonisolated static func parakeetCacheInfo() -> (Bool, Int64?) {
-        let hfCache = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+        let hfCache = VoicePaths.huggingFaceHubDirectory
 
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: hfCache,
@@ -436,7 +450,18 @@ final class ModelManager: ObservableObject {
     /// engine. This is intentionally synchronous so SettingsStore can make its
     /// first-run decision before ModelManager is constructed.
     nonisolated static func hasAnyDownloadedModel() -> Bool {
-        LocalModel.allCases.contains { model in
+        let newRepo = downloadBase.appendingPathComponent("models/\(repo)", isDirectory: true)
+        let completion = newRepo.deletingLastPathComponent()
+            .appendingPathComponent(".\(newRepo.lastPathComponent)-migration-complete")
+        // Settings resolves before migration. Count pending legacy downloads,
+        // but never revive an orphan after a completed migration and deletion.
+        if !FileManager.default.fileExists(atPath: completion.path),
+           whisperKitRepoHasUsableContent(
+               legacyDocumentsHuggingFaceBase.appendingPathComponent("models/\(repo)", isDirectory: true)
+           ) {
+            return true
+        }
+        return LocalModel.allCases.contains { model in
             guard model != .appleSpeech else { return false }
             if let folder = modelFolderURL(for: model) {
                 return variantFolderHasModelPayload(folder)

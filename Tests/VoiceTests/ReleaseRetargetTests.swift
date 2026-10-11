@@ -1,13 +1,18 @@
 import XCTest
 @testable import Voice
 
-/// Release-time targeting (2026-08-10): the app frontmost at hotkey RELEASE
-/// is the inject destination; the hold-start app is only kept when the
-/// release sample has no identity or the app never changed. Covers the pure
-/// seam behind `retargetedSessionHoldAtRelease` — the AX/NSWorkspace shell
-/// stays thin and untested by design (same pattern as the mic-watchdog
-/// seams).
+/// Hold-start targeting applies to both voice edits and ordinary dictation.
 final class ReleaseRetargetTests: XCTestCase {
+
+    func testEditCapturedInAReleasedOverBDoesNotInjectIntoB() {
+        let held = CaretContext.Snapshot(value: "old words", location: 0,
+            selectionLength: .readable(9), precedingChar: .startOfField, isUnknown: false)
+        XCTAssertEqual(VoiceEditRouting.decide(snapshot: held, enabled: true, shiftHeld: false),
+                       .edit(selection: "old words"))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("new words", over: "old words"))
+        let deliveryPID: pid_t = AudioRecorder.shouldRetargetSessionHoldAtRelease(startPID: 42, releasePID: 99) ? 99 : 42
+        XCTAssertTrue(TranscriptionPipeline.shouldAbortInjectForFrontmostMismatch(held: deliveryPID, current: 99))
+    }
 
     // Unknown release identity → keep the start-time hold (fail toward the
     // long-verified behavior, never toward a nil-anchored inject).
@@ -27,18 +32,16 @@ final class ReleaseRetargetTests: XCTestCase {
         )
     }
 
-    // The live 2026-08-10 abort: hold started in one app, released in the
-    // intended one. Release wins.
-    func testRetargetsWhenAppChangedDuringHold() {
-        XCTAssertTrue(
+    // Switching apps during a hold does not authorize a new destination.
+    func testKeepsOriginalTargetWhenAppChangedDuringHold() {
+        XCTAssertFalse(
             AudioRecorder.shouldRetargetSessionHoldAtRelease(startPID: 1, releasePID: 2)
         )
     }
 
-    // Start-time identity missing but release known → adopt the release app
-    // (strictly more information than the fail-open nil-held path had).
-    func testRetargetsWhenStartPIDUnknownButReleaseKnown() {
-        XCTAssertTrue(
+    // Missing hold-start identity cannot be repaired by adopting another app.
+    func testDoesNotAdoptReleaseAppWhenStartPIDUnknown() {
+        XCTAssertFalse(
             AudioRecorder.shouldRetargetSessionHoldAtRelease(startPID: nil, releasePID: 7)
         )
     }

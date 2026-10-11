@@ -33,6 +33,9 @@ enum CaretContext {
         /// True when focused value/range could not be read at all.
         let isUnknown: Bool
 
+        /// Retained AX identity prevents equal text in another field impersonating this one.
+        var focusedElement: AXUIElement? = nil
+
         static let unknown = Snapshot(
             value: "",
             location: 0,
@@ -42,12 +45,13 @@ enum CaretContext {
         )
     }
 
-    /// Single AX snapshot for strip + leading space (no dual fetch).
-    static func snapshot(
-        frontmostPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+    /// Field identity does not depend on the value or selection, both of which
+    /// change as Unicode chunks land.
+    static func focusedElement(
+        frontmostPID: pid_t?,
         reader: AXReader = AXReader()
-    ) -> Snapshot {
-        guard let pid = frontmostPID else { return .unknown }
+    ) -> AXUIElement? {
+        guard let pid = frontmostPID else { return nil }
 
         let appElement = AXUIElementCreateApplication(pid)
         _ = reader.setTimeout(appElement, messagingTimeoutSeconds)
@@ -58,12 +62,22 @@ enum CaretContext {
             kAXFocusedUIElementAttribute as CFString,
             &focusedRef
         ) == .success, let focusedRef else {
-            return .unknown
+            return nil
         }
         guard CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return (focusedRef as! AXUIElement)
+    }
+
+    /// Single AX snapshot for strip + leading space (no dual fetch).
+    static func snapshot(
+        frontmostPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+        reader: AXReader = AXReader()
+    ) -> Snapshot {
+        guard let focused = focusedElement(frontmostPID: frontmostPID, reader: reader) else {
             return .unknown
         }
-        let focused = focusedRef as! AXUIElement
         _ = reader.setTimeout(focused, messagingTimeoutSeconds)
 
         var valueRef: CFTypeRef?
@@ -107,7 +121,8 @@ enum CaretContext {
             location: parsed.location,
             selectionLength: selectionLength,
             precedingChar: preceding,
-            isUnknown: false
+            isUnknown: false,
+            focusedElement: focused
         )
     }
 

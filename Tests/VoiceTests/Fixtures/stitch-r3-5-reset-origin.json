@@ -1,0 +1,40 @@
+{
+  "name": "r3-5-reset-origin",
+  "events": [
+    {
+      "type": "final",
+      "text": "Call Alice.",
+      "words": [
+        {
+          "text": "Call",
+          "start": 0,
+          "end": 0.5
+        },
+        {
+          "text": "Alice",
+          "start": 0.5,
+          "end": 1
+        }
+      ],
+      "speechFinal": true
+    },
+    {
+      "type": "final",
+      "text": "Call Bob.",
+      "words": [
+        {
+          "text": "Call",
+          "start": 0,
+          "end": 0.5
+        },
+        {
+          "text": "Bob",
+          "start": 0.5,
+          "end": 1
+        }
+      ],
+      "speechFinal": true
+    }
+  ],
+  "expected": "Call Alice. Call Bob."
+}
