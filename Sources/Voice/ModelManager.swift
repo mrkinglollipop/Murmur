@@ -345,7 +345,7 @@ final class ModelManager: ObservableObject {
     /// Filesystem scan, off the main actor. Returns (present, totalBytes).
     private nonisolated static func scanDisk(for model: LocalModel) async -> (Bool, Int64?) {
         guard let folder = modelFolderURL(for: model) else {
-            // Parakeet — not a WhisperKit folder; best-effort via HF cache.
+            // Parakeet — not a WhisperKit folder; validate its HF snapshot.
             return parakeetCacheInfo()
         }
 
@@ -399,30 +399,37 @@ final class ModelManager: ObservableObject {
             .appendingPathComponent(variant, isDirectory: true)
     }
 
-    /// Parakeet is cached by `parakeet-mlx` in the standard HuggingFace CLI
-    /// cache (`~/.cache/huggingface/hub/`), not WhisperKit's folder. This is
-    /// best-effort: if the expected cache layout isn't found, we report "not
-    /// downloaded" rather than guessing — Parakeet acquisition is owned by
-    /// the Python sidecar itself, not this manager.
+    /// The sidecar loads mlx-community/parakeet-tdt-0.6b-v3 at revision main.
+    /// Only that revision's readable config and weights establish readiness;
+    /// other Parakeet repositories, stale snapshots and hub metadata do not.
     private nonisolated static func parakeetCacheInfo() -> (Bool, Int64?) {
-        let hfCache = VoicePaths.huggingFaceHubDirectory
-
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: hfCache,
-            includingPropertiesForKeys: nil
-        ) else {
+        let fm = FileManager.default
+        let parakeetDir = VoicePaths.huggingFaceHubDirectory
+            .appendingPathComponent("models--mlx-community--parakeet-tdt-0.6b-v3", isDirectory: true)
+        guard let ref = try? String(contentsOf: parakeetDir.appendingPathComponent("refs/main"), encoding: .utf8) else {
+            return (false, nil)
+        }
+        let revision = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard revision.count == 40, revision.allSatisfy({ "0123456789abcdef".contains($0) }) else {
             return (false, nil)
         }
 
-        // parakeet-mlx caches under a folder name containing "parakeet".
-        guard let parakeetDir = contents.first(where: {
-            $0.lastPathComponent.lowercased().contains("parakeet")
-        }) else {
+        let snapshot = parakeetDir.appendingPathComponent("snapshots/\(revision)", isDirectory: true)
+        for name in ["config.json", "model.safetensors"] {
+            // HF snapshots normally symlink to blobs; inspect the target so
+            // broken links and unfinished downloads never count as payload.
+            let file = snapshot.appendingPathComponent(name).resolvingSymlinksInPath()
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, (values.fileSize ?? 0) > 0,
+                  fm.isReadableFile(atPath: file.path) else {
+                return (false, nil)
+            }
+        }
+        guard let config = try? Data(contentsOf: snapshot.appendingPathComponent("config.json")),
+              (try? JSONSerialization.jsonObject(with: config)) is [String: Any] else {
             return (false, nil)
         }
-
-        let bytes = directorySize(parakeetDir)
-        return (bytes > 0, bytes)
+        return (true, directorySize(parakeetDir))
     }
 
     /// True for the Parakeet model — its storage is managed by the Python
