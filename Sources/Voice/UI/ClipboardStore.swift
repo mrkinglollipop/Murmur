@@ -368,6 +368,8 @@ final class ClipboardStore: ObservableObject {
         Thread.isMainThread ? apply() : DispatchQueue.main.async(execute: apply)
     }
     private var loadedMetadata = false
+    /// An explicit clear can persist an empty array even while the key is unavailable.
+    private var pendingMetadataClear = false
 
     /// Guards `activate()` against re-entry while its Keychain resolution is
     /// still in flight, when `isActivated` is not yet true.
@@ -478,7 +480,12 @@ final class ClipboardStore: ObservableObject {
                     }
                     return entry
                 }
-                if needsMigration { self.save() }
+                if needsMigration {
+                    self.save()
+                } else if self.loadedMetadata {
+                    do { try self.removeVerifiedMigrationBackup(using: resolved) }
+                    catch { self.storageFailure(error) }
+                }
                 guard !self.isLockedOut, !self.isMetadataCorrupt else {
                     self.isActivating = false
                     self.isActivated = true
@@ -682,6 +689,37 @@ final class ClipboardStore: ObservableObject {
         }
     }
 
+    /// Read back the encrypted generation and prove every backup preview survived
+    /// before deleting the only plaintext recovery copy. Also handles a prior
+    /// launch that finished migration but could not remove its backup.
+    private func removeVerifiedMigrationBackup(using crypto: ClipboardCrypto) throws {
+        let backup: Data
+        do { backup = try fileOperations.read(migrationBackupURL) }
+        catch {
+            if Self.isMissingFile(error) { return }
+            throw error
+        }
+        let original = try decodeStoredEntries(backup)
+        let current = try decodeStoredEntries(fileOperations.read(metadataURL))
+        guard current.allSatisfy({ $0.preview == nil && $0.sealedPreview != nil }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        for row in original {
+            // Retention or deletion can outlive a backup from an earlier launch.
+            // Keep that unverified recovery copy without disabling the current store.
+            guard let migrated = current.first(where: { $0.id == row.id }) else { return }
+            guard let sealed = migrated.sealedPreview else { throw CocoaError(.fileReadCorruptFile) }
+            if let preview = row.preview {
+                guard try crypto.open(sealed) == Data(preview.utf8) else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+            } else if sealed != row.sealedPreview {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+        }
+        try fileOperations.remove(migrationBackupURL)
+    }
+
     private func storageFailure(_ error: Error) {
         isStorageUnavailable = true
         logger.error("Clipboard storage unavailable: \(error.localizedDescription)")
@@ -701,6 +739,17 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func save() {
+        if pendingMetadataClear && entries.isEmpty {
+            do {
+                try fileOperations.write(Data("[]".utf8), metadataURL)
+                pendingMetadataClear = false
+                loadedMetadata = true
+                isStorageUnavailable = false
+            } catch {
+                storageFailure(error)
+            }
+            return
+        }
         guard !isMetadataCorrupt, !isLockedOut,
               !(isStorageUnavailable && !loadedMetadata), let crypto else { return }
         let encoder = JSONEncoder()
@@ -723,6 +772,8 @@ final class ClipboardStore: ObservableObject {
             try fileOperations.write(try encoder.encode(stored), metadataURL)
             storedEntries = stored
             loadedMetadata = true
+            pendingMetadataClear = false
+            try removeVerifiedMigrationBackup(using: crypto)
             isStorageUnavailable = false
         } catch {
             storageFailure(error)
@@ -1128,7 +1179,8 @@ final class ClipboardStore: ObservableObject {
             self.storedEntries = []
             self.unreadablePreviews.removeAll()
             self.isLockedOut = false
-            self.scheduleSave()
+            self.pendingMetadataClear = true
+            self.save()
         }
         Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }

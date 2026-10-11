@@ -4,6 +4,26 @@
 import Foundation
 import Network
 
+/// Transport boundary lets request lifecycle tests use no sockets or network.
+protocol LoopbackHTTPConnection: AnyObject {
+    func start(queue: DispatchQueue)
+    func readHeadChunk(_ completion: @escaping (Data?, Bool, Error?) -> Void)
+    func writeResponse(_ data: Data, completion: @escaping () -> Void)
+    func cancel()
+}
+
+extension NWConnection: LoopbackHTTPConnection {
+    func readHeadChunk(_ completion: @escaping (Data?, Bool, Error?) -> Void) {
+        receive(minimumIncompleteLength: 1, maximumLength: 1024) { data, _, complete, error in
+            completion(data, complete, error)
+        }
+    }
+
+    func writeResponse(_ data: Data, completion: @escaping () -> Void) {
+        send(content: data, completion: .contentProcessed { _ in completion() })
+    }
+}
+
 /// Loopback HTTP listener for the OAuth browser round trip.
 ///
 /// A browser cannot render a `murmur://` custom-scheme redirect — macOS hands
@@ -97,14 +117,16 @@ final class LoopbackRedirectServer {
     let port: UInt16
     var redirectURI: String { Self.redirectURI(port: port) }
 
-    private let listener: NWListener
+    private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.matt.voice-dictation.loopback-auth")
     /// A callback needs one short-lived connection. Keep a small cap so a
     /// local process cannot make the listener retain an unbounded array while
     /// a browser attempt is open.
     private static let maximumConnections = 8
     private static let maximumRequestHeadBytes = 8 * 1024
-    private var connections: [NWConnection] = []
+    private var connections: [LoopbackHTTPConnection] = []
+    private let scheduleHeaderTimeout: (DispatchWorkItem) -> Void
+    private var headerTimeouts: [ObjectIdentifier: DispatchWorkItem] = [:]
     private var onResult: ((Result<String, SupabaseAuthClient.AuthError>) -> Void)?
     private var isStopped = false
 
@@ -133,6 +155,16 @@ final class LoopbackRedirectServer {
         return nil
     }
 
+    /// No listener is created when a transport and clock are supplied by tests.
+    init(
+        scheduleHeaderTimeout: @escaping (DispatchWorkItem) -> Void,
+        onResult: @escaping (Result<String, SupabaseAuthClient.AuthError>) -> Void
+    ) {
+        self.port = 0
+        self.scheduleHeaderTimeout = scheduleHeaderTimeout
+        self.onResult = onResult
+    }
+
     private init(
         port: UInt16,
         onResult: @escaping (Result<String, SupabaseAuthClient.AuthError>) -> Void
@@ -141,7 +173,12 @@ final class LoopbackRedirectServer {
         let params = NWParameters.tcp
         // Loopback only — never reachable from the network.
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: nwPort)
-        self.listener = try NWListener(using: params)
+        let listener = try NWListener(using: params)
+        self.listener = listener
+        let timeoutQueue = queue
+        self.scheduleHeaderTimeout = { work in
+            timeoutQueue.asyncAfter(deadline: .now() + 5, execute: work)
+        }
         self.port = port
         self.onResult = onResult
         listener.newConnectionHandler = { [weak self] connection in
@@ -171,17 +208,19 @@ final class LoopbackRedirectServer {
         queue.async { [self] in
             isStopped = true
             onResult = nil
-            listener.cancel()
+            listener?.cancel()
+            headerTimeouts.values.forEach { $0.cancel() }
+            headerTimeouts.removeAll()
             connections.forEach { $0.cancel() }
             connections.removeAll()
         }
     }
 
     deinit {
-        listener.cancel()
+        listener?.cancel()
     }
 
-    private func accept(_ connection: NWConnection) {
+    func accept(_ connection: LoopbackHTTPConnection) {
         guard Self.shouldAcceptConnection(
             retainedCount: connections.count,
             hasResultHandler: onResult != nil,
@@ -191,20 +230,32 @@ final class LoopbackRedirectServer {
             return
         }
         connections.append(connection)
+        let timeout = DispatchWorkItem { [weak self, weak connection] in
+            guard let self, let connection,
+                  self.headerTimeouts[ObjectIdentifier(connection)] != nil else { return }
+            self.close(connection)
+        }
+        headerTimeouts[ObjectIdentifier(connection)] = timeout
+        scheduleHeaderTimeout(timeout)
         connection.start(queue: queue)
         receiveRequestHead(from: connection, accumulated: Data())
     }
 
-    private func receiveRequestHead(from connection: NWConnection, accumulated: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, complete, error in
-            guard let self, error == nil, let data else {
-                self?.close(connection)
+    private func receiveRequestHead(from connection: LoopbackHTTPConnection, accumulated: Data) {
+        connection.readHeadChunk { [weak self] data, complete, error in
+            guard let self else { return }
+            // Cancellation can still deliver a buffered receive completion.
+            guard self.connections.contains(where: { $0 === connection }) else { return }
+            guard error == nil, let data else {
+                self.close(connection)
                 return
             }
             switch Self.requestHeadResult(accumulated: accumulated, received: data, complete: complete) {
             case .target(let target):
+                self.cancelHeaderTimeout(for: connection)
                 self.respond(to: connection, target: target)
             case .badRequest:
+                self.cancelHeaderTimeout(for: connection)
                 self.send(connection, status: "400 Bad Request", body: "")
             case .waitForMore:
                 self.receiveRequestHead(from: connection, accumulated: accumulated + data)
@@ -212,7 +263,7 @@ final class LoopbackRedirectServer {
         }
     }
 
-    private func respond(to connection: NWConnection, target: String) {
+    private func respond(to connection: LoopbackHTTPConnection, target: String) {
         guard let result = Self.callbackResult(fromTarget: target) else {
             // Favicon or other stray request: close it, keep listening.
             send(connection, status: "404 Not Found", body: "")
@@ -222,15 +273,20 @@ final class LoopbackRedirectServer {
         onResult?(result)
     }
 
-    private func send(_ connection: NWConnection, status: String, body: String) {
+    private func send(_ connection: LoopbackHTTPConnection, status: String, body: String) {
         let payload = Data(body.utf8)
         let head = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(payload.count)\r\nConnection: close\r\n\r\n"
-        connection.send(content: Data(head.utf8) + payload, completion: .contentProcessed { [weak self] _ in
+        connection.writeResponse(Data(head.utf8) + payload) { [weak self] in
             self?.close(connection)
-        })
+        }
     }
 
-    private func close(_ connection: NWConnection) {
+    private func cancelHeaderTimeout(for connection: LoopbackHTTPConnection) {
+        headerTimeouts.removeValue(forKey: ObjectIdentifier(connection))?.cancel()
+    }
+
+    private func close(_ connection: LoopbackHTTPConnection) {
+        cancelHeaderTimeout(for: connection)
         connection.cancel()
         connections.removeAll { $0 === connection }
     }

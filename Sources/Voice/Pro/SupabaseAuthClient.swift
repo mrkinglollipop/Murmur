@@ -177,5 +177,6 @@ struct SupabaseAuthClient {
         }
         let code = object["error_code"] as? String ?? object["code"] as? String
         return code == "refresh_token_already_used" || code == "refresh_token_not_found"
+            || code == "session_expired"
     }
 }

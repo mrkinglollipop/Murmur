@@ -434,8 +434,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// a grant (or revocation) lands without a relaunch. The first live test
     /// required bouncing the app because sign-in was the only refresh trigger.
     func applicationDidBecomeActive(_ notification: Notification) {
-        if case .signedIn(let session) = authFlow.state {
-            Task {
+        Task {
+            if let session = await authFlow.sessionForForegroundActivation() {
                 await entitlementStore.refresh(session: session) {
                     await self.authFlow.authenticatedSession()
                 }
