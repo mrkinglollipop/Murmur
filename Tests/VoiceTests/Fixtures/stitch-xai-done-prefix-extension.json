@@ -1,0 +1,19 @@
+{
+  "name": "xai-done-full-session-prefix-extension",
+  "events": [
+    {
+      "type": "final",
+      "text": "Call Alice.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "Call Alice. Call Bob.",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Call Alice. Call Bob.",
+  "requiresRecovery": false
+}

@@ -1,0 +1,32 @@
+{
+  "name": "xai-invalid-word-prefix-remains-ambiguous",
+  "events": [
+    {
+      "type": "final",
+      "text": "Call Ann",
+      "speechFinal": false,
+      "words": [
+        { "text": "Call", "start": 0, "end": 0.4 },
+        { "text": "Anne", "start": 0.4, "end": 0.8 }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "Call Anna.",
+      "speechFinal": true,
+      "words": [
+        { "text": "Call", "start": 0, "end": 0.4 },
+        { "text": "Annie", "start": 0.4, "end": 0.8 }
+      ]
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Call Ann Call Anna.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

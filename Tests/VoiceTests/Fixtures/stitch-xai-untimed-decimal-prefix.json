@@ -1,0 +1,26 @@
+{
+  "name": "xai-untimed-decimal-prefix-remains-ambiguous",
+  "events": [
+    {
+      "type": "final",
+      "text": "Set 3",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Set 3.5 milligrams.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Set 3 Set 3.5 milligrams.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

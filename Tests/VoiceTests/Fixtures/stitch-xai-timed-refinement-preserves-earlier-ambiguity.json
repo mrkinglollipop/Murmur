@@ -1,0 +1,60 @@
+{
+  "name": "xai-timed-refinement-preserves-earlier-ambiguity",
+  "events": [
+    {
+      "type": "final",
+      "text": "Earlier words.",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Intro.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Call Alice",
+      "speechFinal": false,
+      "words": [
+        {
+          "text": "Call",
+          "start": 0,
+          "end": 0.4
+        },
+        {
+          "text": "Alice",
+          "start": 0.4,
+          "end": 1
+        }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "Call Alice.",
+      "speechFinal": true,
+      "words": [
+        {
+          "text": "Call",
+          "start": 0,
+          "end": 0.4
+        },
+        {
+          "text": "Alice",
+          "start": 0.4,
+          "end": 1
+        }
+      ]
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Earlier words. Intro. Call Alice.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

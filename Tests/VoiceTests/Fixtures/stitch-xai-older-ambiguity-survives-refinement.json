@@ -1,0 +1,32 @@
+{
+  "name": "xai-older-ambiguity-survives-last-chunk-refinement",
+  "events": [
+    {
+      "type": "final",
+      "text": "Amber.",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Blue.",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "Blue.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "Amber. Blue.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

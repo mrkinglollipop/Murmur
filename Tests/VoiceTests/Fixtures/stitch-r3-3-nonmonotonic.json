@@ -36,5 +36,7 @@
       "speechFinal": false
     }
   ],
-  "expected": "Call Alice tomorrow. Wait."
+  "expected": "Call Alice tomorrow. Wait.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
 }
