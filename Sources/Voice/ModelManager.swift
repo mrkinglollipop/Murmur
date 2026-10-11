@@ -3,6 +3,105 @@ import os.log
 import Speech
 import WhisperKit
 
+/// Narrow system boundary so asset lifecycle tests never contact Apple's service.
+@MainActor
+protocol AppleSpeechAssetInventory {
+    func locale(for language: String) async throws -> Locale
+    func status(for locale: Locale) async -> AssetInventory.Status
+    func installationRequest(for locale: Locale) async throws -> AssetInstallationRequest?
+    var reservedLocales: [Locale] { get async }
+    func release(_ locale: Locale) async
+}
+
+@MainActor
+struct SystemAppleSpeechAssetInventory: AppleSpeechAssetInventory {
+    func locale(for language: String) async throws -> Locale {
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: language)) else {
+            throw AppleSpeechEngineError.unsupportedLanguage(language)
+        }
+        return locale
+    }
+
+    func status(for locale: Locale) async -> AssetInventory.Status {
+        await AssetInventory.status(forModules: [SpeechTranscriber(locale: locale, preset: .transcription)])
+    }
+
+    func installationRequest(for locale: Locale) async throws -> AssetInstallationRequest? {
+        try await AssetInventory.assetInstallationRequest(
+            supporting: [SpeechTranscriber(locale: locale, preset: .transcription)]
+        )
+    }
+
+    var reservedLocales: [Locale] { get async { await AssetInventory.reservedLocales } }
+
+    func release(_ locale: Locale) async {
+        await AssetInventory.release(reservedLocale: locale)
+    }
+}
+
+/// Serializes reservation release against transcription start. A lease belongs
+/// to the decoder operation, which can outlive the caller's timeout.
+actor AppleSpeechAssetUsage {
+    static let shared = AppleSpeechAssetUsage()
+    private var activeLanguages: [String: Int] = [:]
+    private var locked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    private func lock() async {
+        if !locked {
+            locked = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func unlock() {
+        if waiters.isEmpty {
+            locked = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+
+    func withTranscription(
+        language: String,
+        operation: @Sendable () async throws -> String
+    ) async throws -> String {
+        await lock()
+        activeLanguages[language, default: 0] += 1
+        unlock()
+        defer {
+            let remaining = activeLanguages[language, default: 1] - 1
+            activeLanguages[language] = remaining == 0 ? nil : remaining
+        }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    func releaseUnused(
+        inventory: any AppleSpeechAssetInventory,
+        selectedLanguage: @MainActor () -> String
+    ) async throws {
+        await lock()
+        defer { unlock() }
+        let reservations = await inventory.reservedLocales
+        for reserved in reservations {
+            // Resolve aliases through the same API as the transcription module.
+            // Re-read selection after suspension; Settings can change mid-scan.
+            let selected = await selectedLanguage()
+            var retained = Set<Locale>()
+            for language in Set(activeLanguages.keys).union([selected]) {
+                retained.insert(try await inventory.locale(for: language))
+            }
+            let canonical = try await inventory.locale(for: reserved.identifier)
+            guard await selectedLanguage() == selected else { return }
+            if !retained.contains(canonical) {
+                await inventory.release(reserved)
+            }
+        }
+    }
+}
+
 // MARK: - Per-model download / storage state
 
 /// Lifecycle state for an individual model's on-disk presence, published by
@@ -126,8 +225,16 @@ final class ModelManager: ObservableObject {
     private var systemAssetRequests: [LocalModel: AssetInstallationRequest] = [:]
     private var systemAssetProgressObservers: [LocalModel: NSKeyValueObservation] = [:]
     private var appleSpeechLanguage = "en"
+    private let appleSpeechInventory: any AppleSpeechAssetInventory
+    private let appleSpeechUsage: AppleSpeechAssetUsage
 
-    init(loadDiskState: Bool = true) {
+    init(
+        loadDiskState: Bool = true,
+        appleSpeechInventory: (any AppleSpeechAssetInventory)? = nil,
+        appleSpeechUsage: AppleSpeechAssetUsage = .shared
+    ) {
+        self.appleSpeechInventory = appleSpeechInventory ?? SystemAppleSpeechAssetInventory()
+        self.appleSpeechUsage = appleSpeechUsage
         guard loadDiskState else { return }
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         Self.migrateWhisperKitModelsFromDocumentsIfNeeded()
@@ -484,8 +591,8 @@ final class ModelManager: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let transcriber = try await AppleSpeechEngine.transcriber(language: language)
-                let status = await AssetInventory.status(forModules: [transcriber])
+                let locale = try await self.appleSpeechInventory.locale(for: language)
+                let status = await self.appleSpeechInventory.status(for: locale)
                 guard self.appleSpeechLanguage == language else { return }
                 self.applyAppleSpeechAssetStatus(status, language: language)
             } catch {
@@ -540,8 +647,12 @@ final class ModelManager: ObservableObject {
         let task = Task { [weak self] in
             guard let self else { return }
             do {
-                let transcriber = try await AppleSpeechEngine.transcriber(language: language)
-                let currentStatus = await AssetInventory.status(forModules: [transcriber])
+                let locale = try await self.appleSpeechInventory.locale(for: language)
+                try await self.appleSpeechUsage.releaseUnused(
+                    inventory: self.appleSpeechInventory,
+                    selectedLanguage: { self.appleSpeechLanguage }
+                )
+                let currentStatus = await self.appleSpeechInventory.status(for: locale)
                 guard self.appleSpeechLanguage == language else {
                     self.finishAppleSpeechAssetRequest()
                     self.refreshAppleSpeechAssetStatus()
@@ -557,7 +668,7 @@ final class ModelManager: ObservableObject {
                 self.downloaded[model] = false
                 self.state[model] = .downloading
                 self.downloadProgress[model] = 0
-                guard let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else {
+                guard let request = try await self.appleSpeechInventory.installationRequest(for: locale) else {
                     self.downloadTasks[model] = nil
                     self.refreshAppleSpeechAssetStatus()
                     return

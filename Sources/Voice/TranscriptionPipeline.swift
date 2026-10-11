@@ -652,6 +652,7 @@ final class TranscriptionPipeline {
                 vlog("transcription error [\(engine.id)]: \(error.localizedDescription)")
                 self.reportTranscriptionFailure(
                     engineID: engine.id,
+                    error: error,
                     audioPath: audioPath,
                     replaceHistoryEntryID: replaceHistoryEntryID,
                     sessionHeldToken: sessionHeldToken,
@@ -664,6 +665,7 @@ final class TranscriptionPipeline {
 
     func reportTranscriptionFailure(
         engineID: String,
+        error: Error? = nil,
         audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
@@ -687,7 +689,16 @@ final class TranscriptionPipeline {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
             // The user already saw this hold dismissed; no late error pill.
-            if !abandoned, sessionHeldToken == self.heldCaretToken { self.onFailure?(.transcriptionFailed) }
+            if !abandoned, sessionHeldToken == self.heldCaretToken {
+                let failure: DictationFailure
+                if let appleError = error as? AppleSpeechEngineError,
+                   case .assetNotInstalled = appleError {
+                    failure = .speechModelDownloading
+                } else {
+                    failure = .transcriptionFailed
+                }
+                self.onFailure?(failure)
+            }
             self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
             completion?(.failed)
         }
