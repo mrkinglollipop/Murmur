@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Offline guard oracle. Only sourced functions run; no publish/build entrypoint.
 set -euo pipefail
+# Shell functions override PATH stubs; startup hooks must not reach children.
+unset -f gh xcrun hdiutil codesign git curl xcodebuild xcodegen security
+unset BASH_ENV ENV
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Serialize this oracle across worktrees, with a bounded wait on the shared lock.
 if [[ "${1:-}" != --locked ]]; then
@@ -16,10 +19,24 @@ with open(os.path.join(tempfile.gettempdir(), 'murmur-test-publish-guards.lock')
             if time.monotonic() >= deadline:
                 sys.exit('ORACLE FAILED: shared lock timeout')
             time.sleep(0.2)
-    try:
-        sys.exit(subprocess.run(['bash', sys.argv[1], '--locked'], timeout=120).returncode)
-    except subprocess.TimeoutExpired:
-        sys.exit('ORACLE FAILED: 120s timeout')
+    # Exercise inherited-function isolation on every run, without real commands.
+    with tempfile.TemporaryDirectory(prefix='publish-guard-inheritance.') as tmp:
+        env = os.environ.copy()
+        env['ISOLATION_SENTINEL'] = os.path.join(tmp, 'sentinel')
+        env['BASH_ENV_LOG'] = os.path.join(tmp, 'startup')
+        startup = os.path.join(tmp, 'bash-env')
+        definitions = []
+        for name in ['gh', 'xcrun', 'hdiutil', 'codesign', 'git', 'curl']:
+            body = '() { printf "%s\\n" ' + name + ' >> "$ISOLATION_SENTINEL"; command ' + name + ' "$@"; }'
+            env['BASH_FUNC_' + name + '%%'] = body
+            definitions.append(name + body + '\nexport -f ' + name)
+        with open(startup, 'w') as f:
+            f.write('echo startup >> "$BASH_ENV_LOG"\n' + '\n'.join(definitions) + '\n')
+        env['BASH_ENV'] = startup
+        try:
+            sys.exit(subprocess.run(['bash', sys.argv[1], '--locked'], env=env, timeout=120).returncode)
+        except subprocess.TimeoutExpired:
+            sys.exit('ORACLE FAILED: 120s timeout')
 PY
 fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/publish-guards.XXXXXX")"
@@ -34,9 +51,23 @@ name="${0##*/}"
 printf '%s %s\n' "$name" "$*" >> "$FIXTURE/calls"
 case "$name" in
   git)
-    if [[ "$*" == 'status --porcelain' ]]; then
+    checkout="$PWD"
+    if [[ "${1:-}" == -C ]]; then checkout="$2"; shift 2; fi
+    # Model Git's repository selection and hidden-untracked configuration.
+    if [[ -n "${GIT_DIR:-}${GIT_WORK_TREE:-}${GIT_COMMON_DIR:-}${GIT_INDEX_FILE:-}" ]]; then
+      checkout="$FIXTURE/other-checkout"
+    fi
+    if [[ "$1" == status ]]; then
+      if [[ -f "$checkout/Sources/Voice/Extra.swift" ]] &&
+          { [[ "$*" == *--untracked-files=all* ]] ||
+            [[ "${HIDE_UNTRACKED:-0}" == 0 && "${GIT_CONFIG_VALUE_0:-}" != no ]]; }; then
+        echo '?? Sources/Voice/Extra.swift'
+      fi
       printf '%s' "${STATUS_OUTPUT:-}"
       exit "${STATUS_RC:-0}"
+    elif [[ "$*" == 'rev-parse HEAD' ]]; then
+      if [[ "$checkout" == "$FIXTURE" ]]; then echo fixture-sha; else echo wrong-sha; fi
+      exit 0
     fi
     ;;
   hdiutil)
@@ -107,6 +138,13 @@ case "$1" in
   asset_error) assets_include_dmg() { return 2; }; guard_version_collision ;;
   reuse) SKIP_MAKE_DMG=1; prepare_public_dmg; validate_dmg_payload ;;
   status) assert_clean_source; touch "$FIXTURE/artifact-work" ;;
+  provenance)
+    initialize_publish() { cd "$ROOT"; }
+    yaml_get_voice_version() { printf '1.0\n2\n'; }
+    # Stop at the first artifact command; no real script can execute.
+    bash() { printf '%s\n' "$RELEASE_SHA" > "$FIXTURE/artifact-work"; exit 0; }
+    publish_main
+    ;;
   upload) upload_versioned_dmg ;;
   fresh) require_fresh_public_build ;;
 
@@ -182,6 +220,38 @@ run_case status
 unset STATUS_RC
 LABEL='#4 git status failure stops before artifact work'
 check status_refused
+
+# Exercise the real main path: provenance must reject before the icon/build step.
+for hidden in config environment; do
+  make_fixture
+  mkdir -p "$FIXTURE/Sources/Voice"
+  touch "$FIXTURE/Sources/Voice/Extra.swift"
+  if [[ "$hidden" == config ]]; then
+    export HIDE_UNTRACKED=1
+  else
+    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=status.showUntrackedFiles GIT_CONFIG_VALUE_0=no
+  fi
+  run_case provenance
+  unset HIDE_UNTRACKED GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+  LABEL="round 2 #1 hidden untracked Swift input refuses ($hidden)"
+  check refused 'working tree is dirty'
+  LABEL="round 2 #1 hidden input never reaches artifact work ($hidden)"
+  check test ! -e "$FIXTURE/artifact-work"
+done
+for selector in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE; do
+  make_fixture
+  mkdir -p "$FIXTURE/Sources/Voice"
+  touch "$FIXTURE/Sources/Voice/Extra.swift"
+  export "$selector=$FIXTURE/other-checkout"
+  run_case provenance
+  LABEL="round 2 #1 $selector cannot hide dirty build inputs"
+  check refused 'working tree is dirty'
+  rm "$FIXTURE/Sources/Voice/Extra.swift"
+  run_case provenance
+  unset "$selector"
+  LABEL="round 2 #1 $selector cannot redirect the reported SHA"
+  check test "$(cat "$FIXTURE/artifact-work" 2>/dev/null || true)" = fixture-sha
+done
 
 # Boundary and success cases keep the new guards fail-closed without rejecting
 # valid standard artifacts or clean source. No full publishing flow is invoked.
@@ -298,6 +368,11 @@ assert main.index('guard_version_collision || exit 1') < main.index('xcodegen ge
 assert main.index('prepare_public_dmg || exit 1') < main.index('validate_dmg_payload || exit 1') < main.index('upload_versioned_dmg || exit 1')
 PY
 
-printf '\nTests: %s, failures: %s\n' "$TOTAL" "$FAILED"
+LABEL='round 2 #2 inherited external-command wrappers never run'
+check test ! -s "$ISOLATION_SENTINEL"
+LABEL='round 2 #2 BASH_ENV is not inherited by tested child shells'
+check test "$(wc -l < "$BASH_ENV_LOG" | tr -d ' ')" -eq 1
+
+printf '\nTests: %s, failures: %s\n'  "$TOTAL" "$FAILED"
 if [[ "$FAILED" != 0 ]]; then echo 'ORACLE FAILED'; exit 1; fi
 echo 'ORACLE OK — publish guards'

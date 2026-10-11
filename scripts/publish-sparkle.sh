@@ -349,9 +349,18 @@ load_gh_release_asset_names() {
   GH_RELEASE_ASSET_NAMES="$out"
 }
 
+# The build uses ROOT regardless of the caller's Git repository environment.
+source_git() (
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE \
+    GIT_SHALLOW_FILE GIT_NAMESPACE GIT_PREFIX GIT_CONFIG GIT_CONFIG_PARAMETERS \
+    GIT_CONFIG_COUNT GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE
+  git -C "$ROOT" "$@"
+)
+
 assert_clean_source() {
   local status
-  if ! status="$(git status --porcelain)"; then
+  if ! status="$(source_git status --porcelain --untracked-files=all)"; then
     echo "error: git status failed; cannot establish committed-source provenance." >&2
     return 1
   fi
@@ -465,7 +474,7 @@ if [[ -z "$SHORT" || -z "$BUILD" ]]; then
 fi
 
 assert_clean_source || exit 1
-RELEASE_SHA="$(git rev-parse HEAD)" || {
+RELEASE_SHA="$(source_git rev-parse HEAD)" || {
   echo "error: could not determine the committed source revision." >&2
   exit 1
 }
