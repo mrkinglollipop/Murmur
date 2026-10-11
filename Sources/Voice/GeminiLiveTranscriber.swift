@@ -255,7 +255,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard let continuation, !blocked else { return }
         guard let pcmData = convertToPCM16(buffer) else {
             markStreamIntegrityFailed()
-            vlog("gemini-stream: send — conversion produced no data, dropping buffer")
+            vlogFromAudioTap(.conversionFailure(.gemini, .emptyConversion))
             return
         }
         continuation.yield(GeminiLiveOptions.makeAudioFrameJSON(pcmData: pcmData))
@@ -728,7 +728,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         streamIntegrityFailed = true
         lastFinalizeRequiresBufferedAudioRecovery = true
         stateLock.unlock()
-        if newlyReached { vlog("gemini-stream: 10min cap") }
+        if newlyReached { vlogFromAudioTap(.geminiDurationCap) }
     }
 
     func noteSocketClosed(closeCode: URLSessionWebSocketTask.CloseCode) {
@@ -808,7 +808,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         if converter == nil || converterInputFormat != inputFormat {
             guard let newConverter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                vlog("gemini-stream: failed to create AVAudioConverter for input format")
+                vlogFromAudioTap(.conversionFailure(.gemini, .converterCreation))
                 return nil
             }
             converter = newConverter
@@ -820,7 +820,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             (Double(buffer.frameLength) * outputFormat.sampleRate / inputFormat.sampleRate).rounded(.up) + 16
         )
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            vlog("gemini-stream: failed to allocate output PCM buffer")
+            vlogFromAudioTap(.conversionFailure(.gemini, .bufferAllocation))
             return nil
         }
 
@@ -837,7 +837,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
 
         guard status != .error, error == nil else {
-            vlog("gemini-stream: conversion error: \(error?.localizedDescription ?? "unknown")")
+            vlogFromAudioTap(.conversionFailure(.gemini, .conversion))
             return nil
         }
         guard let int16Data = outputBuffer.int16ChannelData else {

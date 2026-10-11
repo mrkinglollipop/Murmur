@@ -28,7 +28,9 @@ enum MenuBarIcon: Equatable {
         switch self {
         case .paused: return "Murmur, paused"
         case .error: return "Murmur — error"
-        case .idle, .listening, .processing: return "Murmur"
+        case .idle: return "Murmur"
+        case .listening: return "Murmur, listening"
+        case .processing: return "Murmur, processing"
         }
     }
 

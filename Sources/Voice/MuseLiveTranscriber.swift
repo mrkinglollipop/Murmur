@@ -220,7 +220,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard let continuation else { return }
         guard let pcmData = convertToPCM16(buffer) else {
             markStreamIntegrityFailed()
-            vlog("muse-stream: send — conversion produced no data, dropping buffer")
+            vlogFromAudioTap(.conversionFailure(.muse, .emptyConversion))
             return
         }
         continuation.yield(pcmData)
@@ -698,7 +698,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         if converter == nil || converterInputFormat != inputFormat {
             guard let newConverter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                vlog("muse-stream: failed to create AVAudioConverter for input format")
+                vlogFromAudioTap(.conversionFailure(.muse, .converterCreation))
                 return nil
             }
             converter = newConverter
@@ -710,7 +710,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             (Double(buffer.frameLength) * outputFormat.sampleRate / inputFormat.sampleRate).rounded(.up) + 16
         )
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            vlog("muse-stream: failed to allocate output PCM buffer")
+            vlogFromAudioTap(.conversionFailure(.muse, .bufferAllocation))
             return nil
         }
 
@@ -727,7 +727,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
 
         guard status != .error, error == nil else {
-            vlog("muse-stream: conversion error: \(error?.localizedDescription ?? "unknown")")
+            vlogFromAudioTap(.conversionFailure(.muse, .conversion))
             return nil
         }
         guard let int16Data = outputBuffer.int16ChannelData else {
