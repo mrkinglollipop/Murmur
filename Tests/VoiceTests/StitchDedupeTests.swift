@@ -3,6 +3,33 @@ import XCTest
 
 final class StitchDedupeTests: XCTestCase {
 
+    func testTimedDonePreservesUntimedInterimThroughFinalize() async {
+        let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Yes.","is_final":true,"words":[{"text":"Yes","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Alice.","is_final":false}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":"Yes.","words":[{"text":"Yes","start":0,"end":1}]}"#)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "Yes. Call Alice.")
+    }
+
+    func testTimedDoneCannotChooseBetweenResetUtteranceOrigins() async {
+        let session = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Alice.","is_final":true,"speech_final":true,"words":[{"text":"Call Alice","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Bob.","is_final":true,"speech_final":true,"words":[{"text":"Call Bob","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":"Wait.","words":[{"text":"Wait","start":0,"end":1}]}"#)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "Call Alice. Call Bob. Wait.")
+    }
+
+    func testOverlappingTimestampsWithoutAnEstablishedOriginPreserveBothSegments() {
+        let result = XAIStreamingTranscriber.mergeSegmentIntoConfirmed(
+            confirmed: "Do not send.", text: "Wait.",
+            incomingWords: [TranscriptWord(text: "Wait", start: 0, end: 1)],
+            committedWords: [TranscriptWord(text: "Do not send", start: 0, end: 1)],
+            lastCommittedEnd: 1)
+        XCTAssertEqual(result.confirmedText, "Do not send. Wait.")
+    }
+
     func testCompletePrefixSentenceSurvivesPostprocessing() {
         let text = "I will send the report. I will send the report only after approval."
         XCTAssertEqual(XAIStreamingTranscriber.postProcessTranscript(text), text)
@@ -365,7 +392,8 @@ final class StitchDedupeTests: XCTestCase {
             text: "world again",
             incomingWords: incoming,
             committedWords: existing,
-            lastCommittedEnd: 1.0
+            lastCommittedEnd: 1.0,
+            timestampOrigin: 0
         )
         XCTAssertEqual(result.committedWords.count, 3)
         XCTAssertEqual(result.committedWords.last?.text, "again")

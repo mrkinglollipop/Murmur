@@ -31,3 +31,13 @@ Round 2 text safety: replacement fixtures include overlapping word timestamps;
 their expected corrected text is unchanged. Untimed and disjoint-prefix fixtures
 preserve both completed sentences. Text-only unit goldens now preserve sentences;
 these timestamped replays retain coverage for actual same-audio refinements.
+
+Round 3 adds `done` events through the server handler and synthetic replays for
+untimed interim tails, non-monotonic words, misaligned incoming words, and
+utterance-local timestamp resets. The missing-timestamp ruling now also
+preserves unfinished confirmed fragments: `chunk-overlap` and
+`speech-final-containment` retain both segments instead of permitting text-only
+replacement. The three untimed overlap/repetition cases in
+`GoldenTranscriptTests` likewise assert preservation; they no longer authorize
+deletion on text similarity. Same-utterance timestamped refinement expectations
+remain intact.

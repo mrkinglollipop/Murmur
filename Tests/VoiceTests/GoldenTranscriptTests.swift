@@ -26,18 +26,18 @@ final class GoldenTranscriptTests: XCTestCase {
         return accumulated
     }
 
-    func testTwoChunkOverlap() {
+    func testUntimedTwoChunkOverlapPreservesBothSegments() {
         let chunks = [
             "We need to finish the report",
             "finish the report by Friday"
         ]
         XCTAssertEqual(
             stitchSequence(chunks),
-            "We need to finish the report by Friday"
+            "We need to finish the report finish the report by Friday"
         )
     }
 
-    func testThreeChunkDictation() {
+    func testUntimedThreeChunkDictationPreservesEverySegment() {
         let chunks = [
             "The quick brown fox",
             "brown fox jumps over",
@@ -45,7 +45,7 @@ final class GoldenTranscriptTests: XCTestCase {
         ]
         XCTAssertEqual(
             stitchSequence(chunks),
-            "The quick brown fox jumps over the lazy dog"
+            "The quick brown fox brown fox jumps over jumps over the lazy dog"
         )
     }
 
@@ -72,14 +72,13 @@ final class GoldenTranscriptTests: XCTestCase {
         XCTAssertEqual(stitched, expected)
     }
 
-    func testStitchedThenDedupedGolden() {
-        // Exact half duplication — collapseNearDuplicateTail requires token drift;
-        // dedupeRepeatedContent still collapses aligned half-and-half duplicates.
+    func testUntimedRepeatedFragmentSurvivesPostprocessing() {
+        // Without shared audio provenance, repetition can be intentional.
         let half = "Dictated paragraph one with enough length"
         let stitched = stitchSequence([half, half])
         XCTAssertEqual(
             XAIStreamingTranscriber.postProcessTranscript(stitched),
-            half
+            half + " " + half
         )
     }
 }

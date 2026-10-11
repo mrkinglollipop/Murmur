@@ -3,6 +3,119 @@ import XCTest
 @testable import Voice
 
 final class StreamIntegrityTests: XCTestCase {
+    /// Observe the real stored transport after abort, without retaining a copy
+    /// before cancellation (that copy would itself keep the queue alive).
+    private func transportStream<Element>(of session: AnyObject, as: Element.Type) -> AsyncStream<Element>? {
+        Mirror(reflecting: session).children.first { $0.label == "frameStream" }?.value as? AsyncStream<Element>
+    }
+
+    private func retainedFrames<Element>(in stream: AsyncStream<Element>?) async -> Int {
+        guard let stream else { return 0 }
+        var count = 0
+        for await _ in stream { count += 1 }
+        return count
+    }
+
+    private func queuedPCM() -> AVAudioPCMBuffer {
+        let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
+                                   channels: 1, interleaved: true)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!
+        buffer.frameLength = 160
+        for index in 0..<160 { buffer.int16ChannelData![0][index] = 1024 }
+        return buffer
+    }
+
+    func testCancelledPreStartSessionsReleaseTransportPayloads() async {
+        let xai = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        let eleven = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+        let gemini = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        let muse = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        for _ in 0..<8 {
+            xai.send(queuedPCM()); eleven.send(queuedPCM())
+            gemini.send(queuedPCM()); muse.send(queuedPCM())
+        }
+        xai.cancel(); eleven.cancel(); gemini.cancel(); muse.cancel()
+        let counts = [
+            await retainedFrames(in: transportStream(of: xai, as: Data.self)),
+            await retainedFrames(in: transportStream(of: eleven, as: String.self)),
+            await retainedFrames(in: transportStream(of: gemini, as: String.self)),
+            await retainedFrames(in: transportStream(of: muse, as: Data.self))
+        ]
+        XCTAssertEqual(counts, [0, 0, 0, 0], "cancel must release payloads while sessions remain alive")
+    }
+
+    func testPreStartTransportIsBoundedAndOverflowRequestsRecovery() async throws {
+        let xai = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        let eleven = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+        let gemini = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        let muse = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        for _ in 0..<257 {
+            xai.send(queuedPCM()); eleven.send(queuedPCM())
+            gemini.send(queuedPCM()); muse.send(queuedPCM())
+        }
+        XCTAssertTrue(xai.requiresBufferedAudioRecovery)
+        XCTAssertTrue(eleven.requiresBufferedAudioRecovery)
+        XCTAssertTrue(gemini.requiresBufferedAudioRecovery)
+        XCTAssertTrue(muse.requiresBufferedAudioRecovery)
+        // A retained test copy lets us count the buffer after finish without
+        // starting a sender or touching a socket.
+        let xaiStream = transportStream(of: xai, as: Data.self)
+        let elevenStream = transportStream(of: eleven, as: String.self)
+        let geminiStream = transportStream(of: gemini, as: String.self)
+        let museStream = transportStream(of: muse, as: Data.self)
+        xai.cancel(); eleven.cancel(); gemini.cancel(); muse.cancel()
+        for count in [await retainedFrames(in: xaiStream), await retainedFrames(in: elevenStream),
+                      await retainedFrames(in: geminiStream), await retainedFrames(in: museStream)] {
+            XCTAssertLessThanOrEqual(count, 256)
+        }
+    }
+
+    func testPreStartOverflowRecoverySurvivesSuccessfulStart() async throws {
+        let xai = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        let eleven = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+        let gemini = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        let muse = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        defer { xai.cancel(); eleven.cancel(); gemini.cancel(); muse.cancel() }
+        for _ in 0..<257 {
+            xai.send(queuedPCM()); eleven.send(queuedPCM())
+            gemini.send(queuedPCM()); muse.send(queuedPCM())
+        }
+        try await xai.start(beforeReadiness: { xai.handleServerEvent(#"{"type":"transcript.created"}"#) })
+        try await eleven.start(beforeReadiness: { eleven.handleServerEvent(#"{"message_type":"session_started"}"#) })
+        try await gemini.start(beforeReadiness: { gemini.handleServerEvent(#"{"setupComplete":{}}"#) })
+        try await muse.start(beforeReadiness: { muse.handleServerEvent(#"{"sessionId":"offline"}"#) })
+        XCTAssertTrue(xai.requiresBufferedAudioRecovery)
+        XCTAssertTrue(eleven.requiresBufferedAudioRecovery)
+        XCTAssertTrue(gemini.requiresBufferedAudioRecovery)
+        XCTAssertTrue(muse.requiresBufferedAudioRecovery)
+    }
+
+    func testFailedHandshakeReleasesPreStartQueueForEveryProvider() async {
+        let xai = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        let eleven = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+        let gemini = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in throw InjectedFailure.send })
+        let muse = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in throw InjectedFailure.send })
+        defer { xai.cancel(); eleven.cancel(); gemini.cancel(); muse.cancel() }
+        for _ in 0..<8 {
+            xai.send(queuedPCM()); eleven.send(queuedPCM())
+            gemini.send(queuedPCM()); muse.send(queuedPCM())
+        }
+        do {
+            try await xai.start(beforeReadiness: { xai.noteSocketClosed(closeCode: .abnormalClosure) })
+            XCTFail("xAI handshake must fail")
+        } catch {}
+        do {
+            try await eleven.start(beforeReadiness: { eleven.noteSocketClosed(closeCode: .abnormalClosure) })
+            XCTFail("ElevenLabs handshake must fail")
+        } catch {}
+        do { try await gemini.start(); XCTFail("Gemini handshake must fail") } catch {}
+        do { try await muse.start(); XCTFail("Muse handshake must fail") } catch {}
+        XCTAssertNil(transportStream(of: xai, as: Data.self))
+        XCTAssertNil(transportStream(of: eleven, as: String.self))
+        XCTAssertNil(transportStream(of: gemini, as: String.self))
+        XCTAssertNil(transportStream(of: muse, as: Data.self))
+    }
+
     private enum InjectedFailure: Error { case send }
 
     func testFinalizeDeadlineBoundsNonCooperativeTerminalSendForXAI() async {
