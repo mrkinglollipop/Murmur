@@ -1062,8 +1062,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         // repetitions on the new utterance are proven different speech.
         if last.timestampOrigin != incoming.timestampOrigin { return .different }
 
-        if incoming.interval != nil, existing.allSatisfy({ $0.interval != nil }) {
-            let sameOrigin = existing.filter { $0.timestampOrigin == incoming.timestampOrigin }
+        let sameOrigin = existing.filter { $0.timestampOrigin == incoming.timestampOrigin }
+        if incoming.interval != nil, sameOrigin.allSatisfy({ $0.interval != nil }) {
             if sameOrigin.contains(where: { $0.interval!.overlaps(incoming.interval!) }) {
                 return .same
             }

@@ -66,7 +66,8 @@ final class StitchReplayTests: XCTestCase {
             "xai-done-full-session-prefix-extension", "xai-untimed-separate-utterances-remain-distinct",
             "xai-invalid-word-prefix-remains-ambiguous", "xai-older-ambiguity-survives-last-chunk-refinement",
             "xai-empty-done-promotes-provisional-ambiguity", "xai-done-sign-conflict-remains-ambiguous",
-            "xai-untimed-negation-prefix-remains-ambiguous", "xai-untimed-decimal-prefix-remains-ambiguous"
+            "xai-untimed-negation-prefix-remains-ambiguous", "xai-untimed-decimal-prefix-remains-ambiguous",
+            "xai-timed-refinement-after-untimed-utterance", "xai-timed-refinement-preserves-earlier-ambiguity"
         ]
         XCTAssertTrue(requiredNames.isSubset(of: Set(fixtures.map(\.name))),
                       "Replay must include every xAI stitch acceptance fixture.")
