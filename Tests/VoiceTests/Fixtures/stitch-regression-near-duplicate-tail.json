@@ -1,0 +1,18 @@
+{
+  "name": "regression-near-duplicate-tail",
+  "events": [
+    {
+      "type": "final",
+      "text": "The imaginary observatory needs a fresh map. Several paper stars have fallen off the wall. Please arrange the remaining constellations before the parade. After reviewing the fictional atlas, the explorers decided they would be better off using Starclaw for every imaginary expedition.",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "After reviewing the fictional atlas, the explorers decided they would be better off using StarCrawl for every imaginary expedition.",
+      "speechFinal": true,
+      "words": []
+    }
+  ],
+  "expected": "The imaginary observatory needs a fresh map. Several paper stars have fallen off the wall. Please arrange the remaining constellations before the parade. After reviewing the fictional atlas, the explorers decided they would be better off using StarCrawl for every imaginary expedition."
+}

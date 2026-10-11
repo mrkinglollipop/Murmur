@@ -70,9 +70,10 @@ still not a product pass until `oracle-dictation-start.sh` exits 0.
 - Branches: `feat/<slug>` / `fix/<slug>`. Conventional commits. Prefer GitHub
   PRs with merge commits.
 - Tests accompany behavior changes.
-- Stitch-pipeline changes: prefer a replay fixture once
-  [`plans/002-stitch-fixture-harness.md`](plans/002-stitch-fixture-harness.md)
-  lands (not yet done).
+- Stitch-pipeline changes: add a synthetic replay fixture under
+  `Tests/VoiceTests/Fixtures/` before fixing the bug. `StitchReplayTests`
+  replays those fixtures through the real ingestion path. See the fixture
+  directory's README for the format and privacy constraints.
 
 ## Sharp edges
 
