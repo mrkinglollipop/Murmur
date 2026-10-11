@@ -1,0 +1,40 @@
+{
+  "name": "r3-4-misaligned-incoming",
+  "events": [
+    {
+      "type": "final",
+      "text": "Do not send.",
+      "words": [
+        {
+          "text": "Do",
+          "start": 0,
+          "end": 0.3
+        },
+        {
+          "text": "not",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "send",
+          "start": 0.6,
+          "end": 1
+        }
+      ],
+      "speechFinal": false
+    },
+    {
+      "type": "final",
+      "text": "Wait.",
+      "words": [
+        {
+          "text": "unrelated",
+          "start": 0,
+          "end": 1
+        }
+      ],
+      "speechFinal": false
+    }
+  ],
+  "expected": "Do not send. Wait."
+}

@@ -1,4 +1,5 @@
 import Foundation
+import ApplicationServices
 
 /// Decides whether a hold with a focused selection is an edit instruction or
 /// ordinary dictation. Kept pure so AX reads stay at lifecycle boundaries and the safety
@@ -59,10 +60,17 @@ enum VoiceEditRouting {
         return (0.4...2.0).contains(ratio)
     }
 
-    /// The entire field value and exact range must still match the hold-start
-    /// snapshot; equal text at a different location is a different selection.
+    static func fieldMatches(held: AXUIElement, fresh: AXUIElement?) -> Bool {
+        guard let fresh else { return false }
+        return CFEqual(held, fresh)
+    }
+
+    /// Element identity, field value, and range must all match the hold-start
+    /// snapshot. Another field with identical content is not the same selection.
     static func selectionMatches(held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot) -> Bool {
-        guard let held, let selected = selectedText(in: held),
+        guard let held, let heldElement = held.focusedElement,
+              fieldMatches(held: heldElement, fresh: fresh.focusedElement),
+              let selected = selectedText(in: held),
               selectedText(in: fresh) == selected else { return false }
         return held.value == fresh.value && held.location == fresh.location
             && held.selectionLength == fresh.selectionLength

@@ -1,0 +1,40 @@
+{
+  "name": "word-timestamp-overlap",
+  "events": [
+    {
+      "type": "final",
+      "text": "silver lantern",
+      "speechFinal": false,
+      "words": [
+        {
+          "text": "silver",
+          "start": 0,
+          "end": 0.5
+        },
+        {
+          "text": "lantern",
+          "start": 0.5,
+          "end": 1
+        }
+      ]
+    },
+    {
+      "type": "final",
+      "text": "lantern glows",
+      "speechFinal": true,
+      "words": [
+        {
+          "text": "lantern",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "glows",
+          "start": 1.3,
+          "end": 1.8
+        }
+      ]
+    }
+  ],
+  "expected": "silver lantern glows"
+}

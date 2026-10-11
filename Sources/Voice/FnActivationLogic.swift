@@ -99,6 +99,15 @@ struct FnActivationLogic {
         return []
     }
 
+    /// Capture failure ends the logical hold without inventing a physical key
+    /// release. A still-held Fn must be released before the next activation.
+    static func resetAfterCaptureFailure(state: inout State) {
+        state.isRecording = false
+        state.isToggleLocked = false
+        state.firstTapAnchor = nil
+        state.holdDeadline = nil
+    }
+
     /// Restart does not start recording; only syncs physical-down for correct edges.
     static func reconcilePhysicalDownAfterRestart(state: inout State, fnHeld: Bool) {
         state.fnPhysicallyDown = fnHeld

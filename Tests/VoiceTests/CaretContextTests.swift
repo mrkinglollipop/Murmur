@@ -4,6 +4,29 @@ import XCTest
 
 final class CaretContextTests: XCTestCase {
 
+    func testFocusedElementReadsIdentityWithoutValueOrSelection() {
+        let focused = AXUIElementCreateApplication(456)
+        var timeoutWasSet = false
+        var reads = 0
+        let reader = CaretContext.AXReader(
+            setTimeout: { _, seconds in
+                XCTAssertEqual(seconds, CaretContext.messagingTimeoutSeconds)
+                timeoutWasSet = true
+                return .success
+            },
+            copyAttribute: { _, attribute, output in
+                XCTAssertTrue(timeoutWasSet)
+                XCTAssertEqual(attribute as String, kAXFocusedUIElementAttribute)
+                reads += 1
+                output.pointee = focused
+                return .success
+            }
+        )
+        let identity = CaretContext.focusedElement(frontmostPID: 123, reader: reader)
+        XCTAssertTrue(identity.map { CFEqual($0, focused) } ?? false)
+        XCTAssertEqual(reads, 1)
+    }
+
     func testSnapshot_setsBoundedTimeoutBeforeEveryElementRead() {
         let focused = AXUIElementCreateApplication(456)
         var range = CFRange(location: 5, length: 0)
@@ -33,6 +56,7 @@ final class CaretContextTests: XCTestCase {
         )
         let snapshot = CaretContext.snapshot(frontmostPID: 123, reader: reader)
         XCTAssertEqual(calls, ["app timeout", "focus read", "focused timeout", "value read", "range read"])
+        XCTAssertTrue(snapshot.focusedElement.map { CFEqual($0, focused) } ?? false)
         XCTAssertEqual(snapshot.value, "hello")
         XCTAssertEqual(snapshot.location, 5)
         XCTAssertEqual(snapshot.selectionLength, .readable(0))

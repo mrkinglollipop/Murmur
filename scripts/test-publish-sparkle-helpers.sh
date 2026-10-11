@@ -6,13 +6,51 @@
 # whitespace-only / versionless-newest fail-closed (no older-item fall-through).
 # No network / gh required.
 set -euo pipefail
+# Shell functions override PATH stubs; startup hooks must not reach children.
+unset -f gh xcrun hdiutil codesign git curl xcodebuild xcodegen security
+unset BASH_ENV ENV
+
+# Share the guard oracle's lock; neither offline suite overlaps release checks.
+if [[ "${1:-}" != --locked ]]; then
+  exec python3 - "$0" <<'PYLOCK'
+import fcntl, os, subprocess, sys, tempfile, time
+with open(os.path.join(tempfile.gettempdir(), 'murmur-test-publish-guards.lock'), 'a') as lock:
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                sys.exit('ORACLE FAILED: shared lock timeout')
+            time.sleep(0.2)
+    try:
+        sys.exit(subprocess.run(['bash', sys.argv[1], '--locked'], timeout=120).returncode)
+    except subprocess.TimeoutExpired:
+        sys.exit('ORACLE FAILED: 120s timeout')
+PYLOCK
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/scripts/publish-sparkle.sh"
 FAIL=0
+TOTAL=0
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/publish-sparkle-test.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/blocked" <<'BLOCK'
+#!/bin/sh
+echo "unexpected external command: $0 $*" >&2
+exit 97
+BLOCK
+chmod +x "$TMP/bin/blocked"
+for cmd in gh xcrun hdiutil codesign git curl xcodebuild xcodegen security; do
+  ln -s blocked "$TMP/bin/$cmd"
+done
+export PATH="$TMP/bin:$PATH"
 
-pass() { echo "  PASS: $*"; }
-fail() { echo "  FAIL: $*" >&2; FAIL=1; }
+pass() { TOTAL=$((TOTAL + 1)); echo "  PASS: $*"; }
+fail() { TOTAL=$((TOTAL + 1)); echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 echo "==> bash -n publish-sparkle.sh"
 if bash -n "$SCRIPT"; then
@@ -37,7 +75,7 @@ else
 fi
 
 echo "==> local unnotarized path never reaches public release state"
-if grep -q 'git status --porcelain' "$SCRIPT" \
+if grep -q 'source_git status --porcelain --untracked-files=all' "$SCRIPT" \
   && grep -q 'if \[\[ "\${ALLOW_UNNOTARIZED:-0}" == "1" \]\]; then' "$SCRIPT" \
   && grep -q 'is_stable_dmg_path "\$DMG" "\$ROOT/build/Murmur.dmg"' "$SCRIPT" \
   && grep -q 'is_pro_app_bundle "\$APP"' "$SCRIPT" \
@@ -47,14 +85,6 @@ if grep -q 'git status --porcelain' "$SCRIPT" \
 else
   fail "publish-sparkle.sh lost a release safety gate"
 fi
-LOCAL_EXIT_LINE="$(grep -n 'Local-only artifact' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
-PUBLIC_FLOW_LINE="$(grep -n '^HAS_PRIOR=0' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
-if [[ -n "$LOCAL_EXIT_LINE" && -n "$PUBLIC_FLOW_LINE" ]] && (( LOCAL_EXIT_LINE < PUBLIC_FLOW_LINE )); then
-  pass "local-only exit precedes the public publish flow"
-else
-  fail "could not prove local-only exit precedes the public publish flow"
-fi
-
 echo "==> What's New release notes wired into appcast item"
 if grep -q 'Resources/WhatsNew/releases\.json' "$SCRIPT" \
   && grep -q 'WhatsNew' "$SCRIPT" \
@@ -67,6 +97,7 @@ else
 fi
 
 echo "==> appcast description builder (python)"
+TOTAL=$((TOTAL + 1))
 ROOT="$ROOT" python3 - <<'PY'
 import html
 import json
@@ -153,34 +184,10 @@ if errors:
 print("  PASS: appcast description builder (match, escape, CDATA-safe)")
 PY
 
-echo "==> icon oracle before xcodegen / make-dmg / upload"
-ICON_ORACLE_PATTERN='^[[:space:]]*bash "\$ROOT/scripts/test-app-icon-helpers\.sh"[[:space:]]*$'
-ICON_ORACLE_MATCHES="$(grep -En "$ICON_ORACLE_PATTERN" "$SCRIPT" || true)"
-if [[ -n "$ICON_ORACLE_MATCHES" ]]; then
-  ICON_ORACLE_COUNT="$(printf '%s\n' "$ICON_ORACLE_MATCHES" | wc -l | tr -d ' ')"
-  ICON_ORACLE_LINE="$(printf '%s\n' "$ICON_ORACLE_MATCHES" | head -1 | cut -d: -f1)"
-else
-  ICON_ORACLE_COUNT=0
-  ICON_ORACLE_LINE=""
-fi
-XCODEGEN_LINE="$(grep -n '^xcodegen generate' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
-MAKE_DMG_LINE="$(grep -n 'bash "\$ROOT/scripts/make-dmg\.sh"' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
-DMG_UPLOAD_LINE="$(grep -n 'gh release upload "\$TAG"' "$SCRIPT" | head -1 | cut -d: -f1 || true)"
-if [[ "$ICON_ORACLE_COUNT" -ne 1 ]]; then
-  fail "publish-sparkle.sh must invoke test-app-icon-helpers.sh exactly once (found $ICON_ORACLE_COUNT unconditional bash lines)"
-elif [[ -z "$XCODEGEN_LINE" || -z "$MAKE_DMG_LINE" || -z "$DMG_UPLOAD_LINE" ]]; then
-  fail "could not locate xcodegen / make-dmg / DMG upload anchors in publish-sparkle.sh"
-elif (( ICON_ORACLE_LINE >= XCODEGEN_LINE )); then
-  fail "icon oracle must run before xcodegen generate (oracle=$ICON_ORACLE_LINE, xcodegen=$XCODEGEN_LINE)"
-elif (( ICON_ORACLE_LINE >= MAKE_DMG_LINE )); then
-  fail "icon oracle must run before make-dmg.sh (oracle=$ICON_ORACLE_LINE, make-dmg=$MAKE_DMG_LINE)"
-elif (( ICON_ORACLE_LINE >= DMG_UPLOAD_LINE )); then
-  fail "icon oracle must run before DMG upload (oracle=$ICON_ORACLE_LINE, upload=$DMG_UPLOAD_LINE)"
-else
-  pass "exactly one unconditional test-app-icon-helpers.sh before xcodegen ($XCODEGEN_LINE), make-dmg ($MAKE_DMG_LINE), upload ($DMG_UPLOAD_LINE)"
-fi
+# Runtime ordering checks appear below, after the helper fixtures.
 
 echo "==> mask + pre-clobber version collection (python)"
+TOTAL=$((TOTAL + 1))
 SCRIPT="$SCRIPT" python3 - <<'PY'
 import re, sys, os
 
@@ -546,9 +553,6 @@ LIB="$ROOT/scripts/release-lib.sh"
 RECOVER="$ROOT/scripts/recover-appcast.sh"
 # shellcheck source=release-lib.sh
 source "$LIB"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/publish-sparkle-test.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
-
 echo "==> bash -n release-lib.sh / recover-appcast.sh"
 if bash -n "$LIB" && bash -n "$RECOVER"; then pass "bash -n lib + recover"; else fail "bash -n lib/recover"; fi
 
@@ -679,30 +683,12 @@ echo "==> cache-busted URL"
   && pass "nonce appended with & to an existing query" || fail "query url"
 
 echo "==> publish-sparkle.sh release-safety wiring"
-ln_of() { grep -n -m1 -- "$1" "$SCRIPT" | cut -d: -f1; }
-TEAM_LINE="$(ln_of '^resolve_development_team ')"
-FETCH_LINE="$(ln_of '^if fetch_prior_appcast')"
-if [[ -n "$TEAM_LINE" && -n "$FETCH_LINE" ]] && (( TEAM_LINE < FETCH_LINE )); then
-  pass "team-id preflight ($TEAM_LINE) precedes the first network call ($FETCH_LINE)"
-else
-  fail "team-id preflight missing or after fetch_prior_appcast (team=$TEAM_LINE fetch=$FETCH_LINE)"
-fi
 if grep -q 'env -u DMG_PATH' "$SCRIPT"; then pass "DMG_PATH unset for make-dmg.sh"; else fail "make-dmg.sh still inherits DMG_PATH"; fi
 if grep -q 'xcrun stapler validate "\$DMG"' "$SCRIPT" \
   && grep -q 'codesign --verify --deep --strict "\$APP"' "$SCRIPT"; then
   pass "SKIP_MAKE_DMG + NOTARIZE=1 runs stapler + codesign --strict"
 else
   fail "SKIP_MAKE_DMG reuse lacks stapler/codesign checks"
-fi
-VERIFY_LINE="$(ln_of 'sign_update.*--verify.*VERIFY_DMG\|--verify --ed-key-file "\$SPARKLE_PRIVATE_KEY" "\$VERIFY_DMG"')"
-BACKUP_LINE="$(ln_of 'appcast.backup.\$(date')"
-UPLOAD_LINE="$(ln_of '^if ! gh release upload appcast "\$STAGE_APPCAST"')"
-DMGUP_LINE="$(ln_of 'gh release upload "\$TAG"')"
-if [[ -n "$VERIFY_LINE" && -n "$BACKUP_LINE" && -n "$UPLOAD_LINE" && -n "$DMGUP_LINE" ]] \
-  && (( DMGUP_LINE < VERIFY_LINE && VERIFY_LINE < BACKUP_LINE && BACKUP_LINE < UPLOAD_LINE )); then
-  pass "order: DMG upload ($DMGUP_LINE) → verify download ($VERIFY_LINE) → backup ($BACKUP_LINE) → appcast upload ($UPLOAD_LINE)"
-else
-  fail "release order wrong/missing (dmgup=$DMGUP_LINE verify=$VERIFY_LINE backup=$BACKUP_LINE upload=$UPLOAD_LINE)"
 fi
 if grep -q 'restore_appcast_backup "\$APPCAST_BACKUP"' "$SCRIPT"; then pass "failed appcast upload restores the backup"; else fail "no restore on failed appcast upload"; fi
 if grep -q 'gh release upload appcast "\$STAGE_APPCAST" --repo "\$UPDATES_REPO" --clobber$' "$SCRIPT"; then
@@ -755,7 +741,176 @@ else
   fail "recover-appcast.sh missing a guard"
 fi
 
+echo "==> publish_main execution order (private command stubs)"
+mkdir -p "$TMP/order-bin" "$TMP/order/Config" "$TMP/order/Resources/WhatsNew" "$TMP/home"
+cat > "$TMP/order-bin/stub" <<'ORDER_STUB'
+#!/bin/sh
+set -eu
+event() { printf '%s\n' "$1" >> "$ORDER_LOG"; }
+case "${0##*/}" in
+  git)
+    [ "$1" = -C ] && shift 2
+    case "$*" in
+      'status --porcelain --untracked-files=all') event status; exit 0 ;;
+      'rev-parse HEAD') event sha; echo fixture-sha; exit 0 ;;
+    esac ;;
+  bash)
+    case "$1" in
+      "$ORDER_ROOT/scripts/test-app-icon-helpers.sh")
+        event icon; exit "${ICON_RC:-0}" ;;
+      "$ORDER_ROOT/scripts/make-dmg.sh")
+        event make
+        mkdir -p "$ORDER_ROOT/build"
+        printf DMG > "${DMG_PATH:-$ORDER_ROOT/build/Murmur-1.0.dmg}"
+        exit 0 ;;
+    esac ;;
+  xcodegen) event xcodegen; exit 0 ;;
+  hdiutil)
+    case "$1" in
+      attach)
+        event mount
+        while [ "$1" != -mountpoint ]; do shift; done
+        cp -R "$ORDER_ROOT/payload/Murmur.app" "$2/"; exit 0 ;;
+      detach) rm -rf "$2/Murmur.app"; exit 0 ;;
+    esac ;;
+  xcrun) event stapler; exit 0 ;;
+  codesign) event codesign; exit 0 ;;
+  sign_update)
+    case "$*" in
+      *--verify*verify-download*) event verify-download ;;
+      *--verify*) event verify-local ;;
+      *) event sign; echo 'sparkle:edSignature="fixture-signature" length="3"' ;;
+    esac
+    exit 0 ;;
+  generate_keys) exit 0 ;;
+  gh)
+    case "$1 $2" in
+      'release view') exit 0 ;;
+      'release edit') exit 0 ;;
+      'release upload')
+        case "$3:${4##*/}" in
+          v1.0:*) event upload-dmg ;;
+          appcast:appcast.xml)
+            # Observe the backup at the actual publication boundary.
+            for backup in "$ORDER_ROOT"/build/appcast.backup.*.xml; do
+              cmp "$backup" "$ORDER_ROOT/prior.xml" || exit 96
+              event backup
+            done
+            event upload-appcast
+            cp "$4" "$ORDER_ROOT/live.xml" ;;
+          appcast:Murmur.dmg) event upload-stable ;;
+          *) exit 97 ;;
+        esac
+        exit 0 ;;
+    esac ;;
+  curl)
+    out='' code=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -o) out="$2"; shift ;;
+        -w) code=1; shift ;;
+      esac
+      shift
+    done
+    if [ "$code" = 1 ]; then echo 200; exit 0; fi
+    case "${out##*/}" in
+      appcast.prev.xml) event fetch; cp "$ORDER_ROOT/prior.xml" "$out" ;;
+      verify-download-*) event download; printf DMG > "$out" ;;
+      appcast.live.xml) event live; cp "$ORDER_ROOT/live.xml" "$out" ;;
+      *) exit 97 ;;
+    esac
+    exit 0 ;;
+esac
+echo "unexpected order stub call: $0 $*" >&2
+exit 97
+ORDER_STUB
+chmod +x "$TMP/order-bin/stub"
+for cmd in gh xcrun hdiutil codesign git curl bash xcodegen sign_update generate_keys; do
+  ln -s stub "$TMP/order-bin/$cmd"
+done
+python3 - "$TMP/order" <<'PYORDER'
+import json, pathlib, plistlib, sys
+r = pathlib.Path(sys.argv[1])
+(r / 'Config/Team.xcconfig').write_text('DEVELOPMENT_TEAM = ABCDE12345\n')
+(r / 'project.yml').write_text('''targets:
+  Voice:
+    type: application
+    CFBundleVersion: "2"
+    CFBundleShortVersionString: "1.0"
+  VoiceTests:
+''')
+(r / 'seed').write_text('fixture only')
+(r / 'Resources/WhatsNew/releases.json').write_text(json.dumps([
+    dict(version='1.0', build='2', items=['Fixture release'])]))
+p = r / 'payload/Murmur.app/Contents/Info.plist'
+p.parent.mkdir(parents=True)
+p.write_bytes(plistlib.dumps(dict(CFBundleShortVersionString='1.0', CFBundleVersion='2',
+    SUFeedURL='https://fixture.invalid/appcast.xml', SUPublicEDKey='fixture-key')))
+(r / 'prior.xml').write_text('''<rss><channel><item><sparkle:version>1</sparkle:version>
+<enclosure sparkle:edSignature="prior-signature" /></item></channel></rss>''')
+PYORDER
+cat > "$TMP/order-driver" <<'ORDER_DRIVER'
+set -euo pipefail
+source "$SCRIPT"
+ROOT="$ORDER_ROOT"
+# Keep preflight behavior, recording when the real team check is reached.
+eval "$(declare -f resolve_development_team | sed '1s/resolve_development_team/original_resolve_team/')"
+resolve_development_team() {
+  echo team >> "$ORDER_LOG"
+  original_resolve_team "$@"
+}
+# Portable plist I/O and a dummy signing key; no machine key material is read.
+plist_get() {
+  python3 - "$1" "$2" <<'PYPLIST'
+import plistlib, sys
+with open(sys.argv[2], 'rb') as f:
+    print(plistlib.load(f)[sys.argv[1]])
+PYPLIST
+}
+sparkle_public_key_from_seed_file() { echo fixture-key; }
+publish_main
+ORDER_DRIVER
+for scenario in public local icon-failure team-failure; do
+  : > "$TMP/order.log"
+  local_only=0 icon_rc=0 team=ABCDE12345
+  case "$scenario" in
+    local) local_only=1 ;;
+    icon-failure) icon_rc=1 ;;
+    team-failure) team=INVALID ;;
+  esac
+  rc=0
+  env -i PATH="$TMP/order-bin:$PATH" HOME="$TMP/home" TMPDIR="$TMP" \
+    SCRIPT="$SCRIPT" ORDER_ROOT="$TMP/order" ORDER_LOG="$TMP/order.log" \
+    NOTARIZE=1 ALLOW_UNNOTARIZED="$local_only" ICON_RC="$icon_rc" \
+    DEVELOPMENT_TEAM="$team" SPARKLE_PRIVATE_KEY="$TMP/order/seed" \
+    SPARKLE_BIN="$TMP/order-bin" UPDATES_REPO=fixture/updates \
+    /bin/bash "$TMP/order-driver" > "$TMP/order-output" 2>&1 || rc=$?
+  if python3 - "$scenario" "$rc" "$TMP/order.log" <<'PYORDER'
+import pathlib, sys
+scenario, rc, log = sys.argv[1:]
+events = pathlib.Path(log).read_text().splitlines()
+expected = ['status', 'sha', 'icon']
+if scenario == 'public':
+    expected += ['team', 'fetch', 'xcodegen', 'make', 'mount', 'stapler', 'codesign',
+                 'sign', 'verify-local', 'upload-dmg', 'download', 'verify-download',
+                 'backup', 'upload-appcast', 'upload-stable', 'live']
+elif scenario == 'local':
+    expected += ['make']
+elif scenario == 'team-failure':
+    expected += ['team']
+assert events == expected, (scenario, events, expected)
+assert (int(rc) == 0) == (scenario in ('public', 'local')), (scenario, rc)
+PYORDER
+  then
+    pass "publish_main $scenario execution order"
+  else
+    cat "$TMP/order-output" >&2
+    fail "publish_main $scenario execution order"
+  fi
+done
+
 echo ""
+printf "Tests: %s, failures: %s\n" "$TOTAL" "$FAIL"
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ORACLE FAILED"
   exit 1

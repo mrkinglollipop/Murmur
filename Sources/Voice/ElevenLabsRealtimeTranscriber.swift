@@ -73,10 +73,15 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     private var task: URLSessionWebSocketTask?
     private var receiveLoopTask: Task<Void, Never>?
     private var senderTask: Task<Void, Never>?
+    /// Opens only on a successful handshake; finishing without a value aborts sending.
+    private var senderReadyContinuation: AsyncStream<Void>.Continuation?
 
     /// Feeds ready-to-send JSON `input_audio_chunk` frames (already encoded
     /// as a string) from `send(_:)` (audio-tap thread, synchronous,
     /// non-blocking) to the single sender `Task`.
+    // Bound transport storage even when start is never called. Overflow latches
+    // buffered-recording recovery; it must never silently truncate dictation.
+    private var frameStream: AsyncStream<String>?
     private var frameContinuation: AsyncStream<String>.Continuation?
 
     /// Lazily built on the first `send(_:)` call once the input buffer's
@@ -126,7 +131,9 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// Resolved exactly once by the receive loop when `session_started` arrives.
     private var readyContinuation: CheckedContinuation<Void, Error>?
-    private var readyResolved = false
+    // The first outcome also belongs to waiters registered after it resolves.
+    private var readyResult: Result<Void, Error>?
+    private var readyResolved: Bool { readyResult != nil }
     /// Set once `start()` has begun. With `readyResolved` still false, the
     /// server has not sent `session_started`, so the commit frame would reach
     /// the socket ahead of any audio.
@@ -193,6 +200,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         self.keyterms = keyterms
         self.realtimeOptions = realtimeOptions.clamped()
         self.injectedMessageSender = messageSender
+        // Capture may begin as soon as this session is published, before start().
+        let (stream, frames) = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingOldest(256))
+        self.frameStream = stream
+        self.frameContinuation = frames
         super.init()
     }
 
@@ -200,15 +211,21 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// Opens the socket and awaits `session_started`. Throws on
     /// connection/auth failure or if readiness doesn't arrive within ~5s.
-    func start() async throws {
+    // Lifecycle hooks let offline tests hold start at the readiness boundary.
+    func start(
+        beforeReadiness: (() -> Void)? = nil,
+        afterReadiness: (() async -> Void)? = nil
+    ) async throws {
         vlog("elevenlabs-stream: starting session")
         stateLock.lock()
         startInvoked = true
-        streamIntegrityFailed = false
+        // Preserve conversion/overflow failures from audio captured before start.
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
         stateLock.unlock()
         resetTranscriptState()
+        var started = false
+        defer { if !started { tearDownSocket() } }
 
         guard let url = Self.buildSocketURL(
             language: language,
@@ -241,28 +258,49 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             if let task { try await task.send(message) } else { try await sendMessage(message) }
         }
 
-        // Buffer frames captured during the handshake (unbounded AsyncStream)
+        // Buffer frames captured during the handshake in capture order
         // so the leading audio of the utterance survives socket-open latency;
         // the sender only starts draining once `session_started` arrives.
-        let stream = AsyncStream<String> { continuation in
-            self.stateLock.lock()
-            self.frameContinuation = continuation
-            self.stateLock.unlock()
+        let (readiness, readySignal) = AsyncStream<Void>.makeStream()
+        // Install the gated consumer under the finalize lock so finalize can
+        // drain the prepared queue even before start resumes from readiness.
+        stateLock.lock()
+        guard !tornDown, let stream = frameStream else {
+            stateLock.unlock()
+            tearDownSocket()
+            throw CancellationError()
         }
+        senderReadyContinuation = readySignal
+        senderTask = Task {
+            defer { self.releaseFrameQueue() }
+            var readyIterator = readiness.makeAsyncIterator()
+            guard await readyIterator.next() != nil, !Task.isCancelled else { return }
+            for await frame in stream {
+                do {
+                    try await sendFrame(.string(frame))
+                } catch {
+                    self.markStreamIntegrityFailed()
+                    vlog("elevenlabs-stream: send failed, stopping sender: \(error.localizedDescription)")
+                    break
+                }
+            }
+        }
+        stateLock.unlock()
 
         receiveLoopTask = Task { [weak self] in
             await self?.runReceiveLoop()
         }
 
         task?.resume()
+        beforeReadiness?()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     self.stateLock.lock()
-                    if self.readyResolved {
+                    if let result = self.readyResult {
                         self.stateLock.unlock()
-                        continuation.resume()
+                        continuation.resume(with: result)
                         return
                     }
                     self.readyContinuation = continuation
@@ -280,7 +318,10 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
                 stateLock.lock()
                 let pending = readyResolved ? nil : readyContinuation
                 if !readyResolved {
-                    readyResolved = true
+                    streamIntegrityFailed = true
+                    senderReadyContinuation?.finish()
+                    senderReadyContinuation = nil
+                    readyResult = .failure(error)
                     readyContinuation = nil
                 }
                 stateLock.unlock()
@@ -290,19 +331,8 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             }
         }
 
-        // Ready: safe to stream audio. Single consumer keeps writes ordered
-        // even though each `task.send` is itself async.
-        senderTask = Task {
-            for await frame in stream {
-                do {
-                    try await sendFrame(.string(frame))
-                } catch {
-                    self.markStreamIntegrityFailed()
-                    vlog("elevenlabs-stream: send failed, stopping sender: \(error.localizedDescription)")
-                    break
-                }
-            }
-        }
+        started = true
+        await afterReadiness?()
 
         vlog("elevenlabs-stream: session ready")
     }
@@ -310,7 +340,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// Converts one captured buffer to 16kHz mono PCM16, base64-encodes it,
     /// and enqueues the JSON frame payload for sending. Called from the
     /// realtime audio-tap thread — returns quickly, never blocks on the
-    /// network. No-op until started and before finalize/cancel.
+    /// network. Buffers before start; no-op after finalize/cancel.
     func send(_ buffer: AVAudioPCMBuffer) {
         stateLock.lock()
         let continuation = frameContinuation
@@ -318,10 +348,12 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         guard let continuation else { return }
         guard let pcmData = convertToPCM16(buffer) else {
             markStreamIntegrityFailed()
-            vlog("elevenlabs-stream: send — conversion produced no data, dropping buffer")
+            vlogFromAudioTap(.conversionFailure(.elevenlabs, .emptyConversion))
             return
         }
-        continuation.yield(Self.makeInputAudioChunkFrame(pcmData: pcmData, commit: false))
+        if case .dropped = continuation.yield(Self.makeInputAudioChunkFrame(pcmData: pcmData, commit: false)) {
+            markStreamIntegrityFailed()
+        }
     }
 
     /// Sends a final `commit:true` frame (with an empty audio payload — all
@@ -354,6 +386,11 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         let framesToFinish = frameContinuation
         frameContinuation = nil
         let senderToDrain = senderTask
+        if startInvoked && !readyResolved {
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+        }
         stateLock.unlock()
         framesToFinish?.finish()
 
@@ -503,6 +540,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// Hard stop, no read-back. Cancels the socket and sender.
     func cancel() {
+        let error = CloudTranscriptionError(provider: .elevenLabs, message: "cancelled")
         stateLock.lock()
         if tornDown {
             stateLock.unlock()
@@ -521,7 +559,9 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         // (mirrors XAIStreamingTranscriber.cancel).
         let pendingReady = readyResolved ? nil : readyContinuation
         if !readyResolved {
-            readyResolved = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         // Extract any pending finalize()-side continuation before discarding
@@ -534,7 +574,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         let accumulated = Self.joinedTranscript(segments: committedSegments, partial: latestPartial)
         resetTranscriptState()
         stateLock.unlock()
-        pendingReady?.resume(throwing: CloudTranscriptionError(provider: .elevenLabs, message: "cancelled"))
+        pendingReady?.resume(throwing: error)
         pendingDone?.resume(returning: accumulated)
 
         tearDownSocket()
@@ -555,14 +595,27 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         doneDrainTask = nil
     }
 
+    private func releaseFrameQueue() {
+        stateLock.lock()
+        let frames = frameContinuation
+        frameContinuation = nil
+        frameStream = nil
+        stateLock.unlock()
+        frames?.finish()
+    }
+
     private func tearDownSocket() {
+        releaseFrameQueue()
         stateLock.lock()
         intentionalSocketShutdown = true
+        let senderToCancel = senderTask
+        senderTask = nil
+        senderReadyContinuation?.finish()
+        senderReadyContinuation = nil
         stateLock.unlock()
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
-        senderTask?.cancel()
-        senderTask = nil
+        senderToCancel?.cancel()
         finalizeWorkerTask?.cancel()
         finalizeWorkerTask = nil
         finalizeDeadlineTask?.cancel()
@@ -603,15 +656,19 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// than let it block on the 5s timeout, so the caller falls back to the
     /// file/batch path promptly. No-op once ready has resolved.
     private func failReadyIfPending(_ reason: String) {
+        let error = CloudTranscriptionError(provider: .elevenLabs, message: reason)
         stateLock.lock()
         socketClosed = true
         let cont = readyResolved ? nil : readyContinuation
         if !readyResolved {
-            readyResolved = true
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+            readyResult = .failure(error)
             readyContinuation = nil
         }
         stateLock.unlock()
-        cont?.resume(throwing: CloudTranscriptionError(provider: .elevenLabs, message: reason))
+        cont?.resume(throwing: error)
     }
 
     // MARK: - Receive loop
@@ -679,7 +736,12 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         case "session_started":
             stateLock.lock()
             let continuation = readyResolved ? nil : readyContinuation
-            readyResolved = true
+            if !readyResolved {
+                readyResult = .success(())
+                senderReadyContinuation?.yield(())
+            }
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
             readyContinuation = nil
             stateLock.unlock()
             continuation?.resume()
@@ -1008,7 +1070,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
         if converter == nil || converterInputFormat != inputFormat {
             guard let newConverter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                vlog("elevenlabs-stream: failed to create AVAudioConverter for input format")
+                vlogFromAudioTap(.conversionFailure(.elevenlabs, .converterCreation))
                 return nil
             }
             converter = newConverter
@@ -1020,7 +1082,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             (Double(buffer.frameLength) * outputFormat.sampleRate / inputFormat.sampleRate).rounded(.up) + 16
         )
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            vlog("elevenlabs-stream: failed to allocate output PCM buffer")
+            vlogFromAudioTap(.conversionFailure(.elevenlabs, .bufferAllocation))
             return nil
         }
 
@@ -1037,7 +1099,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         }
 
         guard status != .error, error == nil else {
-            vlog("elevenlabs-stream: conversion error: \(error?.localizedDescription ?? "unknown")")
+            vlogFromAudioTap(.conversionFailure(.elevenlabs, .conversion))
             return nil
         }
         guard let int16Data = outputBuffer.int16ChannelData else {

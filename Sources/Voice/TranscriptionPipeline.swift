@@ -29,6 +29,10 @@ final class TranscriptionPipeline {
     /// Resolves engines and cloud settings from the owning selector.
     weak var engineSelector: ASREngineSelector?
 
+    /// Injectable ASR boundaries keep pipeline tests offline and model-free.
+    var cloudServiceProvider: (CloudModel) -> any CloudTranscriptionService = CloudTranscriberFactory.service
+    var localEngineProvider: (() -> any ASREngine)?
+
     /// Master on/off for the AI cleanup pass.
     var cleanupEnabled: Bool = false
 
@@ -85,7 +89,24 @@ final class TranscriptionPipeline {
     }
     var voiceEditInjectionHooks: VoiceEditInjectionHooks?
 
+    /// Runs the real delivery pipeline with isolated AX and event dependencies.
+    struct DeliveryHooks {
+        let injector: TextInjector.Hooks
+        let snapshot: () -> CaretContext.Snapshot
+    }
+    var deliveryHooks: DeliveryHooks?
+
+    private func deliverySnapshot(frontmostPID: pid_t?) -> CaretContext.Snapshot {
+        deliveryHooks?.snapshot() ?? CaretContext.snapshot(frontmostPID: frontmostPID)
+    }
+
+    private func deliveryFocusedElement(frontmostPID: pid_t) -> AXUIElement? {
+        if let hooks = deliveryHooks { return hooks.snapshot().focusedElement }
+        return CaretContext.focusedElement(frontmostPID: frontmostPID)
+    }
+
     private func injectionTarget(voiceEdit: Bool) -> TextInjector.InjectionTarget {
+        if let hooks = deliveryHooks { return hooks.injector.target() }
         if voiceEdit, let hooks = voiceEditInjectionHooks { return hooks.target() }
         let app = NSWorkspace.shared.frontmostApplication
         return TextInjector.InjectionTarget(
@@ -97,6 +118,12 @@ final class TranscriptionPipeline {
 
     /// Main-thread secure re-read protects clipboard fallback as well as typing.
     private func leaveOnClipboardIfAllowed(_ text: String, voiceEdit: Bool) -> Bool {
+        if let hooks = deliveryHooks {
+            guard !hooks.injector.target().secureInput else { return true }
+            hooks.injector.pasteboard.clearContents()
+            hooks.injector.pasteboard.setString(text, forType: .string)
+            return false
+        }
         if !voiceEdit { return Self.appSwitchAbortLeaveOnMain(text: text) }
         guard !injectionTarget(voiceEdit: true).secureInput else { return true }
         if let hooks = voiceEditInjectionHooks { hooks.leaveOnClipboard(text) }
@@ -132,6 +159,16 @@ final class TranscriptionPipeline {
 
     /// Terminal failure hook (transcription, injection, audio capture).
     var onFailure: ((DictationFailure) -> Void)?
+
+    /// Presentation ownership lives with the recorder HUD, not this pipeline's
+    /// latest lifecycle token. A newer startup can advance that token and then
+    /// abort before it ever presents, leaving an older processing hold entitled
+    /// to its terminal failure.
+    var presentedHoldToken: (() -> UInt64?)?
+
+    private func shouldNotifyFailure(for token: UInt64) -> Bool {
+        token == heldCaretToken || presentedHoldToken?() == token
+    }
 
     /// Capture caret AX context + frontmost PID on the main thread at
     /// recording-will-start. Replaces any prior hold and bumps the generation token.
@@ -406,6 +443,8 @@ final class TranscriptionPipeline {
     ///   is non-nil, use that triple (sampled at recording-stop) instead of
     ///   reading `heldCaret*` at entry — avoids poisoning across async IO/ASR
     ///   gaps. History-retry leaves them nil and keeps entry-sample behavior.
+    /// `onHoldAbandoned` releases live HUD ownership on main without completing
+    /// transcription. `completion` remains terminal so temporary audio stays alive.
     func transcribeAndLog(
         audioURL: URL,
         audioIsTemporary: Bool = false,
@@ -413,6 +452,7 @@ final class TranscriptionPipeline {
         sessionHeldToken providedToken: UInt64? = nil,
         sessionHeldSnapshot providedSnapshot: CaretContext.Snapshot? = nil,
         sessionHeldFrontmostPID providedPID: pid_t? = nil,
+        onHoldAbandoned: (() -> Void)? = nil,
         completion: ((InjectPipelineResult) -> Void)? = nil
     ) {
         guard let selector = engineSelector else {
@@ -439,7 +479,7 @@ final class TranscriptionPipeline {
 
             Task {
                 do {
-                    let service = CloudTranscriberFactory.service(for: cloudModel)
+                    let service = self.cloudServiceProvider(cloudModel)
                     if let gemini = service as? GeminiTranscriptionService {
                         gemini.smartMode = selector.removeFillerWordsEnabled
                         gemini.vocabulary = selector.geminiVocabularyProvider?() ?? []
@@ -450,6 +490,9 @@ final class TranscriptionPipeline {
                         model: cloudModel,
                         language: selector.selectedLanguage
                     )
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw CloudTranscriptionError.emptyTranscript(provider: cloudModel.provider)
+                    }
                     let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID)
                     let transformed = cleaned.text
                     self.finishTranscription(
@@ -464,8 +507,21 @@ final class TranscriptionPipeline {
                         completion: completion
                     )
                 } catch {
-                    self.logger.error("Cloud transcription failed [\(engineTag)]: \(error.localizedDescription)")
-                    vlog("cloud transcription error [\(engineTag)]: \(error.localizedDescription) — falling back to local")
+                    let emptyResponse = (error as? CloudTranscriptionError)?.isEmptyTranscript == true
+                    let recoverInBackground = await MainActor.run {
+                        guard emptyResponse, replaceID == nil,
+                              !self.isVoiceEditHold(sessionHeldToken) else { return false }
+                        self.markHoldAbandoned(sessionHeldToken)
+                        // Completion still owns audio cleanup and must wait for local ASR.
+                        onHoldAbandoned?()
+                        return true
+                    }
+                    if emptyResponse {
+                        vlog("cloud empty transcript [\(engineTag)] — recovering locally")
+                    } else {
+                        self.logger.error("Cloud transcription failed [\(engineTag)]: \(error.localizedDescription)")
+                        vlog("cloud transcription error [\(engineTag)]: \(error.localizedDescription) — falling back to local")
+                    }
                     self.transcribeLocally(
                         audioURL: audioURL,
                         audioPath: audioPath,
@@ -473,6 +529,7 @@ final class TranscriptionPipeline {
                         sessionHeldToken: sessionHeldToken,
                         sessionHeldSnapshot: sessionHeldSnapshot,
                         sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                        saveWithoutInsertion: recoverInBackground,
                         completion: completion
                     )
                 }
@@ -561,6 +618,8 @@ final class TranscriptionPipeline {
         sessionHeldToken: UInt64,
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
+        // Survives eviction from the bounded watchdog token set during slow recovery.
+        saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)? = nil
     ) {
         guard let selector = engineSelector else {
@@ -568,7 +627,7 @@ final class TranscriptionPipeline {
             return
         }
 
-        let engine = selector.makeEngine()
+        let engine = localEngineProvider?() ?? selector.makeEngine()
         logger.info("Transcribing \(audioURL.lastPathComponent) with engine '\(engine.id)'")
 
         Task {
@@ -585,6 +644,7 @@ final class TranscriptionPipeline {
                     sessionHeldToken: sessionHeldToken,
                     sessionHeldSnapshot: sessionHeldSnapshot,
                     sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                    saveWithoutInsertion: saveWithoutInsertion,
                     completion: completion
                 )
             } catch {
@@ -595,29 +655,31 @@ final class TranscriptionPipeline {
                     audioPath: audioPath,
                     replaceHistoryEntryID: replaceHistoryEntryID,
                     sessionHeldToken: sessionHeldToken,
+                    saveWithoutInsertion: saveWithoutInsertion,
                     completion: completion
                 )
             }
         }
     }
 
-    private func reportTranscriptionFailure(
+    func reportTranscriptionFailure(
         engineID: String,
         audioPath: String?,
         replaceHistoryEntryID: UUID?,
         sessionHeldToken: UInt64,
+        saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
         DispatchQueue.main.async {
             let abandoned = self.consumeAbandonedHold(
                 token: sessionHeldToken,
                 replaceHistoryEntryID: replaceHistoryEntryID
-            )
+            ) || saveWithoutInsertion
             if replaceHistoryEntryID == nil,
                self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
-                if !abandoned { self.onFailure?(.voiceEditFailed) }
+                if !abandoned, sessionHeldToken == self.heldCaretToken { self.onFailure?(.voiceEditFailed) }
                 completion?(.failed)
                 return
             }
@@ -625,7 +687,7 @@ final class TranscriptionPipeline {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
             }
             // The user already saw this hold dismissed; no late error pill.
-            if !abandoned { self.onFailure?(.transcriptionFailed) }
+            if !abandoned, sessionHeldToken == self.heldCaretToken { self.onFailure?(.transcriptionFailed) }
             self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
             completion?(.failed)
         }
@@ -743,6 +805,21 @@ final class TranscriptionPipeline {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Model edge whitespace is incidental; selected boundary whitespace belongs
+    /// to the document and must survive the replacement.
+    static func prepareVoiceEditResult(_ text: String, selection: String?) -> String {
+        let body = normalizeTranscriptForInjection(text)
+        guard !body.isEmpty, let selection else { return body }
+        let leading = selection.prefix(while: { $0.isWhitespace })
+        let trailing = selection.dropFirst(leading.count).reversed().prefix(while: { $0.isWhitespace }).reversed()
+        return String(leading) + body + String(trailing)
+    }
+
+    /// A history retry has no live hold; pin it to its own late target sample.
+    static func expectedDeliveryPID(heldPID: pid_t?, isHistoryRetry: Bool, latePID: pid_t?) -> pid_t? {
+        isHistoryRetry ? latePID : heldPID
+    }
+
     private func applyAutoTransform(_ text: String) async -> String {
         guard let transform = engineSelector?.autoRunTransform else { return text }
         do {
@@ -759,84 +836,99 @@ final class TranscriptionPipeline {
     }
 
     static func cleanupLooksSane(input: String, output: String) -> Bool {
-        func words(_ s: String) -> [String] {
-            s.lowercased()
-                .replacingOccurrences(of: "’", with: "'")
+        func words(_ text: String) -> [String] {
+            text.lowercased().replacingOccurrences(of: "’", with: "'")
                 .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
                 .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
                 .filter { !$0.isEmpty }
         }
-        let inWords = words(input)
-        let outWords = words(output)
-        // No words in the input leaves nothing to compare against.
-        guard !inWords.isEmpty else { return true }
-
-        let ratio = Double(output.count) / Double(max(input.count, 1))
-        if ratio > 2.0 || ratio < 0.4 { return false }
-
-        // A symbol-only reply ("…", an emoji) is not a cleanup of spoken words.
+        func expand(_ word: String) -> [String] {
+            let irregular: [String: [String]] = [
+                "can't": ["can", "not"], "cannot": ["can", "not"],
+                "won't": ["will", "not"], "shan't": ["shall", "not"],
+                "i'm": ["i", "am"], "let's": ["let", "us"]
+            ]
+            if let expanded = irregular[word] { return expanded }
+            let negatives: Set<String> = [
+                "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't",
+                "hasn't", "haven't", "hadn't", "couldn't", "wouldn't", "shouldn't",
+                "mustn't", "needn't", "mightn't"
+            ]
+            if negatives.contains(word) { return [String(word.dropLast(3)), "not"] }
+            let pronouns: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "there", "that", "what", "who"]
+            for (suffix, verb) in [("'ll", "will"), ("'re", "are"), ("'ve", "have")] {
+                if word.hasSuffix(suffix) {
+                    let stem = String(word.dropLast(suffix.count))
+                    if pronouns.contains(stem) { return [stem, verb] }
+                }
+            }
+            // 's and 'd can mean different verbs (or possession). Preserve
+            // them unless a later, context-aware contract can disambiguate.
+            return [word]
+        }
+        let inputWords = words(input)
+        guard !inputWords.isEmpty else { return true }
+        let outWords = words(output).flatMap(expand)
         guard !outWords.isEmpty else { return false }
 
-        let inSet = Set(inWords)
-        let newWords = outWords.filter { !inSet.contains($0) }
-        guard Double(newWords.count) / Double(outWords.count) <= 0.4 else { return false }
-
-        // Negations and digits carry the meaning; cleanup may not lose one.
-        let negations: Set<String> = ["not", "no", "never", "none", "nothing", "nobody", "neither", "nor", "cannot"]
-        func isNegation(_ w: String) -> Bool { negations.contains(w) || w.hasSuffix("n't") }
-        guard outWords.filter(isNegation).count >= inWords.filter(isNegation).count else { return false }
-        var outNumbers: [String: Int] = [:]
-        for w in outWords where w.contains(where: \.isNumber) { outNumbers[w, default: 0] += 1 }
-        for w in inWords where w.contains(where: \.isNumber) {
-            guard let left = outNumbers[w], left > 0 else { return false }
-            outNumbers[w] = left - 1
+        // Punctuation cleanup must not turn 12.50 into 12 50, or -5 into 5.
+        func numbers(_ text: String) -> [String] {
+            let expression = try! NSRegularExpression(pattern: #"[+-]?\d+(?:[.,]\d+)*"#)
+            return expression.matches(in: text, range: NSRange(text.startIndex..., in: text))
+                .compactMap { Range($0.range, in: text).map { String(text[$0]) } }
         }
+        guard numbers(input) == numbers(output) else { return false }
 
-        // The checks above cannot see a dropped sentence. Align the two word
-        // sequences in order and require every input sentence to survive at
-        // least by half.
-        let sentences = input
-            .replacingOccurrences(of: #"[.!?]\s+"#, with: "\n", options: .regularExpression)
-            .components(separatedBy: .newlines)
-            .map(words)
-            .filter { !$0.isEmpty }
-        guard sentences.count > 1 else { return true }
-        let kept = orderedMatches(inWords, outWords)
+        // Keep standalone sentences even when all of their words can also be
+        // fillers. Punctuation can be added elsewhere by the cleanup pass.
+        let sentences = input.split(whereSeparator: { ".!?".contains($0) }).map { words(String($0)) }
+        var protected = Set<Int>()
         var offset = 0
         for sentence in sentences {
-            let range = offset..<(offset + sentence.count)
-            offset = range.upperBound
-            guard sentence.count >= 3 else { continue }
-            let survived = kept[range].filter { $0 }.count
-            if survived * 2 < sentence.count { return false }
-        }
-        return true
-    }
-
-    /// Longest-common-subsequence alignment: which words of `a` survive, in
-    /// order, in `b`.
-    private static func orderedMatches(_ a: [String], _ b: [String]) -> [Bool] {
-        var matched = [Bool](repeating: false, count: a.count)
-        guard !a.isEmpty, !b.isEmpty else { return matched }
-        var table = [[Int]](repeating: [Int](repeating: 0, count: b.count + 1), count: a.count + 1)
-        for i in stride(from: a.count - 1, through: 0, by: -1) {
-            for j in stride(from: b.count - 1, through: 0, by: -1) {
-                table[i][j] = a[i] == b[j] ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
+            if sentence == ["like"] || sentence == ["you", "know"] {
+                protected.formUnion(offset..<(offset + sentence.count))
             }
+            offset += sentence.count
         }
-        var i = 0, j = 0
-        while i < a.count, j < b.count {
-            if a[i] == b[j] {
-                matched[i] = true
-                i += 1
-                j += 1
-            } else if table[i + 1][j] >= table[i][j + 1] {
-                i += 1
-            } else {
-                j += 1
+        let asideExpression = try! NSRegularExpression(pattern: #"(?i)(?:^|[,—])\s*(like|you\s+know)\s*(?=[,—.!?]|$)"#)
+        let asideStarts = Set(asideExpression.matches(in: input, range: NSRange(input.startIndex..., in: input))
+            .compactMap { match -> Int? in
+                guard let range = Range(match.range(at: 1), in: input) else { return nil }
+                return words(String(input[..<range.lowerBound])).count
+            })
+        let clauseStarts: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "there", "this", "that"]
+        let fillerLeads: Set<String> = ["um", "uh", "so"]
+        var inputIndex = 0
+        var outputIndex = 0
+        while inputIndex < inputWords.count {
+            let word = inputWords[inputIndex]
+            let equivalent = expand(word)
+            if outputIndex + equivalent.count <= outWords.count,
+               Array(outWords[outputIndex..<(outputIndex + equivalent.count)]) == equivalent {
+                inputIndex += 1
+                outputIndex += equivalent.count
+                continue
             }
+            if word == "um" || word == "uh" { inputIndex += 1; continue }
+            if !protected.contains(inputIndex), word == "like", inputIndex + 1 < inputWords.count,
+               (asideStarts.contains(inputIndex) || ((inputIndex == 0 || fillerLeads.contains(inputWords[inputIndex - 1]))
+                && clauseStarts.contains(expand(inputWords[inputIndex + 1])[0]))) {
+                inputIndex += 1
+                continue
+            }
+            if !protected.contains(inputIndex), word == "you", inputIndex + 1 < inputWords.count,
+               inputWords[inputIndex + 1] == "know" {
+                let after = inputIndex + 2
+                let startsAside = inputIndex == 0 || fillerLeads.contains(inputWords[inputIndex - 1])
+                if asideStarts.contains(inputIndex)
+                    || (startsAside && after < inputWords.count && clauseStarts.contains(expand(inputWords[after])[0])) {
+                    inputIndex += 2
+                    continue
+                }
+            }
+            return false
         }
-        return matched
+        return outputIndex == outWords.count
     }
 
     /// Failed edits have no usable result to retain. Their audio is an
@@ -850,7 +942,7 @@ final class TranscriptionPipeline {
         let abandoned = consumeAbandonedHold(token: token, replaceHistoryEntryID: nil)
         clearHeldCaretSnapshot(matching: token)
         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
-        if !abandoned { onFailure?(failure) }
+        if !abandoned, token == heldCaretToken { onFailure?(failure) }
         completion?(.failed)
     }
 
@@ -864,9 +956,12 @@ final class TranscriptionPipeline {
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
         voiceEditInstruction: String? = nil,
+        saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
-        let trimmed = Self.normalizeTranscriptForInjection(text)
+        let trimmed = voiceEditInstruction == nil
+            ? Self.normalizeTranscriptForInjection(text)
+            : text
         self.logger.info("Transcribed \(trimmed.count) chars with engine '\(engineID)'")
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 
@@ -892,7 +987,7 @@ final class TranscriptionPipeline {
                                 return
                             }
                             self.finishTranscription(
-                                text: result,
+                                text: Self.prepareVoiceEditResult(result, selection: selection),
                                 hadExplicitTrailingNewline: false,
                                 engineID: engineID,
                                 audioPath: audioPath,
@@ -916,12 +1011,14 @@ final class TranscriptionPipeline {
                 let abandoned = self.consumeAbandonedHold(
                     token: sessionHeldToken,
                     replaceHistoryEntryID: replaceHistoryEntryID
-                )
+                ) || saveWithoutInsertion
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if !abandoned { self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed) }
-                if let audioPath, voiceEditInstruction == nil {
+                if !abandoned, self.shouldNotifyFailure(for: sessionHeldToken) {
+                    self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed)
+                }
+                if voiceEditInstruction == nil, audioPath != nil || saveWithoutInsertion {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
                 completion?(.failed)
@@ -937,7 +1034,7 @@ final class TranscriptionPipeline {
             let abandoned = self.consumeAbandonedHold(
                 token: sessionHeldToken,
                 replaceHistoryEntryID: replaceHistoryEntryID
-            )
+            ) || saveWithoutInsertion
             if replaceHistoryEntryID != nil || abandoned {
                 // Retrying a recording is a History operation. Focus may be on
                 // History's search field or an unrelated app by the time ASR ends.
@@ -1023,7 +1120,7 @@ final class TranscriptionPipeline {
                         if needsFresh {
                             // Fresh AX read must hop to main — do not call AX only off utility.
                             fresh = DispatchQueue.main.sync {
-                                CaretContext.snapshot()
+                                self.deliveryHooks?.snapshot() ?? CaretContext.snapshot()
                             }
                         } else {
                             fresh = .unknown
@@ -1036,7 +1133,7 @@ final class TranscriptionPipeline {
                         // Re-sample secure immediately before transforms/gate (TOCTOU
                         // vs the early PID sample). PID abort was already decided.
                         liveSecure = DispatchQueue.main.sync {
-                            IsSecureEventInputEnabled()
+                            self.deliveryHooks?.injector.target().secureInput ?? IsSecureEventInputEnabled()
                         }
                         textToInject = Self.applyInjectTransforms(
                             expanded: Self.prepareResolvedSnapshotTextForInjection(
@@ -1081,7 +1178,7 @@ final class TranscriptionPipeline {
                     // Re-sample frontmost immediately before insert (TOCTOU vs
                     // early PID). Late mismatch → same abort-leave as above.
                     enum LateInjectDecision {
-                        case insert
+                        case insert(pid: pid_t)
                         case abort(becameSecure: Bool)
                     }
                     let late: LateInjectDecision = DispatchQueue.main.sync {
@@ -1093,7 +1190,7 @@ final class TranscriptionPipeline {
                                 return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
                             }
                             let fresh = self.voiceEditInjectionHooks?.snapshot()
-                                ?? CaretContext.snapshot(frontmostPID: heldPID)
+                                ?? self.deliverySnapshot(frontmostPID: heldPID)
                             guard sessionHeldToken == self.heldCaretToken,
                                   VoiceEditRouting.selectionMatches(held: heldAtStart, fresh: fresh) else {
                                 return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
@@ -1109,22 +1206,42 @@ final class TranscriptionPipeline {
                                 becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil)
                             )
                         }
-                        return .insert
+                        guard let deliveryPID = Self.expectedDeliveryPID(
+                            heldPID: heldPID, isHistoryRetry: replaceID != nil, latePID: latePID
+                        ) else {
+                            return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil))
+                        }
+                        return .insert(pid: deliveryPID)
                     }
                     switch late {
                     case .abort(let becameSecure):
                         abortLeaveBecameSecure = becameSecure
                         insertResult = .failed
                         proceededToInsert = false
-                    case .insert:
+                    case .insert(let deliveryPID):
                         // Undo relies on the host's ⌘Z: replacement is one inject,
                         // with no delete or select-all step in any lane.
                         if voiceEditInstruction != nil, let hooks = self.voiceEditInjectionHooks {
                             insertResult = hooks.insert(textToInject)
                         } else {
-                            insertResult = TextInjector().insert(
+                            insertResult = TextInjector(hooks: self.deliveryHooks?.injector).insert(
                                 textToInject,
-                                expectedTargetPID: voiceEditInstruction == nil ? nil : heldPID
+                                expectedTargetPID: deliveryPID,
+                                validateSelection: voiceEditInstruction == nil ? nil : {
+                                    VoiceEditRouting.selectionMatches(
+                                        held: heldAtStart,
+                                        fresh: self.deliverySnapshot(frontmostPID: deliveryPID)
+                                    )
+                                },
+                                validateField: heldAtStart?.focusedElement.map { heldElement in
+                                    {
+                                        guard let fresh = self.deliveryFocusedElement(frontmostPID: deliveryPID) else {
+                                            return voiceEditInstruction == nil ? nil : false
+                                        }
+                                        return VoiceEditRouting.fieldMatches(held: heldElement, fresh: fresh)
+                                    }
+                                },
+                                preserveBoundaryWhitespace: voiceEditInstruction != nil
                             )
                         }
                         proceededToInsert = true
@@ -1192,7 +1309,7 @@ final class TranscriptionPipeline {
                     if replaceID == nil {
                         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
-                    if let failure = outcome.failure {
+                    if let failure = outcome.failure, self.shouldNotifyFailure(for: sessionHeldToken) {
                         self.onFailure?(failure)
                     }
 
