@@ -121,6 +121,35 @@ final class VoiceLogTests: XCTestCase {
         }
     }
 
+    func testLegacyOversizedLogRetainsNewestCompleteRecords() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("debug.log")
+        let maxBytes = 1_048_576
+        let recentRecord = Data("recent-tail: latest failure 🧪\n".utf8)
+        var legacy = Data("old-prefix: obsolete diagnostics\n".utf8)
+        legacy.append(Data(repeating: 65, count: maxBytes))
+        legacy.append(Data("\n".utf8))
+        legacy.append(recentRecord)
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: file.path, contents: legacy,
+            attributes: [.posixPermissions: 0o644]
+        ))
+
+        let log = VoiceDebugLog(path: file.path)
+        log.write("first append after migration")
+
+        let backup = try Data(contentsOf: URL(fileURLWithPath: file.path + ".1"))
+        XCTAssertEqual(backup, recentRecord, "Rotation must retain recent complete diagnostics")
+        XCTAssertLessThanOrEqual(backup.count, maxBytes)
+        XCTAssertTrue(String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            .contains("first append after migration"))
+        for path in [file.path, file.path + ".1"] {
+            let mode = try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber
+            XCTAssertEqual(mode?.intValue, 0o600)
+        }
+    }
+
     private func makeDirectory() throws -> URL {
         // #filePath anchors scratch files to this worktree, never the real data directory.
         let worktree = URL(fileURLWithPath: #filePath).deletingLastPathComponent()

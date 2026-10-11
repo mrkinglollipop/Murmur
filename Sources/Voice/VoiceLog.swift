@@ -68,11 +68,23 @@ final class VoiceDebugLog {
                 let attributes = try fm.attributesOfItem(atPath: path)
                 let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
                 if size > UInt64(maxBytes - boundedData.count) {
-                    // A legacy unbounded log must not become an oversized backup.
+                    // Bound legacy logs from the tail so recent diagnostics survive rotation.
                     if size > UInt64(maxBytes) {
-                        let legacy = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+                        let legacy = try FileHandle(forUpdating: URL(fileURLWithPath: path))
                         defer { try? legacy.close() }
-                        try legacy.truncate(atOffset: UInt64(maxBytes))
+                        try legacy.seek(toOffset: size - UInt64(maxBytes) - 1)
+                        let precedingByte = try legacy.read(upToCount: 1)?.first
+                        var recent = try legacy.read(upToCount: maxBytes) ?? Data()
+                        if precedingByte != 0x0A, let newline = recent.firstIndex(of: 0x0A) {
+                            let nextLine = recent.index(after: newline)
+                            // Keep the bounded tail when one oversized record fills the window.
+                            if nextLine < recent.endIndex {
+                                recent = Data(recent[nextLine...])
+                            }
+                        }
+                        try legacy.seek(toOffset: 0)
+                        try legacy.write(contentsOf: recent)
+                        try legacy.truncate(atOffset: UInt64(recent.count))
                     }
                     let backup = path + ".1"
                     if fm.fileExists(atPath: backup) {
