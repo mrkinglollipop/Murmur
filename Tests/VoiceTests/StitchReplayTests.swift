@@ -10,7 +10,7 @@ final class StitchReplayTests: XCTestCase {
     }
 
     private struct Event: Decodable {
-        enum Kind: String, Decodable { case final, interim }
+        enum Kind: String, Decodable { case final, interim, done }
 
         let type: Kind
         let text: String
@@ -56,12 +56,12 @@ final class StitchReplayTests: XCTestCase {
                             words: event.words.map(\.transcriptWord),
                             speechFinal: event.speechFinal
                         )
-                    case .interim:
+                    case .interim, .done:
                         // Use the real event handler to populate private interim
                         // state without introducing another production seam.
                         do {
                             let data = try JSONSerialization.data(withJSONObject: [
-                                "type": "transcript.partial", "text": event.text,
+                                "type": event.type == .done ? "transcript.done" : "transcript.partial", "text": event.text,
                                 "is_final": false, "speech_final": false,
                                 "words": event.words.map {
                                     ["text": $0.text, "start": $0.start, "end": $0.end] as [String: Any]

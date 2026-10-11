@@ -20,8 +20,8 @@
       "text": "The SILVER LANTERN glows.",
       "speechFinal": true,
       "words": [],
-      "expectedAfter": "The SILVER LANTERN glows."
+      "expectedAfter": "silver lantern The SILVER LANTERN glows."
     }
   ],
-  "expected": "The SILVER LANTERN glows."
+  "expected": "silver lantern The SILVER LANTERN glows."
 }

@@ -30,7 +30,9 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// Opens only on a successful handshake; finishing without a value aborts sending.
     private var senderReadyContinuation: AsyncStream<Void>.Continuation?
 
-    private let frameStream: AsyncStream<Data>
+    // Bound transport storage even when start is never called. Overflow latches
+    // buffered-recording recovery; it must never silently truncate dictation.
+    private var frameStream: AsyncStream<Data>?
     private var frameContinuation: AsyncStream<Data>.Continuation?
 
     private var converter: AVAudioConverter?
@@ -104,7 +106,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.readinessTimeoutSeconds = readinessTimeoutSeconds
         self.finalizeBudgetOverride = finalizeBudgetOverride
         // Capture may begin as soon as this session is published, before start().
-        let (stream, frames) = AsyncStream<Data>.makeStream()
+        let (stream, frames) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingOldest(256))
         self.frameStream = stream
         self.frameContinuation = frames
         super.init()
@@ -120,11 +122,13 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         vlog("muse-stream: starting session")
         stateLock.lock()
         startInvoked = true
-        streamIntegrityFailed = false
+        // Preserve conversion/overflow failures from audio captured before start.
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
         stateLock.unlock()
         resetTranscriptState()
+        var started = false
+        defer { if !started { tearDownSocket() } }
 
         guard let url = Self.buildSocketURL(sessionId: sessionId) else {
             throw CloudTranscriptionError(provider: .meta, message: "Failed to build streaming URL")
@@ -149,18 +153,18 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             if let task { try await task.send(message) } else { try await sendMessage(message) }
         }
 
-        let stream = frameStream
         let (readiness, readySignal) = AsyncStream<Void>.makeStream()
         // Install the gated consumer under the finalize lock so finalize can
         // drain the prepared queue even before start resumes from readiness.
         stateLock.lock()
-        guard !tornDown else {
+        guard !tornDown, let stream = frameStream else {
             stateLock.unlock()
             tearDownSocket()
             throw CancellationError()
         }
         senderReadyContinuation = readySignal
         senderTask = Task {
+            defer { self.releaseFrameQueue() }
             var readyIterator = readiness.makeAsyncIterator()
             guard await readyIterator.next() != nil, !Task.isCancelled else { return }
             for await pcmData in stream {
@@ -204,6 +208,7 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             throw error
         }
 
+        started = true
         await afterReadiness?()
 
         vlog("muse-stream: session ready")
@@ -250,7 +255,9 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             vlogFromAudioTap(.conversionFailure(.muse, .emptyConversion))
             return
         }
-        continuation.yield(pcmData)
+        if case .dropped = continuation.yield(pcmData) {
+            markStreamIntegrityFailed()
+        }
     }
 
     func finalize(recordingDuration: TimeInterval = 0) async -> String {
@@ -456,7 +463,17 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         finalizeSpeechCompleteSeen = false
     }
 
+    private func releaseFrameQueue() {
+        stateLock.lock()
+        let frames = frameContinuation
+        frameContinuation = nil
+        frameStream = nil
+        stateLock.unlock()
+        frames?.finish()
+    }
+
     private func tearDownSocket() {
+        releaseFrameQueue()
         stateLock.lock()
         intentionalSocketShutdown = true
         let senderToCancel = senderTask

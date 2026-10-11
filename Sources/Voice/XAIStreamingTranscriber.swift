@@ -88,7 +88,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// thread, synchronous, non-blocking) to the single sender `Task` (which
     /// awaits the actual network write). This is what lets `send(_:)` return
     /// immediately without ever touching `await`.
-    private let frameStream: AsyncStream<Data>
+    // Bound transport storage even when start is never called. Overflow latches
+    // buffered-recording recovery; it must never silently truncate dictation.
+    private var frameStream: AsyncStream<Data>?
     private var frameContinuation: AsyncStream<Data>.Continuation?
 
     /// Lazily built on the first `send(_:)` call once we know the input
@@ -136,6 +138,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var latestInterim: String = ""
     private var latestInterimWords: [TranscriptWord] = []
     private var confirmedSegments: [AudioSegment] = []
+    /// Numeric timestamps may restart at an utterance boundary. Only segments
+    /// received within the same open utterance share a timestamp origin.
+    private var timestampOrigin = 0
+    private var lastFinalTimestampOrigin = 0
     /// True once any non-empty interim/confirmed text arrived this session.
     private var everHadNonEmptyStreamText = false
     /// Word provenance retained alongside the original punctuated segment text.
@@ -192,7 +198,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.injectedMessageSender = messageSender
         self.finalizeBudgetOverride = finalizeBudgetOverride
         // Capture may begin as soon as this session is published, before start().
-        let (stream, frames) = AsyncStream<Data>.makeStream()
+        let (stream, frames) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingOldest(256))
         self.frameStream = stream
         self.frameContinuation = frames
         super.init()
@@ -225,11 +231,13 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         vlog("xai-stream: starting session")
         stateLock.lock()
         startInvoked = true
-        streamIntegrityFailed = false
+        // Preserve conversion/overflow failures from audio captured before start.
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
         stateLock.unlock()
         resetTranscriptState()
+        var started = false
+        defer { if !started { tearDownSocket() } }
 
         guard let url = Self.buildSocketURL(language: language, endpointingMs: endpointingMs) else {
             throw CloudTranscriptionError(provider: .xai, message: "Failed to build streaming URL")
@@ -259,18 +267,18 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
 
         // Consume the queue prepared before publication. Audio must wait for
         // transcript.created before it can be sent to the server.
-        let stream = frameStream
         let (readiness, readySignal) = AsyncStream<Void>.makeStream()
         // Install the gated consumer under the finalize lock so finalize can
         // drain the prepared queue even before start resumes from readiness.
         stateLock.lock()
-        guard !tornDown else {
+        guard !tornDown, let stream = frameStream else {
             stateLock.unlock()
             tearDownSocket()
             throw CancellationError()
         }
         senderReadyContinuation = readySignal
         senderTask = Task {
+            defer { self.releaseFrameQueue() }
             var readyIterator = readiness.makeAsyncIterator()
             guard await readyIterator.next() != nil, !Task.isCancelled else { return }
             for await frame in stream {
@@ -339,6 +347,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             }
         }
 
+        started = true
         await afterReadiness?()
 
         vlog("xai-stream: session ready")
@@ -358,7 +367,9 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             vlogFromAudioTap(.conversionFailure(.xai, .emptyConversion))
             return
         }
-        continuation.yield(pcmData)
+        if case .dropped = continuation.yield(pcmData) {
+            markStreamIntegrityFailed()
+        }
     }
 
     /// Drains buffered frames, sends `{"type":"audio.done"}`, and awaits
@@ -565,13 +576,25 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         latestInterim = ""
         latestInterimWords = []
         confirmedSegments = []
+        timestampOrigin = 0
+        lastFinalTimestampOrigin = 0
         everHadNonEmptyStreamText = false
         committedWords = []
         lastCommittedEnd = 0
         hasLoggedWordTimestampSample = false
     }
 
+    private func releaseFrameQueue() {
+        stateLock.lock()
+        let frames = frameContinuation
+        frameContinuation = nil
+        frameStream = nil
+        stateLock.unlock()
+        frames?.finish()
+    }
+
     private func tearDownSocket() {
+        releaseFrameQueue()
         stateLock.lock()
         intentionalSocketShutdown = true
         let senderToCancel = senderTask
@@ -801,7 +824,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         return Self.mergeSegmentIntoConfirmed(
             confirmed: confirmedText, text: latestInterim,
             incomingWords: latestInterimWords, committedWords: committedWords,
-            lastCommittedEnd: lastCommittedEnd, segments: confirmedSegments
+            lastCommittedEnd: lastCommittedEnd, segments: confirmedSegments,
+            timestampOrigin: timestampOrigin
         ).confirmedText
     }
 
@@ -809,15 +833,19 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// `transcript.done` payload. Must be called with `stateLock` held.
     private func bestResolvedTranscript(doneText: String, words: [TranscriptWord]) -> String {
         if !words.isEmpty, !doneText.isEmpty {
-            let timedSnapshot = latestInterimWords.isEmpty ? confirmedSegments : Self.mergeSegmentIntoConfirmed(
+            let timedSnapshot = latestInterim.isEmpty ? confirmedSegments : Self.mergeSegmentIntoConfirmed(
                 confirmed: confirmedText, text: latestInterim, incomingWords: latestInterimWords,
                 committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
-                segments: confirmedSegments
+                segments: confirmedSegments, timestampOrigin: timestampOrigin
             ).segments
+            // A session-wide completion cannot prove which locally timed
+            // utterance it revises after more than one origin has been seen.
+            let origins = Set(timedSnapshot.filter { $0.interval != nil }.compactMap(\.timestampOrigin))
+            let doneOrigin = origins.count <= 1 ? origins.first ?? lastFinalTimestampOrigin : nil
             return Self.mergeSegmentIntoConfirmed(
                 confirmed: confirmedText, text: doneText, incomingWords: words,
                 committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
-                segments: timedSnapshot
+                segments: timedSnapshot, timestampOrigin: doneOrigin
             ).confirmedText
         }
         if !doneText.isEmpty, confirmedText.isEmpty
@@ -846,8 +874,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             incomingWords: words,
             committedWords: committedWords,
             lastCommittedEnd: lastCommittedEnd,
-            segments: confirmedSegments
+            segments: confirmedSegments, timestampOrigin: timestampOrigin
         )
+        lastFinalTimestampOrigin = timestampOrigin
+        if speechFinal { timestampOrigin += 1 }
         confirmedText = merged.confirmedText
         committedWords = merged.committedWords
         lastCommittedEnd = merged.lastCommittedEnd
@@ -881,12 +911,17 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     struct AudioSegment {
         let text: String
         let words: [TranscriptWord]
+        let timestampOrigin: Int?
 
         var interval: Range<Double>? {
             guard !words.isEmpty,
-                  words.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end > $0.start }),
-                  let start = words.map(\.start).min(), let end = words.map(\.end).max() else { return nil }
-            return start..<end
+                  words.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end > $0.start
+                    && !XAIStreamingTranscriber.normalizedEquivalenceTokens($0.text).isEmpty }),
+                  zip(words, words.dropFirst()).allSatisfy({ $0.end <= $1.start }),
+                  words.flatMap({ XAIStreamingTranscriber.normalizedEquivalenceTokens($0.text) })
+                    == XAIStreamingTranscriber.normalizedEquivalenceTokens(text),
+                  let first = words.first, let last = words.last else { return nil }
+            return first.start..<last.end
         }
 
         /// Preserve the original punctuation outside the revised audio.
@@ -918,10 +953,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             if last + 1 < words.count, wordRanges[last].upperBound > wordRanges[last + 1].lowerBound { return nil }
             let before: AudioSegment? = first == 0 ? nil : AudioSegment(
                 text: String(text[..<wordRanges[first].lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines),
-                words: Array(words[..<first]))
+                words: Array(words[..<first]), timestampOrigin: timestampOrigin)
             let after: AudioSegment? = last + 1 == words.count ? nil : AudioSegment(
                 text: String(text[wordRanges[last + 1].lowerBound...]),
-                words: Array(words[(last + 1)...]))
+                words: Array(words[(last + 1)...]), timestampOrigin: timestampOrigin)
             return (before, after)
         }
     }
@@ -932,9 +967,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         incomingWords: [TranscriptWord],
         committedWords: [TranscriptWord],
         lastCommittedEnd: Double,
-        segments: [AudioSegment]? = nil
+        segments: [AudioSegment]? = nil,
+        timestampOrigin: Int? = nil
     ) -> (confirmedText: String, committedWords: [TranscriptWord], lastCommittedEnd: Double, segments: [AudioSegment]) {
-        var current = segments ?? (confirmed.isEmpty ? [] : [AudioSegment(text: confirmed, words: committedWords)])
+        var current = segments ?? (confirmed.isEmpty ? [] : [AudioSegment(text: confirmed, words: committedWords, timestampOrigin: timestampOrigin)])
         let textTokens = normalizedEquivalenceTokens(incomingText)
         let freshWords = incomingWords.filter { $0.start >= lastCommittedEnd }
         // Some payloads include prior-audio metadata absent from their text.
@@ -944,19 +980,21 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         let freshWordsMatchText = freshWords.flatMap { normalizedEquivalenceTokens($0.text) } == textTokens
         let alignedWords = !textTokens.isEmpty && !wordsMatchText && freshWordsMatchText
             ? freshWords : incomingWords
-        let incoming = AudioSegment(text: incomingText.trimmingCharacters(in: .whitespacesAndNewlines), words: alignedWords)
+        let incoming = AudioSegment(text: incomingText.trimmingCharacters(in: .whitespacesAndNewlines), words: alignedWords,
+                                    timestampOrigin: timestampOrigin)
         if !incoming.text.isEmpty {
             if let interval = incoming.interval {
                 var replaced: [AudioSegment] = []
                 var inserted = false
                 for segment in current {
-                    if let oldInterval = segment.interval, oldInterval.overlaps(interval),
+                    let sharesOrigin = incoming.timestampOrigin != nil && segment.timestampOrigin == incoming.timestampOrigin
+                    if sharesOrigin, let oldInterval = segment.interval, oldInterval.overlaps(interval),
                        let outside = segment.outside(interval) {
                         if let before = outside.before { replaced.append(before) }
                         if !inserted { replaced.append(incoming); inserted = true }
                         if let after = outside.after { replaced.append(after) }
                     } else {
-                        if !inserted, let oldInterval = segment.interval, oldInterval.lowerBound >= interval.upperBound {
+                        if sharesOrigin, !inserted, let oldInterval = segment.interval, oldInterval.lowerBound >= interval.upperBound {
                             replaced.append(incoming)
                             inserted = true
                         }
@@ -965,9 +1003,6 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                 }
                 if !inserted { replaced.append(incoming) }
                 current = replaced
-            } else if let last = current.last, last.interval == nil {
-                current[current.count - 1] = AudioSegment(
-                    text: mergeStreamingSegment(left: last.text, right: incoming.text), words: [])
             } else {
                 current.append(incoming)
             }

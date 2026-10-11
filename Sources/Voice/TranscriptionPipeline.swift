@@ -898,8 +898,6 @@ final class TranscriptionPipeline {
             })
         let clauseStarts: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "there", "this", "that"]
         let fillerLeads: Set<String> = ["um", "uh", "so"]
-        let knowledgeLeads: Set<String> = ["what", "that", "if", "whether", "think", "hope", "everything", "anything",
-            "something", "nothing", "all", "who", "whom", "do", "did", "does", "don't", "didn't", "doesn't"]
         var inputIndex = 0
         var outputIndex = 0
         while inputIndex < inputWords.count {
@@ -922,11 +920,8 @@ final class TranscriptionPipeline {
                inputWords[inputIndex + 1] == "know" {
                 let after = inputIndex + 2
                 let startsAside = inputIndex == 0 || fillerLeads.contains(inputWords[inputIndex - 1])
-                let beforeTime = after < inputWords.count && ["today", "tomorrow", "yesterday", "now", "later"].contains(inputWords[after])
-                    && (inputIndex == 0 || !knowledgeLeads.contains(inputWords[inputIndex - 1]))
                 if asideStarts.contains(inputIndex)
-                    || (startsAside && after < inputWords.count && clauseStarts.contains(expand(inputWords[after])[0]))
-                    || beforeTime {
+                    || (startsAside && after < inputWords.count && clauseStarts.contains(expand(inputWords[after])[0])) {
                     inputIndex += 2
                     continue
                 }

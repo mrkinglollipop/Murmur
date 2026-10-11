@@ -29,7 +29,9 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// Opens only on a successful handshake; finishing without a value aborts sending.
     private var senderReadyContinuation: AsyncStream<Void>.Continuation?
 
-    private let frameStream: AsyncStream<String>
+    // Bound transport storage even when start is never called. Overflow latches
+    // buffered-recording recovery; it must never silently truncate dictation.
+    private var frameStream: AsyncStream<String>?
     private var frameContinuation: AsyncStream<String>.Continuation?
 
     private var converter: AVAudioConverter?
@@ -114,7 +116,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         self.finalizeBudgetOverride = finalizeBudgetOverride
         self.now = now
         // Capture may begin as soon as this session is published, before start().
-        let (stream, frames) = AsyncStream<String>.makeStream()
+        let (stream, frames) = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingOldest(256))
         self.frameStream = stream
         self.frameContinuation = frames
         super.init()
@@ -130,11 +132,13 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         vlog("gemini-stream: starting session")
         stateLock.lock()
         startInvoked = true
-        streamIntegrityFailed = false
+        // Preserve conversion/overflow failures from audio captured before start.
         lastFinalizeRequiresBufferedAudioRecovery = false
         intentionalSocketShutdown = false
         stateLock.unlock()
         resetTranscriptState()
+        var started = false
+        defer { if !started { tearDownSocket() } }
 
         guard let url = Self.buildSocketURL(apiKey: apiKey) else {
             throw CloudTranscriptionError(provider: .gemini, message: "Failed to build streaming URL")
@@ -160,12 +164,11 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         }
         self.sessionStartTime = now()
 
-        let stream = frameStream
         let (readiness, readySignal) = AsyncStream<Void>.makeStream()
         // Install the gated consumer under the finalize lock so finalize can
         // drain the prepared queue even before start resumes from readiness.
         stateLock.lock()
-        guard !tornDown else {
+        guard !tornDown, let stream = frameStream else {
             stateLock.unlock()
             tearDownSocket()
             throw CancellationError()
@@ -173,6 +176,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         senderReadyContinuation = readySignal
         senderTask = Task { [weak self] in
             guard let self else { return }
+            defer { self.releaseFrameQueue() }
             var readyIterator = readiness.makeAsyncIterator()
             guard await readyIterator.next() != nil, !Task.isCancelled else { return }
             if self.liveOptions.vadMode == .manual, !self.activityStartSent {
@@ -231,6 +235,7 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             throw error
         }
 
+        started = true
         await afterReadiness?()
 
         vlog("gemini-stream: session ready")
@@ -285,7 +290,9 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
             vlogFromAudioTap(.conversionFailure(.gemini, .emptyConversion))
             return
         }
-        continuation.yield(GeminiLiveOptions.makeAudioFrameJSON(pcmData: pcmData))
+        if case .dropped = continuation.yield(GeminiLiveOptions.makeAudioFrameJSON(pcmData: pcmData)) {
+            markStreamIntegrityFailed()
+        }
     }
 
     func finalize(recordingDuration: TimeInterval = 0) async -> String {
@@ -514,7 +521,17 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         sessionStartTime = nil
     }
 
+    private func releaseFrameQueue() {
+        stateLock.lock()
+        let frames = frameContinuation
+        frameContinuation = nil
+        frameStream = nil
+        stateLock.unlock()
+        frames?.finish()
+    }
+
     private func tearDownSocket() {
+        releaseFrameQueue()
         stateLock.lock()
         intentionalSocketShutdown = true
         let senderToCancel = senderTask

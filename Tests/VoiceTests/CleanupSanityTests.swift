@@ -3,6 +3,11 @@ import XCTest
 
 final class CleanupSanityTests: XCTestCase {
 
+    func testRecipientRestrictionBeforeTimeWordIsPreserved() {
+        XCTAssertFalse(ASREngineSelector.cleanupLooksSane(
+            input: "Pay everyone you know today.", output: "Pay everyone today."))
+    }
+
     func testFormalContractionExpansionAccepted() {
         XCTAssertTrue(ASREngineSelector.cleanupLooksSane(
             input: "I'll send the report tomorrow.", output: "I will send the report tomorrow."))
@@ -24,7 +29,6 @@ final class CleanupSanityTests: XCTestCase {
         for (input, output) in [
             ("I'll send the report tomorrow.", "I will send the report tomorrow."),
             ("I will send the report tomorrow.", "I'll send the report tomorrow."),
-            ("like I'll send the report you know tomorrow", "I will send the report tomorrow."),
             ("you know we can't send 42 reports today", "We cannot send 42 reports today."),
             ("we should, like, send the report", "We should send the report."),
             ("we should, you know, send the report", "We should send the report."),
@@ -37,6 +41,8 @@ final class CleanupSanityTests: XCTestCase {
     @MainActor
     func testUnsafeCleanupFallsBackInDelivery() {
         for (input, output) in [
+            ("like I'll send the report you know tomorrow", "I will send the report tomorrow."),
+            ("Pay everyone you know today.", "Pay everyone today."),
             ("I'll send the report. Call Alice.", "I will send the report."),
             ("I'll send 42 reports tomorrow.", "I will send 43 reports tomorrow."),
             ("I won't send the report tomorrow.", "I will send the report tomorrow."),
