@@ -176,6 +176,166 @@ final class TextInjectorTests: XCTestCase {
         }
     }
 
+    func testSafariPasteRejectsClipboardOverwriteDuringSelectionValidation() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.bundleIdentifier = "com.apple.Safari"
+        harness.onWait = { _ in 1 }
+        XCTAssertEqual(harness.injector().insert("replacement longer than one chunk", expectedTargetPID: 123,
+            validateSelection: {
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("foreign payload", forType: .string)
+                return true
+            }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0, "No chord may consume the foreign payload")
+        XCTAssertEqual(harness.unicodePosts, 0)
+    }
+
+    func testBlindPasteRejectsClipboardOverwriteDuringSelectionValidation() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.observerAvailable = false
+        XCTAssertEqual(harness.injector().insert("replacement", expectedTargetPID: 123,
+            validateSelection: {
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("foreign payload", forType: .string)
+                return true
+            }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0, "No blind chord may consume the foreign payload")
+    }
+
+    func testPasteFallbackRejectsClipboardOverwriteDuringSelectionValidation() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        harness.onWait = { _ in 1 }
+        XCTAssertEqual(harness.injector().insert("replacement", expectedTargetPID: 123,
+            validateSelection: {
+                self.testPasteboard.clearContents()
+                self.testPasteboard.setString("foreign payload", forType: .string)
+                return true
+            }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0, "No fallback chord may consume the foreign payload")
+    }
+
+    func testEditSelectionChangedAfterEntryPostsNoText() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        var selectionMatches = true
+        var reads = 0
+        harness.beforeTargetRead = {
+            reads += 1
+            if reads > 1 { selectionMatches = false }
+        }
+        harness.onWait = { _ in 4 }
+        XCTAssertTrue(selectionMatches) // Pipeline validation succeeded.
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: 123,
+            validateSelection: { selectionMatches }), .failed)
+        XCTAssertEqual(harness.unicodePosts, 0)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testEditSelectionChangedBeforeUnicodeRetryDoesNotRetype() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        var selectionMatches = true
+        harness.onWait = { counter in
+            if case .canary = counter { selectionMatches = false; return 1 }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: 123,
+            validateSelection: { selectionMatches }), .failed)
+        XCTAssertEqual(harness.unicodePosts, 1)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testEditSelectionChangedBeforePasteFallbackPostsNoPaste() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        var selectionMatches = true
+        harness.unicodeResult = 0
+        harness.afterUnicode = { selectionMatches = false }
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: 123,
+            validateSelection: { selectionMatches }), .failed)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testEditPreservesSelectedBoundaryWhitespaceThroughPreparationAndInjection() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.onWait = { _ in 10 }
+        let prepared = TranscriptionPipeline.prepareVoiceEditResult("small cat ", selection: "big cat ")
+        XCTAssertEqual(prepared, "small cat ")
+        let result = harness.injector().insert(prepared, expectedTargetPID: 123,
+            validateSelection: { true }, preserveBoundaryWhitespace: true)
+        guard case .inserted(let delivered) = result else { return XCTFail("Expected delivery") }
+        let field = ("big cat sat" as NSString).replacingCharacters(in: NSRange(location: 0, length: 8), with: delivered)
+        XCTAssertEqual(field, "small cat sat")
+    }
+
+    func testOrdinaryDictationSwitchAtInjectorEntryPostsNoText() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        let heldPID: pid_t = 42
+        XCTAssertFalse(TranscriptionPipeline.shouldAbortInjectAfterTransforms(
+            replaceHistoryEntryID: nil, heldPID: heldPID, latePID: heldPID))
+        harness.pid = 99
+        harness.onWait = { _ in 4 }
+        let expected = TranscriptionPipeline.expectedDeliveryPID(heldPID: heldPID, isHistoryRetry: false, latePID: heldPID)
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: expected), .failed)
+        XCTAssertEqual(harness.unicodePosts, 0)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testEditSelectionChangedBeforePasteRetryDoesNotPasteAgain() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        var selectionMatches = true
+        harness.onWait = { counter in
+            if case .pasteChord = counter { selectionMatches = false }
+            return 0
+        }
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: 123,
+            validateSelection: { selectionMatches }), .failed)
+        XCTAssertEqual(harness.pastePosts, 1)
+    }
+
+    func testEditSelectionChangedBeforeBlindPastePostsNoText() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.observerAvailable = false
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: 123,
+            validateSelection: { false }), .failed)
+        XCTAssertEqual(harness.unicodePosts, 0)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testEditSelectionChangedBeforeSafariPastePostsNoText() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.bundleIdentifier = "com.apple.Safari"
+        XCTAssertEqual(harness.injector().insert("long enough for multiple chunks", expectedTargetPID: 123,
+            validateSelection: { false }), .failed)
+        XCTAssertEqual(harness.unicodePosts, 0)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testMissingFrontmostIdentityAfterEntryPostsNoText() {
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        var reads = 0
+        harness.beforeTargetRead = {
+            reads += 1
+            if reads > 1 { harness.pid = nil }
+        }
+        XCTAssertEqual(harness.injector().insert("text", expectedTargetPID: 123), .failed)
+        XCTAssertEqual(harness.unicodePosts, 0)
+        XCTAssertEqual(harness.pastePosts, 0)
+    }
+
+    func testDeliveryTargetRequiresOriginalHoldExceptForHistoryRetry() {
+        XCTAssertNil(TranscriptionPipeline.expectedDeliveryPID(heldPID: nil, isHistoryRetry: false, latePID: 99))
+        XCTAssertEqual(TranscriptionPipeline.expectedDeliveryPID(heldPID: 42, isHistoryRetry: false, latePID: 99), 42)
+        XCTAssertEqual(TranscriptionPipeline.expectedDeliveryPID(heldPID: 42, isHistoryRetry: true, latePID: 99), 99)
+        XCTAssertNil(TranscriptionPipeline.expectedDeliveryPID(heldPID: 42, isHistoryRetry: true, latePID: nil))
+    }
+
+    func testEditWhitespaceUsesSelectionBoundariesEvenWhenModelOmitsThem() {
+        XCTAssertEqual(TranscriptionPipeline.prepareVoiceEditResult("word", selection: "    "), "    word")
+        XCTAssertEqual(TranscriptionPipeline.prepareVoiceEditResult("small cat", selection: "big cat "), "small cat ")
+        XCTAssertEqual(TranscriptionPipeline.prepareVoiceEditResult(" small cat ", selection: "\tbig cat\n"), "\tsmall cat\n")
+        XCTAssertEqual(TranscriptionPipeline.prepareVoiceEditResult(" small cat ", selection: "big cat"), "small cat")
+    }
+
     func testInsert_blindPasteObserverPostsOnlyOneChord() {
         let harness = InjectionHarness(pasteboard: testPasteboard)
         harness.unicodeResult = 0

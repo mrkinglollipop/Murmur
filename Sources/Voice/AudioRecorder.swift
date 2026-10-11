@@ -19,6 +19,10 @@ final class AudioRecorder {
     private var engine = AVAudioEngine()
     private var pcmBuffers: [AVAudioPCMBuffer] = []
     private let pcmBuffersLock = NSLock()
+    /// Guarded by `pcmBuffersLock`; retained audio from a prior tap must not
+    /// make a silent replacement tap look healthy.
+    private var bufferDeliveryGeneration: UInt64 = 0
+    private var buffersDeliveredThisGeneration = 0
     /// Guarded by `pcmBuffersLock`. `pcmBuffers` is only cleared when a hold's
     /// mic capture begins, so buffers seen at stop while this is false belong
     /// to an earlier hold and must never be transcribed again.
@@ -83,10 +87,119 @@ final class AudioRecorder {
     /// while the first ~200ms of speech hit a dying or not-yet-started tap.
     private var didAnnounceListeningThisTake = false
 
-    init() {
-        registerEngineConfigObserver()
-        registerDefaultInputDeviceListener()
+    init(
+        streamingCoordinator: StreamingCoordinator = StreamingCoordinator(),
+        voiceProfileStore: VoiceProfileStore? = nil,
+        hud: RecordingHUD = RecordingHUD(),
+        observeInputDevices: Bool = true
+    ) {
+        self.streamingCoordinator = streamingCoordinator
+        self.voiceGateProfileStore = voiceProfileStore ?? VoiceProfileStore()
+        self.hud = hud
+        self.asrSelector.pipeline.presentedHoldToken = { [weak hud] in hud?.holdToken }
+        if observeInputDevices {
+            registerEngineConfigObserver()
+            registerDefaultInputDeviceListener()
+        }
     }
+
+    /// Main-thread notification for activation state after capture terminates.
+    var onTerminalCaptureFailure: (() -> Void)?
+
+    #if DEBUG
+    /// Replaces hardware and wall-clock boundaries only; recovery and teardown
+    /// still execute the same recorder methods as a live capture.
+    final class MicCaptureTestHooks {
+        var boundDeviceID: AudioDeviceID? = 81
+        var engineRunning = false
+        var successfulStarts = 0
+        var receiveBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        let schedule: MicHealthWarningMonitor.Schedule
+        let now: () -> Date
+
+        init(schedule: @escaping MicHealthWarningMonitor.Schedule, now: @escaping () -> Date) {
+            self.schedule = schedule
+            self.now = now
+        }
+    }
+    private var micCaptureTestHooks: MicCaptureTestHooks?
+
+    convenience init(micCaptureTestHooks: MicCaptureTestHooks, streamingCoordinator: StreamingCoordinator = StreamingCoordinator()) {
+        self.init(streamingCoordinator: streamingCoordinator, observeInputDevices: false)
+        self.micCaptureTestHooks = micCaptureTestHooks
+    }
+
+    func beginMicCaptureForTesting() {
+        precondition(micCaptureTestHooks != nil)
+        wantsRecording = true
+        isStopping = false
+        startTime = micCaptureTestHooks!.now()
+        micHealthGeneration &+= 1
+        startMicHealthMonitoring()
+        startMicCapture()
+    }
+
+    func microphoneConfigurationChangedForTesting() {
+        precondition(micCaptureTestHooks != nil)
+        handleEngineConfigurationChange()
+    }
+
+    var micCaptureStateForTesting: (wanted: Bool, stopping: Bool, tapInstalled: Bool, buffers: [AVAudioPCMBuffer], maxRMS: Float) {
+        (wantsRecording, isStopping, isSetUp, pcmBuffersLock.withLock { pcmBuffers }, levelLock.withLock { maxLevelObserved })
+    }
+    #endif
+
+
+#if DEBUG
+    /// Seeds lifecycle state without requesting permission or opening hardware.
+    func test_prepareHold(token: UInt64, active: Bool = false, inFlight: Bool = false) {
+        recordingStartGeneration &+= 1
+        pendingHeldCaretToken = active ? nil : token
+        activeHeldCaretToken = active ? token : nil
+        wantsRecording = true
+        isStopping = false
+        engineStartInFlight = inFlight
+        micCaptureBeganThisHold = inFlight || active
+        startTime = Date()
+    }
+
+    func test_failMicStart() { failMicStart(reason: "injected bind failure") }
+    func test_flushStopGrace() { flushPendingStopGrace() }
+    func test_abortForSecureInput() { abortForSecureInput() }
+    func test_receiveAudio(_ buffer: AVAudioPCMBuffer) { sendCapturedAudioToCloud(buffer) }
+    var test_bufferCount: Int { pcmBuffersLock.withLock { pcmBuffers.count } }
+    func test_bufferAudio(_ buffer: AVAudioPCMBuffer) {
+        pcmBuffersLock.withLock { pcmBuffers.append(buffer) }
+    }
+    func test_seedCachedSessionHold(
+        token: UInt64,
+        snapshot: CaretContext.Snapshot? = nil,
+        pid: pid_t? = nil
+    ) {
+        cachedSessionHolds[token] = (snapshot, pid)
+    }
+    var test_cachedSessionHoldTokens: Set<UInt64> { Set(cachedSessionHolds.keys) }
+    /// Invokes the same file-handoff completion used after background recovery.
+    func test_completeFileTranscriptionHandoff(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        sessionHeldToken: UInt64?,
+        releasedHUD: Bool,
+        cleanup: @escaping () -> Void
+    ) {
+        completeFileTranscriptionHandoff(
+            result: result, sessionHeldToken: sessionHeldToken,
+            releasedHUD: releasedHUD, cleanup: cleanup
+        )
+    }
+    func test_armProcessingDeadline(token: UInt64) -> () -> Void {
+        armProcessingWatchdog(sessionToken: token, audioDuration: 0)
+        let generation = processingWatchdogGeneration
+        return { [weak self] in
+            self?.fireProcessingWatchdog(generation: generation, sessionToken: token)
+        }
+    }
+#endif
 
     deinit {
         if let engineConfigObserver {
@@ -137,23 +250,22 @@ final class AudioRecorder {
             }
             return
         }
-        let currentDefault = Self.halDefaultInputDeviceID()
-        // Continuity appearing fires this listener ~80ms after a good start.
-        // Same Sound Input → keep the live tap. Tearing down anyway is the
-        // 195ms double-start that clips the front of the take (2026-08-19).
-        guard Self.shouldRebuildCaptureAfterInputReroute(
+        let route = micInputRoute()
+        let preferredUID = preferredInputDeviceUIDProvider?()
+        let action = MicHealth.inputRerouteAction(
             lastBound: lastBoundInputDeviceID,
-            currentDefault: currentDefault
-        ) else {
-            vlog("audio engine configuration change MID-HOLD — default unchanged, keeping live tap")
+            currentDefault: route.defaultID,
+            boundUID: route.boundUID,
+            preferredUID: preferredUID,
+            boundIsHealthy: route.boundIsHealthy,
+            engineRunning: micEngineIsRunning
+        )
+        guard case .rebuild(let failedID) = action else {
+            vlog("audio engine configuration change MID-HOLD — keeping live tap")
             return
         }
         watchdogRetriedThisTake = true
         vlog("audio engine configuration change MID-HOLD — rebuilding engine, restarting capture")
-        let failedID = Self.excludeAfterInputReroute(
-            lastBound: lastBoundInputDeviceID,
-            currentDefault: currentDefault
-        )
         teardownMicEngine()
         rebuildEngine(excluding: failedID)
         startMicCapture(isWatchdogRetry: true, excluding: failedID)
@@ -168,6 +280,9 @@ final class AudioRecorder {
     }
 
     private func registerDefaultInputDeviceListener() {
+        #if DEBUG
+        guard micCaptureTestHooks == nil else { return }
+        #endif
         guard defaultInputListenerBlock == nil else { return }
         var address = Self.defaultInputPropertyAddress
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -217,6 +332,12 @@ final class AudioRecorder {
     /// input format. A new `AVAudioEngine()` rebinds to the *current default*,
     /// which can still be a ghost Bluetooth ID after unplug — that is not enough.
     private func bindAliveInputDevice(excluding failedDeviceID: AudioDeviceID? = nil) -> AudioDeviceID? {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            lastBoundInputDeviceID = hooks.boundDeviceID
+            return hooks.boundDeviceID
+        }
+        #endif
         let defaultID = Self.halDefaultInputDeviceID()
         let defaultAlive = defaultID.map(Self.isAudioDeviceAlive) ?? false
         let defaultFormatDead = defaultID.map(Self.audioDeviceInputFormatLooksDead) ?? true
@@ -587,6 +708,12 @@ final class AudioRecorder {
     /// Returns the bound device ID, or nil when bind failed (fail closed).
     @discardableResult
     private func rebuildEngine(excluding failedDeviceID: AudioDeviceID? = nil) -> AudioDeviceID? {
+        #if DEBUG
+        if micCaptureTestHooks != nil {
+            engineNeedsRebuild = false
+            return bindAliveInputDevice(excluding: failedDeviceID)
+        }
+        #endif
         engine.stop()
         engine = AVAudioEngine()
         registerEngineConfigObserver()
@@ -849,14 +976,41 @@ final class AudioRecorder {
         processingHUDWatchdogBaseSeconds + (audioDuration.isFinite ? max(0, audioDuration) : 0)
     }
 
-    /// Only the watchdog armed for the current hold may fire, and only while
-    /// the HUD is still showing processing.
+    /// Expiry follows the armed lifecycle, not presentation: an error pill
+    /// must not allow a timed-out result to replace selected text.
     static func shouldFireProcessingWatchdog(
         generation: UInt64,
         currentGeneration: UInt64,
         hudIsProcessing: Bool
     ) -> Bool {
-        generation == currentGeneration && hudIsProcessing
+        generation == currentGeneration
+    }
+
+    enum ProcessingWatchdogEvent {
+        case startRequested
+        case recordingStarted
+        case alreadyStopping
+    }
+
+    enum ProcessingWatchdogAction {
+        case keep
+        case cancel
+        case rearm
+    }
+
+    /// Lifecycle decisions are independent of microphone, permission, and HUD I/O.
+    static func processingWatchdogAction(
+        for event: ProcessingWatchdogEvent,
+        hudIsProcessing: Bool
+    ) -> ProcessingWatchdogAction {
+        switch event {
+        case .startRequested:
+            return .keep
+        case .recordingStarted:
+            return .cancel
+        case .alreadyStopping:
+            return hudIsProcessing ? .rearm : .keep
+        }
     }
 
     /// Bumped whenever a processing watchdog is armed or cancelled, so a
@@ -865,6 +1019,7 @@ final class AudioRecorder {
     /// Hold the armed watchdog belongs to, so a late finish for an older hold
     /// cannot cancel a newer hold's timer.
     private var processingWatchdogToken: UInt64?
+    private var processingWatchdogAudioDuration: TimeInterval = 0
 
     /// Tracks the most recent start/stop request. Guards against a stale
     /// permission-completion handler (fired after a later stopRecording())
@@ -908,15 +1063,55 @@ final class AudioRecorder {
     /// Read-only seam so tests can assert on the short-hold base constant.
     internal static var postReleaseCaptureGraceForTesting: TimeInterval { postReleaseCaptureGraceBase }
 
-    /// Bumped whenever a post-release capture grace is scheduled or flushed
-    /// early, so a stale `asyncAfter` callback from a superseded grace never
-    /// runs `finishStop` twice.
-    private var stopGraceGeneration: UInt64 = 0
+    /// Main-thread deferred stop, shared with deterministic lifecycle tests.
+    final class StopGrace {
+        private(set) var generation: UInt64 = 0
+        private var finalize: (() -> Void)?
 
-    /// The deferred finalize body for the currently-pending capture grace,
-    /// if any. Non-nil only between `scheduleStopGrace` and whichever of
-    /// `runStopGraceIfCurrent` / `flushPendingStopGrace` runs it.
-    private var stopGraceFinalize: (() -> Void)?
+        @discardableResult
+        func schedule(_ finalize: @escaping () -> Void) -> UInt64 {
+            generation &+= 1
+            self.finalize = finalize
+            return generation
+        }
+
+        func run(_ capturedGeneration: UInt64) {
+            guard AudioRecorder.shouldRunStopGrace(
+                generation: capturedGeneration, currentGeneration: generation
+            ), let finalize else { return }
+            self.finalize = nil
+            finalize()
+        }
+
+        func flush() {
+            guard let finalize else { return }
+            self.finalize = nil
+            generation &+= 1
+            finalize()
+        }
+    }
+
+    enum RecordingStartPhase { case request, capture }
+
+    static func shouldSettleStopGrace(at phase: RecordingStartPhase) -> Bool {
+        phase == .request
+    }
+
+    static func heldCaretTokensAtStartRequest(
+        active: UInt64?, pending: UInt64?
+    ) -> (active: UInt64?, pending: UInt64?) {
+        // The previous capture has settled; its eventual completion retains
+        // its frozen token, but it must never be sampled by this request's stop.
+        (nil, pending)
+    }
+
+    private var recordingStartGeneration: UInt64 = 0
+
+    static func isCurrentStartCallback(generation: UInt64, currentGeneration: UInt64) -> Bool {
+        generation == currentGeneration
+    }
+
+    private let stopGrace = StopGrace()
 
     /// Release-time app-targeting context, sampled once at `doStop` and
     /// carried through the capture grace into `finishStop`.
@@ -950,7 +1145,7 @@ final class AudioRecorder {
 
     /// Single shared HUD instance, shown/hidden across the capture lifecycle
     /// — never recreated per recording.
-    let hud = RecordingHUD()
+    let hud: RecordingHUD
 
     /// Thread-safe smoothed mic level (0...1), written from the realtime
     /// audio-tap thread and consumed on main via `publishLevel`. A simple
@@ -971,6 +1166,7 @@ final class AudioRecorder {
     /// guarded by `levelLock` with the cumulative RMS so an old hold cannot
     /// paint a no-audio hint over a newer hold.
     private var micHealthGeneration: UInt64 = 0
+    private var micHealthMonitor: MicHealthWarningMonitor?
 
     /// Raw-RMS speech-presence threshold. If the loudest buffer of a whole
     /// recording never crosses this, the clip is treated as silence and the
@@ -980,7 +1176,7 @@ final class AudioRecorder {
     private static let speechRMSThreshold: Float = 0.007
 
     /// xAI / WhisperKit streaming session state and start/stop decisions.
-    private let streamingCoordinator = StreamingCoordinator()
+    private let streamingCoordinator: StreamingCoordinator
 
     /// Off-main queue for concatenating buffers, writing CAF, and retention copy.
     private let audioIOQueue = DispatchQueue(label: "com.matt.voice-dictation.audio-io", qos: .userInitiated)
@@ -1011,7 +1207,7 @@ final class AudioRecorder {
         set { voiceGateProcessorRef.current = newValue }
     }
     private lazy var voiceGateEmbeddingProvider: FluidAudioEmbeddingProvider = FluidAudioEmbeddingProvider()
-    private let voiceGateProfileStore = VoiceProfileStore()
+    private let voiceGateProfileStore: VoiceProfileStore
     private let voiceGateRecordingSession = VoiceGateRecordingSession()
 
     /// Publishes in-memory speaker-gate telemetry snapshots on the main queue.
@@ -1136,27 +1332,16 @@ final class AudioRecorder {
         )
     }
 
-    /// Pure seam: re-anchor the session hold at hotkey release only when the
-    /// release-time frontmost is known AND differs from the start-time PID.
-    /// Same app (or unknown release identity) keeps the start-time hold, so
-    /// the long-verified same-app path is byte-for-byte unchanged.
+    /// A release-time app switch never authorizes changing a hold's destination.
     internal static func shouldRetargetSessionHoldAtRelease(
         startPID: pid_t?,
         releasePID: pid_t?
     ) -> Bool {
-        guard let releasePID else { return false }
-        return startPID != releasePID
+        false
     }
 
-    /// Release-time targeting: the app the user is in when the hotkey is
-    /// RELEASED is the inject destination, not the app the hold started in.
-    /// (2026-08-10 live abort: a hold began while switching away from
-    /// another app, so a perfectly good transcript landed on the clipboard
-    /// instead of the frontmost textbox.) Replaces the cached snapshot + PID
-    /// with a fresh same-moment sample so caret transforms can never mix
-    /// apps. The pre-insert TOCTOU guard in TranscriptionPipeline still
-    /// aborts if focus changes between release and insert (cloud finalize
-    /// can take seconds).
+    /// Keep the original PID and selection together through release. The late
+    /// pipeline and injector checks refuse delivery if that target loses focus.
     private func retargetedSessionHoldAtRelease(
         _ startHold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?)
     ) -> (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?) {
@@ -1356,22 +1541,32 @@ final class AudioRecorder {
     // MARK: - Public interface
 
     func startRecording(heldCaretToken: UInt64? = nil) {
-        pendingHeldCaretToken = heldCaretToken
-        // A newer hold owns the HUD now; the previous hold's watchdog must
-        // not hide it. `startRecording` can arrive off-main.
-        if Thread.isMainThread {
-            cancelProcessingWatchdog()
-        } else {
-            DispatchQueue.main.async { [weak self] in self?.cancelProcessingWatchdog() }
+        // Settlement and ownership transfer are atomic with main-queue stop
+        // callbacks, including when activation originates on the event tap.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.sync { self.startRecording(heldCaretToken: heldCaretToken) }
+            return
         }
-        // Freeze hold immediately while this token still owns the pipeline
-        // slot — a rapid re-press can steal the live slot before stop samples.
+        if Self.shouldSettleStopGrace(at: .request) { flushPendingStopGrace() }
+        recordingStartGeneration &+= 1
+        let generation = recordingStartGeneration
+        let ownership = Self.heldCaretTokensAtStartRequest(
+            active: activeHeldCaretToken, pending: heldCaretToken
+        )
+        activeHeldCaretToken = ownership.active
+        pendingHeldCaretToken = ownership.pending
+        // Aborted requests retain the previous processing deadline.
+        updateProcessingWatchdog(for: .startRequested)
         cacheHoldForAssignedToken(heldCaretToken)
         if IsSecureEventInputEnabled() {
             logger.info("Secure input active — refusing to start capture.")
             clearPendingHeldCaretSnapshot()
             DispatchQueue.main.async { [weak self] in
-                self?.asrSelector.onFailure?(.secureInputBlocked)
+                guard let self, Self.isCurrentStartCallback(
+                    generation: generation, currentGeneration: self.recordingStartGeneration
+                ) else { return }
+                self.hud.claimHold(heldCaretToken)
+                self.asrSelector.onFailure?(.secureInputBlocked)
             }
             return
         }
@@ -1382,16 +1577,18 @@ final class AudioRecorder {
         pcmBuffersLock.unlock()
         vlog("AudioRecorder.startRecording — requesting mic permission")
         requestMicrophonePermissionIfNeeded { [weak self] granted in
-            vlog("mic permission callback — granted=\(granted)")
-            guard let self = self, granted else {
-                self?.logger.error("Microphone permission denied.")
-                self?.clearPendingHeldCaretSnapshot()
-                DispatchQueue.main.async {
-                    self?.asrSelector.onFailure?(.micStartFailed)
-                }
-                return
-            }
             DispatchQueue.main.async {
+                guard let self, Self.isCurrentStartCallback(
+                    generation: generation, currentGeneration: self.recordingStartGeneration
+                ) else { return }
+                vlog("mic permission callback — granted=\(granted)")
+                guard granted else {
+                    self.logger.error("Microphone permission denied.")
+                    self.clearPendingHeldCaretSnapshot()
+                    self.hud.claimHold(heldCaretToken)
+                    self.asrSelector.onFailure?(.micStartFailed)
+                    return
+                }
                 guard self.wantsRecording else {
                     self.logger.info("Mic permission resolved after stopRecording() — skipping start.")
                     self.clearPendingHeldCaretSnapshot()
@@ -1533,11 +1730,8 @@ final class AudioRecorder {
             clearPendingHeldCaretSnapshot()
             return
         }
-        // A fast re-press can land while the previous hold's post-release
-        // capture grace (Self.postReleaseCaptureGrace) is still pending —
-        // end it now, before touching the mic engine / streaming sessions
-        // below, so the new hold never overlaps the old one's tap/session.
-        flushPendingStopGrace()
+        // Grace settlement belongs to the request, even if capture is skipped.
+        if Self.shouldSettleStopGrace(at: .capture) { flushPendingStopGrace() }
         isStopping = false
         streamingCoordinator.resetStreamTextLatch()
         didAnnounceListeningThisTake = false
@@ -1546,6 +1740,7 @@ final class AudioRecorder {
         levelLock.lock()
         micHealthGeneration &+= 1
         levelLock.unlock()
+        startMicHealthMonitoring()
 
         if streamingCoordinator.tryStartXAI(asrSelector: asrSelector, startMicCapture: { [weak self] in
             self?.startMicCapture()
@@ -1631,6 +1826,10 @@ final class AudioRecorder {
             watchdogRetriedThisTake = false
         }
         captureGeneration &+= 1
+        pcmBuffersLock.lock()
+        bufferDeliveryGeneration = captureGeneration
+        buffersDeliveredThisGeneration = 0
+        pcmBuffersLock.unlock()
 
         vlog("startMicCapture — AVAudioEngine begins capture")
         // A recovery restart continues the SAME hold — the audio captured
@@ -1676,7 +1875,7 @@ final class AudioRecorder {
 
         // A device mid-transition can report a dead format; a tap installed
         // against it never fires. Rebuild once, excluding the failed ID.
-        let probeFormat = engine.inputNode.outputFormat(forBus: 0)
+        let probeFormat = micInputFormat()
         if Self.inputFormatLooksDead(
             sampleRate: probeFormat.sampleRate,
             channelCount: probeFormat.channelCount
@@ -1693,7 +1892,7 @@ final class AudioRecorder {
                 failMicStart(reason: "bind failed after excluding format-dead device \(ghostID ?? 0)")
                 return
             }
-            let retryFormat = engine.inputNode.outputFormat(forBus: 0)
+            let retryFormat = micInputFormat()
             if Self.shouldFailClosedAfterDeadFormatFallback(
                 formatStillDead: Self.inputFormatLooksDead(
                     sampleRate: retryFormat.sampleRate,
@@ -1711,13 +1910,18 @@ final class AudioRecorder {
             }
         }
 
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+        let format = micInputFormat()
 
         // Avoid double-installing a tap
         if !isSetUp {
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            let tapGeneration = captureGeneration
+            installMicTap(format: format) { [weak self] buffer, _ in
                 guard let self = self else { return }
+                self.pcmBuffersLock.lock()
+                if self.bufferDeliveryGeneration == tapGeneration {
+                    self.buffersDeliveredThisGeneration += 1
+                }
+                self.pcmBuffersLock.unlock()
 
                 // Realtime-thread safe: compute smoothed RMS amplitude and
                 // publish it for the HUD waveform. Only a Float + a lock — no
@@ -1775,15 +1979,19 @@ final class AudioRecorder {
                 // xAI/ElevenLabs is ever active (both gated on the same
                 // single-value `cloudModel` selection), so both sends are
                 // safe no-ops when their session is nil.
-                self.streamingCoordinator.sendToXAI(buffer)
-                self.streamingCoordinator.sendToElevenLabs(buffer)
-                self.streamingCoordinator.sendToGemini(buffer)
-                self.streamingCoordinator.sendToMuse(buffer)
+                self.sendCapturedAudioToCloud(buffer)
             }
             isSetUp = true
         }
 
         startEngineOffMain(isWatchdogRetry: isWatchdogRetry)
+    }
+
+    private func sendCapturedAudioToCloud(_ buffer: AVAudioPCMBuffer) {
+        streamingCoordinator.sendToXAI(buffer)
+        streamingCoordinator.sendToElevenLabs(buffer)
+        streamingCoordinator.sendToGemini(buffer)
+        streamingCoordinator.sendToMuse(buffer)
     }
 
     /// Constraint: `AVAudioEngine.start()` can block in HAL on a ghost input
@@ -1803,6 +2011,16 @@ final class AudioRecorder {
     /// occupy its attempt queue until HAL returns; that must not starve the
     /// next hold's new engine.
     private func startEngineOffMain(isWatchdogRetry: Bool) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.engineRunning = true
+            hooks.successfulStarts += 1
+            handleEngineStartFinished(token: engineStartToken, generation: captureGeneration,
+                                      engineToStart: engine, result: .success(()),
+                                      isWatchdogRetry: isWatchdogRetry)
+            return
+        }
+        #endif
         engineStartToken &+= 1
         let token = engineStartToken
         let generation = captureGeneration
@@ -1971,47 +2189,69 @@ final class AudioRecorder {
     }
 
     private func failMicStart(reason: String) {
+        let generation = recordingStartGeneration
+        let token = pendingHeldCaretToken ?? activeHeldCaretToken
         logger.error("mic start failed — \(reason)")
         vlog("failMicStart — \(reason)")
-        // Next hold's startMicCapture only rebuilds when this is set.
-        // Bind/start failures can leave the graph unusable.
+        terminateFailedMicCapture()
+        scheduleMicHealthCheck(after: 0) { [weak self] in
+            guard let self, Self.isCurrentStartCallback(
+                generation: generation, currentGeneration: self.recordingStartGeneration
+            ) else { return }
+            // The failed request owns its error even while an older deadline remains armed.
+            self.hud.claimHold(token)
+            self.asrSelector.onFailure?(.micStartFailed)
+        }
+    }
+
+    private func terminateFailedMicCapture() {
+        let failedHoldToken = activeHeldCaretToken ?? pendingHeldCaretToken
+        wantsRecording = false
+        isStopping = true
+        // Bind/start failures can leave the graph unusable for the next hold.
         engineNeedsRebuild = true
         invalidateSecureInputPollTimer()
         teardownMicEngine()
         endVoiceGateRecordingSession()
+        streamingCoordinator.cancelAll()
+        clearHeldCaretSnapshotMatchingSession(activeHeldCaretToken)
         clearPendingHeldCaretSnapshot()
-        DispatchQueue.main.async { [weak self] in
-            // onFailure flashes the error pill. hide() here would cancel it.
-            self?.asrSelector.onFailure?(.micStartFailed)
-        }
+        micHealthMonitor = nil
+        cancelProcessingWatchdog(forToken: failedHoldToken)
+        onTerminalCaptureFailure?()
     }
 
     /// Detects the silent-wedge case the config-change notification can miss:
     /// `engine.start()` returned success but the tap never fires. One rebuild
-    /// + restart per hold; the tap's always-on pcmBuffers copy is the buffer
-    /// counter, so this works identically in streaming and file modes.
+    /// + restart per hold; delivery is counted per tap generation in both
+    /// streaming and file modes, independently of retained recovery audio.
     private func armZeroBufferWatchdog() {
         let generation = captureGeneration
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + Self.zeroBufferWatchdogDelay
-        ) { [weak self] in
+        scheduleMicHealthCheck(after: Self.zeroBufferWatchdogDelay) { [weak self] in
             guard let self else { return }
             self.pcmBuffersLock.lock()
-            let buffersSeen = self.pcmBuffers.count
+            let buffersSeen = self.buffersDeliveredThisGeneration
             self.pcmBuffersLock.unlock()
 
-            guard Self.watchdogShouldRestartCapture(
+            let action = MicHealth.zeroBufferAction(
                 generationMatches: generation == self.captureGeneration,
                 stillWanted: self.wantsRecording,
                 tapInstalled: self.isSetUp,
                 buffersSeen: buffersSeen,
                 alreadyRetried: self.watchdogRetriedThisTake
-            ) else {
-                if buffersSeen == 0, generation == self.captureGeneration,
-                   self.wantsRecording, self.watchdogRetriedThisTake {
-                    vlog("mic watchdog: still zero buffers after rebuild — leaving hold to the silence guard")
-                }
+            )
+            switch action {
+            case .ignore:
                 return
+            case .fail:
+                vlog("mic watchdog: still zero buffers after rebuild — ending capture")
+                self.terminateFailedMicCapture()
+                // The existing failure path replaces Listening with the error
+                // pill and auto-hides it; hide() here would cancel that pill.
+                self.asrSelector.onFailure?(.micDeliveredNoAudio)
+                return
+            case .restart:
+                break
             }
 
             self.watchdogRetriedThisTake = true
@@ -2024,6 +2264,9 @@ final class AudioRecorder {
     }
 
     private func startSecureInputPollTimer() {
+        #if DEBUG
+        guard micCaptureTestHooks == nil else { return }
+        #endif
         invalidateSecureInputPollTimer()
         let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -2097,15 +2340,24 @@ final class AudioRecorder {
             excludeOnNextStartDeviceID = lastBoundInputDeviceID
             teardownMicEngine()
             engineNeedsRebuild = true
+            if activeHeldCaretToken == nil { discardUnpromotedCapture() }
             if Self.shouldReturnAfterInFlightDoStopTeardown(wantsRecording: wantsRecording) {
                 vlog("doStop — torn down in-flight start; re-press owns the hold")
                 return
             }
         }
         if isStopping {
+            updateProcessingWatchdog(for: .alreadyStopping)
             invalidateSecureInputPollTimer()
             logger.info("doStop ignored — stop already in progress")
             vlog("doStop ignored — already stopping")
+            return
+        }
+        // A request can own a socket and tap before microphone promotion.
+        // Settle those resources without consuming the preceding hold again.
+        guard activeHeldCaretToken != nil else {
+            discardUnpromotedCapture()
+            clearPendingHeldCaretSnapshot()
             return
         }
         isStopping = true
@@ -2118,6 +2370,7 @@ final class AudioRecorder {
             endVoiceGateRecordingSession()
         }
 
+        hud.claimHold(activeHeldCaretToken)
         playFeedbackSound(named: "Pop")
         hud.clearInterimText()
         // Flip to processing immediately at fn-release so the pill shows
@@ -2125,7 +2378,7 @@ final class AudioRecorder {
         // For the streaming path this is normally near-instant (the ASR
         // already ran during the hold) — still set for visual consistency
         // and to cover the brief finalize step.
-        DispatchQueue.main.async { [weak self] in self?.hud.setProcessing() }
+        hud.setProcessing()
 
         // Capture hold before streaming finalize / file-IO Tasks so a rapid
         // re-press cannot poison inject with a newer will-start snapshot.
@@ -2144,6 +2397,19 @@ final class AudioRecorder {
         scheduleStopGrace(sessionHold: sessionHold, holdDuration: holdDuration)
     }
 
+    /// A cancelled startup has no promoted hold to finalize, but its stream
+    /// must be detached before a subsequent Local capture installs a tap.
+    private func discardUnpromotedCapture() {
+        invalidateSecureInputPollTimer()
+        teardownMicEngine()
+        streamingCoordinator.cancelAll()
+        endVoiceGateRecordingSession()
+        pcmBuffersLock.withLock {
+            pcmBuffers.removeAll(keepingCapacity: false)
+            micCaptureBeganThisHold = false
+        }
+    }
+
     /// Bounds how long the processing HUD can outlive release. On expiry the
     /// HUD is hidden and the hold marked abandoned, so a late result is saved
     /// to History instead of typed into whatever app is focused by then.
@@ -2151,9 +2417,24 @@ final class AudioRecorder {
         processingWatchdogGeneration &+= 1
         let generation = processingWatchdogGeneration
         processingWatchdogToken = sessionToken
+        processingWatchdogAudioDuration = audioDuration
         let bound = Self.processingHUDWatchdogBound(audioDuration: audioDuration)
         DispatchQueue.main.asyncAfter(deadline: .now() + bound) { [weak self] in
             self?.fireProcessingWatchdog(generation: generation, sessionToken: sessionToken)
+        }
+    }
+
+    private func updateProcessingWatchdog(for event: ProcessingWatchdogEvent) {
+        switch Self.processingWatchdogAction(for: event, hudIsProcessing: hud.isProcessing) {
+        case .keep:
+            break
+        case .cancel:
+            cancelProcessingWatchdog()
+        case .rearm:
+            armProcessingWatchdog(
+                sessionToken: processingWatchdogToken,
+                audioDuration: processingWatchdogAudioDuration
+            )
         }
     }
 
@@ -2179,7 +2460,7 @@ final class AudioRecorder {
         if let sessionToken {
             asrSelector.pipeline.markHoldAbandoned(sessionToken)
         }
-        hud.hide()
+        if hud.ownsHold(sessionToken) { hud.hide() }
     }
 
     /// Schedules `finishStop` to run after `postReleaseCaptureGrace(forHoldDuration:)`,
@@ -2188,10 +2469,8 @@ final class AudioRecorder {
     /// the active cloud transcriber. A fast re-press ends this early via
     /// `flushPendingStopGrace()` instead of waiting out the delay.
     private func scheduleStopGrace(sessionHold: SessionHold, holdDuration: TimeInterval?) {
-        stopGraceGeneration &+= 1
-        let generation = stopGraceGeneration
         let grace = Self.postReleaseCaptureGrace(forHoldDuration: holdDuration ?? 0)
-        stopGraceFinalize = { [weak self] in
+        let generation = stopGrace.schedule { [weak self] in
             self?.finishStop(sessionHold: sessionHold, holdDuration: holdDuration)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
@@ -2201,7 +2480,7 @@ final class AudioRecorder {
 
     /// Pure guard for the scheduled `asyncAfter` grace callback: only the
     /// generation that scheduled it may run it. `flushPendingStopGrace` and
-    /// a fresh `scheduleStopGrace` both bump `stopGraceGeneration`, so a
+    /// a fresh `scheduleStopGrace` both bump the grace generation, so a
     /// superseded or already-flushed callback finds its generation stale
     /// and no-ops instead of double-running `finishStop`.
     internal static func shouldRunStopGrace(generation: UInt64, currentGeneration: UInt64) -> Bool {
@@ -2211,12 +2490,7 @@ final class AudioRecorder {
     /// Runs the deferred finalize only if nothing already flushed it early
     /// (a fast re-press) and no newer stop superseded it.
     private func runStopGraceIfCurrent(_ generation: UInt64) {
-        guard
-            Self.shouldRunStopGrace(generation: generation, currentGeneration: stopGraceGeneration),
-            let finalize = stopGraceFinalize
-        else { return }
-        stopGraceFinalize = nil
-        finalize()
+        stopGrace.run(generation)
     }
 
     /// Ends a pending post-release capture grace immediately, running its
@@ -2224,10 +2498,7 @@ final class AudioRecorder {
     /// Call this before a new recording starts so a fast re-press can never
     /// overlap two live holds on the same mic engine / streaming session.
     private func flushPendingStopGrace() {
-        guard let finalize = stopGraceFinalize else { return }
-        stopGraceFinalize = nil
-        stopGraceGeneration &+= 1 // invalidate the still-pending timer callback
-        finalize()
+        stopGrace.flush()
     }
 
     /// The stop/finalize sequence proper — unchanged from before the capture
@@ -2598,6 +2869,7 @@ final class AudioRecorder {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.cancelProcessingWatchdog(forToken: sessionHeldToken)
+            guard self.hud.ownsHold(sessionHeldToken) else { return }
             self.hud.hide()
         }
     }
@@ -2634,6 +2906,7 @@ final class AudioRecorder {
                 true,
                 nil
             )
+            guard self.hud.ownsHold(sessionHeldToken) else { return }
             if deadMic {
                 // Routes through the standard failure path: error pill,
                 // failure sound, menu-bar badge.
@@ -2651,6 +2924,14 @@ final class AudioRecorder {
         engineStartToken &+= 1
         engineStartInFlight = false
         guard isSetUp else { return }
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.engineRunning = false
+            hooks.receiveBuffer = nil
+            isSetUp = false
+            return
+        }
+        #endif
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         isSetUp = false
@@ -2686,7 +2967,6 @@ final class AudioRecorder {
         let alpha: Float = rawRMS > smoothedLevel ? 0.6 : 0.3
         smoothedLevel = smoothedLevel + (rawRMS - smoothedLevel) * alpha
         let level = smoothedLevel
-        let maxLevel = maxLevelObserved
         let healthGeneration = micHealthGeneration
         levelLock.unlock()
 
@@ -2704,17 +2984,99 @@ final class AudioRecorder {
                   !self.isStopping,
                   self.isCurrentMicHealthGeneration(healthGeneration)
             else { return }
-            let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? 0
-            if MicHealth.shouldShowNoAudioWarning(
-                elapsed: elapsed,
-                maxRMS: maxLevel,
-                engineRunning: self.engine.isRunning
-            ) {
-                self.hud.showMicrophoneNoAudio(self.lastBoundInputDeviceName)
-            } else if maxLevel >= MicHealth.realRMSThreshold {
-                self.hud.clearMicrophoneNoAudio()
-            }
+            self.micHealthMonitor?.evaluate()
         }
+    }
+
+    private func micInputRoute() -> (defaultID: AudioDeviceID?, boundUID: String?, boundIsHealthy: Bool) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            return (hooks.boundDeviceID, "test-microphone", hooks.boundDeviceID != nil)
+        }
+        #endif
+        let currentDefault = Self.halDefaultInputDeviceID()
+        let boundUID = lastBoundInputDeviceID.map {
+            Self.audioDeviceCFString($0, kAudioDevicePropertyDeviceUID)
+        }
+        let boundIsHealthy = lastBoundInputDeviceID.map {
+            Self.isAudioDeviceAlive($0) && !Self.audioDeviceInputFormatLooksDead($0)
+                && !(excludedInputDeviceUIDsProvider?() ?? []).contains(boundUID ?? "")
+        } ?? false
+        return (currentDefault, boundUID, boundIsHealthy)
+    }
+
+    private var micEngineIsRunning: Bool {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks { return hooks.engineRunning }
+        #endif
+        return engine.isRunning
+    }
+
+    private func micInputFormat() -> AVAudioFormat {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks { return hooks.format }
+        #endif
+        return engine.inputNode.outputFormat(forBus: 0)
+    }
+
+    private func installMicTap(format: AVAudioFormat, receive: @escaping AVAudioNodeTapBlock) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.receiveBuffer = receive
+            return
+        }
+        #endif
+        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format, block: receive)
+    }
+
+    private func scheduleMicHealthCheck(after delay: TimeInterval, action: @escaping () -> Void) {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks {
+            hooks.schedule(delay, action)
+            return
+        }
+        #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
+    }
+
+    private var micHealthNow: Date {
+        #if DEBUG
+        if let hooks = micCaptureTestHooks { return hooks.now() }
+        #endif
+        return Date()
+    }
+
+    private func startMicHealthMonitoring() {
+        let generation = micHealthGeneration
+        micHealthMonitor = MicHealthWarningMonitor(
+            snapshot: { [weak self] in
+                guard let self, self.wantsRecording, !self.isStopping else { return nil }
+                self.levelLock.lock()
+                let isCurrent = generation == self.micHealthGeneration
+                let maxLevel = self.maxLevelObserved
+                self.levelLock.unlock()
+                guard isCurrent else { return nil }
+                return MicHealthWarningMonitor.Snapshot(
+                    elapsed: self.startTime.map { self.micHealthNow.timeIntervalSince($0) } ?? 0,
+                    maxRMS: maxLevel,
+                    engineRunning: self.micEngineIsRunning,
+                    deviceName: self.lastBoundInputDeviceName
+                )
+            },
+            warning: { [weak self] deviceName in
+                #if DEBUG
+                if self?.micCaptureTestHooks != nil { return }
+                #endif
+                if let deviceName {
+                    self?.hud.showMicrophoneNoAudio(deviceName)
+                } else {
+                    self?.hud.clearMicrophoneNoAudio()
+                }
+            },
+            schedule: { [weak self] delay, action in
+                self?.scheduleMicHealthCheck(after: delay, action: action)
+            }
+        )
     }
 
     private func isCurrentMicHealthGeneration(_ generation: UInt64) -> Bool {
@@ -2881,6 +3243,7 @@ final class AudioRecorder {
                         true,
                         nil
                     )
+                    guard self.hud.ownsHold(sessionHeldToken) else { return }
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
@@ -2913,17 +3276,33 @@ final class AudioRecorder {
                 ) { audioURL, retainedURL, cleanup in
                     DispatchQueue.main.async {
                         self.asrSelector.setLastRetainedRecordingURL(retainedURL)
-                        self.asrSelector.transcribeAndLog(
+                        var releasedHUD = false
+                        self.asrSelector.pipeline.transcribeAndLog(
                             audioURL: audioURL,
                             audioIsTemporary: retainedURL == nil,
                             sessionHeldToken: sessionHeldToken,
                             sessionHeldSnapshot: sessionHeldSnapshot,
-                            sessionHeldFrontmostPID: sessionHeldFrontmostPID
+                            sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                            onHoldAbandoned: { [weak self] in
+                                releasedHUD = true
+                                guard let self,
+                                      self.processingWatchdogToken == sessionHeldToken,
+                                      !self.wantsRecording else { return }
+                                self.finishHUDAfterPipeline(
+                                    result: .deduped,
+                                    sessionHeldToken: sessionHeldToken
+                                )
+                            }
                         ) { [weak self] result in
-                            cleanup()
-                            self?.finishHUDAfterPipeline(
+                            guard let self else {
+                                cleanup()
+                                return
+                            }
+                            self.completeFileTranscriptionHandoff(
                                 result: result,
-                                sessionHeldToken: sessionHeldToken
+                                sessionHeldToken: sessionHeldToken,
+                                releasedHUD: releasedHUD,
+                                cleanup: cleanup
                             )
                         }
                     }
@@ -2940,6 +3319,7 @@ final class AudioRecorder {
                         true,
                         nil
                     )
+                    guard self.hud.ownsHold(sessionHeldToken) else { return }
                     self.asrSelector.onFailure?(.audioWriteFailed)
                     self.hud.hide()
                 }
@@ -2949,6 +3329,25 @@ final class AudioRecorder {
 
     // MARK: - Feedback sound
 
+    /// Shared terminal handoff for file-backed transcription. The recovery
+    /// callback releases a HUD only when it still owns presentation; its audio
+    /// cleanup always remains terminal.
+    private func completeFileTranscriptionHandoff(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        sessionHeldToken: UInt64?,
+        releasedHUD: Bool,
+        cleanup: @escaping () -> Void
+    ) {
+        cleanup()
+        if let sessionHeldToken {
+            clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        }
+        // Background recovery must not dismiss a newer hold's HUD.
+        if !releasedHUD {
+            finishHUDAfterPipeline(result: result, sessionHeldToken: sessionHeldToken)
+        }
+    }
+
     /// Inserted → success checkmark. Dedupe → neutral hide (no fake success).
     /// Failed → hide only when still `.processing` (onFailure may already flash).
     /// All terminal results clear the consumed session hold so the next press
@@ -2957,15 +3356,17 @@ final class AudioRecorder {
         result: TranscriptionPipeline.InjectPipelineResult,
         sessionHeldToken: UInt64?
     ) {
-        clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        if let sessionHeldToken {
+            clearConsumedSessionHold(sampledToken: sessionHeldToken)
+        }
         cancelProcessingWatchdog(forToken: sessionHeldToken)
-        switch result {
-        case .inserted:
-            hud.showSuccessThenHide()
-        case .savedToHistory, .deduped, .failed:
-            if hud.isProcessing {
-                hud.hide()
-            }
+        switch RecordingHUD.pipelineCompletionAction(
+            result: result, token: sessionHeldToken, owner: hud.holdToken,
+            isProcessing: hud.isProcessing
+        ) {
+        case .success: hud.showSuccessThenHide()
+        case .hide: hud.hide()
+        case .none: break
         }
     }
 
@@ -2986,12 +3387,20 @@ final class AudioRecorder {
     /// Tink + HUD after the mic is actually capturing. Once per hold so a
     /// real HAL reroute restart does not chirp twice.
     private func announceListeningIfNeeded() {
+        #if DEBUG
+        guard micCaptureTestHooks == nil else { return }
+        #endif
         guard !didAnnounceListeningThisTake else { return }
         didAnnounceListeningThisTake = true
         playFeedbackSound(named: "Tink")
+        let generation = recordingStartGeneration
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, Self.isCurrentStartCallback(
+                generation: generation, currentGeneration: self.recordingStartGeneration
+            ) else { return }
             guard self.wantsRecording else { return }
+            self.hud.claimHold(self.activeHeldCaretToken)
+            self.updateProcessingWatchdog(for: .recordingStarted)
             if let label = self.activationKeyLabelProvider?() {
                 self.hud.setActivationKeyLabel(label)
             }

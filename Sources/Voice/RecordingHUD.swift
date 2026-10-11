@@ -34,6 +34,36 @@ struct HUDTransitionToken: Equatable {
 
 final class RecordingHUD {
 
+    private(set) var holdToken: UInt64?
+
+    /// Ownership changes invalidate flash timers and fade completions from
+    /// the preceding hold before presenting the new hold's state.
+    func claimHold(_ token: UInt64?) {
+        holdToken = token
+        _ = beginTransition()
+    }
+
+    func ownsHold(_ token: UInt64?) -> Bool {
+        Self.holdOwnsPresentation(token: token, owner: holdToken)
+    }
+
+    static func holdOwnsPresentation(token: UInt64?, owner: UInt64?) -> Bool {
+        token == owner
+    }
+
+    enum PipelineCompletionAction { case success, hide, none }
+
+    static func pipelineCompletionAction(
+        result: TranscriptionPipeline.InjectPipelineResult,
+        token: UInt64?, owner: UInt64?, isProcessing: Bool
+    ) -> PipelineCompletionAction {
+        guard holdOwnsPresentation(token: token, owner: owner) else { return .none }
+        switch result {
+        case .inserted: return .success
+        case .savedToHistory, .deduped, .failed: return isProcessing ? .hide : .none
+        }
+    }
+
     enum State: Equatable {
         case listening
         case editingSelection
@@ -83,6 +113,7 @@ final class RecordingHUD {
         return false
     }
 
+    private let presentsWindows: Bool
     private let panel: NSPanel
     private let waveformView: WaveformView
 
@@ -117,7 +148,8 @@ final class RecordingHUD {
     /// Short label for the push-to-talk key chip (e.g. "fn", "⌥").
     private(set) var activationKeyLabel: String = "fn"
 
-    init() {
+    init(presentsWindows: Bool = true) {
+        self.presentsWindows = presentsWindows
         let content = WaveformView(frame: NSRect(origin: .zero, size: NSSize(width: pillWidth, height: pillListeningHeight)))
         self.waveformView = content
 
@@ -190,7 +222,7 @@ final class RecordingHUD {
         applyState(initialState)
         resizePanel(forInterim: false)
         positionOnMainScreen(offsetBelowFinal: 8)
-        panel.orderFrontRegardless()
+        if presentsWindows { panel.orderFrontRegardless() }
         isVisible = true
         notifyLayoutChange()
         waveformView.startAnimating()
@@ -292,7 +324,7 @@ final class RecordingHUD {
         applyState(.error(message))
         panel.ignoresMouseEvents = false
         positionOnMainScreen(offsetBelowFinal: 8)
-        panel.orderFrontRegardless()
+        if presentsWindows { panel.orderFrontRegardless() }
         isVisible = true
         notifyLayoutChange()
         waveformView.startAnimating()
@@ -372,6 +404,11 @@ final class RecordingHUD {
             onHide?()
             return
         }
+        if !presentsWindows {
+            onHide?()
+            finishHide(generation: generation)
+            return
+        }
         AccessibilityAnnouncement.post("Dictation stopped", element: panel)
         // Menu-bar idle immediately. Keep `isVisible` true through the fade so
         // LearnToastHUD does not snap to resting Y while the pill is still on
@@ -410,6 +447,10 @@ final class RecordingHUD {
         return transitionToken.advance()
     }
 
+#if DEBUG
+    func test_fireAutoHideTimer() { pendingHideTimer?.fire() }
+#endif
+
     private func scheduleAutoHide(after interval: TimeInterval, generation: Int) {
         pendingHideTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             guard let self, self.transitionToken.isCurrent(generation) else { return }
@@ -418,7 +459,7 @@ final class RecordingHUD {
     }
 
     private func applyState(_ newState: State) {
-        if currentState != newState || !isVisible {
+        if presentsWindows && (currentState != newState || !isVisible) {
             AccessibilityAnnouncement.post(newState.accessibilityAnnouncement, element: panel)
         }
         currentState = newState

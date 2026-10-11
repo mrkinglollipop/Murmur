@@ -623,7 +623,8 @@ final class SettingsStore: ObservableObject {
 
     init(defaults: UserDefaults = VoiceDefaults.shared, profileDirectory: URL? = nil,
          keychain: KeychainStore = KeychainStore(),
-         apiKeyLookup: ((String) -> String?)? = nil) {
+         apiKeyLookup: ((String) -> String?)? = nil,
+         downloadedLocalModelLookup: () -> Bool = ModelManager.hasAnyDownloadedModel) {
         self.keychain = keychain
         self.defaults = defaults
         self.profileDirectory = profileDirectory
@@ -654,12 +655,14 @@ final class SettingsStore: ObservableObject {
             }
             let hasStoredCloudSelection = defaults.object(forKey: Keys.useCloudEngine) != nil
                 || defaults.string(forKey: Keys.selectedCloudModel) != nil
-            selectedLocalModel = Self.initialLocalModel(
+            let resolvedLocalModel = Self.initialLocalModel(
                 storedRawValue: nil,
                 hasStoredCloudSelection: hasStoredCloudSelection,
                 hasCloudKey: hasCloudKey,
-                hasDownloadedLocalModel: ModelManager.hasAnyDownloadedModel()
+                hasDownloadedLocalModel: downloadedLocalModelLookup()
             )
+            selectedLocalModel = resolvedLocalModel
+            defaults.set(resolvedLocalModel.rawValue, forKey: Keys.selectedLocalModel)
         }
 
         // A previously-stored (or the static `.default`) selection may point

@@ -152,6 +152,9 @@ final class DeepgramTranscriptionService: CloudTranscriptionService {
         guard let transcript = decoded.results.channels.first?.alternatives.first?.transcript else {
             throw CloudTranscriptionError(provider: .deepgram, message: "No transcript in response")
         }
+        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CloudTranscriptionError.emptyTranscript(provider: .deepgram)
+        }
         return transcript
     }
 }
@@ -295,8 +298,15 @@ final class XAITranscriptionService: CloudTranscriptionService {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .xai, body: String(data: data, encoding: .utf8))
         }
-        guard let decoded = try? JSONDecoder().decode(Response.self, from: data), !decoded.text.isEmpty else {
+        return try Self.decodeTranscript(from: data)
+    }
+
+    static func decodeTranscript(from data: Data) throws -> String {
+        guard let decoded = try? JSONDecoder().decode(Response.self, from: data) else {
             throw CloudTranscriptionError(provider: .xai, message: "No transcript in response")
+        }
+        guard !decoded.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CloudTranscriptionError.emptyTranscript(provider: .xai)
         }
         return decoded.text
     }
@@ -341,8 +351,15 @@ final class ElevenLabsTranscriptionService: CloudTranscriptionService {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw CloudTranscriptionError.httpStatus(status, provider: .elevenLabs, body: String(data: data, encoding: .utf8))
         }
-        guard let decoded = try? JSONDecoder().decode(Response.self, from: data), !decoded.text.isEmpty else {
+        return try Self.decodeTranscript(from: data)
+    }
+
+    static func decodeTranscript(from data: Data) throws -> String {
+        guard let decoded = try? JSONDecoder().decode(Response.self, from: data) else {
             throw CloudTranscriptionError(provider: .elevenLabs, message: "No transcript in response")
+        }
+        guard !decoded.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CloudTranscriptionError.emptyTranscript(provider: .elevenLabs)
         }
         return decoded.text
     }
