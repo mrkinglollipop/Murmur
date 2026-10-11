@@ -1,9 +1,111 @@
 import XCTest
 import Foundation
 import AVFoundation
+import ApplicationServices
 @testable import Voice
 
 final class MicHealthTests: XCTestCase {
+
+    private struct CapturedSpeechEngine: ASREngine {
+        let id = "captured-speech-fixture"
+        let displayName = "Captured speech fixture"
+        func transcribe(audioURL: URL) async throws -> String {
+            let file = try AVAudioFile(forReading: audioURL)
+            let audio = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 160))
+            try file.read(into: audio)
+            XCTAssertEqual(audio.frameLength, 160)
+            XCTAssertEqual(audio.floatChannelData![0][159], 0.0001, accuracy: 0.000001)
+            return "Recovered speech."
+        }
+    }
+
+    private final class RecoveryObserver: TextInjectionObserver {
+        var observedUTF16Units = 0
+        var observedPasteChordCount = 0
+        var keycodeZeroKeyDownCount = 0
+        var canaryObservedCount = 0
+        var wentBlind = false
+        func resetObservedCount() { observedUTF16Units = 0 }
+        func resetCanaryCount() { canaryObservedCount = 0 }
+        func stop() {}
+    }
+
+    @MainActor
+    func testTerminalRecoveryHandsCapturedSpeechToDeliveryOrHistoryExactlyOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mic-recovery-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let previous = RecordingRetention.recordingsDirectoryOverride
+        RecordingRetention.recordingsDirectoryOverride = directory
+        defer {
+            RecordingRetention.recordingsDirectoryOverride = previous
+            try? FileManager.default.removeItem(at: directory)
+            TextInjector.resetDedupeStateForTesting()
+        }
+        for bindFailure in [false, true] {
+            for switchedTarget in [false, true] {
+                TextInjector.resetDedupeStateForTesting()
+                let clock = MicHealthTestClock()
+                let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+                let recorder = AudioRecorder(micCaptureTestHooks: hooks)
+                let pipeline = recorder.asrSelector.pipeline
+                pipeline.localEngineProvider = { CapturedSpeechEngine() }
+                let held = CaretContext.Snapshot(value: "", location: 0, selectionLength: .readable(0),
+                    precedingChar: .startOfField, isUnknown: false,
+                    focusedElement: AXUIElementCreateApplication(42))
+                let token = pipeline.test_holdSnapshot(held, frontmostPID: 42)
+                recorder.test_prepareHold(token: token)
+                recorder.test_seedCachedSessionHold(token: token, snapshot: held, pid: 42)
+                let board = NSPasteboard(name: .init("mic-recovery-\(UUID().uuidString)"))
+                defer { board.releaseGlobally() }
+                let observer = RecoveryObserver()
+                var delivered = ""
+                pipeline.deliveryHooks = .init(injector: .init(
+                    pasteboard: board,
+                    target: { .init(secureInput: false, pid: switchedTarget ? 43 : 42, bundleIdentifier: "fixture") },
+                    createObserver: { observer },
+                    postUnicode: { _ in XCTFail("Use real chunk delivery"); return 0 },
+                    postPasteChord: { XCTFail("No paste fallback expected"); return false },
+                    postCanary: { false },
+                    waitForConfirmation: { _, _ in observer.observedUTF16Units },
+                    postUnicodeChunk: { units in
+                        delivered += String(decoding: units, as: UTF16.self)
+                        observer.observedUTF16Units += units.count
+                    }), snapshot: { held })
+                var failures: [DictationFailure] = []
+                recorder.asrSelector.onFailure = { failures.append($0) }
+                var rows = 0
+                let logged = expectation(description: "Captured audio reaches History: bind=\(bindFailure), switched=\(switchedTarget)")
+                pipeline.onTranscriptionLogged = { text, engine, injected, path, failed, _ in
+                    XCTAssertEqual(text, "Recovered speech.")
+                    XCTAssertEqual(engine, "captured-speech-fixture")
+                    XCTAssertEqual(injected, !switchedTarget)
+                    XCTAssertFalse(failed)
+                    XCTAssertNotNil(path)
+                    XCTAssertTrue(path.map { FileManager.default.fileExists(atPath: $0) } ?? false)
+                    rows += 1
+                    logged.fulfill()
+                }
+                recorder.beginMicCaptureForTesting()
+                let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: hooks.format, frameCapacity: 160))
+                buffer.frameLength = 160
+                for frame in 0..<160 { buffer.floatChannelData![0][frame] = 0.0001 }
+                try XCTUnwrap(hooks.receiveBuffer)(buffer, AVAudioTime(sampleTime: 0, atRate: 16_000))
+                clock.advance(to: 0.4)
+                hooks.engineRunning = false
+                if bindFailure { hooks.boundDeviceID = nil }
+                recorder.microphoneConfigurationChangedForTesting()
+                clock.advance(to: 0.8)
+                XCTAssertFalse(recorder.micCaptureStateForTesting.wanted)
+                XCTAssertTrue(recorder.micCaptureStateForTesting.stopping)
+                XCTAssertEqual(failures, [.micDeliveredNoAudio])
+                recorder.stopRecording() // Physical release after terminal failure must not duplicate delivery.
+                await fulfillment(of: [logged], timeout: 3)
+                XCTAssertEqual(rows, 1)
+                XCTAssertEqual(delivered, switchedTarget ? "" : "Recovered speech.")
+                recorder.hud.hide()
+            }
+        }
+    }
 
     @MainActor
     func testRecoveryWithoutReplacementBuffersFailsAndPreservesEarlierSpeech() throws {

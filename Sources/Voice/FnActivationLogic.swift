@@ -37,7 +37,7 @@ struct FnActivationLogic {
 
         if !useToggleLock {
             var effects: [Effect] = []
-            if fnDown && !state.isRecording {
+            if fnDown && !wasPhysicallyDown && !state.isRecording {
                 effects.append(.startRecording)
                 state.isRecording = true
                 state.firstTapAnchor = nil
