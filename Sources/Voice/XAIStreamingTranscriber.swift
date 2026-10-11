@@ -131,9 +131,11 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private var confirmedText: String = ""
     /// Most recent (not-yet-final) interim text, for `onInterim`'s running preview.
     private var latestInterim: String = ""
+    private var latestInterimWords: [TranscriptWord] = []
+    private var confirmedSegments: [AudioSegment] = []
     /// True once any non-empty interim/confirmed text arrived this session.
     private var everHadNonEmptyStreamText = false
-    /// Words committed by timestamp filter — used for boundary dedup only, not text rebuild.
+    /// Word provenance retained alongside the original punctuated segment text.
     private var committedWords: [TranscriptWord] = []
     /// Latest `end` time among committed words (seconds).
     private var lastCommittedEnd: Double = 0
@@ -535,6 +537,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     private func resetTranscriptState() {
         confirmedText = ""
         latestInterim = ""
+        latestInterimWords = []
+        confirmedSegments = []
         everHadNonEmptyStreamText = false
         committedWords = []
         lastCommittedEnd = 0
@@ -663,12 +667,12 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             stateLock.lock()
             if !partialText.isEmpty {
                 latestInterim = partialText
+                latestInterimWords = words
                 everHadNonEmptyStreamText = true
                 if isFinal {
                     ingestFinalSegment(text: partialText, words: words, speechFinal: speechFinal)
-                    if confirmedText.localizedCaseInsensitiveContains(partialText) {
-                        latestInterim = ""
-                    }
+                    latestInterim = ""
+                    latestInterimWords = []
                 }
             }
             let running = mergeConfirmedWithInterim()
@@ -689,11 +693,12 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             // must not clobber earlier chunk finals.
             let doneText = (json["text"] as? String) ?? ""
             stateLock.lock()
-            let resolved = bestResolvedTranscript(doneText: doneText)
+            let resolved = bestResolvedTranscript(doneText: doneText, words: Self.parseWords(from: json))
             confirmedText = resolved
             // Resolution already incorporated or superseded the interim. A
             // waiter installed after done must see the same resolved text.
             latestInterim = ""
+            latestInterimWords = []
             if !resolved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 everHadNonEmptyStreamText = true
             }
@@ -755,24 +760,30 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         if confirmedText.isEmpty { return latestInterim }
         if latestInterim.isEmpty { return confirmedText }
 
-        let confirmed = confirmedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let interim = latestInterim.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if interim.caseInsensitiveCompare(confirmed) == .orderedSame { return confirmedText }
-        if interim.hasPrefix(confirmed) { return latestInterim }
-        if confirmed.hasPrefix(interim) { return confirmedText }
-        if confirmed.localizedCaseInsensitiveContains(interim) { return confirmedText }
-        if let merged = Self.stitchWithWordOverlap(confirmed, interim),
-           merged.count > confirmed.count {
-            return merged
-        }
-
-        return Self.dedupeStitchArtifacts(Self.mergeStreamingSegment(left: confirmed, right: interim))
+        return Self.mergeSegmentIntoConfirmed(
+            confirmed: confirmedText, text: latestInterim,
+            incomingWords: latestInterimWords, committedWords: committedWords,
+            lastCommittedEnd: lastCommittedEnd, segments: confirmedSegments
+        ).confirmedText
     }
 
     /// Picks the best final transcript between client-stitched text and a
     /// `transcript.done` payload. Must be called with `stateLock` held.
-    private func bestResolvedTranscript(doneText: String) -> String {
+    private func bestResolvedTranscript(doneText: String, words: [TranscriptWord]) -> String {
+        if !words.isEmpty, !doneText.isEmpty {
+            let timedSnapshot = latestInterimWords.isEmpty ? confirmedSegments : Self.mergeSegmentIntoConfirmed(
+                confirmed: confirmedText, text: latestInterim, incomingWords: latestInterimWords,
+                committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
+                segments: confirmedSegments
+            ).segments
+            return Self.mergeSegmentIntoConfirmed(
+                confirmed: confirmedText, text: doneText, incomingWords: words,
+                committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
+                segments: timedSnapshot
+            ).confirmedText
+        }
+        if !doneText.isEmpty, confirmedText.isEmpty
+            || (doneText.hasPrefix(confirmedText) && doneText.count > confirmedText.count) { return doneText }
         let stitched = mergeConfirmedWithInterim()
         let stitchedTrimmed = stitched.trimmingCharacters(in: .whitespacesAndNewlines)
         let doneTrimmed = doneText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -791,34 +802,20 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             vlog("xai-stream: word timestamp sample starts=[\(starts)] lastCommittedEnd=\(String(format: "%.2f", lastCommittedEnd))")
         }
 
-        if speechFinal, !confirmedText.isEmpty {
-            let confirmedLower = confirmedText.lowercased()
-            let incomingLower = trimmed.lowercased()
-            if incomingLower.contains(confirmedLower), trimmed.count >= confirmedText.count {
-                confirmedText = trimmed
-                if !words.isEmpty {
-                    committedWords = words
-                    lastCommittedEnd = words.last?.end ?? lastCommittedEnd
-                }
-                latestInterim = ""
-                return
-            }
-        }
-
         let merged = Self.mergeSegmentIntoConfirmed(
             confirmed: confirmedText,
             text: trimmed,
             incomingWords: words,
             committedWords: committedWords,
-            lastCommittedEnd: lastCommittedEnd
+            lastCommittedEnd: lastCommittedEnd,
+            segments: confirmedSegments
         )
         confirmedText = merged.confirmedText
         committedWords = merged.committedWords
         lastCommittedEnd = merged.lastCommittedEnd
-        confirmedText = Self.dedupeStitchArtifacts(confirmedText)
-        if speechFinal {
-            latestInterim = ""
-        }
+        confirmedSegments = merged.segments
+        latestInterim = ""
+        latestInterimWords = []
     }
 
     // MARK: - Stitch / dedupe (static, @testable)
@@ -829,7 +826,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         for dict in raw {
             guard let text = dict["text"] as? String else { continue }
             guard let start = parseJSONDouble(dict["start"]),
-                  let end = parseJSONDouble(dict["end"]) else { continue }
+                  let end = parseJSONDouble(dict["end"]),
+                  start.isFinite, end.isFinite, start >= 0, end > start else { continue }
             result.append(TranscriptWord(text: text, start: start, end: end))
         }
         return result
@@ -842,63 +840,93 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         return nil
     }
 
+    struct AudioSegment {
+        let text: String
+        let words: [TranscriptWord]
+
+        var interval: Range<Double>? {
+            guard !words.isEmpty,
+                  words.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end > $0.start }),
+                  let start = words.map(\.start).min(), let end = words.map(\.end).max() else { return nil }
+            return start..<end
+        }
+
+        /// Preserve the original punctuation outside the revised audio.
+        /// Replacement requires word-to-text alignment; a malformed
+        /// payload must not authorize deleting an unrelated passage.
+        func outside(_ incoming: Range<Double>) -> (before: AudioSegment?, after: AudioSegment?)? {
+            guard interval != nil else { return nil }
+            let overlapping = words.indices.filter {
+                words[$0].start < incoming.upperBound && words[$0].end > incoming.lowerBound
+            }
+            guard let first = overlapping.first, let last = overlapping.last else { return nil }
+            let expression = try! NSRegularExpression(pattern: #"\S+"#)
+            let ranges = expression.matches(in: text, range: NSRange(text.startIndex..., in: text))
+                .compactMap { Range($0.range, in: text) }
+            let tokens = ranges.flatMap { range in
+                XAIStreamingTranscriber.normalizedEquivalenceTokens(String(text[range])).map { ($0, range) }
+            }
+            var cursor = 0
+            var wordRanges: [Range<String.Index>] = []
+            for word in words {
+                let expected = XAIStreamingTranscriber.normalizedEquivalenceTokens(word.text)
+                guard !expected.isEmpty, cursor + expected.count <= tokens.count,
+                      Array(tokens[cursor..<(cursor + expected.count)].map { $0.0 }) == expected else { return nil }
+                wordRanges.append(tokens[cursor].1.lowerBound..<tokens[cursor + expected.count - 1].1.upperBound)
+                cursor += expected.count
+            }
+            guard cursor == tokens.count else { return nil }
+            if first > 0, wordRanges[first - 1].upperBound > wordRanges[first].lowerBound { return nil }
+            if last + 1 < words.count, wordRanges[last].upperBound > wordRanges[last + 1].lowerBound { return nil }
+            let before: AudioSegment? = first == 0 ? nil : AudioSegment(
+                text: String(text[..<wordRanges[first].lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines),
+                words: Array(words[..<first]))
+            let after: AudioSegment? = last + 1 == words.count ? nil : AudioSegment(
+                text: String(text[wordRanges[last + 1].lowerBound...]),
+                words: Array(words[(last + 1)...]))
+            return (before, after)
+        }
+    }
+
     static func mergeSegmentIntoConfirmed(
         confirmed: String,
         text incomingText: String,
         incomingWords: [TranscriptWord],
         committedWords: [TranscriptWord],
-        lastCommittedEnd: Double
-    ) -> (confirmedText: String, committedWords: [TranscriptWord], lastCommittedEnd: Double) {
-        var confirmedText = confirmed
-        var wordsOut = committedWords
-        var endOut = lastCommittedEnd
-
-        guard !incomingText.isEmpty else {
-            return (confirmedText, wordsOut, endOut)
-        }
-
-        if confirmedText.isEmpty {
-            return (incomingText, incomingWords, incomingWords.last?.end ?? 0)
-        }
-
-        if incomingText.hasPrefix(confirmedText) {
-            confirmedText = incomingText
-            if !incomingWords.isEmpty {
-                wordsOut = incomingWords
-                endOut = incomingWords.last?.end ?? endOut
-            }
-            return (confirmedText, wordsOut, endOut)
-        }
-
-        if confirmedText.hasPrefix(incomingText) {
-            return (confirmedText, wordsOut, endOut)
-        }
-
-        if confirmedText.count > 0,
-           incomingText.range(of: confirmedText, options: [.caseInsensitive]) != nil,
-           incomingText.count >= confirmedText.count {
-            confirmedText = incomingText
-            if !incomingWords.isEmpty {
-                wordsOut = incomingWords
-                endOut = incomingWords.last?.end ?? endOut
-            }
-            return (confirmedText, wordsOut, endOut)
-        }
-
-        if !incomingWords.isEmpty {
-            let tolerance = 0.15
-            let newWords = incomingWords.filter {
-                endOut > 0 ? $0.start >= endOut : $0.start >= -tolerance
-            }
-            if !newWords.isEmpty {
-                wordsOut.append(contentsOf: newWords)
-                endOut = max(endOut, newWords.map(\.end).max() ?? endOut)
+        lastCommittedEnd: Double,
+        segments: [AudioSegment]? = nil
+    ) -> (confirmedText: String, committedWords: [TranscriptWord], lastCommittedEnd: Double, segments: [AudioSegment]) {
+        var current = segments ?? (confirmed.isEmpty ? [] : [AudioSegment(text: confirmed, words: committedWords)])
+        let incoming = AudioSegment(text: incomingText.trimmingCharacters(in: .whitespacesAndNewlines), words: incomingWords)
+        if !incoming.text.isEmpty {
+            if let interval = incoming.interval {
+                var replaced: [AudioSegment] = []
+                var inserted = false
+                for segment in current {
+                    if let oldInterval = segment.interval, oldInterval.overlaps(interval),
+                       let outside = segment.outside(interval) {
+                        if let before = outside.before { replaced.append(before) }
+                        if !inserted { replaced.append(incoming); inserted = true }
+                        if let after = outside.after { replaced.append(after) }
+                    } else {
+                        if !inserted, let oldInterval = segment.interval, oldInterval.lowerBound >= interval.upperBound {
+                            replaced.append(incoming)
+                            inserted = true
+                        }
+                        replaced.append(segment)
+                    }
+                }
+                if !inserted { replaced.append(incoming) }
+                current = replaced
+            } else if let last = current.last, last.interval == nil {
+                current[current.count - 1] = AudioSegment(
+                    text: mergeStreamingSegment(left: last.text, right: incoming.text), words: [])
+            } else {
+                current.append(incoming)
             }
         }
-
-        confirmedText = mergeStreamingSegment(left: confirmedText, right: incomingText)
-        confirmedText = dedupeStitchArtifacts(confirmedText)
-        return (confirmedText, wordsOut, endOut)
+        let words = current.flatMap(\.words)
+        return (current.map(\.text).joined(separator: " "), words, words.map(\.end).max() ?? lastCommittedEnd, current)
     }
 
     static func mergeStreamingSegment(left: String, right: String) -> String {
@@ -907,38 +935,21 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         guard !rightTrim.isEmpty else { return leftTrim }
         guard !leftTrim.isEmpty else { return rightTrim }
 
-        let leftTokens = normalizedEquivalenceTokens(leftTrim)
-        let rightTokens = normalizedEquivalenceTokens(rightTrim)
-
-        // Same word sequence, different surface form (punctuation / ITN) → ASR
-        // refinement of one segment, not an intentional verbatim repeat.
-        if leftTokens == rightTokens {
-            if leftTrim.caseInsensitiveCompare(rightTrim) == .orderedSame {
-                return leftTrim + (leftTrim.hasSuffix(" ") ? "" : " ") + rightTrim
-            }
-            return rightTrim
+        // With no audio evidence, a completed sentence is never a replaceable
+        // prefix. Only unfinished fragments can use the legacy chunk overlap.
+        if leftTrim.contains(where: { ".!?".contains($0) }) {
+            return leftTrim + " " + rightTrim
         }
-
-        if let window = nearDuplicateTailWindow(in: leftTrim, right: rightTrim) {
-            return dedupeStitchArtifacts(replaceTailWindow(in: leftTrim, dropWordCount: window, with: rightTrim))
-        }
-
-        if let merged = stitchWithWordOverlap(leftTrim, rightTrim),
-           merged.count > leftTrim.count {
-            if let window = nearDuplicateTailWindow(in: merged, right: rightTrim) {
-                return dedupeStitchArtifacts(replaceTailWindow(in: merged, dropWordCount: window, with: rightTrim))
-            }
-            return dedupeStitchArtifacts(merged)
-        }
-
-        let appended = leftTrim + (leftTrim.hasSuffix(" ") ? "" : " ") + rightTrim
-        return dedupeStitchArtifacts(appended)
+        if rightTrim.range(of: leftTrim, options: [.caseInsensitive]) != nil { return rightTrim }
+        if let merged = stitchWithWordOverlap(leftTrim, rightTrim) { return merged }
+        return leftTrim + " " + rightTrim
     }
 
     /// Words at the end of `left` to drop when `right` is an ASR refinement of
     /// that trailing passage. Prefers a window close to `right`'s length so
     /// partial 6-word prefix matches do not leave duplicated phrase heads.
-    static func nearDuplicateTailWindow(in left: String, right: String) -> Int? {
+    static func nearDuplicateTailWindow(in left: String, right: String, overlappingAudio: Bool = false) -> Int? {
+        guard overlappingAudio else { return nil }
         let rightWords = normalizedTokens(right)
         let rightEquiv = normalizedEquivalenceTokens(right)
         guard rightWords.count >= 5 else { return nil }
@@ -1005,8 +1016,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     static func shouldCollapseNearDuplicateSentencePair(
         earlier: String,
         later: String,
-        allowOverlapPath: Bool = true
+        allowOverlapPath: Bool = true,
+        overlappingAudio: Bool = false
     ) -> Bool {
+        guard overlappingAudio else { return false }
         if earlier.caseInsensitiveCompare(later) == .orderedSame { return false }
 
         if isExtensionNearDuplicate(earlier: earlier, later: later) {
@@ -1095,43 +1108,8 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     static func collapseNearDuplicateWordTail(_ text: String) -> String {
-        var words = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        guard words.count >= 12 else { return text }
-
-        var changed = true
-        while changed {
-            changed = false
-            let maxWindow = min(40, words.count / 2)
-            guard maxWindow >= 6 else { break }
-
-            for window in stride(from: maxWindow, through: 6, by: -1) {
-                guard words.count >= window * 2 else { continue }
-                let tail = Array(words.suffix(window))
-                let prev = Array(words.dropLast(window).suffix(window))
-                let tailStr = tail.joined(separator: " ")
-                let prevStr = prev.joined(separator: " ")
-                let prevNorm = normalizedEquivalenceTokens(prevStr)
-                let tailNorm = normalizedEquivalenceTokens(tailStr)
-
-                if prevNorm == tailNorm {
-                    if prevStr.caseInsensitiveCompare(tailStr) != .orderedSame {
-                        words = Array(words.dropLast(window * 2)) + tail
-                        changed = true
-                        break
-                    }
-                    continue
-                }
-
-                guard wordOverlapRatio(prevStr, tailStr) >= 0.85 else { continue }
-
-                guard isKnownSpellingRefinement(earlier: prevStr, later: tailStr) else { continue }
-
-                words = Array(words.dropLast(window * 2)) + tail
-                changed = true
-                break
-            }
-        }
-        return words.joined(separator: " ")
+        // A text-only caller cannot establish that repeated words share audio.
+        return text
     }
 
     static func splitSentences(_ text: String) -> [String] {
@@ -1194,26 +1172,18 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     }
 
     static func resolveFinalTranscript(stitched: String, done: String) -> String {
-        let stitchedCollapsed = collapseNearDuplicateTail(stitched)
-
-        if done.isEmpty { return stitchedCollapsed }
-        if stitched.isEmpty { return done }
-        if done.caseInsensitiveCompare(stitched) == .orderedSame { return stitched }
-
-        // Segment-local `transcript.done` payloads are often shorter than the
-        // client stitch — never clobber a longer accumulated transcript.
-        if done.count < stitchedCollapsed.count { return stitchedCollapsed }
-
-        if hasNearDuplicateTailSentence(stitched) { return done }
-        if done.count >= stitchedCollapsed.count { return done }
-        return stitchedCollapsed
+        let accumulated = stitched.trimmingCharacters(in: .whitespacesAndNewlines)
+        let final = done.trimmingCharacters(in: .whitespacesAndNewlines)
+        if accumulated.isEmpty { return final }
+        // An untimed done can extend the known transcript, but its length or
+        // similarity cannot establish permission to replace confirmed speech.
+        if final.hasPrefix(accumulated) { return final }
+        return accumulated
     }
 
     static func postProcessTranscript(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        var current = dedupeStitchArtifacts(trimmed)
-        current = collapseNearDuplicateWordTail(current)
-        return dedupeRepeatedContent(current)
+        // Replacement happens during ingestion, while audio provenance exists.
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Joins `left` and `right` when they share trailing/leading words

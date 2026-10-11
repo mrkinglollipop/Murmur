@@ -5,13 +5,165 @@
       "type": "final",
       "text": "The lantern should be the default. Lantern, not lantern with ribbons, unless I missed something.",
       "speechFinal": false,
-      "words": []
+      "words": [
+        {
+          "text": "The",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "lantern",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "should",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "be",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "the",
+          "start": 1.2,
+          "end": 1.5
+        },
+        {
+          "text": "default.",
+          "start": 1.5,
+          "end": 1.8
+        },
+        {
+          "text": "Lantern,",
+          "start": 1.8,
+          "end": 2.1
+        },
+        {
+          "text": "not",
+          "start": 2.1,
+          "end": 2.4
+        },
+        {
+          "text": "lantern",
+          "start": 2.4,
+          "end": 2.7
+        },
+        {
+          "text": "with",
+          "start": 2.7,
+          "end": 3.0
+        },
+        {
+          "text": "ribbons,",
+          "start": 3.0,
+          "end": 3.3
+        },
+        {
+          "text": "unless",
+          "start": 3.3,
+          "end": 3.6
+        },
+        {
+          "text": "I",
+          "start": 3.6,
+          "end": 3.9
+        },
+        {
+          "text": "missed",
+          "start": 3.9,
+          "end": 4.2
+        },
+        {
+          "text": "something.",
+          "start": 4.2,
+          "end": 4.5
+        }
+      ]
     },
     {
       "type": "final",
       "text": "The lantern should be the default lantern, not lantern with ribbons, unless I missed something.",
       "speechFinal": true,
-      "words": []
+      "words": [
+        {
+          "text": "The",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "lantern",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "should",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "be",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "the",
+          "start": 1.2,
+          "end": 1.5
+        },
+        {
+          "text": "default",
+          "start": 1.5,
+          "end": 1.8
+        },
+        {
+          "text": "lantern,",
+          "start": 1.8,
+          "end": 2.1
+        },
+        {
+          "text": "not",
+          "start": 2.1,
+          "end": 2.4
+        },
+        {
+          "text": "lantern",
+          "start": 2.4,
+          "end": 2.7
+        },
+        {
+          "text": "with",
+          "start": 2.7,
+          "end": 3.0
+        },
+        {
+          "text": "ribbons,",
+          "start": 3.0,
+          "end": 3.3
+        },
+        {
+          "text": "unless",
+          "start": 3.3,
+          "end": 3.6
+        },
+        {
+          "text": "I",
+          "start": 3.6,
+          "end": 3.9
+        },
+        {
+          "text": "missed",
+          "start": 3.9,
+          "end": 4.2
+        },
+        {
+          "text": "something.",
+          "start": 4.2,
+          "end": 4.5
+        }
+      ]
     }
   ],
   "expected": "The lantern should be the default lantern, not lantern with ribbons, unless I missed something."

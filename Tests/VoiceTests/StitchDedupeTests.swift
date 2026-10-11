@@ -3,6 +3,127 @@ import XCTest
 
 final class StitchDedupeTests: XCTestCase {
 
+    func testCompletePrefixSentenceSurvivesPostprocessing() {
+        let text = "I will send the report. I will send the report only after approval."
+        XCTAssertEqual(XAIStreamingTranscriber.postProcessTranscript(text), text)
+    }
+
+    func testCompletePrefixSentenceSurvivesFinalDeliveryWithoutTimestamps() async throws {
+        let first = "I will send the report."
+        let second = "I will send the report only after approval."
+        let result = try await replayFinals([(first, nil), (second, nil)], done: second)
+        XCTAssertEqual(result, first + " " + second)
+    }
+
+    func testSameAudioSpellingRefinementSurvivesFinalDelivery() async throws {
+        let original = "Please use Fireclaw for all my searches."
+        let corrected = "Please use FireCrawl for all my searches."
+        let result = try await replayFinals([(original, 0), (corrected, 0)], done: corrected)
+        XCTAssertEqual(result, corrected)
+    }
+
+    func testDisjointAudioKeepsRepeatedAndExtendedSentences() async throws {
+        for (first, second) in [
+            ("I will send the report.", "I will send the report only after approval."),
+            ("Please use Fireclaw for all my searches.", "Please use FireCrawl for all my searches."),
+            ("Please send all the reports today", "Please send all the reports today"),
+            ("Please send all the reports today.", "Please send all the reports today!"),
+            ("Please send all the reports today.", "Please send all the reports today.")
+        ] {
+            let result = try await replayFinals([(first, 0), (second, 10)], done: second)
+            XCTAssertEqual(result, first + " " + second)
+        }
+    }
+
+    func testSameAudioTailRefinementPreservesEarlierAndLaterAudio() async throws {
+        let prefix = "The first sentence stays."
+        let original = "Please use Fireclaw for all my searches."
+        let corrected = "Please use FireCrawl for all my searches."
+        let trailer = "Call Alice tomorrow."
+        let result = try await replayFinals(
+            [(prefix, 0), (original, 4), (trailer, 8), (corrected, 4)], done: corrected)
+        XCTAssertEqual(result, prefix + " " + corrected + " " + trailer)
+    }
+
+    func testTouchingAudioIntervalsAreDisjoint() async throws {
+        let sentence = "Please send all the reports today."
+        let result = try await replayFinals([(sentence, 0), (sentence, 1.8)], done: sentence)
+        XCTAssertEqual(result, sentence + " " + sentence)
+    }
+
+    func testUntimedDoneCannotReplaceConfirmedSentenceByLength() async throws {
+        let sentence = "Send the report."
+        let result = try await replayFinals([(sentence, nil)], done: "Do not send the report tomorrow.")
+        XCTAssertEqual(result, sentence)
+    }
+
+    func testUntimedFinalReplacesItsOwnInterim() async {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Send the report.","is_final":true}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Alex.","is_final":false}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Alice.","is_final":true}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":""}"#)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "Send the report. Call Alice.")
+    }
+
+    func testTimestampedDoneRefinesTheSameAudio() async {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Fireclaw.","is_final":true,"words":[{"text":"Fireclaw","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":"FireCrawl.","words":[{"text":"FireCrawl","start":0,"end":1}]}"#)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "FireCrawl.")
+    }
+
+    func testTimestampedInterimFromDisjointAudioIsKept() async {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Yes.","is_final":true,"words":[{"text":"Yes","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Yes.","is_final":false,"words":[{"text":"Yes","start":1,"end":2}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":""}"#)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "Yes. Yes.")
+    }
+
+    func testIncompleteWordMetadataCannotDeleteUntimedText() async {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Keep this sentence. Fireclaw.","is_final":true,"words":[{"text":"Fireclaw","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"FireCrawl.","is_final":true,"words":[{"text":"FireCrawl","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":"FireCrawl."}"#)
+        let result = await session.finalize()
+        // Unaligned metadata cannot authorize deleting the untimed prefix.
+        XCTAssertEqual(result, "Keep this sentence. Fireclaw. FireCrawl.")
+    }
+
+    func testTimestampedDonePreservesLaterInterimAudio() async {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Yes.","is_final":true,"words":[{"text":"Yes","start":0,"end":1}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Alice.","is_final":false,"words":[{"text":"Call","start":1,"end":1.5},{"text":"Alice","start":1.5,"end":2}]}"#)
+        session.handleServerEvent(#"{"type":"transcript.done","text":"Yes.","words":[{"text":"Yes","start":0,"end":1}]}"#)
+        let result = await session.finalize()
+        XCTAssertEqual(result, "Yes. Call Alice.")
+    }
+
+    private func replayFinals(_ segments: [(String, Double?)], done: String) async throws -> String {
+        let session = XAIStreamingTranscriber(apiKey: "unused", messageSender: { _ in })
+        for (index, segment) in segments.enumerated() {
+            var event: [String: Any] = [
+                "type": "transcript.partial", "text": segment.0,
+                "is_final": true, "speech_final": index == segments.count - 1
+            ]
+            if let start = segment.1 {
+                event["words"] = segment.0.split(separator: " ").enumerated().map { offset, word in
+                    ["text": String(word), "start": start + Double(offset) * 0.3,
+                     "end": start + Double(offset + 1) * 0.3] as [String: Any]
+                }
+            }
+            let data = try JSONSerialization.data(withJSONObject: event)
+            session.handleServerEvent(String(decoding: data, as: UTF8.self))
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["type": "transcript.done", "text": done])
+        session.handleServerEvent(String(decoding: data, as: UTF8.self))
+        return await session.finalize()
+    }
+
     func testPostProcessPreservesNearbyWordsWithDifferentMeanings() {
         for (earlier, later) in [
             ("The dose should increase again this morning.", "The dose should decrease again this morning."),
@@ -199,30 +320,30 @@ final class StitchDedupeTests: XCTestCase {
         XCTAssertTrue(merged.hasPrefix(prefix))
     }
 
-    func testMattProjectLollipopGolden() {
+    func testUntimedPunctuationRefinementPreservesBothSentences() {
         let chunk1 =
             "The project should be the default. Project, not project with lollipop, unless I'm missing something."
         let chunk2 =
             "The project should be the default project, not project with lollipop, unless I'm missing something."
         let merged = XAIStreamingTranscriber.mergeStreamingSegment(left: chunk1, right: chunk2)
-        XCTAssertEqual(merged, chunk2)
+        XCTAssertEqual(merged, chunk1 + " " + chunk2)
 
         let duplicated = chunk1 + " " + chunk2
         let cleaned = XAIStreamingTranscriber.postProcessTranscript(duplicated)
-        XCTAssertEqual(cleaned, chunk2)
+        XCTAssertEqual(cleaned, duplicated)
     }
 
-    func testMattAlwaysOnRuleThinkFirstGolden() {
+    func testUntimedHyphenRefinementPreservesBothSentences() {
         let chunk1 =
             "How did the always-on rule think first help during this conversation?"
         let chunk2 =
             "How did the \"always on rule think first\" help during this conversation?"
         let merged = XAIStreamingTranscriber.mergeStreamingSegment(left: chunk1, right: chunk2)
-        XCTAssertEqual(merged, chunk2)
+        XCTAssertEqual(merged, chunk1 + " " + chunk2)
 
         let duplicated = chunk1 + " " + chunk2
         let cleaned = XAIStreamingTranscriber.postProcessTranscript(duplicated)
-        XCTAssertEqual(cleaned, chunk2)
+        XCTAssertEqual(cleaned, duplicated)
     }
 
     func testPostProcessPreservesDistinctHyphenatedSentences() {
@@ -281,9 +402,9 @@ final class StitchDedupeTests: XCTestCase {
     private static let mattADETrailer =
         "An ADE though, not an IDE."
 
-    func testMattCursorFromItGoldenCollapsesWithADETrailer() {
+    func testUntimedExtensionWithTrailerPreservesAllSentences() {
         let stitched = Self.mattCursorEarlier + " " + Self.mattCursorRefined + " " + Self.mattADETrailer
-        let expected = Self.mattCursorRefined + " " + Self.mattADETrailer
+        let expected = stitched
         XCTAssertEqual(XAIStreamingTranscriber.dedupeStitchArtifacts(stitched), expected)
         XCTAssertEqual(XAIStreamingTranscriber.postProcessTranscript(stitched), expected)
     }
@@ -293,13 +414,13 @@ final class StitchDedupeTests: XCTestCase {
             left: Self.mattCursorEarlier,
             right: Self.mattCursorRefined
         )
-        XCTAssertEqual(merged, Self.mattCursorRefined)
+        XCTAssertEqual(merged, Self.mattCursorEarlier + " " + Self.mattCursorRefined)
     }
 
-    func testCollapseNearDuplicateTailScansMidListWithTrailingShortSentence() {
+    func testUntimedMiddleSentenceIsNotDeleted() {
         let stitched = Self.mattCursorEarlier + " " + Self.mattCursorRefined + " " + Self.mattADETrailer
         let collapsed = XAIStreamingTranscriber.collapseNearDuplicateTail(stitched)
-        XCTAssertEqual(collapsed, Self.mattCursorRefined + " " + Self.mattADETrailer)
+        XCTAssertEqual(collapsed, stitched)
     }
 
     func testExtensionNearDuplicatePreservesIntentionalIdenticalRepeat() {
@@ -357,15 +478,15 @@ final class StitchDedupeTests: XCTestCase {
     private static let mattConnectCursorStub = "How do I connect Cursor?"
     private static let mattConnectCursorNotion = "How do I connect Cursor into Notion?"
 
-    func testMattConnectCursorIntoNotionGolden() {
+    func testUntimedShortClauseExtensionPreservesBothSentences() {
         let stitched = Self.mattConnectCursorStub + " " + Self.mattConnectCursorNotion
         XCTAssertEqual(
             XAIStreamingTranscriber.dedupeStitchArtifacts(stitched),
-            Self.mattConnectCursorNotion
+            stitched
         )
         XCTAssertEqual(
             XAIStreamingTranscriber.postProcessTranscript(stitched),
-            Self.mattConnectCursorNotion
+            stitched
         )
     }
 
@@ -374,7 +495,7 @@ final class StitchDedupeTests: XCTestCase {
             left: Self.mattConnectCursorStub,
             right: Self.mattConnectCursorNotion
         )
-        XCTAssertEqual(merged, Self.mattConnectCursorNotion)
+        XCTAssertEqual(merged, Self.mattConnectCursorStub + " " + Self.mattConnectCursorNotion)
     }
 
     func testShortClauseExtensionRequiresFiveTokenPrefix() {
@@ -407,8 +528,7 @@ final class StitchDedupeTests: XCTestCase {
     }
 
     func testMidHoldUnpunctuatedFiveTokenSuffixExtension() {
-        // No sentence boundary — collapseNearDuplicateTail cannot help; merge
-        // must replace the 5-token trailing stub via nearDuplicateTailWindow.
+        // Unfinished fragments retain exact suffix/prefix chunk stitching.
         let left = "I'm wondering about setup How do I connect Cursor"
         let right = "How do I connect Cursor into Notion"
         let merged = XAIStreamingTranscriber.mergeStreamingSegment(left: left, right: right)

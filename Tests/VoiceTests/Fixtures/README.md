@@ -26,3 +26,8 @@ tail cases in `StitchDedupeTests`, with wholly invented wording.
 If a previously fixed regression disagrees with ingestion, document it and
 mark that fixture with a named `XCTSkip` in the harness; do not change the stitch
 algorithm or weaken its expected result to make this infrastructure pass.
+
+Round 2 text safety: replacement fixtures include overlapping word timestamps;
+their expected corrected text is unchanged. Untimed and disjoint-prefix fixtures
+preserve both completed sentences. Text-only unit goldens now preserve sentences;
+these timestamped replays retain coverage for actual same-audio refinements.
