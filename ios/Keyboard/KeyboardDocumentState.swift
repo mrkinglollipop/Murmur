@@ -296,7 +296,9 @@ extension KeyboardEditing {
             recordEditDiagnostic("keyboard.autocorrect.abortedDelete", detail: "wanted=\(allowed)")
             return
         }
-        insertPlain(replacement.insert)
+        for character in replacement.insert {
+            guard insertPlain(String(character)) else { return }
+        }
         autocorrect.noteAutocorrect(original: span, corrected: replacement.insert)
     }
 
@@ -347,7 +349,9 @@ extension KeyboardEditing {
         } else {
             inserted = chosen + trailing
         }
-        insertPlain(inserted)
+        for character in inserted {
+            guard insertPlain(String(character)) else { return }
+        }
         if swipeCommittedWord != nil {
             swipeCommittedWord = inserted
             var remaining = choices.filter { $0.lowercased() != chosen.lowercased() }
@@ -496,6 +500,9 @@ extension KeyboardEditing {
     /// context. Diagnostics never block or undo a user-authorized deletion.
     func deleteBackwardCheckingHostDrop() {
         let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        // A moved caret must not turn an unrelated typed suffix into permission
+        // to automatically edit the fresh bulk region after this Backspace.
+        if !before.hasSuffix(textAfterBulkInsert) { textAfterBulkInsert = "" }
         textDocumentProxy.deleteBackward()
         let after = textDocumentProxy.documentContextBeforeInput ?? ""
         if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count)

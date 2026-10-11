@@ -3,6 +3,65 @@ import UIKit
 
 @MainActor
 final class KeyboardEditingRegressionTests: XCTestCase {
+    func testBackspaceAtMovedCaretCannotAuthorizeCorrectionInsideDictation() {
+        let keyboard = TestKeyboard()
+        keyboard.insertDictationText("tehy ")
+        keyboard.type("tehx")
+        XCTAssertEqual(keyboard.textAfterBulkInsert, "tehx")
+        keyboard.proxy.caret = 4
+
+        keyboard.deleteFromKeyboard()
+
+        XCTAssertEqual(keyboard.proxy.text, "teh tehx")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, 1)
+        XCTAssertEqual(keyboard.textAfterBulkInsert, "")
+        keyboard.type(" ")
+        XCTAssertEqual(keyboard.proxy.text, "teh  tehx")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, 1)
+    }
+
+    func testOrdinaryAutocorrectionCanBeUndoneOnClumpingHost() throws {
+        let keyboard = TestKeyboard()
+        keyboard.proxy.clumpsBulkInserts = true
+        keyboard.type("teh ")
+        XCTAssertEqual(keyboard.proxy.text, "the ")
+
+        try keyboard.choose("teh")
+
+        XCTAssertEqual(keyboard.proxy.text, "teh ")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, 7)
+        XCTAssertNil(keyboard.recentBulkInsertText())
+    }
+
+    func testBackspaceWithinTypedSuffixPreservesItsCorrectionPermission() {
+        let keyboard = TestKeyboard()
+        keyboard.insertDictationText("Dictated text ")
+        keyboard.type("tehx")
+
+        keyboard.deleteFromKeyboard()
+
+        XCTAssertEqual(keyboard.proxy.text, "Dictated text teh")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, 1)
+        XCTAssertEqual(keyboard.textAfterBulkInsert, "teh")
+        keyboard.type(" ")
+        XCTAssertEqual(keyboard.proxy.text, "Dictated text the ")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, 4)
+    }
+
+    func testSuccessiveSwipeAlternativesRemainReplaceableOnClumpingHost() throws {
+        let keyboard = TestKeyboard()
+        keyboard.proxy.clumpsBulkInserts = true
+        keyboard.insertSwipe(["cat", "car"])
+        try keyboard.choose("car")
+        XCTAssertEqual(keyboard.proxy.text, "car ")
+
+        try keyboard.choose("car.")
+
+        XCTAssertEqual(keyboard.proxy.text, "car. ")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, 8)
+        XCTAssertNil(keyboard.recentBulkInsertText())
+    }
+
     func test01LiteralCandidateAfterDictationDoesNotPartiallyDeleteApostropheWord() throws {
         let keyboard = TestKeyboard()
         keyboard.insertDictationText("Dictated text ")
@@ -70,7 +129,7 @@ final class KeyboardEditingRegressionTests: XCTestCase {
         XCTAssertEqual(keyboard.proxy.text, before)
     }
 
-    func test04ProgrammaticCorrectionCannotBeDeletedByNextCandidate() throws {
+    func test04CorrectionUndoOnlyReplacesTypedSuffixAfterDictation() throws {
         let keyboard = TestKeyboard()
         keyboard.insertDictationText("Dictated text ")
         keyboard.proxy.clumpsBulkInserts = true
@@ -78,8 +137,13 @@ final class KeyboardEditingRegressionTests: XCTestCase {
         XCTAssertEqual(keyboard.proxy.text, "Dictated text the ")
         let deletes = keyboard.proxy.deleteCalls
         try keyboard.choose("teh")
-        XCTAssertEqual(keyboard.proxy.deleteCalls, deletes)
-        XCTAssertEqual(keyboard.proxy.text, "Dictated text the ")
+        XCTAssertEqual(keyboard.proxy.deleteCalls, deletes + 4)
+        XCTAssertEqual(keyboard.proxy.text, "Dictated text teh ")
+        XCTAssertEqual(keyboard.recentBulkInsertText(), "Dictated text ")
+        XCTAssertEqual(keyboard.textAfterBulkInsert, "teh ")
+        XCTAssertFalse(keyboard.deleteCharacters(5))
+        XCTAssertEqual(keyboard.proxy.deleteCalls, deletes + 4)
+        XCTAssertEqual(keyboard.proxy.text, "Dictated text teh ")
     }
 
     func test04ExplicitBackspaceStillReachesClumpingGIFHost() {
