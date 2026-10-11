@@ -1,7 +1,110 @@
+import AVFoundation
 import XCTest
 @testable import Voice
 
 final class LocalTranscriptionDeadlineTests: XCTestCase {
+    func testWhisperProductionPathPreservesTenMinuteRecordingDecodedInSixMinutes() async throws {
+        let clock = TranscriptionTestClock(completionTime: 360)
+        let engine = makeWhisperEngine(clock: clock)
+        try await assertLongTranscriptSurvives(engine: engine, clock: clock)
+    }
+
+    func testAppleProductionPathPreservesTenMinuteRecordingDecodedInSixMinutes() async throws {
+        let clock = TranscriptionTestClock(completionTime: 360)
+        let engine = makeAppleEngine(clock: clock)
+        try await assertLongTranscriptSurvives(engine: engine, clock: clock)
+    }
+
+    func testWhisperProductionPathEnforcesDecodeDeadline() async throws {
+        let clock = TranscriptionTestClock(completionTime: 2_401)
+        let engine = makeWhisperEngine(clock: clock)
+        try await assertProductionTimeout(engine: engine, clock: clock)
+    }
+
+    func testAppleProductionPathEnforcesDecodeDeadline() async throws {
+        let clock = TranscriptionTestClock(completionTime: 2_401)
+        let engine = makeAppleEngine(clock: clock)
+        try await assertProductionTimeout(engine: engine, clock: clock)
+    }
+
+    private func makeWhisperEngine(clock: TranscriptionTestClock) -> WhisperKitEngine {
+        WhisperKitEngine(
+            modelID: "offline-test", displayName: "Whisper test", localModel: .default,
+            transcribeAudio: { _, language in
+                XCTAssertEqual(language, "en")
+                return try await clock.completeDecode()
+            },
+            deadline: { seconds, name, operation in
+                try await clock.run(seconds: seconds, engineName: name, operation: operation)
+            }
+        )
+    }
+
+    private func makeAppleEngine(clock: TranscriptionTestClock) -> AppleSpeechEngine {
+        AppleSpeechEngine(
+            transcribeAudio: { audioFile, language in
+                XCTAssertEqual(Double(audioFile.length) / audioFile.processingFormat.sampleRate, 600)
+                XCTAssertEqual(language, "en")
+                return try await clock.completeDecode()
+            },
+            deadline: { seconds, name, operation in
+                try await clock.run(seconds: seconds, engineName: name, operation: operation)
+            }
+        )
+    }
+
+    private func assertLongTranscriptSurvives(
+        engine: ASREngine, clock: TranscriptionTestClock
+    ) async throws {
+        let audioURL = try makeTenMinuteAudio()
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        do {
+            let text = try await engine.transcribe(audioURL: audioURL)
+            XCTAssertEqual(text, "Recognized speech.")
+        } catch {
+            XCTFail("A six-minute decode of ten-minute audio must survive: \(error)")
+        }
+        let scheduledSeconds = await clock.scheduledSeconds
+        XCTAssertEqual(scheduledSeconds, 2_400, "The production engine must apply the scaled deadline")
+    }
+
+    private func assertProductionTimeout(
+        engine: ASREngine, clock: TranscriptionTestClock
+    ) async throws {
+        let audioURL = try makeTenMinuteAudio()
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        do {
+            _ = try await engine.transcribe(audioURL: audioURL)
+            XCTFail("The production engine must reject a decode beyond its deadline")
+        } catch let error as LocalTranscriptionTimeout {
+            XCTAssertEqual(error.engineName, engine.displayName)
+            XCTAssertEqual(error.seconds, 2_400)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        let scheduledSeconds = await clock.scheduledSeconds
+        XCTAssertEqual(scheduledSeconds, 2_400, "Removing the production deadline wrapper must fail this test")
+    }
+
+    private func makeTenMinuteAudio() throws -> URL {
+        let worktree = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let url = worktree.appendingPathComponent(".deadline-audio-\(UUID().uuidString).caf")
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 8_000, channels: 1))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_800_000))
+        buffer.frameLength = buffer.frameCapacity
+        let samples = try XCTUnwrap(buffer.floatChannelData?[0])
+        samples.initialize(repeating: 0.25, count: Int(buffer.frameLength))
+        do {
+            let file = try AVAudioFile(forWriting: url, settings: format.settings)
+            try file.write(from: buffer)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+        return url
+    }
+
     func testShortRecordingsUseFloor() {
         for duration in [TimeInterval(0), 0.1, 1, 7.5] {
             XCTAssertEqual(LocalTranscriptionDeadline.seconds(forAudioDuration: duration), 30)
@@ -14,9 +117,15 @@ final class LocalTranscriptionDeadlineTests: XCTestCase {
         XCTAssertEqual(LocalTranscriptionDeadline.seconds(forAudioDuration: 60), 240)
     }
 
-    func testLongRecordingsUseCeiling() {
-        for duration in [TimeInterval(75), 300, 3_600, .greatestFiniteMagnitude, .infinity] {
-            XCTAssertEqual(LocalTranscriptionDeadline.seconds(forAudioDuration: duration), 300)
+    func testLongRecordingsKeepProportionalBudget() {
+        for duration in [TimeInterval(75), 300, 600, 3_600, 10_800, 21_600] {
+            XCTAssertEqual(LocalTranscriptionDeadline.seconds(forAudioDuration: duration), duration * 4)
+        }
+    }
+
+    func testExtremeDurationsUseTwentyFourHourEmergencyCeiling() {
+        for duration in [TimeInterval(86_400), .greatestFiniteMagnitude, .infinity] {
+            XCTAssertEqual(LocalTranscriptionDeadline.seconds(forAudioDuration: duration), 86_400)
         }
     }
 
@@ -113,6 +222,34 @@ final class LocalTranscriptionDeadlineTests: XCTestCase {
         // Release the intentionally uncooperative stub so the test leaks no task.
         await gate.release()
         await fulfillment(of: [stopped], timeout: 1)
+    }
+}
+
+/// Decode completion advances virtual elapsed time; no wall-clock sleeps,
+/// framework models, speech assets, or user settings are involved.
+private actor TranscriptionTestClock {
+    let completionTime: TimeInterval
+    private(set) var scheduledSeconds: TimeInterval?
+    private var engineName = ""
+
+    init(completionTime: TimeInterval) {
+        self.completionTime = completionTime
+    }
+
+    func run(
+        seconds: TimeInterval, engineName: String,
+        operation: @escaping LocalTranscriptionDeadline.Operation
+    ) async throws -> String {
+        scheduledSeconds = seconds
+        self.engineName = engineName
+        return try await operation()
+    }
+
+    func completeDecode() throws -> String {
+        if let seconds = scheduledSeconds, completionTime >= seconds {
+            throw LocalTranscriptionTimeout(engineName: engineName, seconds: seconds)
+        }
+        return "Recognized speech."
     }
 }
 

@@ -4,8 +4,12 @@ import Foundation
 /// Decode budgets allow slower-than-real-time inference without letting a
 /// parked engine hold the dictation pipeline indefinitely.
 enum LocalTranscriptionDeadline {
+    typealias Operation = @Sendable () async throws -> String
+    typealias Runner = @Sendable (TimeInterval, String, @escaping Operation) async throws -> String
+
     static let minimumTimeout: TimeInterval = 30
-    static let maximumTimeout: TimeInterval = 300
+    /// A last-resort bound for pathological durations, not routine long takes.
+    static let maximumTimeout: TimeInterval = 24 * 60 * 60
     static let audioDurationMultiplier: Double = 4
 
     static func seconds(forAudioDuration duration: TimeInterval) -> TimeInterval {
