@@ -33,9 +33,14 @@ enum AutocorrectEngine {
     static func autocorrectionSpan(beforeInput: String) -> String {
         guard let token = beforeInput.split(whereSeparator: \.isWhitespace).last else { return "" }
         // Inspect the full token before wordSpan discards identifier/URL separators.
-        guard !shouldSkip(String(token)),
-              !token.contains(where: { "_@/\\:".contains($0) }) else { return "" }
-        return wordSpan(beforeInput: beforeInput)
+        guard !token.contains(where: { "_@/\\:".contains($0) }),
+              !token.contains(where: \.isNumber),
+              !token.lowercased().hasPrefix("www.") else { return "" }
+        let word = wordSpan(beforeInput: beforeInput)
+        let prefix = token.dropLast(word.count)
+        let followsEllipsis = prefix.hasSuffix("...") || prefix.hasSuffix("…")
+        guard !shouldSkip(followsEllipsis ? word : String(token)) else { return "" }
+        return word
     }
 
     static func shouldSkip(_ word: String) -> Bool {

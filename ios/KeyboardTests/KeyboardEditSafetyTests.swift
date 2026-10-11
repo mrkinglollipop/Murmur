@@ -1,7 +1,7 @@
 import XCTest
 
 final class KeyboardEditSafetyTests: XCTestCase {
-    func test01BackspacePreservesFreshDictationWithNilOrEmptySelection() {
+    func test01AutomaticDeletionPreservesFreshDictationWithNilOrEmptySelection() {
         let transcript = "A fresh dictated sentence "
         for selection in [nil, ""] as [String?] {
             var proxy = ClumpingProxy(text: transcript, selected: selection)
@@ -23,6 +23,9 @@ final class KeyboardEditSafetyTests: XCTestCase {
         }
         XCTAssertEqual(KeyboardBulkEditPolicy.punctuationDeleteCount(
             trailing: " ", recentBulkInsert: nil
+        ), 1)
+        XCTAssertEqual(KeyboardBulkEditPolicy.punctuationDeleteCount(
+            trailing: " ", recentBulkInsert: "hello "
         ), 0)
     }
 

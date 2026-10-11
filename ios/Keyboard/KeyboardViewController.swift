@@ -3,13 +3,8 @@ import UniformTypeIdentifiers
 
 /// Custom keyboard. Hands dictation to the containing app (iOS blocks in-appex mic),
 /// then inserts the App Group result. Opens murmur://dictate.
-final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedback {
-    private enum Phase {
-        case idle
-        case waiting
-        case secure
-        case setup
-    }
+final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedback, KeyboardEditing {
+    typealias Phase = KeyboardEditingPhase
 
     private let root = KeyboardChromeView()
     private var heightConstraint: NSLayoutConstraint?
@@ -17,16 +12,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
     private var waitingID: String?
     private var pollTask: Task<Void, Never>?
     private var startTimeoutTask: Task<Void, Never>?
-    private var lastSpaceTap: ContinuousClock.Instant?
-    private let autocorrect = AutocorrectController()
-    private var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
-    private var textAfterBulkInsert = ""
+    var lastSpaceTap: ContinuousClock.Instant?
+    let autocorrect = AutocorrectController()
+    var lastBulkInsert: (text: String, at: ContinuousClock.Instant)?
+    var textAfterBulkInsert = ""
     private let dictionary = DictionaryStore()
-    private var insertOrigin: KeyboardInsertOrigin?
-    private var swipeCommittedWord: String? {
-        get { insertOrigin?.swipeWord }
-        set { insertOrigin = newValue.map(KeyboardInsertOrigin.swipe) }
-    }
+    var insertOrigin: KeyboardInsertOrigin?
     private var dictationRequest: KeyboardDictationRequest?
     private var gifInsertionTask: Task<Void, Never>?
     private var observedDocument: KeyboardDocumentFingerprint?
@@ -35,7 +26,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         KeyboardDocumentFingerprint(documentIdentifier: textDocumentProxy.documentIdentifier)
     }
 
-    private var allowsAutocorrection: Bool {
+    var allowsAutocorrection: Bool {
         KeyboardAutocorrectionPolicy.allowsReplacement(
             autocorrectionType: textDocumentProxy.autocorrectionType,
             keyboardType: textDocumentProxy.keyboardType,
@@ -46,7 +37,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
 
     var enableInputClicksWhenVisible: Bool { true }
 
-    private var phase: Phase {
+    var phase: Phase {
         if textDocumentProxy.isSecureTextEntry == true { return .secure }
         if !hasFullAccess || AppGroupStore.selectedEngineAPIKey.isEmpty { return .setup }
         return session
@@ -199,7 +190,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         refreshChrome()
     }
 
-    private func updateCapitalization() {
+    func updateCapitalization() {
         let context = textDocumentProxy.documentContextBeforeInput ?? ""
         let shouldCapitalize: Bool
         let allCharacters: Bool
@@ -224,288 +215,11 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         root.setAutomaticCapitalization(shouldCapitalize, allCharacters: allCharacters)
     }
 
-    private func insertFromKeyboard(_ text: String) {
-        if root.handleGifTyping(text) {
-            UIDevice.current.playInputClick()
-            return
-        }
-        if root.handleEmojiTyping(text) {
-            UIDevice.current.playInputClick()
-            return
-        }
-        // No insert may replace a 1-char selection. Space/return got this
-        // guard first (double-tap "ate the last letter"); letters were left
-        // able to overwrite, so the same phantom host selection could still
-        // silently eat one character per keystroke. Collapse instead.
-        guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
-        let context = textDocumentProxy.documentContextBeforeInput ?? ""
-        let trailingDelete = insertOrigin?.trailingDeleteCount(beforeInserting: text, context: context) ?? 0
-        if trailingDelete > 0, selectedTextIsEmpty {
-            deleteCharacters(trailingDelete)
-        }
-        swipeCommittedWord = nil
-        UIDevice.current.playInputClick()
-        if !text.unicodeScalars.allSatisfy(\.isASCII) {
-            insertPlain(text)
-            lastSpaceTap = nil
-            updateCapitalization()
-            refreshSuggestions()
-            return
-        }
-        if text == " ", shouldReplaceSecondSpaceWithPeriod() {
-            let after = textDocumentProxy.documentContextBeforeInput ?? ""
-            if let walk = AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: after) {
-                // NEVER delete here. Step the caret back over the trailing
-                // space(s), drop the period in, step forward, and consume the
-                // tap. A deleteBackward on this path erased whole dictated
-                // sentences twice (2026-08-25) — hosts can treat a fresh bulk
-                // insert as one deletable clump and lie about it afterward.
-                // Re-check the selection at insert time: delete presses can
-                // re-arm the host's phantom highlight after the entry guard
-                // ran (2026-08-26 repro: period → backspace → double-space
-                // wiped the sentence).
-                guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
-                textDocumentProxy.adjustTextPosition(byCharacterOffset: -walk)
-                textDocumentProxy.insertText(".")
-                textDocumentProxy.adjustTextPosition(byCharacterOffset: walk)
-                HandoffDiagnostics.record("keyboard.doubleSpace.period", detail: "walk=\(walk)")
-                lastSpaceTap = nil
-                updateCapitalization()
-                refreshSuggestions()
-                return
-            }
-        }
-        autocorrect.noteIncomingText(text)
-        applyAutocorrectIfNeeded(beforeInserting: text, context: context)
-        if AutocorrectEngine.isCommitText(text) {
-            let span = AutocorrectEngine.wordSpan(beforeInput: context)
-            if autocorrect.undoOriginal?.lowercased() != span.lowercased() {
-                teachKeyboardWord(span)
-            }
-        }
-        let didInsert = insertPlain(text)
-        lastSpaceTap = didInsert && text == " " && supportsDoubleSpacePeriod
-            ? ContinuousClock().now
-            : nil
-        if autocorrect.suppressUntilWhitespace, AutocorrectEngine.isCommitText(text) {
-            autocorrect.suppressUntilWhitespace = false
-        }
-        updateCapitalization()
-        refreshSuggestions()
-    }
-
-    private func deleteFromKeyboard() {
-        if root.handleGifDelete() {
-            UIDevice.current.playInputClick()
-            return
-        }
-        if root.handleEmojiDelete() {
-            UIDevice.current.playInputClick()
-            return
-        }
-        if let bulk = recentBulkInsertText() {
-            guard KeyboardBulkEditPolicy.allowsDeletion(
-                count: 1, beforeInput: textDocumentProxy.documentContextBeforeInput ?? "",
-                selected: textDocumentProxy.selectedText, recentBulkInsert: bulk,
-                textAfterBulkInsert: textAfterBulkInsert
-            ) else { return }
-        }
-        if let selected = textDocumentProxy.selectedText, selected.count > 1 {
-            let context = textDocumentProxy.documentContextBeforeInput ?? ""
-            UIDevice.current.playInputClick()
-            lastSpaceTap = nil
-            swipeCommittedWord = nil
-            // A "highlight" whose text lives inside the recent dictation
-            // insert is the HOST's phantom selection, not the user's — one
-            // deleteBackward ate 40 such characters on 2026-08-26 while the
-            // before-context stayed identical. Refuse and defuse instead.
-            if AutocorrectEngine.isLikelyHostHighlight(
-                selected: selected,
-                recentBulkInsert: recentBulkInsertText()
-            ) {
-                HandoffDiagnostics.record("keyboard.delete.refusedHostHighlight", detail: "len=\(selected.count)")
-                updateCapitalization()
-                refreshSuggestions()
-                return
-            }
-            if AutocorrectEngine.shouldAbortMultiCharDelete(selected: selected, before: context) {
-                HandoffDiagnostics.record("keyboard.delete.multiSelectAborted", detail: "len=\(selected.count)")
-                updateCapitalization()
-                refreshSuggestions()
-                return
-            }
-            HandoffDiagnostics.record("keyboard.delete.multiSelect", detail: "len=\(selected.count)")
-            // UIKit deletes the highlight even when before is empty (caret at
-            // document start). Host-drop compare needs a non-empty before;
-            // the empty skip stays on the caret path below.
-            if context.isEmpty {
-                textDocumentProxy.deleteBackward()
-            } else {
-                deleteBackwardCheckingHostDrop()
-            }
-            autocorrect.clearUndo()
-            updateCapitalization()
-            refreshSuggestions()
-            return
-        }
-        if let word = swipeCommittedWord, !word.isEmpty {
-            let context = textDocumentProxy.documentContextBeforeInput ?? ""
-            let allowed = insertOrigin?.backspaceCount(context: context) ?? 0
-            if allowed > 0 {
-                UIDevice.current.playInputClick()
-                HandoffDiagnostics.record("keyboard.delete.swipeWord", detail: "count=\(allowed)")
-                deleteCharacters(allowed)
-                swipeCommittedWord = nil
-                lastSpaceTap = nil
-                autocorrect.clearUndo()
-                autocorrect.suppressUntilWhitespace = false
-                updateCapitalization()
-                refreshSuggestions()
-                return
-            }
-            swipeCommittedWord = nil
-        }
-        UIDevice.current.playInputClick()
-        lastSpaceTap = nil
-        deleteBackwardCheckingHostDrop()
-        autocorrect.clearUndo()
-        updateCapitalization()
-        refreshSuggestions()
-    }
-
-    private func insertSwipe(_ candidates: [String]) {
-        guard phase != .waiting else { return }
-        guard let first = candidates.first, !first.isEmpty else { return }
-        if root.handleGifTyping(first) {
-            UIDevice.current.playInputClick()
-            return
-        }
-        UIDevice.current.playInputClick()
-        guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
-        let context = textDocumentProxy.documentContextBeforeInput ?? ""
-        let span = AutocorrectEngine.wordSpan(beforeInput: context)
-        if !span.isEmpty {
-            let allowed = AutocorrectEngine.allowedDeleteCount(span: span, inBeforeInput: context)
-            guard allowed > 0, selectedTextIsEmpty else { return }
-            guard deleteCharacters(allowed) else {
-                HandoffDiagnostics.record("keyboard.swipe.abortedSpanEat", detail: "wanted=\(allowed)")
-                return
-            }
-        }
-        let afterSpan = textDocumentProxy.documentContextBeforeInput ?? ""
-        if AutocorrectEngine.needsLeadingSpace(beforeInput: afterSpan) {
-            insertPlain(" ")
-        }
-        let trailing = phase == .secure ? "" : " "
-        guard insertPlain(first + trailing) else { return }
-        lastBulkInsert = (text: first + trailing, at: ContinuousClock().now)
-        textAfterBulkInsert = ""
-        swipeCommittedWord = first + trailing
-        lastSpaceTap = trailing == " " && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
-        autocorrect.suppressUntilWhitespace = true
-        if phase != .secure {
-            autocorrect.noteSwipe(committed: first, alternatives: candidates)
-            showCandidates()
-        }
-        updateCapitalization()
-    }
-
-    private func applyAutocorrectIfNeeded(beforeInserting text: String, context: String) {
-        guard phase != .secure, phase != .waiting, allowsAutocorrection else { return }
-        guard AutocorrectEngine.isCommitText(text) else { return }
-        // Suppress is for the swipe/dictation token on its own trailing space,
-        // not the next typed word. `noteIncomingText` already cleared it if
-        // this commit follows a new letter span (`i` + space after a swipe).
-        guard !autocorrect.suppressUntilWhitespace else { return }
-        let span = AutocorrectEngine.autocorrectionSpan(beforeInput: context)
-        let allowed = AutocorrectEngine.allowedDeleteCount(span: span, inBeforeInput: context)
-        guard allowed > 0 else { return }
-        guard selectedTextIsEmpty else { return }
-        guard let correction = autocorrect.correction(for: span), correction != span else { return }
-        let replacement = AutocorrectEngine.replacement(span: span, correction: correction)
-        guard replacement.deleteCount == allowed else { return }
-        guard deleteCharacters(allowed) else {
-            HandoffDiagnostics.record("keyboard.autocorrect.abortedDelete", detail: "wanted=\(allowed)")
-            return
-        }
-        insertPlain(replacement.insert)
-        autocorrect.noteAutocorrect(original: span, corrected: replacement.insert)
-    }
-
-    private func applyCandidate(at index: Int) {
-        guard phase != .secure, phase != .waiting, allowsAutocorrection else { return }
-        let choices = autocorrect.displayed
-        guard index >= 0, index < choices.count else { return }
-        let chosen = choices[index]
-        guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
-        let context = textDocumentProxy.documentContextBeforeInput ?? ""
-        if AutocorrectEngine.isPunctuationSuggestion(chosen) {
-            let committed = AutocorrectEngine.committedSpan(beforeInput: context)
-            let deleteCount = KeyboardBulkEditPolicy.punctuationDeleteCount(
-                trailing: committed.trailing, recentBulkInsert: recentBulkInsertText()
-            )
-            guard deleteCharacters(deleteCount) else {
-                HandoffDiagnostics.record("keyboard.candidate.abortedDelete", detail: "trailing=\(committed.trailing.count)")
-                return
-            }
-            insertPlain(chosen + " ")
-            swipeCommittedWord = nil
-            lastSpaceTap = supportsDoubleSpacePeriod ? ContinuousClock().now : nil
-            autocorrect.clearUndo()
-            autocorrect.suppressUntilWhitespace = false
-            updateCapitalization()
-            refreshSuggestions()
-            return
-        }
-        guard let span = KeyboardBulkEditPolicy.candidateSpan(
-            beforeInput: context, recentBulkInsert: recentBulkInsertText(),
-            textAfterBulkInsert: textAfterBulkInsert
-        ) else { return }
-        let target = span.word
-        let trailing = span.trailing
-        guard !target.isEmpty else { return }
-        let removable = target + trailing
-        let allowed = AutocorrectEngine.allowedDeleteCount(span: removable, inBeforeInput: context)
-        guard allowed > 0, selectedTextIsEmpty else { return }
-        guard deleteCharacters(allowed) else {
-            HandoffDiagnostics.record("keyboard.candidate.abortedDelete", detail: "wanted=\(allowed)")
-            return
-        }
-        let inserted: String
-        if AutocorrectEngine.periodAttachedWord(chosen) != nil {
-            inserted = chosen + (trailing.isEmpty && phase != .secure ? " " : trailing)
-        } else if swipeCommittedWord != nil, trailing.isEmpty, phase != .secure {
-            inserted = chosen + " "
-        } else {
-            inserted = chosen + trailing
-        }
-        insertPlain(inserted)
-        if swipeCommittedWord != nil {
-            swipeCommittedWord = inserted
-            var remaining = choices.filter { $0.lowercased() != chosen.lowercased() }
-            remaining.insert(chosen, at: 0)
-            autocorrect.noteSwipe(committed: AutocorrectEngine.periodAttachedWord(chosen) ?? chosen, alternatives: remaining)
-            lastSpaceTap = inserted.hasSuffix(" ") && supportsDoubleSpacePeriod ? ContinuousClock().now : nil
-            updateCapitalization()
-            showCandidates()
-            teachKeyboardWord(AutocorrectEngine.periodAttachedWord(chosen) ?? chosen)
-            return
-        }
-        if let original = autocorrect.undoOriginal, chosen.lowercased() == original.lowercased() {
-            teachKeyboardWord(original)
-        } else if chosen.lowercased() == target.lowercased() {
-            teachKeyboardWord(chosen)
-        }
-        autocorrect.clearUndo()
-        updateCapitalization()
-        refreshSuggestions()
-    }
-
-    private func showCandidates() {
+    func showCandidates() {
         root.setCandidates(autocorrect.displayed, quoted: autocorrect.quoted)
     }
 
-    private func teachKeyboardWord(_ raw: String) {
+    func teachKeyboardWord(_ raw: String) {
         let word = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard AutocorrectEngine.shouldTeach(word, known: FrequencyList.words) else { return }
         autocorrect.ignore(word)
@@ -520,7 +234,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         rebuildSwipeLexicon(uiLexicon: nil)
     }
 
-    private func refreshSuggestions() {
+    func refreshSuggestions() {
         guard phase != .secure, phase != .waiting else { return }
         guard allowsAutocorrection else {
             autocorrect.clearUndo()
@@ -566,151 +280,6 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         autocorrect.setUserWords(priority)
     }
 
-    private func shouldReplaceSecondSpaceWithPeriod() -> Bool {
-        // SIMPLIFIED 2026-08-26: no double-space magic near a bulk insert.
-        // Messages discards its provisional region when anything touches it;
-        // near a transcript or swipe a space is just a space. Failure mode: no period
-        // appears — never a wipe, never a paste. "Near" = the 180-second
-        // recentBulkInsertText window; generous on purpose, since the cost
-        // of suppression is only a missing period.
-        guard recentBulkInsertText() == nil else { return false }
-        guard supportsDoubleSpacePeriod,
-              let lastSpaceTap,
-              ContinuousClock().now - lastSpaceTap < .milliseconds(700) else { return false }
-        let context = textDocumentProxy.documentContextBeforeInput ?? ""
-        // Walk-based: also matches "sentence  " (dictation's auto trailing
-        // space + the first tap), which the single-space check never could.
-        return AutocorrectEngine.doubleSpacePeriodWalk(beforeInput: context) != nil
-    }
-
-    /// `deleteBackward` / `insertText` replace the *selection*, not one character.
-    /// A selected clause plus a keystroke wipes the sentence.
-    private var selectedTextIsEmpty: Bool {
-        guard let selected = textDocumentProxy.selectedText else { return true }
-        return selected.isEmpty
-    }
-
-    /// Collapse a 1-char selection by moving one unit, never by `insertText`.
-    /// Do not jump by `selected.length` — a stale clause-sized `selectedText`
-    /// would move or extend the real range, and the next `deleteBackward`
-    /// wipes the sentence.
-    private func canMutateDocument(allowSingleCharacterSelection: Bool = true) -> Bool {
-        switch AutocorrectEngine.documentMutationDecision(
-            selected: textDocumentProxy.selectedText,
-            allowSingleCharacterSelection: allowSingleCharacterSelection
-        ) {
-        case .allow:
-            return true
-        case .deny:
-            HandoffDiagnostics.record(
-                "keyboard.mutate.denied",
-                detail: "selectedLen=\(textDocumentProxy.selectedText?.count ?? 0)"
-            )
-            return false
-        case .collapseOneCharacterSelection:
-            textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
-            if let still = textDocumentProxy.selectedText, !still.isEmpty {
-                HandoffDiagnostics.record("keyboard.mutate.collapseFailed", detail: "selectedLen=\(still.count)")
-                return false
-            }
-            HandoffDiagnostics.record("keyboard.mutate.collapsed", detail: "")
-            return true
-        }
-    }
-
-    @discardableResult
-    private func insertPlain(_ text: String) -> Bool {
-        // Never overwrite a 1-char selection — collapse it. A phantom host
-        // selection plus insertText is a silently eaten character.
-        guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
-        let before = textDocumentProxy.documentContextBeforeInput ?? ""
-        textDocumentProxy.insertText(text)
-        if recentBulkInsertText() != nil {
-            if !before.hasSuffix(textAfterBulkInsert) { textAfterBulkInsert = "" }
-            textAfterBulkInsert += text
-        }
-        return true
-    }
-
-    /// True when exactly `requested` characters were removed with no host
-    /// anomaly. False → the document is NOT in the expected state; callers
-    /// must skip any replacement insert (deleting fewer characters and then
-    /// inserting a correction garbles the word).
-    @discardableResult
-    private func deleteCharacters(_ requested: Int) -> Bool {
-        guard requested != 0 else { return true }
-        let count = min(max(0, requested), AutocorrectEngine.maxDeleteLoop)
-        guard count > 0 else { return false }
-        guard canMutateDocument(allowSingleCharacterSelection: false) else { return false }
-        for remaining in (1...count).reversed() {
-            let before = textDocumentProxy.documentContextBeforeInput ?? ""
-            guard KeyboardBulkEditPolicy.allowsDeletion(
-                count: remaining, beforeInput: before, selected: textDocumentProxy.selectedText,
-                recentBulkInsert: recentBulkInsertText(), textAfterBulkInsert: textAfterBulkInsert
-            ) else { return false }
-            textDocumentProxy.deleteBackward()
-            let after = textDocumentProxy.documentContextBeforeInput ?? ""
-            if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count)
-                || (recentBulkInsertText() != nil && before.count - after.count != 1) {
-                textAfterBulkInsert = ""
-                restoreHiddenSelectionLoss(before: before, after: after)
-                return false
-            }
-            if !textAfterBulkInsert.isEmpty { textAfterBulkInsert.removeLast() }
-        }
-        return true
-    }
-
-    private func recentBulkInsertText() -> String? {
-        guard let last = lastBulkInsert,
-              ContinuousClock().now - last.at < .seconds(180) else { return nil }
-        return last.text
-    }
-
-    /// A delete removed more than expected (host word-delete or hidden
-    /// selection). SIMPLIFIED 2026-08-26: log only — every automatic
-    /// reinsertion built during the sentence-wipe saga misfired somewhere;
-    /// cleverness here must fail to "nothing happens".
-    private func restoreHiddenSelectionLoss(before: String, after: String) {
-        HandoffDiagnostics.record(
-            "keyboard.delete.hostDrop",
-            detail: "before=\(before.count) after=\(after.count)"
-        )
-    }
-
-    /// One `deleteBackward` for Delete / nil-selection. Insert still treats
-    /// nil `selectedText` as an empty caret. Empty `before` is a no-op
-    /// (nothing to backspace). Multi-char selection at document start
-    /// deletes once in `deleteFromKeyboard` instead. If the host ate a
-    /// hidden range, stop — we cannot un-delete, but we must not loop.
-    /// The first host word-delete cannot be undone.
-    private func deleteBackwardCheckingHostDrop() {
-        let before = textDocumentProxy.documentContextBeforeInput ?? ""
-        guard KeyboardBulkEditPolicy.allowsDeletion(
-            count: 1, beforeInput: before, selected: nil,
-            recentBulkInsert: recentBulkInsertText(), textAfterBulkInsert: textAfterBulkInsert
-        ) else { return }
-        textDocumentProxy.deleteBackward()
-        let after = textDocumentProxy.documentContextBeforeInput ?? ""
-        if AutocorrectEngine.shouldAbortDeleteLoop(beforeCount: before.count, afterCount: after.count)
-            || (recentBulkInsertText() != nil && before.count - after.count != 1) {
-            textAfterBulkInsert = ""
-            restoreHiddenSelectionLoss(before: before, after: after)
-            return
-        }
-        if !textAfterBulkInsert.isEmpty { textAfterBulkInsert.removeLast() }
-    }
-
-    private var supportsDoubleSpacePeriod: Bool {
-        guard textDocumentProxy.isSecureTextEntry != true else { return false }
-        switch textDocumentProxy.keyboardType {
-        case .default, .asciiCapable, .twitter, .webSearch:
-            return true
-        default:
-            return false
-        }
-    }
-
     private var returnTitle: String {
         switch textDocumentProxy.returnKeyType {
         case .go: return "go"
@@ -725,6 +294,16 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
         case .continue: return "continue"
         default: return "return"
         }
+    }
+
+
+    func handleGifTyping(_ text: String) -> Bool { root.handleGifTyping(text) }
+    func handleEmojiTyping(_ text: String) -> Bool { root.handleEmojiTyping(text) }
+    func handleGifDelete() -> Bool { root.handleGifDelete() }
+    func handleEmojiDelete() -> Bool { root.handleEmojiDelete() }
+    func playInputClick() { UIDevice.current.playInputClick() }
+    func recordEditDiagnostic(_ event: String, detail: String) {
+        HandoffDiagnostics.record(event, detail: detail)
     }
 
     private func toggleGifTray() {
@@ -745,7 +324,7 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
             await MainActor.run {
                 guard document.allowsInsertion(into: self.documentFingerprint, isCancelled: Task.isCancelled),
                       self.textDocumentProxy.isSecureTextEntry != true else { return }
-                self.insertPlain(gif.sendURL.absoluteString + " ")
+                self.insertGIFURL(gif.sendURL)
                 HandoffDiagnostics.record(
                     "keyboard.gif.inserted",
                     detail: "p2a url p2b=\(pasted)"
@@ -1075,28 +654,12 @@ final class KeyboardViewController: UIInputViewController, UIInputViewAudioFeedb
                 trailingSpace: true
             )
             if !text.isEmpty {
-                // Messages holds (part of) a fresh bulk insert as a selection
-                // the user never made — proven 2026-08-26: a 40-char reported
-                // highlight matching the last chunk, eaten by one delete tap
-                // with before-context unchanged. Insert in word-boundary
-                // chunks, remember the take for the highlight guard, and
-                // DEFUSE any selection the host reports afterward by walking
-                // the caret to its end (over-walks clamp at document end).
-                // No caret nudge here — an adjust against an anchored pending
-                // region is a suspect for creating that selection.
-                guard canMutateDocument(allowSingleCharacterSelection: false) else { return }
-                let chunks = AutocorrectEngine.bulkInsertChunks(text)
-                for chunk in chunks {
-                    textDocumentProxy.insertText(chunk)
-                }
-                lastBulkInsert = (text: text, at: ContinuousClock().now)
-                textAfterBulkInsert = ""
-                insertOrigin = .dictation
-                autocorrect.suppressUntilWhitespace = true
-                autocorrect.clearUndo()
+                // Dictation owns a protected bulk region. Automatic edits
+                // cannot delete it; explicit Backspace remains the user's choice.
+                guard insertDictationText(text) else { return }
                 HandoffDiagnostics.record(
                     "keyboard.insertion.acknowledged",
-                    detail: "\(payload.id) characters=\(text.count) chunks=\(chunks.count)"
+                    detail: "\(payload.id) characters=\(text.count) chunks=\(AutocorrectEngine.bulkInsertChunks(text).count)"
                 )
             }
             DictationHandoff.clear()

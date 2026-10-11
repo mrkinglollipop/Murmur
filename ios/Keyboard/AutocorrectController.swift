@@ -44,6 +44,14 @@ enum FrequencyList {
 
 /// UITextChecker + lexicon + frequency list. Secure/dictation gating lives in the VC.
 final class AutocorrectController {
+    private let isLearnedWord: (String) -> Bool
+
+    init(isLearnedWord: @escaping (String) -> Bool = {
+        LearnedWordStore.contains($0) || UITextChecker.hasLearnedWord($0)
+    }) {
+        self.isLearnedWord = isLearnedWord
+    }
+
     private let checker = UITextChecker()
     private let language = "en_US"
     private var lexiconWords: [String] = []
@@ -131,8 +139,7 @@ final class AutocorrectController {
         )
         let unknown = misspelled.location != NSNotFound
             && !skipped.contains(span.lowercased())
-            && !LearnedWordStore.contains(span)
-            && !UITextChecker.hasLearnedWord(span)
+            && !isLearnedWord(span)
         quoted = unknown ? [span.lowercased()] : []
         var seeds: [String] = []
         if let contraction = AutocorrectEngine.suggestedContraction(span) {
@@ -185,8 +192,7 @@ final class AutocorrectController {
         guard !suppressUntilWhitespace else { return nil }
         guard !AutocorrectEngine.shouldSkip(span) else { return nil }
         guard !skipped.contains(span.lowercased()) else { return nil }
-        guard !LearnedWordStore.contains(span) else { return nil }
-        guard !UITextChecker.hasLearnedWord(span) else { return nil }
+        guard !isLearnedWord(span) else { return nil }
         if let pronoun = AutocorrectEngine.forcedPronounI(span) {
             return pronoun
         }
