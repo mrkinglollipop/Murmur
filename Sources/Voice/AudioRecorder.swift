@@ -2008,18 +2008,35 @@ final class AudioRecorder {
             let buffersSeen = self.pcmBuffers.count
             self.pcmBuffersLock.unlock()
 
-            guard Self.watchdogShouldRestartCapture(
+            let action = MicHealth.zeroBufferAction(
                 generationMatches: generation == self.captureGeneration,
                 stillWanted: self.wantsRecording,
                 tapInstalled: self.isSetUp,
                 buffersSeen: buffersSeen,
                 alreadyRetried: self.watchdogRetriedThisTake
-            ) else {
-                if buffersSeen == 0, generation == self.captureGeneration,
-                   self.wantsRecording, self.watchdogRetriedThisTake {
-                    vlog("mic watchdog: still zero buffers after rebuild — leaving hold to the silence guard")
-                }
+            )
+            switch action {
+            case .ignore:
                 return
+            case .fail:
+                vlog("mic watchdog: still zero buffers after rebuild — ending capture")
+                self.wantsRecording = false
+                self.isStopping = true
+                self.engineNeedsRebuild = true
+                self.invalidateSecureInputPollTimer()
+                self.teardownMicEngine()
+                self.endVoiceGateRecordingSession()
+                self.streamingCoordinator.cancelAll()
+                self.clearHeldCaretSnapshotMatchingSession(self.activeHeldCaretToken)
+                self.clearPendingHeldCaretSnapshot()
+                self.micHealthMonitor = nil
+                self.cancelProcessingWatchdog()
+                // The existing failure path replaces Listening with the error
+                // pill and auto-hides it; hide() here would cancel that pill.
+                self.asrSelector.onFailure?(.micDeliveredNoAudio)
+                return
+            case .restart:
+                break
             }
 
             self.watchdogRetriedThisTake = true

@@ -12,6 +12,25 @@ struct MicrophoneDevice: Identifiable, Equatable {
 
 /// Pure microphone-selection and no-audio warning decisions.
 enum MicHealth {
+    enum ZeroBufferAction: Equatable {
+        case ignore
+        case restart
+        case fail
+    }
+
+    static func zeroBufferAction(
+        generationMatches: Bool,
+        stillWanted: Bool,
+        tapInstalled: Bool,
+        buffersSeen: Int,
+        alreadyRetried: Bool
+    ) -> ZeroBufferAction {
+        guard generationMatches, stillWanted, tapInstalled, buffersSeen == 0 else {
+            return .ignore
+        }
+        return alreadyRetried ? .fail : .restart
+    }
+
     enum InputRerouteAction: Equatable {
         case keepCapture
         case rebuild(excluding: AudioDeviceID?)

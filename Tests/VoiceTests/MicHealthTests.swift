@@ -4,6 +4,72 @@ import Foundation
 
 final class MicHealthTests: XCTestCase {
 
+    func testTwoSuccessfulStartsWithoutBuffersEndCaptureWithoutARelease() {
+        let clock = MicHealthTestClock()
+        var wantsRecording = true
+        var tapInstalled = true
+        var alreadyRetried = false
+        var successfulStarts = 1
+        var actions: [MicHealth.ZeroBufferAction] = []
+
+        func fireWatchdog() {
+            let action = MicHealth.zeroBufferAction(
+                generationMatches: true, stillWanted: wantsRecording,
+                tapInstalled: tapInstalled, buffersSeen: 0,
+                alreadyRetried: alreadyRetried
+            )
+            actions.append(action)
+            switch action {
+            case .ignore:
+                break
+            case .restart:
+                alreadyRetried = true
+                successfulStarts += 1
+                clock.schedule(after: 0.4, action: fireWatchdog)
+            case .fail:
+                wantsRecording = false
+                tapInstalled = false
+            }
+        }
+
+        clock.schedule(after: 0.4, action: fireWatchdog)
+        clock.advance(to: 0.4)
+        XCTAssertEqual(successfulStarts, 2)
+        XCTAssertTrue(wantsRecording)
+        // A toggle-locked hold sends no stop request when Fn is released.
+        clock.advance(to: 0.8)
+        XCTAssertEqual(actions, [.restart, .fail])
+        XCTAssertFalse(wantsRecording)
+        XCTAssertFalse(tapInstalled)
+        XCTAssertEqual(clock.pendingCount, 0)
+    }
+
+    func testZeroBufferWatchdogIgnoresStaleStoppedOrUntappedCapture() {
+        for alreadyRetried in [false, true] {
+            for state in [(false, true, true), (true, false, true), (true, true, false)] {
+                XCTAssertEqual(
+                    MicHealth.zeroBufferAction(
+                        generationMatches: state.0, stillWanted: state.1,
+                        tapInstalled: state.2, buffersSeen: 0,
+                        alreadyRetried: alreadyRetried
+                    ), .ignore
+                )
+            }
+        }
+    }
+
+    func testZeroBufferWatchdogPreservesDeliveredAudioBeforeAndAfterRetry() {
+        for alreadyRetried in [false, true] {
+            XCTAssertEqual(
+                MicHealth.zeroBufferAction(
+                    generationMatches: true, stillWanted: true,
+                    tapInstalled: true, buffersSeen: 1,
+                    alreadyRetried: alreadyRetried
+                ), .ignore
+            )
+        }
+    }
+
     func testHealthyExplicitMicrophoneSurvivesUnrelatedDefaultInputChange() {
         // USB A stays selected while Sound Input moves from B to C.
         for systemDefault: UInt32 in [145, 200] {
