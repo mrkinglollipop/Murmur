@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import Voice
 
@@ -347,5 +348,225 @@ final class StuckProcessingHUDTests: XCTestCase {
         for token in 1 ... 40 { pipeline.markHoldAbandoned(UInt64(token)) }
         XCTAssertLessThanOrEqual(pipeline.test_abandonedHoldTokens.count, 8)
         XCTAssertTrue(pipeline.test_abandonedHoldTokens.contains(40), "newest hold is kept")
+    }
+}
+
+/// Production stop, notification, and deadline paths with hardware/network I/O replaced.
+final class HoldOwnershipRegressionTests: XCTestCase {
+    @MainActor
+    private func recorder(_ coordinator: StreamingCoordinator = StreamingCoordinator()) -> AudioRecorder {
+        AudioRecorder(
+            streamingCoordinator: coordinator,
+            voiceProfileStore: VoiceProfileStore(directoryURL: URL(fileURLWithPath: #filePath).deletingLastPathComponent()),
+            hud: RecordingHUD(presentsWindows: false),
+            observeInputDevices: false
+        )
+    }
+
+    @MainActor
+    private func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    private final class Frames {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func record(_ message: URLSessionWebSocketTask.Message) {
+            if case .data = message { lock.withLock { value += 1 } }
+        }
+    }
+
+    @MainActor
+    func test01EverySettledStopDetachesCloudBeforeLocalAudio() async throws {
+        // Includes the early return after tearing down a re-armed in-flight start.
+        for path in ["pending", "inFlight", "rearmedInFlight", "active", "secure"] {
+            let frames = Frames()
+            let sent = expectation(description: "connected cloud receives its own audio: \(path)")
+            let session = XAIStreamingTranscriber(apiKey: "fixture", messageSender: { message in
+                frames.record(message)
+                if frames.count == 1 { sent.fulfill() }
+            })
+            session.handleServerEvent(#"{"type":"transcript.created"}"#)
+            try await session.start()
+            let coordinator = StreamingCoordinator(xaiSession: session)
+            let recorder = recorder(coordinator)
+            let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160))
+            buffer.frameLength = 160
+            for index in 0..<160 { buffer.floatChannelData![0][index] = 0.1 }
+            let token = recorder.asrSelector.pipeline.test_holdSnapshot(.unknown)
+            recorder.test_prepareHold(token: token, active: path == "active" || path == "secure",
+                                      inFlight: path == "inFlight" || path == "rearmedInFlight")
+            recorder.test_receiveAudio(buffer)
+            await fulfillment(of: [sent], timeout: 2)
+            XCTAssertEqual(frames.count, 1)
+            recorder.test_bufferAudio(buffer)
+            if path == "secure" {
+                recorder.test_abortForSecureInput()
+            } else {
+                recorder.stopRecording()
+                if path == "rearmedInFlight" {
+                    let next = recorder.asrSelector.pipeline.test_holdSnapshot(.unknown)
+                    recorder.test_prepareHold(token: next, inFlight: true)
+                }
+                await drainMainQueue()
+                recorder.test_flushStopGrace()
+                // A duplicate stop must not reattach or reuse the abandoned session.
+                recorder.stopRecording()
+                await drainMainQueue()
+            }
+            XCTAssertNil(coordinator.xaiSession, path)
+            if path == "pending" || path == "inFlight" || path == "rearmedInFlight" {
+                XCTAssertEqual(recorder.test_bufferCount, 0, path)
+            }
+            recorder.asrSelector.cloudModel = nil
+            XCTAssertNil(recorder.asrSelector.makeXAIStreamingSession())
+            XCTAssertNil(recorder.asrSelector.makeElevenLabsStreamingSession())
+            XCTAssertNil(recorder.asrSelector.makeGeminiStreamingSession())
+            XCTAssertNil(recorder.asrSelector.makeMuseStreamingSession())
+            recorder.test_receiveAudio(buffer)
+            // Drain the real sender before counting, so absence is not a timing assertion.
+            session.handleServerEvent(#"{"type":"transcript.done"}"#)
+            _ = await session.finalize()
+            XCTAssertEqual(frames.count, 1, "Local audio leaked through \(path)")
+            session.cancel()
+        }
+    }
+
+    @MainActor
+    func test02LateEmptyTranscriptCannotReplaceListeningHUD() async {
+        for stale in [true, false] {
+            let pipeline = TranscriptionPipeline()
+            let hud = RecordingHUD(presentsWindows: false)
+            let old = pipeline.test_holdSnapshot(.unknown)
+            let owner = stale ? pipeline.test_holdSnapshot(.unknown) : old
+            hud.claimHold(owner)
+            hud.show()
+            var failures = 0
+            var logs = 0
+            var hides = 0
+            hud.onHide = { hides += 1 }
+            pipeline.onFailure = { _ in failures += 1; hud.showError("Transcription failed") }
+            pipeline.onTranscriptionLogged = { _, _, _, _, failed, _ in
+                XCTAssertTrue(failed)
+                logs += 1
+            }
+            let done = expectation(description: "empty transcript completes")
+            pipeline.finishTranscription(text: "  ", hadExplicitTrailingNewline: false,
+                engineID: "fixture", audioPath: #filePath + ".caf", replaceHistoryEntryID: nil,
+                sessionHeldToken: old, sessionHeldSnapshot: nil, sessionHeldFrontmostPID: nil,
+                completion: { XCTAssertEqual($0, .failed); done.fulfill() })
+            await fulfillment(of: [done], timeout: 2)
+            hud.test_fireAutoHideTimer()
+            XCTAssertEqual(failures, stale ? 0 : 1)
+            XCTAssertEqual(logs, 1)
+            XCTAssertEqual(hides, stale ? 0 : 1)
+            XCTAssertEqual(hud.isVisible, stale)
+            if stale { XCTAssertEqual(hud.currentState, .listening) }
+            hud.hide()
+        }
+    }
+
+    @MainActor
+    func test02LateInjectionFailureCannotReplaceListeningHUD() async {
+        for stale in [true, false] {
+            let pipeline = TranscriptionPipeline()
+            let hud = RecordingHUD(presentsWindows: false)
+            let held = CaretContext.Snapshot(value: "Old words", location: 0,
+                selectionLength: .readable(9), precedingChar: .startOfField, isUnknown: false)
+            let old = pipeline.test_holdSnapshot(held, frontmostPID: 101)
+            hud.claimHold(old)
+            hud.show()
+            var failures = 0
+            var logs = 0
+            var inserts = 0
+            var hides = 0
+            hud.onHide = { hides += 1 }
+            pipeline.onFailure = { _ in failures += 1; hud.showError("Injection failed") }
+            pipeline.onVoiceEditLogged = { _, _, _, injected, _ in
+                XCTAssertFalse(injected)
+                logs += 1
+            }
+            pipeline.voiceEditInjectionHooks = .init(
+                target: { .init(secureInput: false, pid: 101, bundleIdentifier: "fixture") },
+                snapshot: { held }, insert: { _ in
+                    DispatchQueue.main.sync {
+                        inserts += 1
+                        if stale {
+                            let next = pipeline.test_holdSnapshot(.unknown)
+                            hud.claimHold(next)
+                            hud.show()
+                        }
+                    }
+                    return .failed
+                }, leaveOnClipboard: { _ in XCTFail("Must reach the delayed insert result") })
+            let done = expectation(description: "delayed injection failure completes")
+            pipeline.finishTranscription(text: "New words", hadExplicitTrailingNewline: false,
+                engineID: "fixture", audioPath: nil, replaceHistoryEntryID: nil,
+                sessionHeldToken: old, sessionHeldSnapshot: held, sessionHeldFrontmostPID: 101,
+                voiceEditInstruction: "rewrite",
+                completion: { XCTAssertEqual($0, .failed); done.fulfill() })
+            await fulfillment(of: [done], timeout: 2)
+            hud.test_fireAutoHideTimer()
+            XCTAssertEqual(inserts, 1)
+            XCTAssertEqual(logs, 1)
+            XCTAssertEqual(failures, stale ? 0 : 1)
+            XCTAssertEqual(hides, stale ? 0 : 1)
+            XCTAssertEqual(hud.isVisible, stale)
+            if stale { XCTAssertEqual(hud.currentState, .listening) }
+            hud.hide()
+        }
+    }
+
+    @MainActor
+    func test03OlderWatchdogCannotDismissMicrophoneStartError() async {
+        let recorder = recorder()
+        let pipeline = recorder.asrSelector.pipeline
+        let old = pipeline.test_holdSnapshot(.unknown)
+        recorder.hud.claimHold(old)
+        recorder.hud.show()
+        recorder.hud.setProcessing()
+        let deadline = recorder.test_armProcessingDeadline(token: old)
+        let next = pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: next)
+        var failures = 0
+        var hides = 0
+        recorder.hud.onHide = { hides += 1 }
+        pipeline.onFailure = { _ in failures += 1; recorder.hud.showError("Microphone failed") }
+        recorder.test_failMicStart()
+        await drainMainQueue()
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(recorder.hud.currentState, .error("Microphone failed"))
+        deadline()
+        XCTAssertTrue(pipeline.test_abandonedHoldTokens.contains(old))
+        XCTAssertEqual(recorder.hud.holdToken, next)
+        XCTAssertEqual(hides, 0)
+        XCTAssertTrue(recorder.hud.isVisible)
+        recorder.hud.test_fireAutoHideTimer()
+        XCTAssertFalse(recorder.hud.isVisible, "B's own timer still dismisses its error")
+        pipeline.onFailure = nil
+    }
+
+    @MainActor
+    func test03SupersededQueuedMicrophoneFailureCannotClaimNewHold() async {
+        let recorder = recorder()
+        let pipeline = recorder.asrSelector.pipeline
+        let old = pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: old)
+        var failures = 0
+        pipeline.onFailure = { _ in failures += 1 }
+        recorder.test_failMicStart()
+        let next = pipeline.test_holdSnapshot(.unknown)
+        recorder.test_prepareHold(token: next)
+        recorder.hud.claimHold(next)
+        recorder.hud.show()
+        await drainMainQueue()
+        XCTAssertEqual(failures, 0)
+        XCTAssertEqual(recorder.hud.holdToken, next)
+        XCTAssertEqual(recorder.hud.currentState, .listening)
+        recorder.hud.hide()
     }
 }

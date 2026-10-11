@@ -83,10 +83,50 @@ final class AudioRecorder {
     /// while the first ~200ms of speech hit a dying or not-yet-started tap.
     private var didAnnounceListeningThisTake = false
 
-    init() {
-        registerEngineConfigObserver()
-        registerDefaultInputDeviceListener()
+    init(
+        streamingCoordinator: StreamingCoordinator = StreamingCoordinator(),
+        voiceProfileStore: VoiceProfileStore? = nil,
+        hud: RecordingHUD = RecordingHUD(),
+        observeInputDevices: Bool = true
+    ) {
+        self.streamingCoordinator = streamingCoordinator
+        self.voiceGateProfileStore = voiceProfileStore ?? VoiceProfileStore()
+        self.hud = hud
+        if observeInputDevices {
+            registerEngineConfigObserver()
+            registerDefaultInputDeviceListener()
+        }
     }
+
+#if DEBUG
+    /// Seeds lifecycle state without requesting permission or opening hardware.
+    func test_prepareHold(token: UInt64, active: Bool = false, inFlight: Bool = false) {
+        recordingStartGeneration &+= 1
+        pendingHeldCaretToken = active ? nil : token
+        activeHeldCaretToken = active ? token : nil
+        wantsRecording = true
+        isStopping = false
+        engineStartInFlight = inFlight
+        micCaptureBeganThisHold = inFlight || active
+        startTime = Date()
+    }
+
+    func test_failMicStart() { failMicStart(reason: "injected bind failure") }
+    func test_flushStopGrace() { flushPendingStopGrace() }
+    func test_abortForSecureInput() { abortForSecureInput() }
+    func test_receiveAudio(_ buffer: AVAudioPCMBuffer) { sendCapturedAudioToCloud(buffer) }
+    var test_bufferCount: Int { pcmBuffersLock.withLock { pcmBuffers.count } }
+    func test_bufferAudio(_ buffer: AVAudioPCMBuffer) {
+        pcmBuffersLock.withLock { pcmBuffers.append(buffer) }
+    }
+    func test_armProcessingDeadline(token: UInt64) -> () -> Void {
+        armProcessingWatchdog(sessionToken: token, audioDuration: 0)
+        let generation = processingWatchdogGeneration
+        return { [weak self] in
+            self?.fireProcessingWatchdog(generation: generation, sessionToken: token)
+        }
+    }
+#endif
 
     deinit {
         if let engineConfigObserver {
@@ -1018,7 +1058,7 @@ final class AudioRecorder {
 
     /// Single shared HUD instance, shown/hidden across the capture lifecycle
     /// — never recreated per recording.
-    let hud = RecordingHUD()
+    let hud: RecordingHUD
 
     /// Thread-safe smoothed mic level (0...1), written from the realtime
     /// audio-tap thread and consumed on main via `publishLevel`. A simple
@@ -1048,7 +1088,7 @@ final class AudioRecorder {
     private static let speechRMSThreshold: Float = 0.007
 
     /// xAI / WhisperKit streaming session state and start/stop decisions.
-    private let streamingCoordinator = StreamingCoordinator()
+    private let streamingCoordinator: StreamingCoordinator
 
     /// Off-main queue for concatenating buffers, writing CAF, and retention copy.
     private let audioIOQueue = DispatchQueue(label: "com.matt.voice-dictation.audio-io", qos: .userInitiated)
@@ -1079,7 +1119,7 @@ final class AudioRecorder {
         set { voiceGateProcessorRef.current = newValue }
     }
     private lazy var voiceGateEmbeddingProvider: FluidAudioEmbeddingProvider = FluidAudioEmbeddingProvider()
-    private let voiceGateProfileStore = VoiceProfileStore()
+    private let voiceGateProfileStore: VoiceProfileStore
     private let voiceGateRecordingSession = VoiceGateRecordingSession()
 
     /// Publishes in-memory speaker-gate telemetry snapshots on the main queue.
@@ -1852,15 +1892,19 @@ final class AudioRecorder {
                 // xAI/ElevenLabs is ever active (both gated on the same
                 // single-value `cloudModel` selection), so both sends are
                 // safe no-ops when their session is nil.
-                self.streamingCoordinator.sendToXAI(buffer)
-                self.streamingCoordinator.sendToElevenLabs(buffer)
-                self.streamingCoordinator.sendToGemini(buffer)
-                self.streamingCoordinator.sendToMuse(buffer)
+                self.sendCapturedAudioToCloud(buffer)
             }
             isSetUp = true
         }
 
         startEngineOffMain(isWatchdogRetry: isWatchdogRetry)
+    }
+
+    private func sendCapturedAudioToCloud(_ buffer: AVAudioPCMBuffer) {
+        streamingCoordinator.sendToXAI(buffer)
+        streamingCoordinator.sendToElevenLabs(buffer)
+        streamingCoordinator.sendToGemini(buffer)
+        streamingCoordinator.sendToMuse(buffer)
     }
 
     /// Constraint: `AVAudioEngine.start()` can block in HAL on a ghost input
@@ -2048,6 +2092,8 @@ final class AudioRecorder {
     }
 
     private func failMicStart(reason: String) {
+        let generation = recordingStartGeneration
+        let token = pendingHeldCaretToken ?? activeHeldCaretToken
         logger.error("mic start failed — \(reason)")
         vlog("failMicStart — \(reason)")
         // Next hold's startMicCapture only rebuilds when this is set.
@@ -2058,8 +2104,12 @@ final class AudioRecorder {
         endVoiceGateRecordingSession()
         clearPendingHeldCaretSnapshot()
         DispatchQueue.main.async { [weak self] in
-            // onFailure flashes the error pill. hide() here would cancel it.
-            self?.asrSelector.onFailure?(.micStartFailed)
+            guard let self, Self.isCurrentStartCallback(
+                generation: generation, currentGeneration: self.recordingStartGeneration
+            ) else { return }
+            // The failed request owns its error even while an older deadline remains armed.
+            self.hud.claimHold(token)
+            self.asrSelector.onFailure?(.micStartFailed)
         }
     }
 
@@ -2174,6 +2224,7 @@ final class AudioRecorder {
             excludeOnNextStartDeviceID = lastBoundInputDeviceID
             teardownMicEngine()
             engineNeedsRebuild = true
+            if activeHeldCaretToken == nil { discardUnpromotedCapture() }
             if Self.shouldReturnAfterInFlightDoStopTeardown(wantsRecording: wantsRecording) {
                 vlog("doStop — torn down in-flight start; re-press owns the hold")
                 return
@@ -2186,9 +2237,10 @@ final class AudioRecorder {
             vlog("doStop ignored — already stopping")
             return
         }
-        // A released request whose start was skipped owns no capture. In
-        // particular, it must not stop or retarget the preceding hold again.
+        // A request can own a socket and tap before microphone promotion.
+        // Settle those resources without consuming the preceding hold again.
         guard activeHeldCaretToken != nil else {
+            discardUnpromotedCapture()
             clearPendingHeldCaretSnapshot()
             return
         }
@@ -2227,6 +2279,19 @@ final class AudioRecorder {
 
         armProcessingWatchdog(sessionToken: sessionHold.token, audioDuration: holdDuration ?? 0)
         scheduleStopGrace(sessionHold: sessionHold, holdDuration: holdDuration)
+    }
+
+    /// A cancelled startup has no promoted hold to finalize, but its stream
+    /// must be detached before a subsequent Local capture installs a tap.
+    private func discardUnpromotedCapture() {
+        invalidateSecureInputPollTimer()
+        teardownMicEngine()
+        streamingCoordinator.cancelAll()
+        endVoiceGateRecordingSession()
+        pcmBuffersLock.withLock {
+            pcmBuffers.removeAll(keepingCapacity: false)
+            micCaptureBeganThisHold = false
+        }
     }
 
     /// Bounds how long the processing HUD can outlive release. On expiry the

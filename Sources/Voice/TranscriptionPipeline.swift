@@ -920,7 +920,9 @@ final class TranscriptionPipeline {
                 if replaceHistoryEntryID == nil {
                     self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 }
-                if !abandoned { self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed) }
+                if !abandoned, sessionHeldToken == self.heldCaretToken {
+                    self.onFailure?(voiceEditInstruction == nil ? .transcriptionFailed : .voiceEditFailed)
+                }
                 if let audioPath, voiceEditInstruction == nil {
                     self.onTranscriptionLogged?("", engineID, false, audioPath, true, replaceHistoryEntryID)
                 }
@@ -1192,7 +1194,7 @@ final class TranscriptionPipeline {
                     if replaceID == nil {
                         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
-                    if let failure = outcome.failure {
+                    if let failure = outcome.failure, sessionHeldToken == self.heldCaretToken {
                         self.onFailure?(failure)
                     }
 
