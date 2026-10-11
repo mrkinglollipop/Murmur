@@ -22,13 +22,13 @@ final class AppleSpeechEngineTests: XCTestCase {
         for stored in LocalModel.allCases {
             for hasStoredCloudSelection in [false, true] {
                 for hasCloudKey in [false, true] {
-                    for hasDownloadedLocalModel in [false, true] {
+                    for downloadedLocalModel in [nil] + LocalModel.allCases.map(Optional.some) {
                         XCTAssertEqual(
                             SettingsStore.initialLocalModel(
                                 storedRawValue: stored.rawValue,
                                 hasStoredCloudSelection: hasStoredCloudSelection,
                                 hasCloudKey: hasCloudKey,
-                                hasDownloadedLocalModel: hasDownloadedLocalModel
+                                downloadedLocalModel: downloadedLocalModel
                             ),
                             stored
                         )
@@ -41,14 +41,16 @@ final class AppleSpeechEngineTests: XCTestCase {
     func testFreshInstallSelectsAppleOnlyWithoutPriorCloudOrDownloadedModel() {
         for hasStoredCloudSelection in [false, true] {
             for hasCloudKey in [false, true] {
-                for hasDownloadedLocalModel in [false, true] {
+                for downloadedLocalModel in [nil] + LocalModel.allCases.map(Optional.some) {
                     let model = SettingsStore.initialLocalModel(
                         storedRawValue: nil,
                         hasStoredCloudSelection: hasStoredCloudSelection,
                         hasCloudKey: hasCloudKey,
-                        hasDownloadedLocalModel: hasDownloadedLocalModel
+                        downloadedLocalModel: downloadedLocalModel
                     )
-                    if !hasStoredCloudSelection && !hasCloudKey && !hasDownloadedLocalModel {
+                    if let downloadedLocalModel {
+                        XCTAssertEqual(model, downloadedLocalModel)
+                    } else if !hasStoredCloudSelection && !hasCloudKey {
                         XCTAssertEqual(model, .appleSpeech)
                     } else {
                         XCTAssertEqual(model, .default)
@@ -61,7 +63,7 @@ final class AppleSpeechEngineTests: XCTestCase {
                 storedRawValue: "retired-model",
                 hasStoredCloudSelection: false,
                 hasCloudKey: false,
-                hasDownloadedLocalModel: false
+                downloadedLocalModel: nil
             ),
             .default
         )
