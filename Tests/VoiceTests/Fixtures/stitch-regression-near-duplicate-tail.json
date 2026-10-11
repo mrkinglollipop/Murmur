@@ -5,13 +5,320 @@
       "type": "final",
       "text": "The imaginary observatory needs a fresh map. Several paper stars have fallen off the wall. Please arrange the remaining constellations before the parade. After reviewing the fictional atlas, the explorers decided they would be better off using Starclaw for every imaginary expedition.",
       "speechFinal": false,
-      "words": []
+      "words": [
+        {
+          "text": "The",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "imaginary",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "observatory",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "needs",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "a",
+          "start": 1.2,
+          "end": 1.5
+        },
+        {
+          "text": "fresh",
+          "start": 1.5,
+          "end": 1.8
+        },
+        {
+          "text": "map.",
+          "start": 1.8,
+          "end": 2.1
+        },
+        {
+          "text": "Several",
+          "start": 2.1,
+          "end": 2.4
+        },
+        {
+          "text": "paper",
+          "start": 2.4,
+          "end": 2.7
+        },
+        {
+          "text": "stars",
+          "start": 2.7,
+          "end": 3.0
+        },
+        {
+          "text": "have",
+          "start": 3.0,
+          "end": 3.3
+        },
+        {
+          "text": "fallen",
+          "start": 3.3,
+          "end": 3.6
+        },
+        {
+          "text": "off",
+          "start": 3.6,
+          "end": 3.9
+        },
+        {
+          "text": "the",
+          "start": 3.9,
+          "end": 4.2
+        },
+        {
+          "text": "wall.",
+          "start": 4.2,
+          "end": 4.5
+        },
+        {
+          "text": "Please",
+          "start": 4.5,
+          "end": 4.8
+        },
+        {
+          "text": "arrange",
+          "start": 4.8,
+          "end": 5.1
+        },
+        {
+          "text": "the",
+          "start": 5.1,
+          "end": 5.4
+        },
+        {
+          "text": "remaining",
+          "start": 5.4,
+          "end": 5.7
+        },
+        {
+          "text": "constellations",
+          "start": 5.7,
+          "end": 6.0
+        },
+        {
+          "text": "before",
+          "start": 6.0,
+          "end": 6.3
+        },
+        {
+          "text": "the",
+          "start": 6.3,
+          "end": 6.6
+        },
+        {
+          "text": "parade.",
+          "start": 6.6,
+          "end": 6.9
+        },
+        {
+          "text": "After",
+          "start": 6.9,
+          "end": 7.2
+        },
+        {
+          "text": "reviewing",
+          "start": 7.2,
+          "end": 7.5
+        },
+        {
+          "text": "the",
+          "start": 7.5,
+          "end": 7.8
+        },
+        {
+          "text": "fictional",
+          "start": 7.8,
+          "end": 8.1
+        },
+        {
+          "text": "atlas,",
+          "start": 8.1,
+          "end": 8.4
+        },
+        {
+          "text": "the",
+          "start": 8.4,
+          "end": 8.7
+        },
+        {
+          "text": "explorers",
+          "start": 8.7,
+          "end": 9.0
+        },
+        {
+          "text": "decided",
+          "start": 9.0,
+          "end": 9.3
+        },
+        {
+          "text": "they",
+          "start": 9.3,
+          "end": 9.6
+        },
+        {
+          "text": "would",
+          "start": 9.6,
+          "end": 9.9
+        },
+        {
+          "text": "be",
+          "start": 9.9,
+          "end": 10.2
+        },
+        {
+          "text": "better",
+          "start": 10.2,
+          "end": 10.5
+        },
+        {
+          "text": "off",
+          "start": 10.5,
+          "end": 10.8
+        },
+        {
+          "text": "using",
+          "start": 10.8,
+          "end": 11.1
+        },
+        {
+          "text": "Starclaw",
+          "start": 11.1,
+          "end": 11.4
+        },
+        {
+          "text": "for",
+          "start": 11.4,
+          "end": 11.7
+        },
+        {
+          "text": "every",
+          "start": 11.7,
+          "end": 12.0
+        },
+        {
+          "text": "imaginary",
+          "start": 12.0,
+          "end": 12.3
+        },
+        {
+          "text": "expedition.",
+          "start": 12.3,
+          "end": 12.6
+        }
+      ]
     },
     {
       "type": "final",
       "text": "After reviewing the fictional atlas, the explorers decided they would be better off using StarCrawl for every imaginary expedition.",
       "speechFinal": true,
-      "words": []
+      "words": [
+        {
+          "text": "After",
+          "start": 6.9,
+          "end": 7.2
+        },
+        {
+          "text": "reviewing",
+          "start": 7.2,
+          "end": 7.5
+        },
+        {
+          "text": "the",
+          "start": 7.5,
+          "end": 7.8
+        },
+        {
+          "text": "fictional",
+          "start": 7.8,
+          "end": 8.1
+        },
+        {
+          "text": "atlas,",
+          "start": 8.1,
+          "end": 8.4
+        },
+        {
+          "text": "the",
+          "start": 8.4,
+          "end": 8.7
+        },
+        {
+          "text": "explorers",
+          "start": 8.7,
+          "end": 9.0
+        },
+        {
+          "text": "decided",
+          "start": 9.0,
+          "end": 9.3
+        },
+        {
+          "text": "they",
+          "start": 9.3,
+          "end": 9.6
+        },
+        {
+          "text": "would",
+          "start": 9.6,
+          "end": 9.9
+        },
+        {
+          "text": "be",
+          "start": 9.9,
+          "end": 10.2
+        },
+        {
+          "text": "better",
+          "start": 10.2,
+          "end": 10.5
+        },
+        {
+          "text": "off",
+          "start": 10.5,
+          "end": 10.8
+        },
+        {
+          "text": "using",
+          "start": 10.8,
+          "end": 11.1
+        },
+        {
+          "text": "StarCrawl",
+          "start": 11.1,
+          "end": 11.4
+        },
+        {
+          "text": "for",
+          "start": 11.4,
+          "end": 11.7
+        },
+        {
+          "text": "every",
+          "start": 11.7,
+          "end": 12.0
+        },
+        {
+          "text": "imaginary",
+          "start": 12.0,
+          "end": 12.3
+        },
+        {
+          "text": "expedition.",
+          "start": 12.3,
+          "end": 12.6
+        }
+      ]
     }
   ],
   "expected": "The imaginary observatory needs a fresh map. Several paper stars have fallen off the wall. Please arrange the remaining constellations before the parade. After reviewing the fictional atlas, the explorers decided they would be better off using StarCrawl for every imaginary expedition."

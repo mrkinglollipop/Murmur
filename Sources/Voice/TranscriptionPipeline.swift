@@ -788,84 +788,104 @@ final class TranscriptionPipeline {
     }
 
     static func cleanupLooksSane(input: String, output: String) -> Bool {
-        func words(_ s: String) -> [String] {
-            s.lowercased()
-                .replacingOccurrences(of: "’", with: "'")
+        func words(_ text: String) -> [String] {
+            text.lowercased().replacingOccurrences(of: "’", with: "'")
                 .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
                 .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
                 .filter { !$0.isEmpty }
         }
-        let inWords = words(input)
-        let outWords = words(output)
-        // No words in the input leaves nothing to compare against.
-        guard !inWords.isEmpty else { return true }
-
-        let ratio = Double(output.count) / Double(max(input.count, 1))
-        if ratio > 2.0 || ratio < 0.4 { return false }
-
-        // A symbol-only reply ("…", an emoji) is not a cleanup of spoken words.
+        func expand(_ word: String) -> [String] {
+            let irregular: [String: [String]] = [
+                "can't": ["can", "not"], "cannot": ["can", "not"],
+                "won't": ["will", "not"], "shan't": ["shall", "not"],
+                "i'm": ["i", "am"], "let's": ["let", "us"]
+            ]
+            if let expanded = irregular[word] { return expanded }
+            let negatives: Set<String> = [
+                "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't",
+                "hasn't", "haven't", "hadn't", "couldn't", "wouldn't", "shouldn't",
+                "mustn't", "needn't", "mightn't"
+            ]
+            if negatives.contains(word) { return [String(word.dropLast(3)), "not"] }
+            let pronouns: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "there", "that", "what", "who"]
+            for (suffix, verb) in [("'ll", "will"), ("'re", "are"), ("'ve", "have")] {
+                if word.hasSuffix(suffix) {
+                    let stem = String(word.dropLast(suffix.count))
+                    if pronouns.contains(stem) { return [stem, verb] }
+                }
+            }
+            // 's and 'd can mean different verbs (or possession). Preserve
+            // them unless a later, context-aware contract can disambiguate.
+            return [word]
+        }
+        let inputWords = words(input)
+        guard !inputWords.isEmpty else { return true }
+        let outWords = words(output).flatMap(expand)
         guard !outWords.isEmpty else { return false }
 
-        let inSet = Set(inWords)
-        let newWords = outWords.filter { !inSet.contains($0) }
-        guard Double(newWords.count) / Double(outWords.count) <= 0.4 else { return false }
-
-        // Negations and digits carry the meaning; cleanup may not lose one.
-        let negations: Set<String> = ["not", "no", "never", "none", "nothing", "nobody", "neither", "nor", "cannot"]
-        func isNegation(_ w: String) -> Bool { negations.contains(w) || w.hasSuffix("n't") }
-        guard outWords.filter(isNegation).count >= inWords.filter(isNegation).count else { return false }
-        var outNumbers: [String: Int] = [:]
-        for w in outWords where w.contains(where: \.isNumber) { outNumbers[w, default: 0] += 1 }
-        for w in inWords where w.contains(where: \.isNumber) {
-            guard let left = outNumbers[w], left > 0 else { return false }
-            outNumbers[w] = left - 1
+        // Punctuation cleanup must not turn 12.50 into 12 50, or -5 into 5.
+        func numbers(_ text: String) -> [String] {
+            let expression = try! NSRegularExpression(pattern: #"[+-]?\d+(?:[.,]\d+)*"#)
+            return expression.matches(in: text, range: NSRange(text.startIndex..., in: text))
+                .compactMap { Range($0.range, in: text).map { String(text[$0]) } }
         }
+        guard numbers(input) == numbers(output) else { return false }
 
-        // The checks above cannot see a dropped sentence. Align the two word
-        // sequences in order and require every input sentence to survive at
-        // least by half.
-        let sentences = input
-            .replacingOccurrences(of: #"[.!?]\s+"#, with: "\n", options: .regularExpression)
-            .components(separatedBy: .newlines)
-            .map(words)
-            .filter { !$0.isEmpty }
-        guard sentences.count > 1 else { return true }
-        let kept = orderedMatches(inWords, outWords)
+        // Keep standalone sentences even when all of their words can also be
+        // fillers. Punctuation can be added elsewhere by the cleanup pass.
+        let sentences = input.split(whereSeparator: { ".!?".contains($0) }).map { words(String($0)) }
+        var protected = Set<Int>()
         var offset = 0
         for sentence in sentences {
-            let range = offset..<(offset + sentence.count)
-            offset = range.upperBound
-            guard sentence.count >= 3 else { continue }
-            let survived = kept[range].filter { $0 }.count
-            if survived * 2 < sentence.count { return false }
-        }
-        return true
-    }
-
-    /// Longest-common-subsequence alignment: which words of `a` survive, in
-    /// order, in `b`.
-    private static func orderedMatches(_ a: [String], _ b: [String]) -> [Bool] {
-        var matched = [Bool](repeating: false, count: a.count)
-        guard !a.isEmpty, !b.isEmpty else { return matched }
-        var table = [[Int]](repeating: [Int](repeating: 0, count: b.count + 1), count: a.count + 1)
-        for i in stride(from: a.count - 1, through: 0, by: -1) {
-            for j in stride(from: b.count - 1, through: 0, by: -1) {
-                table[i][j] = a[i] == b[j] ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
+            if sentence == ["like"] || sentence == ["you", "know"] {
+                protected.formUnion(offset..<(offset + sentence.count))
             }
+            offset += sentence.count
         }
-        var i = 0, j = 0
-        while i < a.count, j < b.count {
-            if a[i] == b[j] {
-                matched[i] = true
-                i += 1
-                j += 1
-            } else if table[i + 1][j] >= table[i][j + 1] {
-                i += 1
-            } else {
-                j += 1
+        let asideExpression = try! NSRegularExpression(pattern: #"(?i)(?:^|[,—])\s*(like|you\s+know)\s*(?=[,—.!?]|$)"#)
+        let asideStarts = Set(asideExpression.matches(in: input, range: NSRange(input.startIndex..., in: input))
+            .compactMap { match -> Int? in
+                guard let range = Range(match.range(at: 1), in: input) else { return nil }
+                return words(String(input[..<range.lowerBound])).count
+            })
+        let clauseStarts: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "there", "this", "that"]
+        let fillerLeads: Set<String> = ["um", "uh", "so"]
+        let knowledgeLeads: Set<String> = ["what", "that", "if", "whether", "think", "hope", "everything", "anything",
+            "something", "nothing", "all", "who", "whom", "do", "did", "does", "don't", "didn't", "doesn't"]
+        var inputIndex = 0
+        var outputIndex = 0
+        while inputIndex < inputWords.count {
+            let word = inputWords[inputIndex]
+            let equivalent = expand(word)
+            if outputIndex + equivalent.count <= outWords.count,
+               Array(outWords[outputIndex..<(outputIndex + equivalent.count)]) == equivalent {
+                inputIndex += 1
+                outputIndex += equivalent.count
+                continue
             }
+            if word == "um" || word == "uh" { inputIndex += 1; continue }
+            if !protected.contains(inputIndex), word == "like", inputIndex + 1 < inputWords.count,
+               (asideStarts.contains(inputIndex) || ((inputIndex == 0 || fillerLeads.contains(inputWords[inputIndex - 1]))
+                && clauseStarts.contains(expand(inputWords[inputIndex + 1])[0]))) {
+                inputIndex += 1
+                continue
+            }
+            if !protected.contains(inputIndex), word == "you", inputIndex + 1 < inputWords.count,
+               inputWords[inputIndex + 1] == "know" {
+                let after = inputIndex + 2
+                let startsAside = inputIndex == 0 || fillerLeads.contains(inputWords[inputIndex - 1])
+                let beforeTime = after < inputWords.count && ["today", "tomorrow", "yesterday", "now", "later"].contains(inputWords[after])
+                    && (inputIndex == 0 || !knowledgeLeads.contains(inputWords[inputIndex - 1]))
+                if asideStarts.contains(inputIndex)
+                    || (startsAside && after < inputWords.count && clauseStarts.contains(expand(inputWords[after])[0]))
+                    || beforeTime {
+                    inputIndex += 2
+                    continue
+                }
+            }
+            return false
         }
-        return matched
+        return outputIndex == outWords.count
     }
 
     /// Failed edits have no usable result to retain. Their audio is an

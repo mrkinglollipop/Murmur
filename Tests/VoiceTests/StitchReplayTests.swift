@@ -62,7 +62,10 @@ final class StitchReplayTests: XCTestCase {
                         do {
                             let data = try JSONSerialization.data(withJSONObject: [
                                 "type": "transcript.partial", "text": event.text,
-                                "is_final": false, "speech_final": false
+                                "is_final": false, "speech_final": false,
+                                "words": event.words.map {
+                                    ["text": $0.text, "start": $0.start, "end": $0.end] as [String: Any]
+                                }
                             ])
                             session.handleServerEvent(String(decoding: data, as: UTF8.self))
                         } catch {

@@ -5,19 +5,152 @@
       "type": "final",
       "text": "Has anyone built a model of the red planet?",
       "speechFinal": false,
-      "words": []
+      "words": [
+        {
+          "text": "Has",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "anyone",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "built",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "a",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "model",
+          "start": 1.2,
+          "end": 1.5
+        },
+        {
+          "text": "of",
+          "start": 1.5,
+          "end": 1.8
+        },
+        {
+          "text": "the",
+          "start": 1.8,
+          "end": 2.1
+        },
+        {
+          "text": "red",
+          "start": 2.1,
+          "end": 2.4
+        },
+        {
+          "text": "planet?",
+          "start": 2.4,
+          "end": 2.7
+        }
+      ]
     },
     {
       "type": "final",
       "text": "Has anyone built a model of the red planet from clay?",
       "speechFinal": false,
-      "words": []
+      "words": [
+        {
+          "text": "Has",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "text": "anyone",
+          "start": 0.3,
+          "end": 0.6
+        },
+        {
+          "text": "built",
+          "start": 0.6,
+          "end": 0.9
+        },
+        {
+          "text": "a",
+          "start": 0.9,
+          "end": 1.2
+        },
+        {
+          "text": "model",
+          "start": 1.2,
+          "end": 1.5
+        },
+        {
+          "text": "of",
+          "start": 1.5,
+          "end": 1.8
+        },
+        {
+          "text": "the",
+          "start": 1.8,
+          "end": 2.1
+        },
+        {
+          "text": "red",
+          "start": 2.1,
+          "end": 2.4
+        },
+        {
+          "text": "planet",
+          "start": 2.4,
+          "end": 2.7
+        },
+        {
+          "text": "from",
+          "start": 2.7,
+          "end": 3.0
+        },
+        {
+          "text": "clay?",
+          "start": 3.0,
+          "end": 3.3
+        }
+      ]
     },
     {
       "type": "final",
       "text": "A sculpture though, not a globe.",
       "speechFinal": true,
-      "words": []
+      "words": [
+        {
+          "text": "A",
+          "start": 5.0,
+          "end": 5.3
+        },
+        {
+          "text": "sculpture",
+          "start": 5.3,
+          "end": 5.6
+        },
+        {
+          "text": "though,",
+          "start": 5.6,
+          "end": 5.9
+        },
+        {
+          "text": "not",
+          "start": 5.9,
+          "end": 6.2
+        },
+        {
+          "text": "a",
+          "start": 6.2,
+          "end": 6.5
+        },
+        {
+          "text": "globe.",
+          "start": 6.5,
+          "end": 6.8
+        }
+      ]
     }
   ],
   "expected": "Has anyone built a model of the red planet from clay? A sculpture though, not a globe."
