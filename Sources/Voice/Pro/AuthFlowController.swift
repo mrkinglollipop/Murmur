@@ -39,7 +39,7 @@ final class AuthFlowController: ObservableObject {
     /// BYO API keys (legacy login keychain — see KeychainStore's warning
     /// about the Data Protection store before "improving" this).
     static let keychainAccount = "supabase-refresh-token"
-    private let readStoredToken: () -> String?
+    private let readStoredToken: () throws -> String?
     private let writeStoredToken: (String) -> Bool
     private let deleteStoredToken: () -> Bool
     private let exchangeCode: (String, String) async throws -> SupabaseAuthClient.Session
@@ -66,7 +66,7 @@ final class AuthFlowController: ObservableObject {
         exchangeCode: @escaping (String, String) async throws -> SupabaseAuthClient.Session = SupabaseAuthClient.exchangeCode,
         refreshToken: @escaping (String) async throws -> SupabaseAuthClient.Session = SupabaseAuthClient.refresh,
         openBrowser: @escaping (URL) -> Void = { _ = NSWorkspace.shared.open($0) },
-        readStoredToken: (() -> String?)? = nil,
+        readStoredToken: (() throws -> String?)? = nil,
         writeStoredToken: ((String) -> Void)? = nil,
         deleteStoredToken: (() -> Void)? = nil,
         persistStoredToken: ((String) -> Bool)? = nil,
@@ -74,7 +74,7 @@ final class AuthFlowController: ObservableObject {
         browserTimeout: TimeInterval = AuthFlowController.browserTimeout,
         waitForBrowserTimeout: (() async -> Void)? = nil
     ) {
-        self.readStoredToken = readStoredToken ?? { keychain.key(for: Self.keychainAccount) }
+        self.readStoredToken = readStoredToken ?? { try keychain.readKey(for: Self.keychainAccount) }
         self.writeStoredToken = persistStoredToken ?? { value in
             if let writeStoredToken {
                 writeStoredToken(value)
@@ -402,10 +402,10 @@ final class AuthFlowController: ObservableObject {
         // one another so an older rotated token cannot win.
         guard case .signedOut = state else { return }
         shouldRetryRestore = false
-        guard let token = readStoredToken() else { return }
         sessionGeneration &+= 1
         let generation = sessionGeneration
         do {
+            guard let token = try readStoredToken() else { return }
             let session = try await refreshToken(token)
             guard generation == sessionGeneration else { return }
             state = .signedIn(session)
@@ -417,14 +417,15 @@ final class AuthFlowController: ObservableObject {
         } catch {
             guard generation == sessionGeneration else { return }
             shouldRetryRestore = true
-            lastError = "Murmur can't reach the server. Your saved sign-in will be retried when the app becomes active."
+            lastError = error is KeychainReadError
+                ? "Murmur couldn't read your saved sign-in. It will be retried when the app becomes active."
+                : "Murmur can't reach the server. Your saved sign-in will be retried when the app becomes active."
             vlog("auth: session restore temporarily unavailable")
         }
     }
 
     func signOut() {
         shouldRetryRestore = false
-        pendingStoredToken = nil
         sessionGeneration &+= 1
         endBrowserAttempt()
         inFlightRefresh?.task.cancel()
@@ -433,6 +434,7 @@ final class AuthFlowController: ObservableObject {
             lastError = "Murmur couldn't remove your saved sign-in."
             return
         }
+        pendingStoredToken = nil
         state = .signedOut
         lastError = nil
     }

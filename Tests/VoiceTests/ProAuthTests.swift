@@ -1,4 +1,5 @@
 import XCTest
+import Security
 @testable import Voice
 
 /// Pro sign-in plumbing: PKCE primitives, authorize URL, callback parsing,
@@ -741,6 +742,128 @@ final class ProAuthTests: XCTestCase {
         await gate.succeed(restored)
         let available = await first.value
         XCTAssertEqual(available, restored)
+    }
+
+    @MainActor
+    func testKeychainReadDenialRetriesLaunchAndPendingForegroundRestore() async {
+        for failNetworkFirst in [false, true] {
+            let restored = session(refreshToken: "rotated")
+            var denyRead = !failNetworkFirst
+            var reads = 0
+            var refreshes = 0
+            let keychain = KeychainStore(
+                service: "murmur-auth-memory-test",
+                operations: KeychainOperations(
+                    read: { query in
+                        XCTAssertEqual(query[kSecAttrAccount as String] as? String, AuthFlowController.keychainAccount)
+                        reads += 1
+                        return denyRead ? (errSecInteractionNotAllowed, nil) : (errSecSuccess, Data("saved".utf8))
+                    },
+                    add: { _ in XCTFail("Unexpected Keychain write"); return errSecSuccess },
+                    update: { _, _ in XCTFail("Unexpected Keychain update"); return errSecSuccess },
+                    delete: { _ in XCTFail("Unexpected Keychain delete"); return errSecSuccess }
+                )
+            )
+            let controller = AuthFlowController(
+                keychain: keychain,
+                refreshToken: { token in
+                    XCTAssertEqual(token, "saved")
+                    refreshes += 1
+                    if failNetworkFirst && refreshes == 1 { throw URLError(.notConnectedToInternet) }
+                    return restored
+                },
+                openBrowser: { _ in XCTFail("Unexpected browser launch") },
+                persistStoredToken: { _ in true }, removeStoredToken: { XCTFail("Unexpected deletion"); return true }
+            )
+            await controller.restoreSessionIfAvailable()
+            if failNetworkFirst {
+                denyRead = true
+                let unavailable = await controller.sessionForForegroundActivation()
+                XCTAssertNil(unavailable)
+            }
+            XCTAssertEqual(controller.state, .signedOut)
+            denyRead = false
+            let available = await controller.sessionForForegroundActivation()
+            XCTAssertEqual(available, restored)
+            XCTAssertEqual(controller.state, .signedIn(restored))
+            XCTAssertEqual(reads, failNetworkFirst ? 3 : 2)
+            XCTAssertEqual(refreshes, failNetworkFirst ? 2 : 1)
+        }
+    }
+
+    private final class ExpiredSessionProtocol: URLProtocol {
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            XCTAssertEqual(request.url?.path, "/auth/v1/token")
+            XCTAssertEqual(request.url?.query, "grant_type=refresh_token")
+            let response = HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(#"{"code":"session_expired"}"#.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        override func stopLoading() {}
+    }
+
+    @MainActor
+    func testExpiredSessionResponseInvalidatesCredentialsWithoutForegroundRetries() async {
+        XCTAssertTrue(URLProtocol.registerClass(ExpiredSessionProtocol.self))
+        defer { URLProtocol.unregisterClass(ExpiredSessionProtocol.self) }
+        var savedToken: String? = "expired"
+        var refreshes = 0
+        var deletions = 0
+        let controller = AuthFlowController(
+            refreshToken: { token in
+                refreshes += 1
+                return try await SupabaseAuthClient.refresh(refreshToken: token)
+            },
+            openBrowser: { _ in XCTFail("Unexpected browser launch") },
+            readStoredToken: { savedToken },
+            persistStoredToken: { _ in XCTFail("Expired session must not persist"); return true },
+            removeStoredToken: { deletions += 1; savedToken = nil; return true }
+        )
+        await controller.restoreSessionIfAvailable()
+        let first = await controller.sessionForForegroundActivation()
+        let second = await controller.sessionForForegroundActivation()
+        XCTAssertNil(first)
+        XCTAssertNil(second)
+        XCTAssertEqual(controller.state, .signedOut)
+        XCTAssertNil(savedToken)
+        XCTAssertEqual(deletions, 1)
+        XCTAssertEqual(refreshes, 1)
+        XCTAssertEqual(controller.lastError, "Your sign-in expired. Please sign in again.")
+    }
+
+    @MainActor
+    func testFailedSignOutPreservesRotatedTokenPersistenceRetry() async {
+        let restored = session(refreshToken: "rotated")
+        var savedToken = "old"
+        var writes: [String] = []
+        var keychainAvailable = false
+        var refreshes = 0
+        let controller = AuthFlowController(
+            refreshToken: { _ in refreshes += 1; return restored },
+            openBrowser: { _ in XCTFail("Unexpected browser launch") },
+            readStoredToken: { savedToken },
+            persistStoredToken: { token in
+                writes.append(token)
+                guard keychainAvailable else { return false }
+                savedToken = token
+                return true
+            },
+            removeStoredToken: { keychainAvailable }
+        )
+        await controller.restoreSessionIfAvailable()
+        controller.signOut()
+        XCTAssertEqual(controller.state, .signedIn(restored))
+        XCTAssertEqual(savedToken, "old")
+        keychainAvailable = true
+        let available = await controller.authenticatedSession()
+        XCTAssertEqual(available, restored)
+        XCTAssertEqual(writes, ["rotated", "rotated"])
+        XCTAssertEqual(savedToken, "rotated")
+        XCTAssertEqual(refreshes, 1)
+        XCTAssertNil(controller.lastError)
     }
 
 }

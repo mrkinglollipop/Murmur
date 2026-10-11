@@ -705,8 +705,10 @@ final class ClipboardStore: ObservableObject {
             throw CocoaError(.fileReadCorruptFile)
         }
         for row in original {
-            guard let migrated = current.first(where: { $0.id == row.id }),
-                  let sealed = migrated.sealedPreview else { throw CocoaError(.fileReadCorruptFile) }
+            // Retention or deletion can outlive a backup from an earlier launch.
+            // Keep that unverified recovery copy without disabling the current store.
+            guard let migrated = current.first(where: { $0.id == row.id }) else { return }
+            guard let sealed = migrated.sealedPreview else { throw CocoaError(.fileReadCorruptFile) }
             if let preview = row.preview {
                 guard try crypto.open(sealed) == Data(preview.utf8) else {
                     throw CocoaError(.fileReadCorruptFile)

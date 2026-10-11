@@ -1918,4 +1918,32 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
     }
 
+    func testStaleMigrationBackupDoesNotDisableRetentionAfterDeletedEntry() throws {
+        let (directory, crypto, deleted) = try legacyPreviewFixture()
+        let metadata = directory.appendingPathComponent("clipboard.json")
+        let legacy = try Data(contentsOf: metadata)
+        let original = activated(ClipboardStore(directory: directory, crypto: crypto))
+        original.delete(deleted)
+        original.record(snapshot: textSnapshot("retained"), sourceBundleID: nil)
+        original.flush()
+        XCTAssertEqual(original.entries.count, 1)
+        let backup = directory.appendingPathComponent("clipboard.json.pre-migration-backup")
+        try legacy.write(to: backup)
+
+        let store = activated(ClipboardStore(directory: directory, crypto: crypto, maxEntries: 2))
+        XCTAssertTrue(store.canAttemptCapture)
+        XCTAssertFalse(store.isStorageUnavailable)
+        for text in ["second", "third", "fourth"] {
+            store.record(snapshot: textSnapshot(text), sourceBundleID: nil)
+            store.flush()
+        }
+        XCTAssertEqual(store.entries.map(\.preview), ["fourth", "third"])
+        XCTAssertFalse(store.isStorageUnavailable)
+        XCTAssertEqual(try Data(contentsOf: backup), legacy, "Unverified recovery data must survive")
+        let reopened = activated(ClipboardStore(directory: directory, crypto: crypto, maxEntries: 2))
+        XCTAssertEqual(reopened.entries.map(\.preview), ["fourth", "third"])
+        let blobs = try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("blobs").path)
+        XCTAssertEqual(Set(blobs), Set(store.entries.map { $0.id.uuidString }))
+    }
+
 }
