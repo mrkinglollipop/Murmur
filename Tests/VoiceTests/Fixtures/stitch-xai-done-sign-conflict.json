@@ -1,0 +1,20 @@
+{
+  "name": "xai-done-sign-conflict-remains-ambiguous",
+  "events": [
+    {
+      "type": "final",
+      "text": "-100 units.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "100 units.",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "-100 units.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

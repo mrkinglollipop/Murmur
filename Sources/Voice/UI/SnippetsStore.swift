@@ -21,6 +21,8 @@ struct Snippet: Codable, Identifiable, Equatable {
 /// whole-phrase, case-insensitive find/replace expansion.
 final class SnippetsStore: ObservableObject {
 
+    @Published private(set) var saveFailure = SaveFailureNotice()
+
     @Published private(set) var snippets: [Snippet] = []
 
     private let fileURL: URL
@@ -55,6 +57,7 @@ final class SnippetsStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("snippets.json exists but is unreadable — saves disabled this session")
             return
         }
@@ -75,16 +78,29 @@ final class SnippetsStore: ObservableObject {
             logger.error("Quarantined corrupt snippets.json → \(bak.lastPathComponent): \(error.localizedDescription)")
         } catch {
             savesBlocked = true
+            reportSaveFailure()
             logger.error("Failed to quarantine corrupt snippets.json: \(error.localizedDescription)")
         }
         snippets = []
     }
 
+    private func reportSaveFailure() {
+        saveFailure.report("Snippets could not be saved. Copy any changes you want to keep before quitting.")
+    }
+
+    func dismissSaveFailure() {
+        saveFailure.dismiss()
+    }
+
     private func save() {
         guard !savesBlocked else { return }
         rebuildRegexCache()
-        guard let data = try? JSONEncoder().encode(snippets) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(snippets)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            reportSaveFailure()
+        }
     }
 
     private func scheduleSave() {

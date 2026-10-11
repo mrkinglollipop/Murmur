@@ -176,13 +176,21 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// the 3s done-timeout when there's no live socket to answer.
     private var socketClosed = false
     private var streamIntegrityFailed = false
+    /// A conflict among committed finals. Only a consistent documented
+    /// full-session `transcript.done` can clear it. This is distinct from
+    /// transport loss: a genuine queue overflow or conversion failure must
+    /// never be cleared by later transcript text.
+    private var confirmedStitchAmbiguity = false
     private var lastFinalizeRequiresBufferedAudioRecovery = false
     private var intentionalSocketShutdown = false
 
     var requiresBufferedAudioRecovery: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return lastFinalizeRequiresBufferedAudioRecovery || streamIntegrityFailed
+        return lastFinalizeRequiresBufferedAudioRecovery
+            || streamIntegrityFailed
+            || confirmedStitchAmbiguity
+            || hasProvisionalInterimAmbiguityLocked()
     }
 
     init(
@@ -726,7 +734,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             let words = Self.parseWords(from: json)
 
             stateLock.lock()
-            if !partialText.isEmpty {
+            if !partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 latestInterim = partialText
                 latestInterimWords = words
                 everHadNonEmptyStreamText = true
@@ -745,13 +753,12 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             onInterim?(running)
 
         case "transcript.done":
-            // transcript.done is frequently EMPTY even after a correct
-            // transcription — the full text was already delivered via the
-            // final partials — so fall back to the stitched confirmed/interim
-            // text rather than trusting done's (empty) text and losing
-            // everything. When done carries text, prefer it only if it is at
-            // least as complete as what we already stitched — a shorter done
-            // must not clobber earlier chunk finals.
+            // xAI documents `transcript.done` as the full transcript after
+            // `audio.done`, emitted once per channel before the connection
+            // closes: https://docs.x.ai/developers/model-capabilities/audio/speech-to-text
+            // It is authoritative when it agrees with, or can prove a
+            // replacement of, the client stitch. An unresolved conflict keeps
+            // conservative text and requests retained-audio recovery.
             let doneText = (json["text"] as? String) ?? ""
             stateLock.lock()
             let resolved = bestResolvedTranscript(doneText: doneText, words: Self.parseWords(from: json))
@@ -800,6 +807,15 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         stateLock.unlock()
     }
 
+    /// Evidence that authorizes a merge. Anything other than a proven same or
+    /// proven different audio region remains conservative and requests batch
+    /// recovery once it becomes final.
+    private enum StitchEvidence {
+        case same
+        case different
+        case ambiguous
+    }
+
     func noteSocketClosed(closeCode: URLSessionWebSocketTask.CloseCode) {
         stateLock.lock()
         socketClosed = true
@@ -829,31 +845,77 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         ).confirmedText
     }
 
+    /// Must be called with `stateLock` held. An interim is provisional, so it
+    /// is recomputed rather than latched: its own later final can prove the
+    /// relationship without poisoning the completed session.
+    private func hasProvisionalInterimAmbiguityLocked() -> Bool {
+        let interim = latestInterim.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !interim.isEmpty, !confirmedSegments.isEmpty else { return false }
+        let incoming = AudioSegment(text: interim, words: latestInterimWords,
+                                    timestampOrigin: timestampOrigin)
+        return Self.classifyStitchEvidence(
+            existing: confirmedSegments,
+            incoming: incoming,
+            isUtteranceFinal: false
+        ) == .ambiguous
+    }
+
     /// Picks the best final transcript between client-stitched text and a
     /// `transcript.done` payload. Must be called with `stateLock` held.
     private func bestResolvedTranscript(doneText: String, words: [TranscriptWord]) -> String {
-        if !words.isEmpty, !doneText.isEmpty {
-            let timedSnapshot = latestInterim.isEmpty ? confirmedSegments : Self.mergeSegmentIntoConfirmed(
-                confirmed: confirmedText, text: latestInterim, incomingWords: latestInterimWords,
-                committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
-                segments: confirmedSegments, timestampOrigin: timestampOrigin
-            ).segments
-            // A session-wide completion cannot prove which locally timed
-            // utterance it revises after more than one origin has been seen.
-            let origins = Set(timedSnapshot.filter { $0.interval != nil }.compactMap(\.timestampOrigin))
-            let doneOrigin = origins.count <= 1 ? origins.first ?? lastFinalTimestampOrigin : nil
-            return Self.mergeSegmentIntoConfirmed(
-                confirmed: confirmedText, text: doneText, incomingWords: words,
-                committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
-                segments: timedSnapshot, timestampOrigin: doneOrigin
-            ).confirmedText
-        }
-        if !doneText.isEmpty, confirmedText.isEmpty
-            || (doneText.hasPrefix(confirmedText) && doneText.count > confirmedText.count) { return doneText }
         let stitched = mergeConfirmedWithInterim()
         let stitchedTrimmed = stitched.trimmingCharacters(in: .whitespacesAndNewlines)
         let doneTrimmed = doneText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return Self.resolveFinalTranscript(stitched: stitchedTrimmed, done: doneTrimmed)
+        guard !doneTrimmed.isEmpty else {
+            if hasProvisionalInterimAmbiguityLocked() {
+                confirmedStitchAmbiguity = true
+            }
+            return stitchedTrimmed
+        }
+
+        // The documented full-session completion is unopposed when no local
+        // text exists, and authoritative when it exactly preserves the
+        // stitched prefix after whitespace normalization.
+        if stitchedTrimmed.isEmpty {
+            return doneTrimmed
+        }
+        if Self.completionExactlyExtends(stitched: stitchedTrimmed, done: doneTrimmed) {
+            confirmedStitchAmbiguity = false
+            return doneTrimmed
+        }
+
+        // A final owns the current interim before any chunk became confirmed.
+        // This is event ownership, not a text-similarity guess.
+        if confirmedSegments.isEmpty,
+           !latestInterim.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return doneTrimmed
+        }
+
+        let snapshot = latestInterim.isEmpty ? confirmedSegments : Self.mergeSegmentIntoConfirmed(
+            confirmed: confirmedText, text: latestInterim, incomingWords: latestInterimWords,
+            committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
+            segments: confirmedSegments, timestampOrigin: timestampOrigin
+        ).segments
+        let done = AudioSegment(text: doneTrimmed, words: words, timestampOrigin: nil)
+        // Timestamp replacement is safe only when every competing segment is
+        // trustworthy and the session has one established timestamp origin.
+        if done.interval != nil,
+           !snapshot.isEmpty,
+           snapshot.allSatisfy({ $0.interval != nil }) {
+            let origins = Set(snapshot.compactMap(\.timestampOrigin))
+            if origins.count <= 1 {
+                let doneOrigin = origins.first ?? lastFinalTimestampOrigin
+                let merged = Self.mergeSegmentIntoConfirmed(
+                    confirmed: confirmedText, text: doneTrimmed, incomingWords: words,
+                    committedWords: committedWords, lastCommittedEnd: lastCommittedEnd,
+                    segments: snapshot, timestampOrigin: doneOrigin
+                )
+                return merged.confirmedText
+            }
+        }
+
+        confirmedStitchAmbiguity = true
+        return stitchedTrimmed
     }
 
     /// Incorporates a chunk- or utterance-final partial. Must be called with `stateLock` held.
@@ -868,14 +930,38 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
             vlog("xai-stream: word timestamp sample starts=[\(starts)] lastCommittedEnd=\(String(format: "%.2f", lastCommittedEnd))")
         }
 
-        let merged = Self.mergeSegmentIntoConfirmed(
-            confirmed: confirmedText,
-            text: trimmed,
-            incomingWords: words,
-            committedWords: committedWords,
-            lastCommittedEnd: lastCommittedEnd,
-            segments: confirmedSegments, timestampOrigin: timestampOrigin
+        let incoming = AudioSegment(text: trimmed, words: words, timestampOrigin: timestampOrigin)
+        let evidence = Self.classifyStitchEvidence(
+            existing: confirmedSegments,
+            incoming: incoming,
+            isUtteranceFinal: speechFinal
         )
+
+        let merged: (confirmedText: String, committedWords: [TranscriptWord], lastCommittedEnd: Double, segments: [AudioSegment])
+        if evidence == .same,
+           speechFinal,
+           words.isEmpty,
+           let last = confirmedSegments.last,
+           last.words.isEmpty,
+           Self.hasDelimitedTextPrefix(last.text, trimmed) {
+            var replaced = confirmedSegments
+            replaced[replaced.count - 1] = incoming
+            let mergedWords = replaced.flatMap(\.words)
+            merged = (replaced.map(\.text).joined(separator: " "), mergedWords,
+                      mergedWords.map(\.end).max() ?? lastCommittedEnd, replaced)
+        } else {
+            if evidence == .ambiguous {
+                confirmedStitchAmbiguity = true
+            }
+            merged = Self.mergeSegmentIntoConfirmed(
+                confirmed: confirmedText,
+                text: trimmed,
+                incomingWords: words,
+                committedWords: committedWords,
+                lastCommittedEnd: lastCommittedEnd,
+                segments: confirmedSegments, timestampOrigin: timestampOrigin
+            )
+        }
         lastFinalTimestampOrigin = timestampOrigin
         if speechFinal { timestampOrigin += 1 }
         confirmedText = merged.confirmedText
@@ -959,6 +1045,71 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                 words: Array(words[(last + 1)...]), timestampOrigin: timestampOrigin)
             return (before, after)
         }
+    }
+
+    /// Classifies one final/interim against the immediately preceding audio
+    /// region. Timestamp overlap authorizes replacement; trustworthy
+    /// disjoint intervals and a prior `speech_final` boundary authorize
+    /// keeping both. Every other relationship is intentionally unresolved.
+    private static func classifyStitchEvidence(
+        existing: [AudioSegment],
+        incoming: AudioSegment,
+        isUtteranceFinal: Bool
+    ) -> StitchEvidence {
+        guard let last = existing.last else { return .different }
+
+        // `timestampOrigin` advances after a speech_final, so even untimed
+        // repetitions on the new utterance are proven different speech.
+        if last.timestampOrigin != incoming.timestampOrigin { return .different }
+
+        let sameOrigin = existing.filter { $0.timestampOrigin == incoming.timestampOrigin }
+        if incoming.interval != nil, sameOrigin.allSatisfy({ $0.interval != nil }) {
+            if sameOrigin.contains(where: { $0.interval!.overlaps(incoming.interval!) }) {
+                return .same
+            }
+            return .different
+        }
+
+        // The only untimed replacement proof is the provider's utterance
+        // final immediately extending its own untimed chunk. Nonempty words
+        // with an invalid interval are malformed provenance, never "untimed".
+        if isUtteranceFinal,
+           incoming.words.isEmpty,
+           last.words.isEmpty,
+           hasDelimitedTextPrefix(last.text, incoming.text) {
+            return .same
+        }
+
+        return .ambiguous
+    }
+
+    /// A proof may normalize whitespace, but never lexical punctuation: raw
+    /// containment would incorrectly equate `can` with `can't`, `3` with
+    /// `3.5`, or `Call Ann` with `Call Ann-Marie`. A terminal sentence mark
+    /// only completes the prefix when followed by whitespace or the end.
+    private static func hasDelimitedTextPrefix(_ earlier: String, _ later: String) -> Bool {
+        let left = normalizedWhitespace(earlier)
+        let right = normalizedWhitespace(later)
+        guard !left.isEmpty, right.hasPrefix(left) else { return false }
+        let after = right.index(right.startIndex, offsetBy: left.count)
+        guard after < right.endIndex else { return true }
+        let character = right[after]
+        if character.isWhitespace { return true }
+        guard character == "." || character == "!" || character == "?" else { return false }
+        let next = right.index(after: after)
+        return next == right.endIndex || right[next].isWhitespace
+    }
+
+    /// A full-session done is text-only authoritative only when every
+    /// stitched character is an exact leading prefix after whitespace
+    /// normalization. Sentence punctuation can complete that prefix, but
+    /// lexical punctuation, signs, and numeric punctuation cannot change.
+    private static func completionExactlyExtends(stitched: String, done: String) -> Bool {
+        hasDelimitedTextPrefix(stitched, done)
+    }
+
+    private static func normalizedWhitespace(_ text: String) -> String {
+        text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
 
     static func mergeSegmentIntoConfirmed(

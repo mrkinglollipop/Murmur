@@ -1,0 +1,27 @@
+{
+  "name": "xai-done-ambiguous-conflict-recovers",
+  "events": [
+    {
+      "type": "final",
+      "text": "I will send the report tomorrow.",
+      "speechFinal": true,
+      "words": [
+        { "text": "I", "start": 0, "end": 0.1 },
+        { "text": "will", "start": 0.1, "end": 0.3 },
+        { "text": "send", "start": 0.3, "end": 0.5 },
+        { "text": "the", "start": 0.5, "end": 0.6 },
+        { "text": "report", "start": 0.6, "end": 0.9 },
+        { "text": "tomorrow", "start": 0.9, "end": 1.2 }
+      ]
+    },
+    {
+      "type": "done",
+      "text": "I will send the report only after approval.",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "I will send the report tomorrow.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

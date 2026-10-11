@@ -1,0 +1,26 @@
+{
+  "name": "xai-untimed-negation-prefix-remains-ambiguous",
+  "events": [
+    {
+      "type": "final",
+      "text": "I can",
+      "speechFinal": false,
+      "words": []
+    },
+    {
+      "type": "final",
+      "text": "I can't proceed.",
+      "speechFinal": true,
+      "words": []
+    },
+    {
+      "type": "done",
+      "text": "",
+      "speechFinal": false,
+      "words": []
+    }
+  ],
+  "expected": "I can I can't proceed.",
+  "requiresRecovery": true,
+  "verifyFinalize": true
+}

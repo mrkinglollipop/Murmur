@@ -2191,6 +2191,8 @@ final class AudioRecorder {
     private func failMicStart(reason: String) {
         let generation = recordingStartGeneration
         let token = pendingHeldCaretToken ?? activeHeldCaretToken
+        let failure: DictationFailure = pendingHeldCaretToken == nil && activeHeldCaretToken != nil
+            ? .micDeliveredNoAudio : .micStartFailed
         logger.error("mic start failed — \(reason)")
         vlog("failMicStart — \(reason)")
         terminateFailedMicCapture()
@@ -2200,12 +2202,15 @@ final class AudioRecorder {
             ) else { return }
             // The failed request owns its error even while an older deadline remains armed.
             self.hud.claimHold(token)
-            self.asrSelector.onFailure?(.micStartFailed)
+            self.asrSelector.onFailure?(failure)
         }
     }
 
     private func terminateFailedMicCapture() {
         let failedHoldToken = activeHeldCaretToken ?? pendingHeldCaretToken
+        let sessionHold = Self.sampleCachedSessionHold(
+            activeToken: activeHeldCaretToken, cache: cachedSessionHolds
+        )
         wantsRecording = false
         isStopping = true
         // Bind/start failures can leave the graph unusable for the next hold.
@@ -2214,7 +2219,23 @@ final class AudioRecorder {
         teardownMicEngine()
         endVoiceGateRecordingSession()
         streamingCoordinator.cancelAll()
-        clearHeldCaretSnapshotMatchingSession(activeHeldCaretToken)
+        let hasCapturedAudio = pcmBuffersLock.withLock {
+            micCaptureBeganThisHold && !pcmBuffers.isEmpty
+        }
+        if let recoveredToken = sessionHold.token, hasCapturedAudio {
+            // A terminal microphone error ends delivery for this hold.
+            // Retain its earlier audio for History without late injection.
+            asrSelector.pipeline.markHoldAbandoned(recoveredToken)
+            stopFileBasedCapture(
+                sessionHeldToken: sessionHold.token,
+                sessionHeldSnapshot: sessionHold.snapshot,
+                sessionHeldFrontmostPID: sessionHold.pid
+            )
+            // Pipeline completion owns the cached hold and voice-edit intent.
+            activeHeldCaretToken = nil
+        } else {
+            clearHeldCaretSnapshotMatchingSession(activeHeldCaretToken)
+        }
         clearPendingHeldCaretSnapshot()
         micHealthMonitor = nil
         cancelProcessingWatchdog(forToken: failedHoldToken)

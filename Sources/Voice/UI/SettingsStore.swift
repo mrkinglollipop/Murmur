@@ -624,7 +624,7 @@ final class SettingsStore: ObservableObject {
     init(defaults: UserDefaults = VoiceDefaults.shared, profileDirectory: URL? = nil,
          keychain: KeychainStore = KeychainStore(),
          apiKeyLookup: ((String) -> String?)? = nil,
-         downloadedLocalModelLookup: () -> Bool = ModelManager.hasAnyDownloadedModel) {
+         downloadedLocalModelLookup: () -> LocalModel? = ModelManager.firstDownloadedModel) {
         self.keychain = keychain
         self.defaults = defaults
         self.profileDirectory = profileDirectory
@@ -646,7 +646,7 @@ final class SettingsStore: ObservableObject {
                 storedRawValue: storedLocalModelRawValue,
                 hasStoredCloudSelection: false,
                 hasCloudKey: false,
-                hasDownloadedLocalModel: false
+                downloadedLocalModel: nil
             )
         } else {
             let hasCloudKey = CloudProvider.allCases.contains { provider in
@@ -659,7 +659,7 @@ final class SettingsStore: ObservableObject {
                 storedRawValue: nil,
                 hasStoredCloudSelection: hasStoredCloudSelection,
                 hasCloudKey: hasCloudKey,
-                hasDownloadedLocalModel: downloadedLocalModelLookup()
+                downloadedLocalModel: downloadedLocalModelLookup()
             )
             selectedLocalModel = resolvedLocalModel
             defaults.set(resolvedLocalModel.rawValue, forKey: Keys.selectedLocalModel)
@@ -1137,19 +1137,19 @@ final class SettingsStore: ObservableObject {
         modelManager.downloadIfNeeded(selectedLocalModel)
     }
 
-    /// Preserves an existing local selection. Apple is the default only for a
-    /// genuinely fresh local setup: no stored selection, cloud credential, or
-    /// user-downloaded local model.
+    /// Preserves an existing local selection or the actual cached model.
+    /// Without prior cloud setup or a usable cache, fall back to Apple.
     nonisolated static func initialLocalModel(
         storedRawValue: String?,
         hasStoredCloudSelection: Bool,
         hasCloudKey: Bool,
-        hasDownloadedLocalModel: Bool
+        downloadedLocalModel: LocalModel?
     ) -> LocalModel {
         if let storedRawValue {
             return LocalModel(rawValue: storedRawValue) ?? .default
         }
-        if !hasStoredCloudSelection && !hasCloudKey && !hasDownloadedLocalModel {
+        if let downloadedLocalModel { return downloadedLocalModel }
+        if !hasStoredCloudSelection && !hasCloudKey {
             return .appleSpeech
         }
         return .default

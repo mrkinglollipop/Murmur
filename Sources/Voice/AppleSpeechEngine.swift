@@ -14,26 +14,32 @@ final class AppleSpeechEngine: ASREngine {
 
     private let transcribeAudio: @Sendable (AVAudioFile, String) async throws -> String
     private let deadline: LocalTranscriptionDeadline.Runner
+    private let assetUsage: AppleSpeechAssetUsage
 
     init(
         language: String = "en",
         transcribeAudio: (@Sendable (AVAudioFile, String) async throws -> String)? = nil,
-        deadline: @escaping LocalTranscriptionDeadline.Runner = LocalTranscriptionDeadline.run
+        deadline: @escaping LocalTranscriptionDeadline.Runner = LocalTranscriptionDeadline.run,
+        assetUsage: AppleSpeechAssetUsage = .shared
     ) {
         self.language = language
         self.transcribeAudio = transcribeAudio ?? Self.transcribe
         self.deadline = deadline
+        self.assetUsage = assetUsage
     }
 
     func transcribe(audioURL: URL) async throws -> String {
         let audioFile = try AVAudioFile(forReading: audioURL)
         let language = language
         let transcribeAudio = transcribeAudio
+        let assetUsage = assetUsage
         return try await deadline(
             LocalTranscriptionDeadline.seconds(for: audioFile),
             displayName
         ) {
-            try await transcribeAudio(audioFile, language)
+            try await assetUsage.withTranscription(language: language) {
+                try await transcribeAudio(audioFile, language)
+            }
         }
     }
 

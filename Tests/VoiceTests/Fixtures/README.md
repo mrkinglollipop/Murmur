@@ -41,3 +41,32 @@ replacement. The three untimed overlap/repetition cases in
 `GoldenTranscriptTests` likewise assert preservation; they no longer authorize
 deletion on text similarity. Same-utterance timestamped refinement expectations
 remain intact.
+
+The xAI `transcript.done` fixtures exercise the provider's full-session
+completion: an owned interim may be replaced, a timed done may cover multiple
+final utterances, and an utterance final may own its immediately preceding
+untimed chunk. A nonempty done that conflicts without provenance latches
+buffered-audio recovery while preserving the conservative stitched text. The
+distinct-utterance fixture also locks intentional repetitions and materially
+different wording against text-similarity deletion.
+
+`StitchReplayTests` reads source fixtures in addition to bundled fixtures so a
+test-first stitch repair can execute newly checked-in JSON without a generated
+project-file edit. Required fixture names are asserted explicitly; a fixture
+that is present but never replayed is a test failure.
+
+The follow-up acceptance rows distinguish an unopposed or exact token-prefix
+full-session done from ambiguity; preserve untimed repetitions after a
+`speech_final` boundary; reject malformed word payloads and character-only
+prefixes; and promote unresolved provisional interims when an empty done ends
+the session. These rows also verify that a last-chunk refinement cannot clear
+an unrelated earlier ambiguity.
+
+`transcript.done` is documented by xAI as one full-session completion after
+`audio.done`. A nonmatching short done with reset timestamp origins is not
+permission to append guessed new speech: retain confirmed text and request
+buffered-audio recovery.
+
+Prefix proofs preserve lexical and numeric meaning: `-100` is not `100`,
+`can` is not `can't`, and `3` is not `3.5`. A sentence terminal can complete
+an exact prefix only when followed by whitespace or the end of the transcript.

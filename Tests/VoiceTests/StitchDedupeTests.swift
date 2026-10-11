@@ -18,7 +18,10 @@ final class StitchDedupeTests: XCTestCase {
         session.handleServerEvent(#"{"type":"transcript.partial","text":"Call Bob.","is_final":true,"speech_final":true,"words":[{"text":"Call Bob","start":0,"end":1}]}"#)
         session.handleServerEvent(#"{"type":"transcript.done","text":"Wait.","words":[{"text":"Wait","start":0,"end":1}]}"#)
         let result = await session.finalize()
-        XCTAssertEqual(result, "Call Alice. Call Bob. Wait.")
+        // xAI documents done as the full session. A third, reset-timestamp
+        // candidate cannot be guessed to be new speech after two utterances.
+        XCTAssertEqual(result, "Call Alice. Call Bob.")
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
     }
 
     func testOverlappingTimestampsWithoutAnEstablishedOriginPreserveBothSegments() {

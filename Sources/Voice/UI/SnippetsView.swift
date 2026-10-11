@@ -40,6 +40,7 @@ struct SnippetsView: View {
                 list
             }
         }
+        .saveFailureBanner(store.saveFailure, onDismiss: store.dismissSaveFailure)
         .confirmDelete(
             isPresented: $showDeleteConfirmation,
             title: "Delete snippet?",
