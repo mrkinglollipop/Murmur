@@ -446,25 +446,27 @@ final class ModelManager: ObservableObject {
         refreshStatus(.appleSpeech)
     }
 
-    /// Existing installs with a model already on disk keep their selected
-    /// engine. This is intentionally synchronous so SettingsStore can make its
-    /// first-run decision before ModelManager is constructed.
-    nonisolated static func hasAnyDownloadedModel() -> Bool {
+    /// Returns an available model in picker order without downloading anything.
+    /// Settings resolves before ModelManager migrates the legacy cache, so use
+    /// the same repository precedence as migration and retain the variant ID.
+    nonisolated static func firstDownloadedModel() -> LocalModel? {
         let newRepo = downloadBase.appendingPathComponent("models/\(repo)", isDirectory: true)
         let completion = newRepo.deletingLastPathComponent()
             .appendingPathComponent(".\(newRepo.lastPathComponent)-migration-complete")
-        // Settings resolves before migration. Count pending legacy downloads,
-        // but never revive an orphan after a completed migration and deletion.
+        let whisperRepo: URL
+        // A usable current cache wins; completed migrations must never revive
+        // a legacy orphan after the user deletes the current model.
         if !FileManager.default.fileExists(atPath: completion.path),
-           whisperKitRepoHasUsableContent(
-               legacyDocumentsHuggingFaceBase.appendingPathComponent("models/\(repo)", isDirectory: true)
-           ) {
-            return true
+           !whisperKitRepoHasUsableContent(newRepo) {
+            whisperRepo = legacyDocumentsHuggingFaceBase
+                .appendingPathComponent("models/\(repo)", isDirectory: true)
+        } else {
+            whisperRepo = newRepo
         }
-        return LocalModel.allCases.contains { model in
+        return LocalModel.allCases.first { model in
             guard model != .appleSpeech else { return false }
-            if let folder = modelFolderURL(for: model) {
-                return variantFolderHasModelPayload(folder)
+            if let variant = model.whisperKitModelID {
+                return variantFolderHasModelPayload(whisperRepo.appendingPathComponent(variant, isDirectory: true))
             }
             return parakeetCacheInfo().0
         }

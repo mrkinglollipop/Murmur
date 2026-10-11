@@ -18,6 +18,18 @@ final class SettingsModelLifecycleTests: XCTestCase {
 
     @MainActor
     func testLegacyDefaultWhisperSelectionSurvivesMigrationAndRelaunch() throws {
+        try assertLegacyWhisperSelectionSurvivesMigrationAndRelaunch(.default)
+    }
+
+    @MainActor
+    func testLegacyNonDefaultWhisperSelectionSurvivesMigrationAndRelaunch() throws {
+        for model in LocalModel.allCases where model.whisperKitModelID != nil && model != .default {
+            try assertLegacyWhisperSelectionSurvivesMigrationAndRelaunch(model)
+        }
+    }
+
+    @MainActor
+    private func assertLegacyWhisperSelectionSurvivesMigrationAndRelaunch(_ model: LocalModel) throws {
         let suite = "murmur-model-upgrade-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         let oldRepo = VoicePaths.legacyWhisperKitDirectory
@@ -41,7 +53,7 @@ final class SettingsModelLifecycleTests: XCTestCase {
                 try? fm.removeItem(at: path)
             }
         }
-        let variantName = try XCTUnwrap(LocalModel.default.whisperKitModelID)
+        let variantName = try XCTUnwrap(model.whisperKitModelID)
         let variant = oldRepo.appendingPathComponent(variantName)
         try fm.createDirectory(at: variant, withIntermediateDirectories: true)
         try Data("{}".utf8).write(to: variant.appendingPathComponent("config.json"))
@@ -58,8 +70,8 @@ final class SettingsModelLifecycleTests: XCTestCase {
         // Use the production cache lookup before the manager's launch-time migration.
         let store = SettingsStore(defaults: defaults, profileDirectory: directory,
                                   apiKeyLookup: { _ in nil })
-        XCTAssertEqual(store.selectedLocalModel, .default)
-        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), LocalModel.default.rawValue)
+        XCTAssertEqual(store.selectedLocalModel, model)
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), model.rawValue)
 
         ModelManager.migrateWhisperKitModelsIfNeeded(from: oldRepo, to: newRepo)
         XCTAssertFalse(fm.fileExists(atPath: oldRepo.path))
@@ -68,8 +80,16 @@ final class SettingsModelLifecycleTests: XCTestCase {
 
         let reloaded = SettingsStore(defaults: defaults, profileDirectory: directory,
                                      apiKeyLookup: { _ in nil })
-        XCTAssertEqual(reloaded.selectedLocalModel, .default)
-        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), LocalModel.default.rawValue)
+        XCTAssertEqual(reloaded.selectedLocalModel, model)
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), model.rawValue)
+
+        defaults.removePersistentDomain(forName: suite)
+        let withoutSavedSelection = SettingsStore(defaults: defaults, profileDirectory: directory,
+                                                  apiKeyLookup: { _ in nil })
+        XCTAssertEqual(withoutSavedSelection.selectedLocalModel, model)
+        XCTAssertEqual(defaults.string(forKey: "voice.settings.selectedLocalModel"), model.rawValue)
+        let selectedFolder = try XCTUnwrap(ModelManager.modelFolderURL(for: withoutSavedSelection.selectedLocalModel))
+        XCTAssertTrue(fm.fileExists(atPath: selectedFolder.appendingPathComponent("weights.bin").path))
 
         // A completed migration must not make a deleted model look downloaded
         // merely because an old cache remains (the both-caches-present case).
@@ -77,7 +97,7 @@ final class SettingsModelLifecycleTests: XCTestCase {
         try fm.removeItem(at: newRepo)
         let afterDeletion = SettingsStore(defaults: defaults, profileDirectory: directory,
                                           apiKeyLookup: { _ in nil })
-        XCTAssertEqual(afterDeletion.selectedLocalModel, .default)
+        XCTAssertEqual(afterDeletion.selectedLocalModel, model)
         defaults.removePersistentDomain(forName: suite)
         let fresh = SettingsStore(defaults: defaults, profileDirectory: directory,
                                   apiKeyLookup: { _ in nil })
@@ -96,12 +116,12 @@ final class SettingsModelLifecycleTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
         }
         let store = SettingsStore(defaults: defaults, profileDirectory: directory,
-                                  apiKeyLookup: { _ in nil }, downloadedLocalModelLookup: { false })
+                                  apiKeyLookup: { _ in nil }, downloadedLocalModelLookup: { nil })
         XCTAssertEqual(store.selectedLocalModel, .appleSpeech)
         store.useCloudEngine = true
         store.useCloudEngine = false
         let reloaded = SettingsStore(defaults: defaults, profileDirectory: directory,
-                                     apiKeyLookup: { _ in nil }, downloadedLocalModelLookup: { false })
+                                     apiKeyLookup: { _ in nil }, downloadedLocalModelLookup: { nil })
         XCTAssertEqual(reloaded.selectedLocalModel, .appleSpeech)
     }
 
