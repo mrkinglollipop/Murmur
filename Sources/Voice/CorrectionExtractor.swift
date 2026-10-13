@@ -4,6 +4,21 @@ import Foundation
 /// No Accessibility — callers supply field value and caret UTF-16 offset.
 enum CorrectionExtractor {
 
+    /// Host smart punctuation changes presentation, not the dictated words.
+    /// Preserve case and spacing counts so genuine edits remain distinguishable.
+    static func normalizingTypography(_ text: String) -> String {
+        text.map { character -> String in
+            switch character {
+            case "‘", "’": return "'"
+            case "“", "”": return "\""
+            case "–", "—": return "-"
+            case "…": return "..."
+            case "\u{00A0}", "\u{202F}": return " "
+            default: return String(character)
+            }
+        }.joined()
+    }
+
     static let maxFieldUTF16Units = 32_768
 
     struct LocateResult: Equatable {
@@ -89,7 +104,7 @@ enum CorrectionExtractor {
         let newEnd = cur.length - suffixLen
         guard newEnd >= newStart else { return nil }
         let newRegion = cur.substring(with: NSRange(location: newStart, length: newEnd - newStart))
-        guard oldRegion != newRegion else { return nil }
+        guard normalizingTypography(oldRegion) != normalizingTypography(newRegion) else { return nil }
         return RegionDiff(oldRegion: oldRegion, newRegion: newRegion)
     }
 

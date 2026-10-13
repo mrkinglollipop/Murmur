@@ -67,3 +67,20 @@ instruction, not dictation.
 
 M–L. Single-session slices: (A) routing + HUD state + Transform call,
 (B) replace-selection inject + undo, (C) Settings toggle + History row.
+
+## Instruction or replacement (2026-10-13)
+
+A selection hold now makes one voice-edit decision request using the existing
+Transform backends and credentials. The dedicated prompt returns `EDIT` plus
+only edited text for instructions, or `REPLACE` alone for new dictated content.
+An unmarked response retains the legacy edit plausibility check. Markers accept
+case variations and trailing punctuation; an empty edit fails without typing.
+
+`REPLACE` ignores any model body and prepares the user's own spoken text through
+ordinary dictation cleanup, capitalisation, punctuation, dictionary and snippets.
+It uses the same live selection, field, app and secure-input guards as an edit,
+without an edit length ratio. History records a Dictation with its audio; edits
+retain their Edit kind and instruction metadata. Shift still bypasses the model,
+and holds without a selection follow ordinary dictation. Failure diagnostics name
+the edit/replace decision or delivery branch without logging user text. The failure
+pill remains unchanged because its wider proposed copy was not visually verified.
