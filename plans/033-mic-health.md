@@ -63,3 +63,25 @@ hearing them, and can choose which microphones Murmur may use.
 
 M. Slices: (A) exclusion list + device row, (B) no-audio warning, (C) lid
 warning + Insights count.
+
+## Slice C — low delivered microphone level (2026-10-13)
+
+After at least 2.0 seconds of delivered audio and 1.0 second of speech
+frames, compare the speech frames' 90th-percentile RMS with -40 dBFS. Estimate
+the room floor with the 10th percentile of all frames; only frames at least
+6 dB above that floor establish speech. Uniform room noise shows no low-level
+hint. Each tap buffer is one RMS frame weighted by its delivered duration
+(nominally ~100 ms); sample sums are computed outside `levelLock`, and pure
+functions evaluate percentiles off the audio thread.
+
+The nonblocking hint says “Mic level is very low” / “Move closer or raise
+input volume”, uses the no-audio presentation and accessibility path, and
+leaves recording, stop, and transcription unchanged. The no-audio threshold
+still owns holds whose maximum RMS stays below 0.007. Low-level hints cool
+down for 10 minutes and never appear on consecutive holds.
+
+Round 2 traced the 32,000 → 31,744 frame test failure to a partial
+`AVAudioFile.read`: capture, combination, and the retained CAF all contain
+32,000 frames. The synthetic engine now drains reads through the final
+256-frame tail. A separate production retention-handoff test confirms the
+complete file and tail; no production audio-loss change was needed.

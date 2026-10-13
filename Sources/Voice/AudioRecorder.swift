@@ -125,8 +125,12 @@ final class AudioRecorder {
     }
     private var micCaptureTestHooks: MicCaptureTestHooks?
 
-    convenience init(micCaptureTestHooks: MicCaptureTestHooks, streamingCoordinator: StreamingCoordinator = StreamingCoordinator()) {
-        self.init(streamingCoordinator: streamingCoordinator, observeInputDevices: false)
+    convenience init(
+        micCaptureTestHooks: MicCaptureTestHooks,
+        streamingCoordinator: StreamingCoordinator = StreamingCoordinator(),
+        hud: RecordingHUD = RecordingHUD(presentsWindows: false)
+    ) {
+        self.init(streamingCoordinator: streamingCoordinator, hud: hud, observeInputDevices: false)
         self.micCaptureTestHooks = micCaptureTestHooks
     }
 
@@ -135,7 +139,7 @@ final class AudioRecorder {
         wantsRecording = true
         isStopping = false
         startTime = micCaptureTestHooks!.now()
-        micHealthGeneration &+= 1
+        beginMicHealthHold()
         startMicHealthMonitoring()
         startMicCapture()
     }
@@ -147,6 +151,10 @@ final class AudioRecorder {
 
     var micCaptureStateForTesting: (wanted: Bool, stopping: Bool, tapInstalled: Bool, buffers: [AVAudioPCMBuffer], maxRMS: Float) {
         (wantsRecording, isStopping, isSetUp, pcmBuffersLock.withLock { pcmBuffers }, levelLock.withLock { maxLevelObserved })
+    }
+
+    var micLevelFramesForTesting: (frames: [MicHealth.LevelFrame], deliveredSeconds: TimeInterval) {
+        levelLock.withLock { (lowLevelFrames, lowLevelDeliveredSeconds) }
     }
     #endif
 
@@ -1167,6 +1175,12 @@ final class AudioRecorder {
     /// paint a no-audio hint over a newer hold.
     private var micHealthGeneration: UInt64 = 0
     private var micHealthMonitor: MicHealthWarningMonitor?
+    /// Duration-weighted tap RMS frames; percentiles run on the main thread.
+    private var lowLevelFrames: [MicHealth.LevelFrame] = []
+    private var lowLevelDeliveredSeconds: TimeInterval = 0
+    private var previousHoldShowedLowLevelWarning = false
+    private var currentHoldShowedLowLevelWarning = false
+    private var lastLowLevelWarningAt: Date?
 
     /// Raw-RMS speech-presence threshold. If the loudest buffer of a whole
     /// recording never crosses this, the clip is treated as silence and the
@@ -1737,9 +1751,7 @@ final class AudioRecorder {
         didAnnounceListeningThisTake = false
         startTime = Date()
         loggedUnavailablePreferredUID = nil
-        levelLock.lock()
-        micHealthGeneration &+= 1
-        levelLock.unlock()
+        beginMicHealthHold()
         startMicHealthMonitoring()
 
         if streamingCoordinator.tryStartXAI(asrSelector: asrSelector, startMicCapture: { [weak self] in
@@ -1926,17 +1938,13 @@ final class AudioRecorder {
                 // Realtime-thread safe: compute smoothed RMS amplitude and
                 // publish it for the HUD waveform. Only a Float + a lock — no
                 // AppKit access on this thread. Done in BOTH modes.
-                if let channelData = buffer.floatChannelData {
-                    let frameCount = Int(buffer.frameLength)
-                    if frameCount > 0 {
-                        var sum: Float = 0
-                        let samples = channelData[0]
-                        for i in 0 ..< frameCount {
-                            let s = samples[i]
-                            sum += s * s
-                        }
-                        self.publishLevel(sqrt(sum / Float(frameCount)))
-                    }
+                if let channelData = buffer.floatChannelData,
+                   buffer.frameLength > 0 {
+                    self.publishLevel(
+                        samples: channelData[0],
+                        frameCount: Int(buffer.frameLength),
+                        sampleRate: buffer.format.sampleRate
+                    )
                 }
 
                 // ALWAYS copy the unmodified mic buffer before speaker gating.
@@ -2972,12 +2980,24 @@ final class AudioRecorder {
 
     // MARK: - Mic level publishing (audio-reactive waveform)
 
-    /// Called from the realtime audio-tap thread with a raw per-buffer RMS.
-    /// Applies a light exponential smoother, guarded by a lock (no
-    /// allocation, no AppKit access), then hops to main to push the value
-    /// into the HUD's waveform.
-    private func publishLevel(_ rawRMS: Float) {
+    /// The existing per-buffer RMS traversal runs without holding levelLock.
+    /// Only the completed frame and level state are folded under that lock.
+    private func publishLevel(
+        samples: UnsafePointer<Float>,
+        frameCount: Int,
+        sampleRate: Double
+    ) {
+        guard frameCount > 0, sampleRate > 0 else { return }
+        var sum: Float = 0
+        for i in 0 ..< frameCount {
+            let sample = samples[i]
+            sum += sample * sample
+        }
+        let rawRMS = sqrt(sum / Float(frameCount))
+        let duration = Double(frameCount) / sampleRate
         levelLock.lock()
+        lowLevelDeliveredSeconds += duration
+        lowLevelFrames.append(.init(rms: rawRMS, duration: duration))
         // Track the loudest raw buffer of the recording for the silence gate
         // (see maxLevelObserved) — done here under the same lock so the audio
         // thread never takes a second lock.
@@ -3075,29 +3095,51 @@ final class AudioRecorder {
                 self.levelLock.lock()
                 let isCurrent = generation == self.micHealthGeneration
                 let maxLevel = self.maxLevelObserved
+                let levelFrames = self.lowLevelFrames
+                let deliveredSeconds = self.lowLevelDeliveredSeconds
                 self.levelLock.unlock()
                 guard isCurrent else { return nil }
                 return MicHealthWarningMonitor.Snapshot(
                     elapsed: self.startTime.map { self.micHealthNow.timeIntervalSince($0) } ?? 0,
+                    deliveredSeconds: deliveredSeconds,
                     maxRMS: maxLevel,
                     engineRunning: self.micEngineIsRunning,
-                    deviceName: self.lastBoundInputDeviceName
+                    deviceName: self.lastBoundInputDeviceName,
+                    levelFrames: levelFrames,
+                    secondsSincePreviousLowLevelWarning: self.lastLowLevelWarningAt.map {
+                        self.micHealthNow.timeIntervalSince($0)
+                    },
+                    previousHoldShowedLowLevelWarning: self.previousHoldShowedLowLevelWarning
                 )
             },
-            warning: { [weak self] deviceName in
-                #if DEBUG
-                if self?.micCaptureTestHooks != nil { return }
-                #endif
-                if let deviceName {
-                    self?.hud.showMicrophoneNoAudio(deviceName)
-                } else {
-                    self?.hud.clearMicrophoneNoAudio()
+            warning: { [weak self] warning in
+                guard let self else { return }
+                switch warning {
+                case .noAudio(let deviceName):
+                    self.hud.showMicrophoneNoAudio(deviceName)
+                case .lowLevel:
+                    self.currentHoldShowedLowLevelWarning = true
+                    self.lastLowLevelWarningAt = self.micHealthNow
+                    self.hud.showMicrophoneLowLevel()
+                case nil:
+                    self.hud.clearMicrophoneWarning()
                 }
             },
             schedule: { [weak self] delay, action in
                 self?.scheduleMicHealthCheck(after: delay, action: action)
             }
         )
+    }
+
+    private func beginMicHealthHold() {
+        previousHoldShowedLowLevelWarning = currentHoldShowedLowLevelWarning
+        currentHoldShowedLowLevelWarning = false
+        levelLock.lock()
+        micHealthGeneration &+= 1
+        lowLevelFrames.removeAll(keepingCapacity: true)
+        lowLevelFrames.reserveCapacity(128)
+        lowLevelDeliveredSeconds = 0
+        levelLock.unlock()
     }
 
     private func isCurrentMicHealthGeneration(_ generation: UInt64) -> Bool {
