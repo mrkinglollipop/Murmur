@@ -681,6 +681,7 @@ final class TranscriptionPipeline {
                self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
+                self.logger.info("Voice edit failed: instruction transcription threw")
                 if !abandoned, self.shouldNotifyFailure(for: sessionHeldToken) { self.onFailure?(.voiceEditFailed) }
                 completion?(.failed)
                 return
@@ -944,12 +945,23 @@ final class TranscriptionPipeline {
 
     /// Failed edits have no usable result to retain. Their audio is an
     /// instruction that cannot safely be retried without its original selection.
+    /// Error kind for the log: enum case or numeric code, never response text.
+    static func voiceEditErrorKind(_ error: Error) -> String {
+        if let transform = error as? TransformRunnerError { return String(describing: transform) }
+        let ns = error as NSError
+        return "\(ns.domain) \(ns.code)"
+    }
+
     private func failVoiceEdit(
         token: UInt64,
         audioPath: String?,
         failure: DictationFailure = .voiceEditFailed,
+        reason: String,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
+        // Counts and error kinds only; never the selection or the instruction.
+        logger.info("Voice edit failed: \(reason, privacy: .public)")
+        vlog("voice edit failed: \(reason)")
         let abandoned = consumeAbandonedHold(token: token, replaceHistoryEntryID: nil)
         clearHeldCaretSnapshot(matching: token)
         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
@@ -981,10 +993,10 @@ final class TranscriptionPipeline {
                let intent = self.consumeVoiceEditIntent(matching: sessionHeldToken) {
                 switch intent {
                 case .selectionTooLong:
-                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, failure: .voiceEditSelectionTooLong, completion: completion)
+                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, failure: .voiceEditSelectionTooLong, reason: "selection too long", completion: completion)
                 case .edit(let selection):
                     guard !trimmed.isEmpty else {
-                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, reason: "empty instruction", completion: completion)
                         return
                     }
                     let credentials = self.engineSelector?.transformCredentialsProvider?() ?? .unavailable
@@ -992,8 +1004,9 @@ final class TranscriptionPipeline {
                         do {
                             let result = try await self.runVoiceEditTransform(trimmed, selection, credentials)
                             guard VoiceEditRouting.resultLooksUsable(result, over: selection) else {
+                                let reason = "implausible result (\(result.count) chars for a \(selection.count)-char selection)"
                                 DispatchQueue.main.async {
-                                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, reason: reason, completion: completion)
                                 }
                                 return
                             }
@@ -1010,8 +1023,9 @@ final class TranscriptionPipeline {
                                 completion: completion
                             )
                         } catch {
+                            let reason = "transform threw \(type(of: error)) (\(Self.voiceEditErrorKind(error)))"
                             DispatchQueue.main.async {
-                                self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                                self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, reason: reason, completion: completion)
                             }
                         }
                     }
