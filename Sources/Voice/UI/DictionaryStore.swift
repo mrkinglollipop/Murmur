@@ -367,7 +367,12 @@ final class DictionaryStore: ObservableObject {
             // text already has (".net" -> "..NET"). Those terms are reachable
             // through the literal variant pass above only.
             guard PhraseBoundaryPattern.hasWordCharacterEdges(entry.term) else { continue }
-            guard !PhoneticMatcher.isProtectedHeardToken(entry.term, lexicon: lexicon) else { continue }
+            // A contraction is never jargon. A term the user added by hand stays
+            // a target even when it is also an English word ("Aegis", "Manna",
+            // "Tauri" are all in the system word list); an auto-learned one does not.
+            guard !PhoneticMatcher.isContraction(entry.term),
+                  !PhoneticMatcher.isProtectedHeardToken(entry.term) else { continue }
+            guard !(entry.isAutoLearned && lexicon.contains(entry.term)) else { continue }
             let encoded = PhoneticMatcher.encode(entry.term)
             for code in [encoded.primary, encoded.secondary].compactMap({ $0 }) where !code.isEmpty {
                 index[code, default: []].append(entry.id)

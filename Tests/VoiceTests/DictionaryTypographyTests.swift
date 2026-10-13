@@ -13,13 +13,13 @@ final class DictionaryTypographyTests: XCTestCase {
         ("foo bar", "foo\u{00A0}bar"), ("foo bar", "foo\u{202F}bar")
     ]
 
-    private func makeStore(_ entries: [DictionaryEntry] = []) throws -> (DictionaryStore, URL) {
+    private func makeStore(_ entries: [DictionaryEntry] = [], words: Set<String> = ["idea", "whisper"]) throws -> (DictionaryStore, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("dictionary-typography-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("dictionary.json")
         try JSONEncoder().encode(entries).write(to: url)
-        let lexicon = RealWordLexicon { ["idea", "whisper"].contains($0) }
+        let lexicon = RealWordLexicon { words.contains($0) }
         let store = DictionaryStore(fileURL: url, blocklistFileURL: directory.appendingPathComponent("blocklist.json"), lexicon: lexicon)
         addTeardownBlock {
             store.flush()
@@ -94,15 +94,24 @@ final class DictionaryTypographyTests: XCTestCase {
         }
     }
 
-    func testManualContractionsAndEnglishWordsCannotBePhoneticTargets() throws {
+    func testContractionsAndAutoLearnedEnglishWordsCannotBePhoneticTargets() throws {
         let (store, _) = try makeStore([
             DictionaryEntry(term: "I’ve", variants: []),
-            DictionaryEntry(term: "whisper", variants: [])
+            DictionaryEntry(term: "whisper", variants: ["whispr"], isAutoLearned: true)
         ])
         for token in ["we've", "We've", "we’ve", "wispr"] {
             XCTAssertEqual(store.correct(token).text, token)
             XCTAssertTrue(store.correct(token).records.isEmpty)
         }
+    }
+
+    /// "Aegis", "Manna" and "Tauri" are in /usr/share/dict/words. A term the
+    /// user added by hand must stay a phonetic target even so.
+    func testUserAddedTermThatIsAlsoAnEnglishWordStaysAPhoneticTarget() throws {
+        let (store, _) = try makeStore([DictionaryEntry(term: "Tauri", variants: [])], words: ["idea", "tauri"])
+        let result = store.correct("Tari")
+        XCTAssertEqual(result.text, "Tauri")
+        XCTAssertEqual(result.records.map(\.source), [.phonetic])
     }
 
     func testProperNounCorrectionsStillApply() throws {

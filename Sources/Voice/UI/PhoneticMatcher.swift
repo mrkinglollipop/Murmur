@@ -52,7 +52,7 @@ enum PhoneticMatcher {
         let heardLower = heardTrimmed.lowercased()
         guard heardLower.count >= 3 else { return false }
         guard !isProtectedHeardToken(heardLower, lexicon: lexicon),
-              !isProtectedHeardToken(candidateTrimmed, lexicon: lexicon) else { return false }
+              !isContraction(candidateTrimmed) else { return false }
 
         let heardLen = heardTrimmed.count
         let candidateLen = candidateTrimmed.count
@@ -88,7 +88,11 @@ enum PhoneticMatcher {
         // Literal mappings remain explicit user choices. Phonetic guesses must
         // additionally protect English words and keep contractions indivisible.
         guard let lexicon else { return false }
-        return token.contains("'") || token.contains("’") || token.contains("‘") || lexicon.contains(token)
+        return isContraction(token) || lexicon.contains(token)
+    }
+
+    static func isContraction(_ token: String) -> Bool {
+        token.contains("'") || token.contains("’") || token.contains("‘")
     }
 
     /// Whole-phrase variants made only of protected English ("line out")
