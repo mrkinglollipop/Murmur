@@ -623,7 +623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func updateMenuBarIcon(for state: RecordingHUD.State) {
         guard !isDictationPaused else { return }
         switch state {
-        case .listening, .editingSelection, .microphoneNoAudio:
+        case .listening, .editingSelection, .microphoneNoAudio, .microphoneLowLevel:
             menuBarErrorBadgeGeneration &+= 1
             isShowingMenuBarErrorBadge = false
             setMenuBarIcon(.listening)

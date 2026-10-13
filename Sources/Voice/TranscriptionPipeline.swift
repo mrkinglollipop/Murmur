@@ -76,7 +76,7 @@ final class TranscriptionPipeline {
     /// Injectable transform operation; production preserves TransformRunner's
     /// backend ordering, including the on-device-only privacy boundary.
     var runVoiceEditTransform: (String, String, TransformCredentials) async throws -> String = { instruction, selection, credentials in
-        try await TransformRunner.run(prompt: instruction, over: selection, credentials: credentials)
+        try await TransformRunner.runVoiceEdit(spokenText: instruction, selection: selection, credentials: credentials)
     }
 
     /// Injection dependencies for edit verification without AX, CGEvents, or
@@ -268,9 +268,9 @@ final class TranscriptionPipeline {
     /// Test-only route seam; production capture always goes through the AX
     /// snapshot path above.
     @discardableResult
-    func test_holdVoiceEditSnapshot(_ snapshot: CaretContext.Snapshot, frontmostPID: pid_t? = nil) -> UInt64 {
+    func test_holdVoiceEditSnapshot(_ snapshot: CaretContext.Snapshot, frontmostPID: pid_t? = nil, shiftHeld: Bool = false) -> UInt64 {
         let token = test_holdSnapshot(snapshot, frontmostPID: frontmostPID)
-        switch VoiceEditRouting.decide(snapshot: snapshot, enabled: true, shiftHeld: false) {
+        switch VoiceEditRouting.decide(snapshot: snapshot, enabled: true, shiftHeld: shiftHeld) {
         case .edit(let selection): voiceEditIntents[token] = .edit(selection: selection)
         case .selectionTooLong: voiceEditIntents[token] = .selectionTooLong
         case .dictate: break
@@ -681,6 +681,7 @@ final class TranscriptionPipeline {
                self.consumeVoiceEditIntent(matching: sessionHeldToken) != nil {
                 self.clearHeldCaretSnapshot(matching: sessionHeldToken)
                 Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
+                self.logger.info("Voice edit failed: instruction transcription threw")
                 if !abandoned, self.shouldNotifyFailure(for: sessionHeldToken) { self.onFailure?(.voiceEditFailed) }
                 completion?(.failed)
                 return
@@ -944,12 +945,31 @@ final class TranscriptionPipeline {
 
     /// Failed edits have no usable result to retain. Their audio is an
     /// instruction that cannot safely be retried without its original selection.
+    /// Error kind for the log: enum case or numeric code, never response text.
+    static func voiceEditErrorKind(_ error: Error) -> String {
+        if let transform = error as? TransformRunnerError { return String(describing: transform) }
+        let ns = error as NSError
+        return "\(ns.domain) \(ns.code)"
+    }
+
+    /// Optional observer for deterministic failure diagnostics without reading OS logs.
+    var onVoiceEditFailureReason: ((String) -> Void)?
+
+    private func logVoiceEditFailure(reason: String) {
+        // Branch, counts and error kinds only; never selected or dictated text.
+        logger.info("Voice edit failed: \(reason, privacy: .public)")
+        vlog("voice edit failed: \(reason)")
+        onVoiceEditFailureReason?(reason)
+    }
+
     private func failVoiceEdit(
         token: UInt64,
         audioPath: String?,
         failure: DictationFailure = .voiceEditFailed,
+        reason: String,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
+        logVoiceEditFailure(reason: reason)
         let abandoned = consumeAbandonedHold(token: token, replaceHistoryEntryID: nil)
         clearHeldCaretSnapshot(matching: token)
         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: false)
@@ -967,9 +987,11 @@ final class TranscriptionPipeline {
         sessionHeldSnapshot: CaretContext.Snapshot?,
         sessionHeldFrontmostPID: pid_t?,
         voiceEditInstruction: String? = nil,
+        voiceEditReplacement: Bool = false,
         saveWithoutInsertion: Bool = false,
         completion: ((InjectPipelineResult) -> Void)?
     ) {
+        let isSelectionDelivery = voiceEditInstruction != nil || voiceEditReplacement
         let trimmed = voiceEditInstruction == nil
             ? Self.normalizeTranscriptForInjection(text)
             : text
@@ -977,41 +999,59 @@ final class TranscriptionPipeline {
         vlog("transcribed \(trimmed.count) chars [\(engineID)]")
 
         DispatchQueue.main.async {
-            if replaceHistoryEntryID == nil, voiceEditInstruction == nil,
+            if replaceHistoryEntryID == nil, !isSelectionDelivery,
                let intent = self.consumeVoiceEditIntent(matching: sessionHeldToken) {
                 switch intent {
                 case .selectionTooLong:
-                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, failure: .voiceEditSelectionTooLong, completion: completion)
+                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, failure: .voiceEditSelectionTooLong, reason: "selection too long", completion: completion)
                 case .edit(let selection):
                     guard !trimmed.isEmpty else {
-                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, reason: "edit/replace empty spoken text", completion: completion)
                         return
                     }
                     let credentials = self.engineSelector?.transformCredentialsProvider?() ?? .unavailable
                     Task {
                         do {
                             let result = try await self.runVoiceEditTransform(trimmed, selection, credentials)
-                            guard VoiceEditRouting.resultLooksUsable(result, over: selection) else {
-                                DispatchQueue.main.async {
-                                    self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                            switch VoiceEditRouting.parseResponse(result) {
+                            case .edit(let edited):
+                                guard VoiceEditRouting.resultLooksUsable(edited, over: selection) else {
+                                    let reason = "edit implausible result (\(edited.count) chars for a \(selection.count)-char selection)"
+                                    await MainActor.run {
+                                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, reason: reason, completion: completion)
+                                    }
+                                    return
                                 }
-                                return
+                                self.finishTranscription(
+                                    text: Self.prepareVoiceEditResult(edited, selection: selection),
+                                    hadExplicitTrailingNewline: false, engineID: engineID, audioPath: audioPath,
+                                    replaceHistoryEntryID: nil, sessionHeldToken: sessionHeldToken,
+                                    sessionHeldSnapshot: sessionHeldSnapshot, sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                                    voiceEditInstruction: trimmed, completion: completion
+                                )
+                            case .replace:
+                                // The selection intent was consumed before preparation, so
+                                // this follows ordinary dictation's cleanup/formatting path.
+                                let prepared = await self.prepareTranscript(trimmed, holdToken: sessionHeldToken, replaceHistoryEntryID: nil)
+                                guard !Self.normalizeTranscriptForInjection(prepared.text).isEmpty else {
+                                    await MainActor.run {
+                                        self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath,
+                                            reason: "replace empty prepared dictation", completion: completion)
+                                    }
+                                    return
+                                }
+                                self.finishTranscription(
+                                    text: prepared.text, hadExplicitTrailingNewline: prepared.hadExplicitTrailingNewline,
+                                    engineID: engineID, audioPath: audioPath, replaceHistoryEntryID: nil,
+                                    sessionHeldToken: sessionHeldToken, sessionHeldSnapshot: sessionHeldSnapshot,
+                                    sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                                    voiceEditReplacement: true, completion: completion
+                                )
                             }
-                            self.finishTranscription(
-                                text: Self.prepareVoiceEditResult(result, selection: selection),
-                                hadExplicitTrailingNewline: false,
-                                engineID: engineID,
-                                audioPath: audioPath,
-                                replaceHistoryEntryID: nil,
-                                sessionHeldToken: sessionHeldToken,
-                                sessionHeldSnapshot: sessionHeldSnapshot,
-                                sessionHeldFrontmostPID: sessionHeldFrontmostPID,
-                                voiceEditInstruction: trimmed,
-                                completion: completion
-                            )
                         } catch {
+                            let reason = "edit/replace decision transform threw \(type(of: error)) (\(Self.voiceEditErrorKind(error)))"
                             DispatchQueue.main.async {
-                                self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, completion: completion)
+                                self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath, reason: reason, completion: completion)
                             }
                         }
                     }
@@ -1097,7 +1137,7 @@ final class TranscriptionPipeline {
                 // Sample frontmost PID + secure **before** fresh AX / transforms
                 // so app-switch abort never drives wrong-app caret reads.
                 let (currentPID, liveSecureAtSample): (pid_t?, Bool) = DispatchQueue.main.sync {
-                    let target = self.injectionTarget(voiceEdit: voiceEditInstruction != nil)
+                    let target = self.injectionTarget(voiceEdit: isSelectionDelivery)
                     return (target.pid, target.secureInput)
                 }
                 let axPlan = Self.injectAXPlan(
@@ -1144,7 +1184,9 @@ final class TranscriptionPipeline {
                         // Re-sample secure immediately before transforms/gate (TOCTOU
                         // vs the early PID sample). PID abort was already decided.
                         liveSecure = DispatchQueue.main.sync {
-                            self.deliveryHooks?.injector.target().secureInput ?? IsSecureEventInputEnabled()
+                            voiceEditReplacement
+                                ? self.injectionTarget(voiceEdit: true).secureInput
+                                : (self.deliveryHooks?.injector.target().secureInput ?? IsSecureEventInputEnabled())
                         }
                         textToInject = Self.applyInjectTransforms(
                             expanded: Self.prepareResolvedSnapshotTextForInjection(
@@ -1181,7 +1223,7 @@ final class TranscriptionPipeline {
                     // Live secure re-read before pasteboard — skip leave when secure.
                     DispatchQueue.main.sync {
                         Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
-                        abortLeaveBecameSecure = self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil)
+                        abortLeaveBecameSecure = self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: isSelectionDelivery)
                     }
                     insertResult = .failed
                     proceededToInsert = false
@@ -1193,9 +1235,9 @@ final class TranscriptionPipeline {
                         case abort(becameSecure: Bool)
                     }
                     let late: LateInjectDecision = DispatchQueue.main.sync {
-                        let target = self.injectionTarget(voiceEdit: voiceEditInstruction != nil)
+                        let target = self.injectionTarget(voiceEdit: isSelectionDelivery)
                         let latePID = target.pid
-                        if voiceEditInstruction != nil {
+                        if isSelectionDelivery {
                             if target.secureInput { return .abort(becameSecure: true) }
                             guard let heldPID, latePID == heldPID else {
                                 return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
@@ -1214,13 +1256,13 @@ final class TranscriptionPipeline {
                         ) {
                             Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: latePID)
                             return .abort(
-                                becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil)
+                                becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: isSelectionDelivery)
                             )
                         }
                         guard let deliveryPID = Self.expectedDeliveryPID(
                             heldPID: heldPID, isHistoryRetry: replaceID != nil, latePID: latePID
                         ) else {
-                            return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: voiceEditInstruction != nil))
+                            return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: isSelectionDelivery))
                         }
                         return .insert(pid: deliveryPID)
                     }
@@ -1232,13 +1274,13 @@ final class TranscriptionPipeline {
                     case .insert(let deliveryPID):
                         // Undo relies on the host's ⌘Z: replacement is one inject,
                         // with no delete or select-all step in any lane.
-                        if voiceEditInstruction != nil, let hooks = self.voiceEditInjectionHooks {
+                        if isSelectionDelivery, let hooks = self.voiceEditInjectionHooks {
                             insertResult = hooks.insert(textToInject)
                         } else {
                             insertResult = TextInjector(hooks: self.deliveryHooks?.injector).insert(
                                 textToInject,
                                 expectedTargetPID: deliveryPID,
-                                validateSelection: voiceEditInstruction == nil ? nil : {
+                                validateSelection: !isSelectionDelivery ? nil : {
                                     VoiceEditRouting.selectionMatches(
                                         held: heldAtStart,
                                         fresh: self.deliverySnapshot(frontmostPID: deliveryPID)
@@ -1247,12 +1289,12 @@ final class TranscriptionPipeline {
                                 validateField: heldAtStart?.focusedElement.map { heldElement in
                                     {
                                         guard let fresh = self.deliveryFocusedElement(frontmostPID: deliveryPID) else {
-                                            return voiceEditInstruction == nil ? nil : false
+                                            return !isSelectionDelivery ? nil : false
                                         }
                                         return VoiceEditRouting.fieldMatches(held: heldElement, fresh: fresh)
                                     }
                                 },
-                                preserveBoundaryWhitespace: voiceEditInstruction != nil
+                                preserveBoundaryWhitespace: isSelectionDelivery
                             )
                         }
                         proceededToInsert = true
@@ -1279,7 +1321,7 @@ final class TranscriptionPipeline {
                     }()
                     let liveSecureAfterInsert =
                         proceededToInsert && insertFailed
-                        ? self.injectionTarget(voiceEdit: voiceEditInstruction != nil).secureInput
+                        ? self.injectionTarget(voiceEdit: isSelectionDelivery).secureInput
                         : false
                     let outcomeSecure: Bool
                     if abortLeaveBecameSecure {
@@ -1320,8 +1362,11 @@ final class TranscriptionPipeline {
                     if replaceID == nil {
                         Self.discardUnloggedAudio(audioPath: audioPath, shouldLog: outcome.shouldLog && voiceEditInstruction == nil)
                     }
-                    if let failure = outcome.failure, self.shouldNotifyFailure(for: sessionHeldToken) {
-                        self.onFailure?(failure)
+                    if let failure = outcome.failure {
+                        if isSelectionDelivery {
+                            self.logVoiceEditFailure(reason: "\(voiceEditReplacement ? "replace" : "edit") delivery failed (\(failure))")
+                        }
+                        if self.shouldNotifyFailure(for: sessionHeldToken) { self.onFailure?(failure) }
                     }
 
                     completion?(outcome.pipelineResult)

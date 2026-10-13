@@ -51,7 +51,8 @@ enum PhoneticMatcher {
         // distinctive — is never a mishearing worth "fixing".
         let heardLower = heardTrimmed.lowercased()
         guard heardLower.count >= 3 else { return false }
-        guard !lexicon.contains(heardLower) else { return false }
+        guard !isProtectedHeardToken(heardLower, lexicon: lexicon),
+              !isContraction(candidateTrimmed) else { return false }
 
         let heardLen = heardTrimmed.count
         let candidateLen = candidateTrimmed.count
@@ -82,8 +83,16 @@ enum PhoneticMatcher {
     /// Closed-class / high-frequency English. Protected tokens block phonetic
     /// steal; DictionaryStore also skips protected English phrases as literal
     /// variants on add/correct/learn/update.
-    static func isProtectedHeardToken(_ token: String) -> Bool {
-        protectedHeardTokens.contains(token.lowercased())
+    static func isProtectedHeardToken(_ token: String, lexicon: RealWordLexicon? = nil) -> Bool {
+        if protectedHeardTokens.contains(token.lowercased()) { return true }
+        // Literal mappings remain explicit user choices. Phonetic guesses must
+        // additionally protect English words and keep contractions indivisible.
+        guard let lexicon else { return false }
+        return isContraction(token) || lexicon.contains(token)
+    }
+
+    static func isContraction(_ token: String) -> Bool {
+        token.contains("'") || token.contains("’") || token.contains("‘")
     }
 
     /// Whole-phrase variants made only of protected English ("line out")
@@ -129,7 +138,13 @@ struct RealWordLexicon {
     /// `word` should already be lowercased/trimmed by the caller; this also
     /// lowercases defensively so misuse can't silently miss real words.
     func contains(_ word: String) -> Bool {
-        membershipCheck(word.lowercased())
+        let lower = word.lowercased()
+        if membershipCheck(lower) { return true }
+        // System word lists often contain singular nouns without their plurals.
+        if lower.hasSuffix("s"), membershipCheck(String(lower.dropLast())) { return true }
+        if lower.hasSuffix("es"), membershipCheck(String(lower.dropLast(2))) { return true }
+        if lower.hasSuffix("ies"), membershipCheck(String(lower.dropLast(3)) + "y") { return true }
+        return false
     }
 
     /// The production lexicon: `/usr/share/dict/words` loaded once, lazily,
@@ -158,7 +173,7 @@ struct RealWordLexicon {
         let words = Set(
             contents.split(whereSeparator: \.isNewline).map { $0.lowercased() }
         )
-        return words.isEmpty ? fallbackWords : words
+        return words.union(fallbackWords)
     }
 
     static let fallbackWords: Set<String> = [
@@ -172,7 +187,7 @@ struct RealWordLexicon {
         "had", "were", "am", "two", "three", "out", "up", "down", "off",
         "over", "into", "just", "like", "also", "only", "even", "still",
         "back", "well", "way", "now", "here", "there", "more", "most",
-        "some", "any", "all",
+        "some", "any", "all", "idea",
     ]
 }
 
