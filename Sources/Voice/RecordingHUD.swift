@@ -216,6 +216,8 @@ final class RecordingHUD {
     /// Safe to call repeatedly (e.g. re-show for a new recording).
     func show() {
         _ = beginTransition()
+        pendingCorrectionCount = 0
+        waveformView.setCorrectionCount(0)
         clearInterimText()
         let initialState: State = shouldShowEditingSelection ? .editingSelection : .listening
         shouldShowEditingSelection = false
@@ -395,6 +397,7 @@ final class RecordingHUD {
     /// after the panel is offscreen so nothing visibly snaps mid-fade.
     func hide() {
         let generation = beginTransition()
+        pendingCorrectionCount = 0
         panel.ignoresMouseEvents = true
         guard isVisible else {
             waveformView.setInterimText(nil)
@@ -432,6 +435,7 @@ final class RecordingHUD {
         isVisible = false
         isHiding = false
         waveformView.stopAnimating()
+        waveformView.setCorrectionCount(0)
         panel.orderOut(nil)
         waveformView.setInterimText(nil)
         waveformView.setProcessingLabel(false)
@@ -706,7 +710,7 @@ private final class WaveformView: NSView {
         fnChipBackground.frame = CGRect(x: chipX, y: midY - chipHeight / 2, width: chipWidth, height: chipHeight)
         fnLabel.frame = CGRect(x: chipX, y: midY - 7, width: chipWidth, height: 14)
         errorLabel.frame = bounds.insetBy(dx: 16, dy: 0)
-        if correctionCount > 0 {
+        if state == .success && correctionCount > 0 {
             let iconSize: CGFloat = 20
             let gap: CGFloat = 6
             let labelWidth: CGFloat = 90
@@ -736,6 +740,9 @@ private final class WaveformView: NSView {
     func setState(_ newState: RecordingHUD.State) {
         let previous = state
         state = newState
+        if newState != .success {
+            setCorrectionCount(0)
+        }
 
         if case .processing = previous, !isProcessingState(newState) {
             setProcessingLabel(false)
@@ -881,7 +888,9 @@ private final class WaveformView: NSView {
     }
 
     func setCorrectionCount(_ count: Int) {
-        correctionCount = count
+        correctionCount = max(0, count)
+        correctionLabel.isHidden = state != .success || correctionCount == 0
+        if correctionCount == 0 { correctionLabel.stringValue = "" }
         needsLayout = true
     }
 

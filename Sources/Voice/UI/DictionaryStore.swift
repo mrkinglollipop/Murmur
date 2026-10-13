@@ -145,7 +145,7 @@ final class DictionaryStore: ObservableObject {
     /// Metaphone code → entry IDs for phonetic matching over canonical terms.
     private var phoneticIndex: [String: [UUID]] = [:]
     private let wordTokenRegex: NSRegularExpression? = try? NSRegularExpression(
-        pattern: "\\b[\\p{L}\\p{N}'-]+\\b",
+        pattern: "\\b[\\p{L}\\p{N}'‘’-]+\\b",
         options: []
     )
     private var saveWorkItem: DispatchWorkItem?
@@ -153,6 +153,7 @@ final class DictionaryStore: ObservableObject {
 
     private let fileURL: URL
     private let blocklistFileURL: URL
+    private let lexicon: RealWordLexicon
 
     /// Set when dictionary.json / blocklist.json exists but could not be read
     /// or moved aside. Saving then would overwrite recoverable user data, so
@@ -160,9 +161,10 @@ final class DictionaryStore: ObservableObject {
     private var dictionarySavesBlocked = false
     private var blocklistSavesBlocked = false
 
-    init(fileURL: URL? = nil, blocklistFileURL: URL? = nil) {
+    init(fileURL: URL? = nil, blocklistFileURL: URL? = nil, lexicon: RealWordLexicon = .system) {
         self.fileURL = fileURL ?? DictionaryStore.defaultFileURL()
         self.blocklistFileURL = blocklistFileURL ?? DictionaryStore.defaultBlocklistFileURL()
+        self.lexicon = lexicon
         load()
         loadBlocklist()
         rebuildRegexCache()
@@ -192,7 +194,12 @@ final class DictionaryStore: ObservableObject {
         }
         do {
             let decoded = try JSONDecoder().decode([DictionaryEntry].self, from: data)
-            let merged = Self.mergingDuplicateTerms(decoded)
+            let cleaned = decoded.filter { entry in
+                !entry.isAutoLearned || entry.variants.isEmpty || !entry.variants.allSatisfy {
+                    CorrectionExtractor.normalizingTypography($0) == CorrectionExtractor.normalizingTypography(entry.term)
+                }
+            }
+            let merged = Self.mergingDuplicateTerms(cleaned)
             entries = merged
             if merged != decoded {
                 save()
@@ -360,6 +367,7 @@ final class DictionaryStore: ObservableObject {
             // text already has (".net" -> "..NET"). Those terms are reachable
             // through the literal variant pass above only.
             guard PhraseBoundaryPattern.hasWordCharacterEdges(entry.term) else { continue }
+            guard !PhoneticMatcher.isProtectedHeardToken(entry.term, lexicon: lexicon) else { continue }
             let encoded = PhoneticMatcher.encode(entry.term)
             for code in [encoded.primary, encoded.secondary].compactMap({ $0 }) where !code.isEmpty {
                 index[code, default: []].append(entry.id)
@@ -517,18 +525,27 @@ final class DictionaryStore: ObservableObject {
                 guard !isBlocklisted(heard: variant, replaced: entry.term) else { continue }
                 guard let regex = variantRegexCache[variant] else { continue }
                 let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
-                let matches = regex.numberOfMatches(in: result, options: [], range: nsRange)
-                guard matches > 0 else { continue }
+                let matches = regex.matches(in: result, options: [], range: nsRange)
+                guard !matches.isEmpty else { continue }
+                let realHeard = matches.compactMap { match -> String? in
+                    guard let range = Range(match.range, in: result) else { return nil }
+                    let heard = String(result[range])
+                    guard CorrectionExtractor.normalizingTypography(heard) != CorrectionExtractor.normalizingTypography(entry.term) else {
+                        return nil
+                    }
+                    return heard
+                }
                 result = regex.stringByReplacingMatches(
                     in: result,
                     options: [],
                     range: nsRange,
                     withTemplate: NSRegularExpression.escapedTemplate(for: entry.term)
                 )
-                fixCounts[entry.id, default: 0] += matches
+                guard !realHeard.isEmpty else { continue }
+                fixCounts[entry.id, default: 0] += realHeard.count
                 let source: CorrectionSource = entry.isAutoLearned ? .autoLearned : .dictionary
-                for _ in 0..<matches {
-                    records.append(CorrectionRecord(heard: variant, replaced: entry.term, source: source))
+                for heard in realHeard {
+                    records.append(CorrectionRecord(heard: heard, replaced: entry.term, source: source))
                 }
             }
         }
@@ -598,7 +615,7 @@ final class DictionaryStore: ObservableObject {
 
     private func phoneticReplacement(for token: String) -> PhoneticReplacement? {
         guard !token.isEmpty else { return nil }
-        guard !PhoneticMatcher.isProtectedHeardToken(token) else { return nil }
+        guard !PhoneticMatcher.isProtectedHeardToken(token, lexicon: lexicon) else { return nil }
 
         if entries.contains(where: { $0.term.caseInsensitiveCompare(token) == .orderedSame }) {
             return nil
@@ -623,7 +640,8 @@ final class DictionaryStore: ObservableObject {
             guard PhoneticMatcher.guardAccepts(
                 heard: token,
                 candidate: entry.term,
-                primaryKeyMatch: primaryKeyMatch
+                primaryKeyMatch: primaryKeyMatch,
+                lexicon: lexicon
             ) else { continue }
             let distance = PhoneticMatcher.levenshteinDistance(token, entry.term)
             if let current = best {
@@ -664,7 +682,7 @@ final class DictionaryStore: ObservableObject {
     ) -> [LearnedCorrection] {
         let old = oldText.trimmingCharacters(in: .whitespacesAndNewlines)
         let new = newText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard old != new else { return [] }
+        guard CorrectionExtractor.normalizingTypography(old) != CorrectionExtractor.normalizingTypography(new) else { return [] }
 
         let oldWords = tokenizeWords(old)
         let newWords = tokenizeWords(new)
@@ -879,7 +897,8 @@ final class DictionaryStore: ObservableObject {
     }
 
     private func wordsMatch(_ a: String, _ b: String) -> Bool {
-        stripWord(a).caseInsensitiveCompare(stripWord(b)) == .orderedSame
+        CorrectionExtractor.normalizingTypography(stripWord(a))
+            .caseInsensitiveCompare(CorrectionExtractor.normalizingTypography(stripWord(b))) == .orderedSame
     }
 
     private func isLearnableVariant(_ stripped: String) -> Bool {
@@ -901,6 +920,8 @@ final class DictionaryStore: ObservableObject {
         mapsTo term: String,
         respectBlocklist: Bool = false
     ) -> LearnedCorrection? {
+        guard CorrectionExtractor.normalizingTypography(variant)
+            .caseInsensitiveCompare(CorrectionExtractor.normalizingTypography(term)) != .orderedSame else { return nil }
         if respectBlocklist, isBlocklisted(heard: variant, replaced: term) {
             return nil
         }
