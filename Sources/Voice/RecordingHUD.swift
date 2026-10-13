@@ -71,6 +71,7 @@ final class RecordingHUD {
         case success
         case clipboardFlash
         case microphoneNoAudio(String)
+        case microphoneLowLevel
         case error(String)
 
         var accessibilityAnnouncement: String {
@@ -81,6 +82,8 @@ final class RecordingHUD {
             case .success: return "Dictation complete"
             case .clipboardFlash: return "Text copied to clipboard"
             case .microphoneNoAudio(let device): return "No microphone audio from \(device)"
+            case .microphoneLowLevel:
+                return "Mic level is very low. Move closer or raise input volume"
             case .error(let message): return "Dictation failed. \(message)"
             }
         }
@@ -309,14 +312,35 @@ final class RecordingHUD {
         notifyLayoutChange()
     }
 
+    /// A nonblocking hint for delivered microphone audio whose sustained level
+    /// is too low for reliable dictation. Recording continues unchanged.
+    func showMicrophoneLowLevel() {
+        guard isVisible, !isProcessing, currentState != .microphoneLowLevel else { return }
+        applyState(.microphoneLowLevel)
+        resizePanel(forInterim: true)
+        positionOnMainScreen(offsetBelowFinal: 8)
+        notifyLayoutChange()
+    }
+
     /// The first real RMS sample clears the in-hold hint without interrupting
     /// the waveform or changing focus.
-    func clearMicrophoneNoAudio() {
-        guard case .microphoneNoAudio = currentState else { return }
+    func clearMicrophoneWarning() {
+        let hasWarning: Bool
+        switch currentState {
+        case .microphoneNoAudio, .microphoneLowLevel:
+            hasWarning = true
+        default:
+            hasWarning = false
+        }
+        guard hasWarning else { return }
         applyState(recordingIsVoiceEdit ? .editingSelection : .listening)
         resizePanel(forInterim: false)
         positionOnMainScreen(offsetBelowFinal: 8)
         notifyLayoutChange()
+    }
+
+    func clearMicrophoneNoAudio() {
+        clearMicrophoneWarning()
     }
 
     /// Shows a red-tinted error pill with `message`, then auto-hides after 3s.
@@ -805,6 +829,18 @@ private final class WaveformView: NSView {
             interimLabel.isHidden = false
             layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
             layer?.borderColor = NSColor(Theme.amberBorder).withAlphaComponent(0.65).cgColor
+        case .microphoneLowLevel:
+            hasMicrophoneWarning = true
+            errorLabel.isHidden = true
+            successIcon.isHidden = true
+            clipboardIcon.isHidden = true
+            fnChipBackground.isHidden = false
+            fnLabel.isHidden = false
+            for barLayer in barLayers { barLayer.isHidden = false }
+            interimLabel.stringValue = "Mic level is very low\nMove closer or raise input volume"
+            interimLabel.isHidden = false
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
+            layer?.borderColor = NSColor(Theme.amberBorder).withAlphaComponent(0.65).cgColor
         case .error(let message):
             hasMicrophoneWarning = false
             errorLabel.stringValue = message
@@ -974,7 +1010,7 @@ private final class WaveformView: NSView {
 
     private func tick() {
         switch state {
-        case .listening, .editingSelection, .microphoneNoAudio:
+        case .listening, .editingSelection, .microphoneNoAudio, .microphoneLowLevel:
             tickListening()
         case .processing:
             tickProcessing()

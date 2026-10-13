@@ -23,6 +23,47 @@ final class MicHealthTests: XCTestCase {
         }
     }
 
+    private struct HintOnlyEngine: ASREngine {
+        let id = "hint-only-fixture"
+        let displayName = "Hint-only fixture"
+        func transcribe(audioURL: URL) async throws -> String { "" }
+    }
+
+    private struct LowLevelSpeechEngine: ASREngine {
+        let id = "low-level-speech-fixture"
+        let displayName = "Low-level speech fixture"
+        let started: XCTestExpectation
+
+        func transcribe(audioURL: URL) async throws -> String {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+            let file = try AVAudioFile(forReading: audioURL)
+            XCTAssertEqual(file.length, 32_000)
+            let samples = try MicHealthTests.readAllSamples(from: file)
+            XCTAssertEqual(samples.count, 32_000)
+            XCTAssertEqual(try XCTUnwrap(samples.last), 0.008, accuracy: 0.000_001)
+            started.fulfill()
+            return "Quiet delivered speech."
+        }
+    }
+
+    /// AVAudioFile can return a partial read; every delivered frame, including
+    /// the final sub-1024-frame tail, must reach the synthetic engine assertion.
+    private static func readAllSamples(from file: AVAudioFile) throws -> [Float] {
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 1_024))
+        var samples: [Float] = []
+        while file.framePosition < file.length {
+            let count = AVAudioFrameCount(min(1_024, file.length - file.framePosition))
+            try file.read(into: buffer, frameCount: count)
+            guard buffer.frameLength > 0 else {
+                XCTFail("File reader stopped before the captured tail")
+                break
+            }
+            samples.append(contentsOf: UnsafeBufferPointer(start: buffer.floatChannelData![0],
+                                                           count: Int(buffer.frameLength)))
+        }
+        return samples
+    }
+
     private actor RecoveryGate {
         private var released = false
         private var continuation: CheckedContinuation<Void, Never>?
@@ -334,7 +375,7 @@ final class MicHealthTests: XCTestCase {
         var active = true
         var maxRMS: Float = 0
         var device = "USB A"
-        var visibleWarning: String?
+        var visibleWarning: MicHealthWarningMonitor.Warning?
         let monitor = MicHealthWarningMonitor(
             snapshot: {
                 guard active else { return nil }
@@ -354,7 +395,7 @@ final class MicHealthTests: XCTestCase {
         XCTAssertNil(visibleWarning)
         // Neither successful start delivered a buffer callback.
         clock.advance(to: 1.6)
-        XCTAssertEqual(visibleWarning, "Fallback microphone")
+        XCTAssertEqual(visibleWarning, .noAudio(deviceName: "Fallback microphone"))
         maxRMS = 0.02
         monitor.evaluate()
         XCTAssertNil(visibleWarning)
@@ -366,7 +407,7 @@ final class MicHealthTests: XCTestCase {
     func testWarningPollSurvivesRecoveryAcrossWarningDeadline() {
         let clock = MicHealthTestClock()
         var engineRunning = false
-        var visibleWarning: String?
+        var visibleWarning: MicHealthWarningMonitor.Warning?
         let monitor = MicHealthWarningMonitor(
             snapshot: {
                 .init(elapsed: clock.now, maxRMS: 0,
@@ -379,7 +420,7 @@ final class MicHealthTests: XCTestCase {
         XCTAssertNil(visibleWarning)
         engineRunning = true
         clock.advance(to: 2)
-        XCTAssertEqual(visibleWarning, "USB A")
+        XCTAssertEqual(visibleWarning, .noAudio(deviceName: "USB A"))
         withExtendedLifetime(monitor) {}
     }
 
@@ -529,6 +570,415 @@ final class MicHealthTests: XCTestCase {
         XCTAssertFalse(
             MicHealth.shouldShowNoAudioWarning(elapsed: 1.7, maxRMS: 0.02, engineRunning: true)
         )
+    }
+
+    private func frames(_ rms: Float, count: Int) -> [MicHealth.LevelFrame] {
+        Array(repeating: .init(rms: rms, duration: MicHealth.levelFrameDuration), count: count)
+    }
+
+    private func signal(speechRMS: Float, floorRMS: Float = pow(10, -53 / 20),
+                        speechFrames: Int = 10, floorFrames: Int = 10) -> [MicHealth.LevelFrame] {
+        frames(floorRMS, count: floorFrames) + frames(speechRMS, count: speechFrames)
+    }
+
+    private func isolateHintRecorder(_ recorder: AudioRecorder) {
+        recorder.asrSelector.cloudModel = nil
+        recorder.asrSelector.apiKeyProvider = { _ in nil }
+        recorder.asrSelector.pipeline.localEngineProvider = { HintOnlyEngine() }
+    }
+
+    private func deliverFrames(_ levels: [Float], hooks: AudioRecorder.MicCaptureTestHooks) throws {
+        let receive = try XCTUnwrap(hooks.receiveBuffer)
+        for level in levels {
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: hooks.format, frameCapacity: 1_600))
+            buffer.frameLength = 1_600
+            for frame in 0..<1_600 { buffer.floatChannelData![0][frame] = level }
+            receive(buffer, AVAudioTime(sampleTime: 0, atRate: 16_000))
+        }
+    }
+
+    func testRoomNoiseWithoutSpeechEvidenceNeverShowsLowLevelHint() {
+        var warnings: [MicHealthWarningMonitor.Warning?] = []
+        let monitor = MicHealthWarningMonitor(
+            snapshot: {
+                .init(elapsed: 5, deliveredSeconds: 5, maxRMS: 0.02,
+                      engineRunning: true, deviceName: "Fixture microphone",
+                      levelFrames: self.frames(pow(10, -47 / 20), count: 50))
+            },
+            warning: { warnings.append($0) },
+            schedule: { _, _ in }
+        )
+        monitor.evaluate()
+        XCTAssertFalse(warnings.contains(.lowLevel), "Room noise cannot establish speech, even after an earlier peak")
+    }
+
+    func testLessThanOneSecondOfSpeechNeverShowsLowLevelHint() {
+        var warnings: [MicHealthWarningMonitor.Warning?] = []
+        let monitor = MicHealthWarningMonitor(
+            snapshot: {
+                .init(elapsed: 2, deliveredSeconds: 2, maxRMS: 0.008,
+                      engineRunning: true, deviceName: "Fixture microphone",
+                      levelFrames: self.signal(speechRMS: pow(10, -43 / 20), speechFrames: 9, floorFrames: 11))
+            },
+            warning: { warnings.append($0) },
+            schedule: { _, _ in }
+        )
+        monitor.evaluate()
+        XCTAssertFalse(warnings.contains(.lowLevel), "Nine speech frames are insufficient")
+    }
+
+    func testQuietDeliveredAudioShowsLowMicrophoneHintAfterTwoSeconds() {
+        let clock = MicHealthTestClock()
+        var visibleWarning: MicHealthWarningMonitor.Warning?
+        let monitor = MicHealthWarningMonitor(
+            snapshot: {
+                .init(elapsed: clock.now, deliveredSeconds: 2,
+                      maxRMS: 0.008, engineRunning: true,
+                      deviceName: "Fixture microphone",
+                      levelFrames: self.signal(speechRMS: 0.008))
+            },
+            warning: { visibleWarning = $0 },
+            schedule: clock.schedule
+        )
+
+        clock.advance(to: 2.1)
+
+        XCTAssertEqual(
+            visibleWarning,
+            .lowLevel
+        )
+        withExtendedLifetime(monitor) {}
+    }
+
+    func testLowLevelWarningStaysLatchedUntilTheLevelBecomesHealthy() {
+        let clock = MicHealthTestClock()
+        var levelFrames = signal(speechRMS: 0.008)
+        var warnings: [MicHealthWarningMonitor.Warning?] = []
+        let monitor = MicHealthWarningMonitor(
+            snapshot: {
+                .init(elapsed: clock.now, deliveredSeconds: 2, maxRMS: 0.02,
+                      engineRunning: true, deviceName: "Fixture microphone", levelFrames: levelFrames)
+            },
+            warning: { warnings.append($0) },
+            schedule: clock.schedule
+        )
+
+        clock.advance(to: 3)
+        XCTAssertEqual(warnings, [.lowLevel], "The low-level warning must not flash then clear")
+        levelFrames = signal(speechRMS: 0.02)
+        monitor.evaluate()
+        XCTAssertNil(warnings.last!)
+        withExtendedLifetime(monitor) {}
+    }
+
+    func testLowLevelWarningDecisionTruthTable() {
+        let quiet: Float = 0.0099 // just below -40 dBFS
+        let threshold: Float = 0.01 // exactly -40 dBFS
+        let base = (maxRMS: Float(0.02), speechLevel: MicHealth.speechLevel(in: signal(speechRMS: quiet)), engineRunning: true)
+
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 1.99, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: base.engineRunning, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ), "Too little delivered audio must not hint")
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: 0.006, speechLevel: base.speechLevel,
+            engineRunning: true, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ), "Existing silent-hold behavior owns below-threshold samples")
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: MicHealth.speechLevel(in: signal(speechRMS: threshold)),
+            engineRunning: true, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ), "Exactly -40 dBFS is not below the low-level threshold")
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: MicHealth.speechLevel(in: signal(speechRMS: 0.0101)),
+            engineRunning: true, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ), "Above -40 dBFS is healthy")
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: MicHealth.speechLevel(in: []),
+            engineRunning: true, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ), "No completed RMS frames cannot establish a low level")
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: false, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ))
+        XCTAssertTrue(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: true, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ))
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: true, secondsSincePreviousWarning: 599,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ))
+        XCTAssertTrue(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: true, secondsSincePreviousWarning: 600,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ))
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 700, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: true, secondsSincePreviousWarning: 700,
+            previousHoldShowedWarning: true, currentHoldAlreadyShowedWarning: false
+        ), "A low-level hint may not repeat on consecutive holds")
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 700, maxRMS: base.maxRMS, speechLevel: base.speechLevel,
+            engineRunning: true, secondsSincePreviousWarning: 700,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: true
+        ))
+    }
+
+    func testNinetiethPercentileUsesSyntheticRMSFrames() throws {
+        let levels = (1...10).map { MicHealth.LevelFrame(rms: Float($0) / 1_000, duration: 0.1) }
+        XCTAssertEqual(try XCTUnwrap(MicHealth.percentileRMS(levels, percentile: 0.9)), 0.009, accuracy: 0.000_001)
+        XCTAssertEqual(MicHealth.decibelsFullScale(forRMS: 0.01), -40, accuracy: 0.000_001)
+    }
+
+    @MainActor
+    func testTapAccumulatesDurationWeightedRMSFramesWithoutDroppingPartialBuffers() throws {
+        let clock = MicHealthTestClock()
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks)
+        isolateHintRecorder(recorder)
+        recorder.beginMicCaptureForTesting()
+        let receive = try XCTUnwrap(hooks.receiveBuffer)
+
+        func deliver(_ frames: AVAudioFrameCount, amplitude: Float) throws {
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: hooks.format, frameCapacity: frames))
+            buffer.frameLength = frames
+            for frame in 0..<Int(frames) { buffer.floatChannelData![0][frame] = amplitude }
+            receive(buffer, AVAudioTime(sampleTime: 0, atRate: 16_000))
+        }
+
+        try deliver(800, amplitude: 0.008)
+        try deliver(800, amplitude: 0.008)
+        var snapshot = recorder.micLevelFramesForTesting
+        XCTAssertEqual(snapshot.frames.count, 2, "Each tap buffer is a duration-weighted level frame")
+        XCTAssertEqual(snapshot.frames[0].rms, 0.008, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.deliveredSeconds, 0.1, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.frames[0].duration, 0.05, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.frames[1].duration, 0.05, accuracy: 0.000_001)
+        XCTAssertLessThan(
+            MicHealth.decibelsFullScale(forRMS: try XCTUnwrap(MicHealth.percentileRMS(snapshot.frames, percentile: 0.9))),
+            MicHealth.lowLevelWarningThresholdDBFS
+        )
+
+        try deliver(3_200, amplitude: 0.02)
+        snapshot = recorder.micLevelFramesForTesting
+        XCTAssertEqual(snapshot.frames.count, 3, "Every delivered tap buffer contributes one level frame")
+        XCTAssertEqual(snapshot.deliveredSeconds, 0.3, accuracy: 0.000_001)
+        XCTAssertEqual(snapshot.frames[2].duration, 0.2, accuracy: 0.000_001)
+        XCTAssertGreaterThan(
+            MicHealth.decibelsFullScale(forRMS: try XCTUnwrap(MicHealth.percentileRMS(snapshot.frames, percentile: 0.9))),
+            MicHealth.lowLevelWarningThresholdDBFS
+        )
+        recorder.stopRecording()
+    }
+
+    func testSpeechEvidenceUsesDurationWeightingAndSixDecibelBoundary() throws {
+        let floorRMS: Float = 0.001
+        let below = floorRMS * pow(10, 5.99 / 20)
+        let above = floorRMS * pow(10, 6.01 / 20)
+        XCTAssertNil(MicHealth.speechLevel(in: signal(speechRMS: below, floorRMS: floorRMS)))
+        let level = try XCTUnwrap(MicHealth.speechLevel(in: signal(speechRMS: above, floorRMS: floorRMS)))
+        XCTAssertEqual(level.duration, 1, accuracy: 0.000_001)
+
+        let weighted = [MicHealth.LevelFrame(rms: floorRMS, duration: 2),
+                        .init(rms: 0.008, duration: 0.9)]
+        let shortSpeech = try XCTUnwrap(MicHealth.speechLevel(in: weighted))
+        XCTAssertEqual(shortSpeech.duration, 0.9, accuracy: 0.000_001)
+        XCTAssertFalse(MicHealth.shouldShowLowLevelWarning(
+            deliveredSeconds: 2.9, maxRMS: 0.008, speechLevel: shortSpeech,
+            engineRunning: true, secondsSincePreviousWarning: nil,
+            previousHoldShowedWarning: false, currentHoldAlreadyShowedWarning: false
+        ))
+        XCTAssertEqual(try XCTUnwrap(MicHealth.percentileRMS(weighted, percentile: 0.1)), floorRMS)
+        XCTAssertNil(MicHealth.speechLevel(in: frames(0, count: 50)))
+    }
+
+    @MainActor
+    func testPauseThenQuietSpeechShowsHintButNormalSpeechDoesNot() throws {
+        for (floorDB, speechDB, expectsHint) in [(-53.0, -43.0, true), (-47.0, -35.0, false)] {
+            let clock = MicHealthTestClock()
+            let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+            let hud = RecordingHUD(presentsWindows: false)
+            let recorder = AudioRecorder(micCaptureTestHooks: hooks, hud: hud)
+            isolateHintRecorder(recorder)
+            hud.show()
+            recorder.beginMicCaptureForTesting()
+            try deliverFrames(frames(Float(pow(10, floorDB / 20)), count: 20).map(\.rms), hooks: hooks)
+            clock.advance(to: 2.1)
+            XCTAssertNotEqual(hud.currentState, .microphoneLowLevel, "Thinking before speech must not produce a low-level hint")
+            try deliverFrames(frames(Float(pow(10, speechDB / 20)), count: 15).map(\.rms), hooks: hooks)
+            clock.advance(to: 3.6)
+            XCTAssertEqual(hud.currentState == .microphoneLowLevel, expectsHint)
+            XCTAssertTrue(recorder.micCaptureStateForTesting.wanted)
+            recorder.stopRecording()
+            hud.hide()
+        }
+    }
+
+    func testRecordingHandoffPreservesThePartialReadTail() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("open-caf-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let previous = RecordingRetention.recordingsDirectoryOverride
+        RecordingRetention.recordingsDirectoryOverride = directory
+        defer {
+            RecordingRetention.recordingsDirectoryOverride = previous
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_000))
+        buffer.frameLength = 32_000
+        for frame in 0..<32_000 { buffer.floatChannelData![0][frame] = 0.008 }
+        let source = directory.appendingPathComponent("source.caf")
+        var writer: AVAudioFile? = try AVAudioFile(forWriting: source, settings: format.settings,
+                                                  commonFormat: .pcmFormatFloat32, interleaved: false)
+        try XCTUnwrap(writer).write(from: buffer)
+        XCTAssertEqual(writer?.length, 32_000)
+        // Exercise the same open-writer handoff used by AudioRecorder.
+        var retained: URL?
+        RecordingRetention.handoffForTranscription(from: source) { url, retainedURL, _ in
+            retained = retainedURL
+            XCTAssertEqual(try? AVAudioFile(forReading: url).length, 32_000)
+        }
+        writer = nil
+        let retainedFile = try AVAudioFile(forReading: XCTUnwrap(retained))
+        XCTAssertEqual(retainedFile.length, 32_000)
+        let samples = try Self.readAllSamples(from: retainedFile)
+        XCTAssertEqual(samples.count, 32_000)
+        XCTAssertEqual(try XCTUnwrap(samples.last), 0.008, accuracy: 0.000_001)
+    }
+
+    @MainActor
+    func testLowLevelHoldContinuesThroughNormalStopAndTranscription() async throws {
+        XCTAssertTrue(isTestHost, "Audio writes must stay in the isolated test host")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("low-level-hold-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let previousDirectory = RecordingRetention.recordingsDirectoryOverride
+        RecordingRetention.recordingsDirectoryOverride = directory
+        defer {
+            RecordingRetention.recordingsDirectoryOverride = previousDirectory
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let clock = MicHealthTestClock()
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let hud = RecordingHUD(presentsWindows: false)
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks, hud: hud)
+        isolateHintRecorder(recorder)
+        let pipeline = recorder.asrSelector.pipeline
+        let transcribed = expectation(description: "quiet hold reaches local transcription")
+        let logged = expectation(description: "quiet hold completes isolated delivery")
+        pipeline.localEngineProvider = { LowLevelSpeechEngine(started: transcribed) }
+        let held = CaretContext.Snapshot(
+            value: "", location: 0, selectionLength: .readable(0),
+            precedingChar: .startOfField, isUnknown: false,
+            focusedElement: AXUIElementCreateApplication(42)
+        )
+        let board = NSPasteboard(name: .init("low-level-delivery-\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        let observer = RecoveryObserver()
+        var delivered = ""
+        pipeline.deliveryHooks = .init(
+            injector: .init(
+                pasteboard: board,
+                target: { .init(secureInput: false, pid: 42, bundleIdentifier: "fixture") },
+                createObserver: { observer },
+                postUnicode: { _ in XCTFail("Use chunk delivery"); return 0 },
+                postPasteChord: { XCTFail("No paste fallback expected"); return false },
+                postCanary: { false },
+                waitForConfirmation: { _, _ in observer.observedUTF16Units },
+                postUnicodeChunk: { units in
+                    delivered += String(decoding: units, as: UTF16.self)
+                    observer.observedUTF16Units += units.count
+                }
+            ),
+            snapshot: { held }
+        )
+        pipeline.onTranscriptionLogged = { text, engine, injected, _, failed, _ in
+            XCTAssertEqual(text, "Quiet delivered speech.")
+            XCTAssertEqual(engine, "low-level-speech-fixture")
+            XCTAssertTrue(injected)
+            XCTAssertFalse(failed)
+            logged.fulfill()
+        }
+        let token = pipeline.test_holdSnapshot(held, frontmostPID: 42)
+        recorder.test_prepareHold(token: token, active: true)
+        recorder.test_seedCachedSessionHold(token: token, snapshot: held, pid: 42)
+        hud.claimHold(token)
+        hud.show()
+
+        recorder.beginMicCaptureForTesting()
+        try deliverFrames(signal(speechRMS: 0.008).map(\.rms), hooks: hooks)
+        let captured = recorder.micCaptureStateForTesting.buffers
+        XCTAssertEqual(captured.reduce(0) { $0 + Int($1.frameLength) }, 32_000)
+        let combined = try XCTUnwrap(AudioRecorder.combine(buffers: captured))
+        XCTAssertEqual(combined.frameLength, 32_000)
+        XCTAssertEqual(combined.floatChannelData![0][31_999], 0.008, accuracy: 0.000_001)
+        clock.advance(to: 2.1)
+        XCTAssertEqual(hud.currentState, .microphoneLowLevel)
+        XCTAssertTrue(recorder.micCaptureStateForTesting.wanted)
+
+        recorder.stopRecording()
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        recorder.test_flushStopGrace()
+        await fulfillment(of: [transcribed, logged], timeout: 5)
+        XCTAssertEqual(delivered, "Quiet delivered speech.")
+        hud.hide()
+    }
+
+    @MainActor
+    func testRecorderSkipsConsecutiveLowHintsThenAllowsOneAfterCooldown() throws {
+        let clock = MicHealthTestClock()
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let hud = RecordingHUD(presentsWindows: false)
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks, hud: hud)
+        isolateHintRecorder(recorder)
+        func deliverQuietHold() throws {
+            recorder.beginMicCaptureForTesting()
+            try deliverFrames(signal(speechRMS: 0.008).map(\.rms), hooks: hooks)
+        }
+
+        hud.show()
+        try deliverQuietHold()
+        clock.advance(to: 2.1)
+        XCTAssertEqual(hud.currentState, .microphoneLowLevel)
+
+        hud.show()
+        try deliverQuietHold()
+        clock.advance(to: 4.2)
+        XCTAssertEqual(hud.currentState, .listening, "Consecutive holds may not repeat the hint")
+
+        hud.show()
+        try deliverQuietHold()
+        clock.advance(to: 603)
+        XCTAssertEqual(hud.currentState, .microphoneLowLevel, "Cooldown expiry permits a non-consecutive hold")
+        recorder.stopRecording()
+        hud.hide()
+    }
+
+    @MainActor
+    func testLowLevelHUDPresentsAccessibleTwoLineHint() {
+        let hud = RecordingHUD(presentsWindows: false)
+        hud.show()
+        hud.showMicrophoneLowLevel()
+        XCTAssertEqual(hud.currentState, .microphoneLowLevel)
+        XCTAssertEqual(
+            hud.currentState.accessibilityAnnouncement,
+            "Mic level is very low. Move closer or raise input volume"
+        )
+        hud.clearMicrophoneWarning()
+        XCTAssertEqual(hud.currentState, .listening)
+        hud.hide()
     }
 }
 
