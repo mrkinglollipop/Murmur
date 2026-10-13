@@ -7,6 +7,28 @@ import ApplicationServices
 enum VoiceEditRouting {
     static let maximumSelectionUTF16Length = 8_000
 
+    enum Response: Equatable {
+        case edit(String)
+        case replace
+    }
+
+    /// Older/unmarked model responses retain the existing rewrite sanity gate.
+    /// Only a marker occupying the first line can select replacement delivery.
+    static func parseResponse(_ response: String) -> Response {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = trimmed.split(maxSplits: 1, omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
+        let firstLine = String(lines.first ?? "").trimmingCharacters(in: .whitespaces)
+        let marker = String(firstLine.reversed().drop(while: {
+            $0.unicodeScalars.allSatisfy { CharacterSet.punctuationCharacters.contains($0) }
+        }).reversed()).trimmingCharacters(in: .whitespaces).uppercased()
+        switch marker {
+        case "REPLACE": return .replace
+        case "EDIT":
+            return .edit(lines.count > 1 ? String(lines[1]).trimmingCharacters(in: .whitespacesAndNewlines) : "")
+        default: return .edit(trimmed)
+        }
+    }
+
     enum Decision: Equatable {
         case dictate
         case edit(selection: String)
