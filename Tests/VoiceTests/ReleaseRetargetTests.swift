@@ -166,6 +166,40 @@ final class ReleaseRetargetTests: XCTestCase {
         )
     }
 
+    // Codex P2: frontmost must be sampled at release, not when the queued
+    // doStop runs. A switch to B in that gap leaves the release target at A.
+    @MainActor
+    func testReleaseTargetIsSampledBeforeStopHop() {
+        let hooks = AudioRecorder.MicCaptureTestHooks(
+            schedule: { _, _ in }, now: { Date() })
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks)
+        hooks.releaseFrontmostPID = 42       // app A at fn release
+        recorder.stopRecording()
+        hooks.releaseFrontmostPID = 99       // user switches to B before doStop drains
+        let generation = recorder.releaseSample?.generation ?? 0
+        let pid = AudioRecorder.resolvedReleasePID(
+            sample: recorder.releaseSample, generation: generation,
+            live: { hooks.releaseFrontmostPID })
+        XCTAssertEqual(pid, 42)
+        // A sample from another generation is ignored in favor of a live read.
+        XCTAssertEqual(AudioRecorder.resolvedReleasePID(
+            sample: recorder.releaseSample, generation: generation &+ 1,
+            live: { 99 }), 99)
+        XCTAssertTrue(AudioRecorder.shouldRetargetSessionHoldAtRelease(startPID: 7, releasePID: pid))
+    }
+
+    // With the target anchored at A, B being frontmost at insert trips the
+    // existing release→insert clipboard guard.
+    @MainActor
+    func testLaterAppAfterSampledReleaseTriggersClipboardGuard() {
+        let result = deliver(
+            holdStart: caret("", selected: 0, element: 7), holdStartPID: 7,
+            retargetTo: (caret("", selected: 0, element: 42), 42),
+            frontmostPID: 99, expectedOutcome: .failed)
+        XCTAssertEqual(result.typed, "")
+        XCTAssertEqual(result.clipboard, "Hello there.")
+    }
+
     @MainActor
     func testDropVoiceEditIntentIsTokenScoped() {
         let pipeline = TranscriptionPipeline()
