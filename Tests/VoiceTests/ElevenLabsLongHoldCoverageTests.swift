@@ -84,6 +84,11 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
         session.handleServerEvent(String(decoding: data, as: UTF8.self))
     }
 
+    private func partial(_ session: ElevenLabsRealtimeTranscriber, _ text: String) {
+        let data = try! JSONSerialization.data(withJSONObject: ["message_type": "partial_transcript", "text": text])
+        session.handleServerEvent(String(decoding: data, as: UTF8.self))
+    }
+
     private static let first = "The first part of this long dictation covers the budget review for October."
     private static let second = "The second part lists the three vendors we still need to call this week."
     private static let third = "And the last part says to send it all to Dana."
@@ -236,6 +241,102 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
         XCTAssertLessThan(elapsed, 1.9)
         XCTAssertEqual(text, [Self.first, Self.second].joined(separator: " "))
         XCTAssertEqual(transport.commitOffsetsSeconds, [24, 48, 54])
+    }
+
+    /// Commit counts cannot vouch for audio: one answered 28 s segment must not
+    /// pass for a 54 s recording, even though one Murmur segment "could" have
+    /// spanned it under the hard limit.
+    func testRecordingLongerThanStreamedAudioFallsBackDespiteAnsweredCommit() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        await hold(session, transport, seconds: 0..<28, quietSeconds: [])
+        XCTAssertEqual(transport.commitOffsetsSeconds, [28])
+        commit(session, Self.first)
+
+        let coordinator = StreamingCoordinator(elevenLabsSession: session)
+        let fallback = expectation(description: "unstreamed audio recovers from the recording")
+        let recording = Self.pcm(seconds: 54, amplitude: Self.loud)
+        XCTAssertTrue(coordinator.handleStopElevenLabs(
+            context: .init(duration: 54, hadSpeech: true, bufferedAudio: [recording], streamTextEver: true),
+            onSilence: { XCTFail("unexpected silence") },
+            onStreamSuccess: { _ in XCTFail("26 s of unstreamed audio accepted as covered") },
+            onBatchFallback: { buffers, _ in
+                XCTAssertTrue(buffers.first === recording)
+                fallback.fulfill()
+            }
+        ))
+        await fulfillment(of: [fallback], timeout: 1)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        XCTAssertEqual(transport.commitOffsetsSeconds, [28], "the answered commit must not double as terminal")
+    }
+
+    /// The tolerance covers converter latency only (0.25 s).
+    func testStreamedAudioToleranceIsAQuarterSecond() async throws {
+        XCTAssertEqual(ElevenLabsRealtimeTranscriber.streamedAudioToleranceSeconds, 0.25)
+        for (recording, recovers) in [(8.2, false), (8.3, true)] {
+            let transport = Transport()
+            let session = try await startedSession(transport)
+            await hold(session, transport, seconds: 0..<8, quietSeconds: [])
+            let finalizer = Task { await session.finalize(recordingDuration: recording) }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            commit(session, Self.third)
+            _ = await finalizer.value
+            XCTAssertEqual(session.requiresBufferedAudioRecovery, recovers, "recording \(recording) s")
+        }
+    }
+
+    /// An empty answer after the segment showed speech must latch at once:
+    /// the next segment's partial and commit erase the evidence, and the
+    /// commit count still balances.
+    func testEmptyAnswerToSpokenSegmentLatchesRecoveryImmediately() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        await hold(session, transport, seconds: 0..<36, quietSeconds: Self.pauses)
+        partial(session, "the first part of this long dictation covers")
+        commit(session, "")
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+
+        await hold(session, transport, seconds: 36..<54, quietSeconds: Self.pauses)
+        partial(session, "the second part lists the three vendors")
+        commit(session, Self.second)
+        let startedAt = Date()
+        let finalizer = Task { await session.finalize(recordingDuration: 54) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        commit(session, Self.third)
+        _ = await finalizer.value
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.0, "disproven coverage needs no terminal wait")
+    }
+
+    /// A segment with no partial at all is silence; its empty answer still counts.
+    func testEmptyAnswerToSilentSegmentStillCountsAsCovered() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        await hold(session, transport, seconds: 0..<36, quietSeconds: Self.pauses)
+        commit(session, "")
+        await hold(session, transport, seconds: 36..<54, quietSeconds: Self.pauses)
+        commit(session, Self.second)
+        let finalizer = Task { await session.finalize(recordingDuration: 54) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        commit(session, Self.third)
+        let text = await finalizer.value
+        XCTAssertEqual(text, [Self.second, Self.third].joined(separator: " "))
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+    }
+
+    /// Audio the tap delivers after finalize closed the queue never reaches
+    /// the server; the result must recover from the recording.
+    func testAudioCapturedAfterFinalizeBeganLatchesRecovery() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        await hold(session, transport, seconds: 0..<8, quietSeconds: [])
+        let finalizer = Task { await session.finalize(recordingDuration: 8) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        session.send(Self.pcm(seconds: 1, amplitude: Self.loud))
+        commit(session, Self.third)
+        _ = await finalizer.value
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        XCTAssertEqual(transport.all.count, 9, "eight audio chunks and the terminal commit; the late chunk was not sent")
     }
 
     func testVADStrategyNeverPlacesMurmurCommitsAndStillRecovers() async throws {

@@ -37,7 +37,7 @@ final class StreamIntegrityTests: XCTestCase {
         xai.cancel(); eleven.cancel(); gemini.cancel(); muse.cancel()
         let counts = [
             await retainedFrames(in: transportStream(of: xai, as: Data.self)),
-            await retainedFrames(in: transportStream(of: eleven, as: String.self)),
+            await retainedFrames(in: transportStream(of: eleven, as: ElevenLabsRealtimeTranscriber.QueuedFrame.self)),
             await retainedFrames(in: transportStream(of: gemini, as: String.self)),
             await retainedFrames(in: transportStream(of: muse, as: Data.self))
         ]
@@ -60,7 +60,7 @@ final class StreamIntegrityTests: XCTestCase {
         // A retained test copy lets us count the buffer after finish without
         // starting a sender or touching a socket.
         let xaiStream = transportStream(of: xai, as: Data.self)
-        let elevenStream = transportStream(of: eleven, as: String.self)
+        let elevenStream = transportStream(of: eleven, as: ElevenLabsRealtimeTranscriber.QueuedFrame.self)
         let geminiStream = transportStream(of: gemini, as: String.self)
         let museStream = transportStream(of: muse, as: Data.self)
         xai.cancel(); eleven.cancel(); gemini.cancel(); muse.cancel()
@@ -287,7 +287,7 @@ final class StreamIntegrityTests: XCTestCase {
         let duration = 10.657
         let prefix = "We want to customize this draft and make the final result fit the product..."
         XCTAssertFalse(StreamingCoordinator.streamResultLooksTruncated(text: prefix, duration: duration))
-        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        let session = await streamingElevenLabsSession(sending: buffer)
         let coordinator = StreamingCoordinator(elevenLabsSession: session)
         let fallback = expectation(description: "ElevenLabs ellipsis batch fallback")
 
@@ -400,9 +400,20 @@ final class StreamIntegrityTests: XCTestCase {
         XCTAssertEqual(session.joinedTranscriptSnapshot(), "")
     }
 
+    /// A started session that has streamed `buffer`, as the mic tap would:
+    /// the coverage proof only accepts a result for audio that was sent.
+    private func streamingElevenLabsSession(sending buffer: AVAudioPCMBuffer) async -> ElevenLabsRealtimeTranscriber {
+        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        try? await session.start(beforeReadiness: {
+            session.handleServerEvent(#"{"message_type":"session_started"}"#)
+        })
+        session.send(buffer)
+        return session
+    }
+
     func testElevenLabsPromptFinalCommitKeepsStreamingResult() async {
         let buffer = Self.audioBuffer(seconds: 4)
-        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        let session = await streamingElevenLabsSession(sending: buffer)
         let coordinator = StreamingCoordinator(elevenLabsSession: session)
         let success = expectation(description: "prompt committed stream result")
         var fallbackCount = 0
@@ -427,7 +438,7 @@ final class StreamIntegrityTests: XCTestCase {
     /// Replays the logged order: session ready -> finalize -> committed_transcript
     /// 0.15 s in -> a trailing partial that only re-emits committed words.
     func testElevenLabsTrailingDuplicatePartialDoesNotHoldFinalizeToDeadline() async {
-        let session = ElevenLabsRealtimeTranscriber(apiKey: "key", messageSender: { _ in })
+        let session = await streamingElevenLabsSession(sending: Self.audioBuffer(seconds: 4))
         let finalizer = Task { await session.finalize(recordingDuration: 4) }
         try? await Task.sleep(nanoseconds: 150_000_000)
         session.handleServerEvent(#"{"message_type":"committed_transcript","text":"Send the report to Dana before noon today."}"#)
