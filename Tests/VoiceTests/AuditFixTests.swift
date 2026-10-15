@@ -185,7 +185,7 @@ final class AuditFixTests: XCTestCase {
         let suite = "murmur.ui030.key-presence.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let keychain = KeychainStore(service: "com.matt.voice-dictation.apikeys.TESTS")
+        let keychain = KeychainStore(service: "com.matt.voice-dictation.apikeys.TESTS.\(UUID().uuidString)")
         defer {
             keychain.deleteKey(for: CloudProvider.xai.keychainAccount)
             keychain.deleteKey(for: "cleanup-openai")

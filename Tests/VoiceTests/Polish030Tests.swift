@@ -236,14 +236,7 @@ final class Polish030Tests: XCTestCase {
             CorrectionRecord(heard: "WhisperFlow", replaced: "Wispr Flow", source: .dictionary)
         ])
 
-        // Opt-in preview keeps the real glass compositor available for local
-        // visual review while all stores remain isolated synthetic fixtures.
-        let previewURL = URL(fileURLWithPath: "/tmp/murmur-dictionary-visual-preview")
-        let showsPreview = FileManager.default.fileExists(atPath: previewURL.path)
-        let activationPolicy = NSApp.activationPolicy()
-        if showsPreview { NSApp.setActivationPolicy(.regular) }
-        defer { if showsPreview { NSApp.setActivationPolicy(activationPolicy) } }
-        let height: CGFloat = showsPreview ? 760 : 1_050
+        let height: CGFloat = 1_050
         for width: CGFloat in [439, 559] {
             let view = NSHostingView(
                 rootView: DictionaryView(store: store, correctionsLog: corrections)
@@ -253,25 +246,6 @@ final class Polish030Tests: XCTestCase {
             )
             view.frame = NSRect(x: 0, y: 0, width: width, height: height)
             view.layoutSubtreeIfNeeded()
-
-            var previewWindow: NSWindow?
-            if showsPreview {
-                let window = NSWindow(
-                    contentRect: view.frame,
-                    styleMask: [.titled, .closable],
-                    backing: .buffered,
-                    defer: false
-                )
-                window.isReleasedWhenClosed = false
-                window.title = "Murmur Dictionary Preview — \(Int(width)) pt"
-                window.contentView = view
-                window.center()
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
-                previewWindow = window
-                RunLoop.current.run(until: Date().addingTimeInterval(45))
-            }
-            defer { previewWindow?.close() }
 
             XCTAssertTrue(view.bounds.width.isFinite && view.bounds.height.isFinite)
             XCTAssertEqual(view.bounds.width, width)
