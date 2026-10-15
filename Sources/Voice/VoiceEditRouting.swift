@@ -99,16 +99,20 @@ enum VoiceEditRouting {
     ) -> Bool {
         if CFEqual(held, fresh.element) { return true }
         guard let heldRole, fresh.role == heldRole else { return false }
-        return fresh.isEditable == true
+        return fresh.acceptsRelaxedDelivery
     }
 
     /// A release with nothing focused, or a frontmost app with no windows,
     /// binds the take to no field (2026-10-15: browser window closed mid-hold,
     /// user clicked into another app). A focused element that merely reads as
     /// non-editable stays bound: terminals (Terminal, iTerm, Ghostty) report
-    /// their text area that way and must keep typing into it.
-    static func isUnboundReleaseTarget(field: CaretContext.FocusedField?, appHasWindows: Bool?) -> Bool {
-        appHasWindows == false || field == nil
+    /// their text area that way and must keep typing into it. Only definite
+    /// answers unbind: a timed-out or failed focus read keeps the release app,
+    /// so a slow app cannot hand its text to whatever is focused later.
+    static func isUnboundReleaseTarget(focus: CaretContext.FocusRead, appHasWindows: Bool?) -> Bool {
+        if appHasWindows == false { return true }
+        if case .noFocus = focus { return true }
+        return false
     }
 
     /// AX role, editability, PID and bundle only. Never field text.

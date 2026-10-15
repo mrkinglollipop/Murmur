@@ -167,6 +167,9 @@ final class FalseFieldAbortTests: XCTestCase {
         XCTAssertFalse(VoiceEditRouting.ordinaryDeliveryFieldMatches(held: held, heldRole: textArea, fresh: fresh(502, textArea, nil)))
         XCTAssertFalse(VoiceEditRouting.ordinaryDeliveryFieldMatches(held: held, heldRole: textArea, fresh: fresh(502, "AXGroup", true)))
         XCTAssertFalse(VoiceEditRouting.ordinaryDeliveryFieldMatches(held: held, heldRole: nil, fresh: fresh(502, textArea, true)))
+        // Codex P1: never relax onto a password field, whatever editability says.
+        let secure = CaretContext.secureTextFieldRole
+        XCTAssertFalse(VoiceEditRouting.ordinaryDeliveryFieldMatches(held: held, heldRole: secure, fresh: fresh(502, secure, true)))
     }
 
     func testDiagnosticCarriesCountsAndRolesButNoText() {

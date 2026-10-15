@@ -1199,7 +1199,7 @@ final class TranscriptionPipeline {
                 // release-to-insert app-switch rule measures from here.
                 let heldPID = unbound ? currentPID : releasePID
                 let heldAtStart = unbound ? nil : releaseHeld
-                let unboundWithoutTarget = unbound && unboundField?.isEditable != true
+                let unboundWithoutTarget = unbound && unboundField?.acceptsRelaxedDelivery != true
                 let axPlan = Self.injectAXPlan(
                     replaceHistoryEntryID: replaceID,
                     heldPID: heldPID,
@@ -1346,7 +1346,7 @@ final class TranscriptionPipeline {
                         // with no delete or select-all step in any lane.
                         // Unbound: any editable field in the adopted app will do.
                         let unboundFieldCheck: (() -> Bool?)? = !unbound ? nil : {
-                            guard self.deliveryFocusedField(frontmostPID: deliveryPID)?.isEditable == true else {
+                            guard self.deliveryFocusedField(frontmostPID: deliveryPID)?.acceptsRelaxedDelivery == true else {
                                 vlog("inject abort: unbound take lost its editable focus before insert")
                                 return false
                             }

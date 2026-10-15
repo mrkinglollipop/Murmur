@@ -159,20 +159,39 @@ final class UnboundTakeTests: XCTestCase {
     }
 
     func testReleaseTargetRuleIsPure() {
-        func focused(_ role: String?, _ editable: Bool?) -> CaretContext.FocusedField {
-            .init(element: AXUIElementCreateApplication(501), role: role, isEditable: editable)
+        func focused(_ role: String?, _ editable: Bool?) -> CaretContext.FocusRead {
+            .focused(.init(element: AXUIElementCreateApplication(501), role: role, isEditable: editable))
         }
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: nil, appHasWindows: nil))
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: nil, appHasWindows: true))
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: focused(textArea, true), appHasWindows: false))
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXWebArea", false), appHasWindows: false))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: nil))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: true))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: focused(textArea, true), appHasWindows: false))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXWebArea", false), appHasWindows: false))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .unknown, appHasWindows: false))
         // Terminal-like: focused but reads non-editable — stays bound.
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXWebArea", false), appHasWindows: true))
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXGroup", false), appHasWindows: nil))
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused(textArea, true), appHasWindows: true))
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused(textArea, true), appHasWindows: nil))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXWebArea", false), appHasWindows: true))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXGroup", false), appHasWindows: nil))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused(textArea, true), appHasWindows: true))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused(textArea, true), appHasWindows: nil))
         // Unreadable editability keeps the release target.
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXGroup", nil), appHasWindows: true))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXGroup", nil), appHasWindows: true))
+    }
+
+    /// Codex P1: a timed-out or failed focus read is not "nothing focused".
+    func testFailedFocusReadKeepsTakeBound() {
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: .unknown, appHasWindows: nil))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: .unknown, appHasWindows: true))
+    }
+
+    /// Codex P1: a password field is never an unbound destination, even when
+    /// the global Secure Input flag is clear.
+    @MainActor
+    func testUnboundTakeNeverTypesIntoPasswordField() {
+        let password = field(element: 601, role: CaretContext.secureTextFieldRole, editable: true)
+        let result = deliver(
+            held: field(element: 501, role: "AXWebArea", editable: false), unbound: true,
+            atInsert: password, frontmostPID: otherAppPID, expectedOutcome: .failed)
+        XCTAssertEqual(result.typed, "")
+        XCTAssertEqual(result.clipboard, "Hello there.")
     }
 
     func testFocusDiagnosticCarriesNoText() {
