@@ -533,8 +533,47 @@ final class TextInjector {
         return pasteboard.prepareForNewContents(with: options)
     }
 
+    private static let ownedChangeCountsLock = NSLock()
+    private static var ownedChangeCounts: [NSPasteboard.Name: [Int]] = [:]
+    private static let ownedChangeCountLimit = 64
+
+    /// Records the changeCount values produced by a Murmur write that began at
+    /// `before`, so observers can tell Murmur's own writes from a user copy.
+    private static func recordOwnedWrites(from before: Int, on pasteboard: NSPasteboard) {
+        let after = pasteboard.changeCount
+        guard after > before else { return }
+        ownedChangeCountsLock.lock()
+        var counts = ownedChangeCounts[pasteboard.name] ?? []
+        counts.append(contentsOf: (before + 1)...after)
+        if counts.count > ownedChangeCountLimit { counts.removeFirst(counts.count - ownedChangeCountLimit) }
+        ownedChangeCounts[pasteboard.name] = counts
+        ownedChangeCountsLock.unlock()
+    }
+
+    /// True when every change after `startCount` was produced by Murmur's own
+    /// transient writes (paste prep, re-stabilize, restore): no user copy or
+    /// Universal Clipboard arrival happened in between.
+    static func pasteboardChangedOnlyByMurmur(since startCount: Int, on pasteboard: NSPasteboard) -> Bool {
+        let current = pasteboard.changeCount
+        if current == startCount { return true }
+        guard current > startCount, current - startCount <= ownedChangeCountLimit else { return false }
+        ownedChangeCountsLock.lock()
+        defer { ownedChangeCountsLock.unlock() }
+        let owned = Set(ownedChangeCounts[pasteboard.name] ?? [])
+        return ((startCount + 1)...current).allSatisfy(owned.contains)
+    }
+
+    /// Test seam: forget recorded Murmur-owned change counts.
+    static func resetOwnedChangeCountsForTesting() {
+        ownedChangeCountsLock.lock()
+        ownedChangeCounts = [:]
+        ownedChangeCountsLock.unlock()
+    }
+
     /// Writes transcript + concealed marker for paste injection.
     static func preparePasteboardForPaste(_ text: String, on pasteboard: NSPasteboard) {
+        let before = pasteboard.changeCount
+        defer { recordOwnedWrites(from: before, on: pasteboard) }
         beginLocalOnlyTransientWrite(on: pasteboard)
         pasteboard.setString(text, forType: .string)
         pasteboard.setData(Data(), forType: concealedPasteboardType)
@@ -663,6 +702,9 @@ final class TextInjector {
         if let expectedChangeCount, pasteboard.changeCount != expectedChangeCount {
             return false
         }
+        let before = pasteboard.changeCount
+        defer { recordOwnedWrites(from: before, on: pasteboard) }
+        // Accepted AppKit limitation: a copy landing between the check above and this clear is lost.
         beginLocalOnlyTransientWrite(on: pasteboard)
         guard !snapshot.isEmpty else { return true }
         let items: [NSPasteboardItem] = snapshot.map { representations in
