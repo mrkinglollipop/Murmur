@@ -78,8 +78,13 @@ enum VoiceEditRouting {
     static func resultLooksUsable(_ result: String, over selection: String) -> Bool {
         let output = result.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !output.isEmpty, output.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
-        let ratio = Double(output.count) / Double(max(selection.count, 1))
-        return (0.4...2.0).contains(ratio)
+        // Short selections legitimately grow (one word becomes a phrase), so the
+        // ceiling is the larger of 2x and +160 characters; long selections are
+        // still held to 2x so runaway model output cannot replace them.
+        let count = selection.count
+        let ceiling = max(count * 2, count + 160)
+        let floor = Int(0.4 * Double(count))
+        return output.count >= floor && output.count <= ceiling
     }
 
     static func fieldMatches(held: AXUIElement, fresh: AXUIElement?) -> Bool {
