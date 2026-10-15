@@ -120,6 +120,9 @@ final class AudioRecorder {
         var engineRunning = false
         var successfulStarts = 0
         var receiveBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
+        /// The test host's real frontmost app must not retarget a fixture hold.
+        /// Nil is an unknown release identity, which keeps the hold-start target.
+        var releaseFrontmostPID: pid_t?
         let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
         let schedule: MicHealthWarningMonitor.Schedule
         let now: () -> Date
@@ -1354,30 +1357,44 @@ final class AudioRecorder {
         )
     }
 
-    /// A release-time app switch never authorizes changing a hold's destination.
+    /// Pure seam: re-anchor the session hold at hotkey release only when the
+    /// release-time frontmost is known AND differs from the start-time PID.
+    /// Same app (or unknown release identity) keeps the start-time hold, so
+    /// the same-app path, including selection edits, is unchanged.
     internal static func shouldRetargetSessionHoldAtRelease(
         startPID: pid_t?,
         releasePID: pid_t?
     ) -> Bool {
-        false
+        guard let releasePID else { return false }
+        return startPID != releasePID
     }
 
-    /// Keep the original PID and selection together through release. The late
-    /// pipeline and injector checks refuse delivery if that target loses focus.
+    /// Releasing the hotkey is the targeting gesture: ordinary dictation goes
+    /// to the app frontmost at release, with a same-moment caret snapshot so
+    /// caret transforms never mix apps. A hold-start selection edit belongs to
+    /// the hold-start app only, so a retarget drops that intent and the take
+    /// is delivered as plain dictation. The late pipeline and injector checks
+    /// still refuse delivery if focus changes between release and insert.
     private func retargetedSessionHoldAtRelease(
         _ startHold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?)
     ) -> (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?) {
         assert(Thread.isMainThread, "retargetedSessionHoldAtRelease requires main thread")
-        guard startHold.token != nil else { return startHold }
-        let releasePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        guard let token = startHold.token else { return startHold }
+        let releasePID: pid_t? = {
+            #if DEBUG
+            if let hooks = micCaptureTestHooks { return hooks.releaseFrontmostPID }
+            #endif
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier
+        }()
         guard Self.shouldRetargetSessionHoldAtRelease(
             startPID: startHold.pid,
             releasePID: releasePID
         ) else {
             return startHold
         }
+        asrSelector.dropVoiceEditIntent(matching: token)
         vlog("inject target re-anchored at release — frontmost changed during hold")
-        return (startHold.token, CaretContext.snapshot(frontmostPID: releasePID), releasePID)
+        return (token, CaretContext.snapshot(frontmostPID: releasePID), releasePID)
     }
 
     /// After inject pipeline finishes a take: drop that take's AudioRecorder
