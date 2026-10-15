@@ -7,6 +7,46 @@ enum CaretContext {
     struct AXReader {
         var setTimeout: (AXUIElement, Float) -> AXError = AXUIElementSetMessagingTimeout
         var copyAttribute: (AXUIElement, CFString, UnsafeMutablePointer<CFTypeRef?>) -> AXError = AXUIElementCopyAttributeValue
+        var isSettable: (AXUIElement, CFString, UnsafeMutablePointer<DarwinBoolean>) -> AXError = AXUIElementIsAttributeSettable
+    }
+
+    /// Focused element plus the two properties ordinary delivery compares when
+    /// AX identity alone cannot: Chromium/Electron recreate the composer's AX
+    /// element while it keeps focus, so `CFEqual` fails for the same field.
+    struct FocusedField {
+        let element: AXUIElement
+        let role: String?
+        let isEditable: Bool?
+    }
+
+    static let editableTextRoles: Set<String> = [
+        kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String,
+    ]
+
+    static func role(of element: AXUIElement, reader: AXReader = AXReader()) -> String? {
+        var roleRef: CFTypeRef?
+        guard reader.copyAttribute(element, kAXRoleAttribute as CFString, &roleRef) == .success else {
+            return nil
+        }
+        return roleRef as? String
+    }
+
+    /// Text roles count as editable without a further read; any other role is
+    /// editable only when its value is settable. Nil = unreadable.
+    static func isEditableText(_ element: AXUIElement, role: String?, reader: AXReader = AXReader()) -> Bool? {
+        if let role, editableTextRoles.contains(role) { return true }
+        var settable: DarwinBoolean = false
+        guard reader.isSettable(element, kAXValueAttribute as CFString, &settable) == .success else {
+            return nil
+        }
+        return settable.boolValue
+    }
+
+    static func focusedField(frontmostPID: pid_t?, reader: AXReader = AXReader()) -> FocusedField? {
+        guard let element = focusedElement(frontmostPID: frontmostPID, reader: reader) else { return nil }
+        _ = reader.setTimeout(element, messagingTimeoutSeconds)
+        let role = role(of: element, reader: reader)
+        return FocusedField(element: element, role: role, isEditable: isEditableText(element, role: role, reader: reader))
     }
 
     enum PrecedingChar: Equatable {
@@ -35,6 +75,10 @@ enum CaretContext {
 
         /// Retained AX identity prevents equal text in another field impersonating this one.
         var focusedElement: AXUIElement? = nil
+        /// AX role of `focusedElement` (e.g. `AXTextArea`); nil when unread.
+        var focusedRole: String? = nil
+        /// Whether `focusedElement` accepts typed text; nil when unread.
+        var focusedIsEditable: Bool? = nil
 
         static let unknown = Snapshot(
             value: "",
@@ -116,13 +160,16 @@ enum CaretContext {
         }
 
         let preceding = precedingGrapheme(in: value, beforeUTF16Location: parsed.location)
+        let focusedRole = role(of: focused, reader: reader)
         return Snapshot(
             value: value,
             location: parsed.location,
             selectionLength: selectionLength,
             precedingChar: preceding,
             isUnknown: false,
-            focusedElement: focused
+            focusedElement: focused,
+            focusedRole: focusedRole,
+            focusedIsEditable: isEditableText(focused, role: focusedRole, reader: reader)
         )
     }
 

@@ -81,8 +81,12 @@ final class TextInjector {
 
     private func checkInjectionAllowed(targetPID: pid_t?) throws {
         let current = currentTarget()
-        guard !current.secureInput else { throw InjectionAbort.secureInput }
+        guard !current.secureInput else {
+            Self.log("abort check=secure-input pid=\(Self.describe(current.pid)) bundle=\(current.bundleIdentifier ?? "nil")")
+            throw InjectionAbort.secureInput
+        }
         if let targetPID, current.pid != targetPID {
+            Self.log("abort check=app-switch pid=\(targetPID)→\(Self.describe(current.pid)) bundle=\(current.bundleIdentifier ?? "nil")")
             throw InjectionAbort.appSwitch
         }
     }
@@ -94,7 +98,10 @@ final class TextInjector {
         let matches = selectionValidation()
         // AX can block. Recheck focus and Secure Input after it returns.
         try checkInjectionAllowed(targetPID: targetPID)
-        guard matches else { throw InjectionAbort.selectionChanged }
+        guard matches else {
+            logValidatorAbort("selection", targetPID: targetPID)
+            throw InjectionAbort.selectionChanged
+        }
     }
 
     private func checkFieldAllowed(targetPID: pid_t?) throws {
@@ -102,8 +109,19 @@ final class TextInjector {
         let matches = fieldValidation()
         try checkInjectionAllowed(targetPID: targetPID)
         guard let matches else { return }
-        guard matches else { throw InjectionAbort.selectionChanged }
+        guard matches else {
+            logValidatorAbort("field", targetPID: targetPID)
+            throw InjectionAbort.selectionChanged
+        }
     }
+
+    /// The validator closure logs what differed; this names the throw site.
+    private func logValidatorAbort(_ check: String, targetPID: pid_t?) {
+        let current = currentTarget()
+        Self.log("abort check=\(check) pid=\(Self.describe(targetPID)) bundle=\(current.bundleIdentifier ?? "nil")")
+    }
+
+    private static func describe(_ pid: pid_t?) -> String { pid.map { String($0) } ?? "nil" }
 
     private static let dedupeLock = NSLock()
     private static let dedupeWindow: TimeInterval = 1.0
@@ -751,6 +769,7 @@ final class TextInjector {
 
         // Keep the captured destination anchored across the pipeline-to-inject gap.
         if let expectedTargetPID, target.pid != expectedTargetPID {
+            Self.log("abort check=app-switch-at-insert pid=\(expectedTargetPID)→\(Self.describe(target.pid)) bundle=\(target.bundleIdentifier ?? "nil")")
             leaveOnClipboard(trimmed)
             return .failed
         }

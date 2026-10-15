@@ -47,6 +47,9 @@ final class CaretContextTests: XCTestCase {
                 } else if attribute as String == kAXValueAttribute {
                     calls.append("value read")
                     output.pointee = "hello" as CFString
+                } else if attribute as String == kAXRoleAttribute {
+                    calls.append("role read")
+                    output.pointee = kAXTextAreaRole as CFString
                 } else {
                     calls.append("range read")
                     output.pointee = rangeValue
@@ -55,7 +58,9 @@ final class CaretContextTests: XCTestCase {
             }
         )
         let snapshot = CaretContext.snapshot(frontmostPID: 123, reader: reader)
-        XCTAssertEqual(calls, ["app timeout", "focus read", "focused timeout", "value read", "range read"])
+        XCTAssertEqual(calls, ["app timeout", "focus read", "focused timeout", "value read", "range read", "role read"])
+        XCTAssertEqual(snapshot.focusedRole, kAXTextAreaRole as String)
+        XCTAssertEqual(snapshot.focusedIsEditable, true)
         XCTAssertTrue(snapshot.focusedElement.map { CFEqual($0, focused) } ?? false)
         XCTAssertEqual(snapshot.value, "hello")
         XCTAssertEqual(snapshot.location, 5)
