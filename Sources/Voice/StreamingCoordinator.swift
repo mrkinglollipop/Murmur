@@ -615,6 +615,15 @@ final class StreamingCoordinator {
         session.send(buffer)
     }
 
+    /// Makes every active session's result unacceptable so the stop path falls
+    /// back to buffered audio.
+    func requireBufferedAudioRecoveryForActiveSessions() {
+        xaiSession?.requireBufferedAudioRecovery()
+        elevenLabsSession?.requireBufferedAudioRecovery()
+        geminiSession?.requireBufferedAudioRecovery()
+        museSession?.requireBufferedAudioRecovery()
+    }
+
     /// Aborts any in-flight streaming session and drops the reference without
     /// waiting for a final transcript — used when the capture is abandoned
     /// (secure input activated mid-hold) and the audio must not be used.
