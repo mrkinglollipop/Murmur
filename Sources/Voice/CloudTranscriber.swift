@@ -324,6 +324,31 @@ final class XAITranscriptionService: CloudTranscriptionService {
 final class ElevenLabsTranscriptionService: CloudTranscriptionService {
     private struct Response: Decodable { let text: String }
 
+    /// Canonical dictionary terms (same provider output as the realtime path).
+    /// Sent as one repeated `keyterms` multipart field per term; empty omits it.
+    var keyterms: [String] = []
+
+    /// Batch API limits: at most 1000 terms, each under 50 characters and at
+    /// most 5 words. An invalid term is dropped rather than failing the request
+    /// with HTTP 400 and losing the dictation.
+    static let maxBatchKeyterms = 1000
+    static let maxBatchKeytermLength = 49
+    static let maxBatchKeytermWords = 5
+
+    static func filterBatchKeyterms(_ terms: [String]) -> [String] {
+        var valid: [String] = []
+        for raw in terms {
+            let term = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !term.isEmpty,
+                  term.count <= maxBatchKeytermLength,
+                  term.split(whereSeparator: { $0.isWhitespace }).count <= maxBatchKeytermWords
+            else { continue }
+            valid.append(term)
+            if valid.count == maxBatchKeyterms { break }
+        }
+        return valid
+    }
+
     func transcribe(audioURL: URL, apiKey: String, model: CloudModel, language: String) async throws -> String {
         let boundary = "Boundary-\(UUID().uuidString)"
         let payload = try cloudUploadAudio(from: audioURL, provider: .elevenLabs)
@@ -343,7 +368,8 @@ final class ElevenLabsTranscriptionService: CloudTranscriptionService {
                 // Scribe otherwise returns captions such as "[coughing]" for
                 // audio events. Dictation wants spoken words only.
                 "tag_audio_events": "false"
-            ]
+            ],
+            repeatedFields: Self.filterBatchKeyterms(keyterms).map { (name: "keyterms", value: $0) }
         )
 
         let (data, response) = try await HTTPClient.session.data(for: request)

@@ -214,6 +214,26 @@ final class StuckProcessingHUDTests: XCTestCase {
     }
 
     @MainActor
+    func testBatchServiceReceivesKeytermsProviderTerms() {
+        let selector = ASREngineSelector()
+        selector.cloudModel = .elevenLabsScribeV2Realtime
+        selector.apiKeyProvider = { _ in "dummy-test-key" }
+        selector.keytermsProvider = { ["Khipu", "Murmur"] }
+        let service = ElevenLabsTranscriptionService()
+        let pipeline = selector.pipeline
+        pipeline.cloudServiceProvider = { _ in service }
+        pipeline.localEngineProvider = { LocalStub { _ in "" } }
+        pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in }
+        let done = expectation(description: "pipeline finished")
+        // Missing audio file makes the batch call throw after keyterms are set.
+        pipeline.transcribeAndLog(
+            audioURL: URL(fileURLWithPath: "/nonexistent-keyterms-test.caf"), audioIsTemporary: true
+        ) { _ in done.fulfill() }
+        wait(for: [done], timeout: 10)
+        XCTAssertEqual(service.keyterms, ["Khipu", "Murmur"])
+    }
+
+    @MainActor
     func testEmptyCloudRecoversVoiceEditInstructionBeforeTransform() {
         let selector = ASREngineSelector()
         selector.cloudModel = .elevenLabsScribeV2Realtime

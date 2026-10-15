@@ -493,6 +493,9 @@ final class TranscriptionPipeline {
                         gemini.smartMode = selector.removeFillerWordsEnabled
                         gemini.vocabulary = selector.geminiVocabularyProvider?() ?? []
                     }
+                    if let elevenLabs = service as? ElevenLabsTranscriptionService {
+                        elevenLabs.keyterms = selector.keytermsProvider?() ?? []
+                    }
                     let text = try await service.transcribe(
                         audioURL: audioURL,
                         apiKey: key,

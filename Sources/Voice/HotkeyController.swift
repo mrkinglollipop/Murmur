@@ -115,6 +115,7 @@ final class HotkeyController {
             return
         }
 
+        let startedAtChangeCount = NSPasteboard.general.changeCount
         Task {
             do {
                 let result = try await TransformRunner.run(
@@ -123,10 +124,12 @@ final class HotkeyController {
                     credentials: credentials
                 )
                 await MainActor.run {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(result, forType: .string)
-                    self.report(.copiedToClipboard)
+                    let copied = TransformRunner.copyResultIfClipboardUnchanged(
+                        result,
+                        on: .general,
+                        startedAtChangeCount: startedAtChangeCount
+                    )
+                    self.report(copied ? .copiedToClipboard : .failed(TransformRunner.clipboardChangedMessage))
                 }
             } catch {
                 await MainActor.run {

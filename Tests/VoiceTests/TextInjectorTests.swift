@@ -1204,6 +1204,86 @@ final class TextInjectorTests: XCTestCase {
         XCTAssertNotNil(testPasteboard.data(forType: TextInjector.concealedPasteboardType))
     }
 
+    // MARK: - Universal Clipboard locality
+
+    private func recordTransientWrites() -> () -> [(NSPasteboard.Name, NSPasteboard.ContentsOptions)] {
+        var recorded: [(NSPasteboard.Name, NSPasteboard.ContentsOptions)] = []
+        TextInjector.transientWriteOptionsObserverForTesting = { recorded.append(($0, $1)) }
+        addTeardownBlock { TextInjector.transientWriteOptionsObserverForTesting = nil }
+        return { recorded }
+    }
+
+    func testTransientWrites_requestCurrentHostOnly() {
+        let recorded = recordTransientWrites()
+        testPasteboard.clearContents()
+        testPasteboard.setString("phone copy", forType: .string)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+
+        TextInjector.preparePasteboardForPaste("injected", on: testPasteboard)
+        XCTAssertTrue(TextInjector.restorePasteboardSnapshot(saved, on: testPasteboard))
+
+        XCTAssertEqual(recorded().count, 2, "paste preparation and restore are both transient writes")
+        for (name, options) in recorded() {
+            XCTAssertEqual(name, Self.testPasteboardName)
+            XCTAssertEqual(options, .currentHostOnly)
+        }
+        XCTAssertEqual(testPasteboard.string(forType: .string), "phone copy")
+    }
+
+    func testFailedInsert_preparesLocalOnlyThenLeavesOrdinaryCopy() {
+        let recorded = recordTransientWrites()
+        let harness = InjectionHarness(pasteboard: testPasteboard)
+        harness.unicodeResult = 0
+        XCTAssertEqual(harness.injector().insert("text"), .failed)
+
+        XCTAssertFalse(recorded().isEmpty, "paste lane must have prepared the pasteboard")
+        XCTAssertTrue(recorded().allSatisfy { $0.1 == .currentHostOnly })
+        XCTAssertEqual(testPasteboard.string(forType: .string), "text")
+        XCTAssertNil(testPasteboard.data(forType: TextInjector.concealedPasteboardType),
+                     "left-on-clipboard is an ordinary copy, not the concealed paste-lane write")
+    }
+
+    func testRestorePasteboardSnapshot_skipsWhenChangeCountMoved() {
+        let recorded = recordTransientWrites()
+        testPasteboard.clearContents()
+        testPasteboard.setString("prior clipboard", forType: .string)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        TextInjector.preparePasteboardForPaste("injected", on: testPasteboard)
+        let ourWrite = testPasteboard.changeCount
+
+        testPasteboard.clearContents()
+        testPasteboard.setString("injected", forType: .string) // Universal Clipboard arrival, same text
+
+        XCTAssertFalse(TextInjector.restorePasteboardSnapshot(saved, on: testPasteboard, ifChangeCountIs: ourWrite))
+        XCTAssertEqual(testPasteboard.string(forType: .string), "injected")
+        XCTAssertEqual(recorded().count, 1, "a skipped restore must not clear the pasteboard")
+    }
+
+    func testScheduleDeferredPasteboardRestore_skipsSameTextArrivalAfterOurWrite() {
+        TextInjector.resetDeferredRestoreGenerationForTesting()
+        testPasteboard.clearContents()
+        testPasteboard.setString("prior clipboard", forType: .string)
+        let saved = TextInjector.pasteboardSnapshot(from: testPasteboard)
+        TextInjector.preparePasteboardForPaste("injected transcript", on: testPasteboard)
+
+        var work: (() -> Void)?
+        TextInjector.scheduleDeferredPasteboardRestore(
+            injectedText: "injected transcript",
+            savedPasteboard: saved,
+            on: testPasteboard,
+            delay: 2.0,
+            expectedChangeCount: testPasteboard.changeCount,
+            asyncAfter: { _, block in work = block }
+        )
+        testPasteboard.clearContents()
+        testPasteboard.setString("injected transcript", forType: .string)
+        let arrival = testPasteboard.changeCount
+
+        work?()
+        XCTAssertEqual(testPasteboard.changeCount, arrival, "restore must not touch a newer copy")
+        XCTAssertEqual(testPasteboard.string(forType: .string), "injected transcript")
+    }
+
     func testRestorePasteboardSnapshot_restoresPriorString() {
         testPasteboard.clearContents()
         testPasteboard.setString("saved snapshot", forType: .string)
