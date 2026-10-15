@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -412,6 +413,26 @@ struct SettingsView: View {
                             Text("Saved microphone is unavailable or excluded. Using Automatic for this hold.")
                                 .font(Theme.body(10))
                                 .foregroundColor(Theme.amberText)
+                        }
+
+                        Divider().overlay(Theme.hairline)
+
+                        Toggle("Voice isolation", isOn: $settingsStore.voiceIsolation)
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("Uses Apple voice processing on the built-in mic to reduce background noise. Other mics use standard capture. While dictating, Mic Mode can switch to Voice Isolation for stronger noise removal.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+
+                        if settingsStore.voiceIsolation {
+                            Button("Mic Mode…") {
+                                AVCaptureDevice.showSystemUserInterface(.microphoneModes)
+                            }
+                            .buttonStyle(.glass)
+                            .font(Theme.body(12, weight: .medium))
+                            .foregroundColor(Theme.primary)
                         }
 
                         if !settingsStore.microphoneDevices.isEmpty {

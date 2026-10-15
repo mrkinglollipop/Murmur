@@ -63,6 +63,7 @@ final class SettingsStore: ObservableObject {
         static let launchAtLogin = "voice.settings.launchAtLogin"
         static let playDictationSound = "voice.settings.playDictationSound"
         static let allowLastResortInputFallback = "voice.settings.allowLastResortInputFallback"
+        static let voiceIsolation = "voice.settings.voiceIsolation"
         static let preferredInputDeviceUID = "voice.settings.preferredInputDeviceUID"
         static let excludedInputDeviceUIDs = "voice.settings.excludedInputDeviceUIDs"
         static let useStreaming = "voice.settings.useStreaming"
@@ -270,6 +271,16 @@ final class SettingsStore: ObservableObject {
                 allowLastResortInputFallback,
                 forKey: Keys.allowLastResortInputFallback
             )
+        }
+    }
+
+    /// Apple voice processing on the built-in mic. Off by default until a
+    /// real hold confirms the multichannel voice-processing tap carries
+    /// speech on channel 0. Wired into `AudioRecorder` via
+    /// `voiceIsolationProvider`; takes effect on the next hold.
+    @Published var voiceIsolation: Bool {
+        didSet {
+            defaults.set(voiceIsolation, forKey: Keys.voiceIsolation)
         }
     }
 
@@ -716,6 +727,12 @@ final class SettingsStore: ObservableObject {
             allowLastResortInputFallback = defaults.bool(forKey: Keys.allowLastResortInputFallback)
         } else {
             allowLastResortInputFallback = false
+        }
+
+        if defaults.object(forKey: Keys.voiceIsolation) != nil {
+            voiceIsolation = defaults.bool(forKey: Keys.voiceIsolation)
+        } else {
+            voiceIsolation = false
         }
 
         preferredInputDeviceUID = defaults.string(forKey: Keys.preferredInputDeviceUID)
