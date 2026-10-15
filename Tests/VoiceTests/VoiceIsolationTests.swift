@@ -81,6 +81,63 @@ final class VoiceIsolationTests: XCTestCase {
         }
     }
 
+    // MARK: - Input node stays inside the exception catcher
+
+    func testDefaultOffBindFirstTouchesInputNodeInsideTheCatcher() throws {
+        // Default off never replaces the engine before binding, and that
+        // decision reads no input-node state.
+        XCTAssertFalse(AudioRecorder.plainBindNeedsFreshEngine(
+            wantsVoiceProcessing: false, engineHasVoiceProcessing: false))
+        XCTAssertTrue(AudioRecorder.plainBindNeedsFreshEngine(
+            wantsVoiceProcessing: false, engineHasVoiceProcessing: true))
+        XCTAssertFalse(AudioRecorder.plainBindNeedsFreshEngine(
+            wantsVoiceProcessing: true, engineHasVoiceProcessing: true))
+
+        let node = FakeMicInputNode()
+        var steps: [String] = []
+        let (result, format) = AudioRecorder.catchingMicBind(
+            deviceID: 42,
+            voiceProcessing: false,
+            inputNode: { node.resolutions.append(node.insideCatcher); return node },
+            prepare: { steps.append("prepare(inside=\(node.insideCatcher))") },
+            catcher: node.catcher
+        )
+        XCTAssertEqual(try result.get(), .bound)
+        XCTAssertNil(format, "The plain path reads no format inside the bind")
+        XCTAssertEqual(node.resolutions, [true], "First inputNode access must be inside the catcher")
+        XCTAssertEqual(node.calls, ["setCurrentDevice(42, 0)"])
+        XCTAssertEqual(steps, ["prepare(inside=true)"])
+    }
+
+    func testVoiceProcessingBindReadsFormatInsideTheCatcher() throws {
+        let node = FakeMicInputNode()
+        let (result, format) = AudioRecorder.catchingMicBind(
+            deviceID: 42,
+            voiceProcessing: true,
+            inputNode: { node.resolutions.append(node.insideCatcher); return node },
+            prepare: {},
+            catcher: node.catcher
+        )
+        XCTAssertEqual(try result.get(), .bound)
+        XCTAssertEqual(format?.channelCount, 9)
+        XCTAssertFalse(node.resolutions.isEmpty)
+        XCTAssertTrue(node.resolutions.allSatisfy { $0 }, "Every inputNode access must be inside the catcher")
+        XCTAssertEqual(node.calls, ["enable", "ducking", "setCurrentDevice(42, 1)", "format"])
+    }
+
+    func testCaughtExceptionReportsFailureWithoutFormat() {
+        let node = FakeMicInputNode()
+        let (result, format) = AudioRecorder.catchingMicBind(
+            deviceID: 42,
+            voiceProcessing: true,
+            inputNode: { node },
+            prepare: {},
+            catcher: { _ in .failure(NSError(domain: "NSException", code: 0)) }
+        )
+        guard case .failure = result else { return XCTFail("Expected the caught exception") }
+        XCTAssertNil(format)
+    }
+
     func testVoiceProcessingOnlyForBuiltInStoppedUnsuppressedWithSettingOn() {
         XCTAssertTrue(AudioRecorder.shouldEnableVoiceProcessing(
             settingOn: true, deviceIsBuiltIn: true, suppressed: false, engineRunning: false))
@@ -207,6 +264,65 @@ final class VoiceIsolationTests: XCTestCase {
         clock.advance(to: 0.8)
         XCTAssertTrue(failures.isEmpty)
         XCTAssertTrue(recorder.micCaptureStateForTesting.wanted)
+    }
+
+    @MainActor
+    func testUnextractableVoiceProcessingBufferIsDroppedAndHoldRestartsOnStandardPath() throws {
+        let clock = VoiceIsolationTestClock()
+        let hooks = AudioRecorder.MicCaptureTestHooks(schedule: clock.schedule, now: { clock.date })
+        let layout = try XCTUnwrap(AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3))
+        hooks.format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: layout)
+        let recorder = AudioRecorder(micCaptureTestHooks: hooks)
+        recorder.voiceIsolationProvider = { true }
+        var failures: [String] = []
+        recorder.asrSelector.onFailure = { failures.append($0.message) }
+
+        recorder.beginMicCaptureForTesting()
+        XCTAssertEqual(hooks.voiceProcessingAtStart, [true])
+
+        // Interleaved: channel 0 can't be copied out as a plain plane.
+        let interleaved = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 48_000, interleaved: true, channelLayout: layout))
+        let raw = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: interleaved, frameCapacity: 480))
+        raw.frameLength = 480
+        let receive = try XCTUnwrap(hooks.receiveBuffer)
+        receive(raw, AVAudioTime(sampleTime: 0, atRate: 48_000))
+        receive(raw, AVAudioTime(sampleTime: 480, atRate: 48_000))
+
+        XCTAssertTrue(recorder.micCaptureStateForTesting.buffers.isEmpty,
+                      "Raw voice-processing channels must never be stored")
+        clock.advance(to: 0.01)
+
+        XCTAssertEqual(hooks.voiceProcessingAtStart, [true, false], "One restart, without voice processing")
+        XCTAssertEqual(recorder.voiceProcessingStateForTesting.suppressedReason, "channel 0 extraction failed")
+        XCTAssertFalse(recorder.voiceProcessingStateForTesting.active)
+        XCTAssertTrue(recorder.micCaptureStateForTesting.wanted, "A voice-processing failure must not end the hold")
+        XCTAssertTrue(failures.isEmpty)
+    }
+}
+
+private final class FakeMicInputNode: AudioRecorder.MicBindInputNode {
+    var insideCatcher = false
+    var resolutions: [Bool] = []
+    var calls: [String] = []
+
+    func catcher(_ body: @escaping () -> Void) -> Result<Void, NSError> {
+        insideCatcher = true
+        body()
+        insideCatcher = false
+        return .success(())
+    }
+
+    func enableVoiceProcessing() throws { calls.append("enable") }
+    func setMinimumOtherAudioDucking() { calls.append("ducking") }
+    func setCurrentDevice(_ deviceID: AudioDeviceID, element: AudioUnitElement) -> OSStatus? {
+        calls.append("setCurrentDevice(\(deviceID), \(element))")
+        return noErr
+    }
+    var boundOutputFormat: AVAudioFormat {
+        calls.append("format")
+        let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 9)!
+        return AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: layout)
     }
 }
 

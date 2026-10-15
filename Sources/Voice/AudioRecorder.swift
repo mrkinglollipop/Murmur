@@ -66,6 +66,11 @@ final class AudioRecorder {
     /// standard capture path.
     private var voiceProcessingSuppressedReason: String?
 
+    /// The engine whose input node voice processing was enabled on, if it is
+    /// still alive. Lets a plain bind detect a VPIO node without touching
+    /// `engine.inputNode` outside the exception catcher.
+    private weak var voiceProcessingEngine: AVAudioEngine?
+
     /// Tap format of the current capture, for the per-hold diagnostic line.
     private var captureFormatDescription = "unknown"
 
@@ -140,7 +145,7 @@ final class AudioRecorder {
         var startErrors: [Error] = []
         /// Voice-processing value of each successful start, in order.
         var voiceProcessingAtStart: [Bool] = []
-        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        var format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
         let schedule: MicHealthWarningMonitor.Schedule
         let now: () -> Date
 
@@ -245,6 +250,7 @@ final class AudioRecorder {
             NotificationCenter.default.removeObserver(engineConfigObserver)
         }
         unregisterDefaultInputDeviceListener()
+        channelSumSquares.deallocate()
     }
 
     private func registerEngineConfigObserver() {
@@ -556,14 +562,17 @@ final class AudioRecorder {
             engineRunning: engine.isRunning
         )
         voiceProcessingActive = false
-        if !wantsVoiceProcessing, engine.inputNode.isVoiceProcessingEnabled {
+        if Self.plainBindNeedsFreshEngine(
+            wantsVoiceProcessing: wantsVoiceProcessing,
+            engineHasVoiceProcessing: voiceProcessingEngine === engine
+        ) {
             // A plain bind must not inherit a previous hold's VPIO unit.
             replaceEngineForVoiceProcessingChange()
         }
         if wantsVoiceProcessing {
-            let outcome = runMicBind(deviceID, voiceProcessing: true)
-            let format = engine.inputNode.outputFormat(forBus: 0)
-            if outcome == .bound,
+            voiceProcessingEngine = engine
+            let (outcome, format) = runMicBind(deviceID, voiceProcessing: true)
+            if outcome == .bound, let format,
                !Self.inputFormatLooksDead(sampleRate: format.sampleRate, channelCount: format.channelCount) {
                 voiceProcessingActive = true
                 vlog("voice isolation on — device \(deviceID), \(Int(format.sampleRate)) Hz, \(format.channelCount) ch")
@@ -573,46 +582,73 @@ final class AudioRecorder {
             suppressVoiceProcessing(reason: reason)
             replaceEngineForVoiceProcessingChange()
         }
-        return runMicBind(deviceID, voiceProcessing: false) == .bound
+        return runMicBind(deviceID, voiceProcessing: false).outcome == .bound
     }
 
-    private func runMicBind(_ deviceID: AudioDeviceID, voiceProcessing: Bool) -> MicBindOutcome {
+    /// Decided from Murmur's own record of which engine got voice
+    /// processing, never by reading `engine.inputNode`: the first access
+    /// creates the node and can raise on a ghost default, so it must happen
+    /// inside `ObjCExceptionCatcher`.
+    static func plainBindNeedsFreshEngine(wantsVoiceProcessing: Bool, engineHasVoiceProcessing: Bool) -> Bool {
+        !wantsVoiceProcessing && engineHasVoiceProcessing
+    }
+
+    /// The input-node surface the bind touches, so tests can check that
+    /// every access happens inside the exception catcher.
+    protocol MicBindInputNode: AnyObject {
+        func enableVoiceProcessing() throws
+        func setMinimumOtherAudioDucking()
+        /// Nil when the node has no audio unit.
+        func setCurrentDevice(_ deviceID: AudioDeviceID, element: AudioUnitElement) -> OSStatus?
+        var boundOutputFormat: AVAudioFormat { get }
+    }
+
+    /// Runs the whole bind inside `catcher`, resolving the input node lazily
+    /// so its creation is covered too. The format is read only after a
+    /// voice-processing bind, still inside the catcher.
+    static func catchingMicBind<Node: MicBindInputNode>(
+        deviceID: AudioDeviceID,
+        voiceProcessing: Bool,
+        inputNode: @escaping () -> Node,
+        prepare: @escaping () -> Void,
+        catcher: (@escaping () -> Void) -> Result<Void, NSError>
+    ) -> (result: Result<MicBindOutcome, NSError>, format: AVAudioFormat?) {
         var outcome = MicBindOutcome.inputUnitUnavailable
-        let inputNode = engine.inputNode
+        var format: AVAudioFormat?
+        let result = catcher {
+            let operations = MicBindOperations(
+                enableVoiceProcessing: { try inputNode().enableVoiceProcessing() },
+                configureOtherAudioDucking: { inputNode().setMinimumOtherAudioDucking() },
+                setCurrentDevice: { inputNode().setCurrentDevice(deviceID, element: $0) },
+                prepare: prepare
+            )
+            outcome = performMicBind(voiceProcessing: voiceProcessing, operations)
+            if voiceProcessing, outcome == .bound {
+                format = inputNode().boundOutputFormat
+            }
+        }
+        return (result.map { outcome }, format)
+    }
+
+    private func runMicBind(
+        _ deviceID: AudioDeviceID,
+        voiceProcessing: Bool
+    ) -> (outcome: MicBindOutcome, format: AVAudioFormat?) {
         let engine = self.engine
-        let operations = MicBindOperations(
-            enableVoiceProcessing: { try inputNode.setVoiceProcessingEnabled(true) },
-            configureOtherAudioDucking: {
-                // Dictation is not a call: keep music and video audible.
-                inputNode.voiceProcessingOtherAudioDuckingConfiguration =
-                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                        enableAdvancedDucking: false,
-                        duckingLevel: .min
-                    )
-            },
-            setCurrentDevice: { element in
-                guard let audioUnit = inputNode.audioUnit else { return nil }
-                var id = deviceID
-                return AudioUnitSetProperty(
-                    audioUnit,
-                    kAudioOutputUnitProperty_CurrentDevice,
-                    kAudioUnitScope_Global,
-                    element,
-                    &id,
-                    UInt32(MemoryLayout<AudioDeviceID>.size)
-                )
-            },
-            prepare: { engine.prepare() }
+        let (result, format) = Self.catchingMicBind(
+            deviceID: deviceID,
+            voiceProcessing: voiceProcessing,
+            inputNode: { engine.inputNode },
+            prepare: { engine.prepare() },
+            catcher: ObjCExceptionCatcher.run
         )
-        switch ObjCExceptionCatcher.run({
-            outcome = Self.performMicBind(voiceProcessing: voiceProcessing, operations)
-        }) {
+        switch result {
         case .failure(let error):
             logger.error(
                 "bindInputNode: NSException device \(deviceID) vp=\(voiceProcessing): \(error.localizedDescription)"
             )
-            return .exception
-        case .success:
+            return (.exception, nil)
+        case .success(let outcome):
             switch outcome {
             case .bound:
                 break
@@ -627,7 +663,7 @@ final class AudioRecorder {
             case .exception:
                 break
             }
-            return outcome
+            return (outcome, format)
         }
     }
 
@@ -1337,8 +1373,18 @@ final class AudioRecorder {
     private var lowLevelFrames: [MicHealth.LevelFrame] = []
     private var lowLevelDeliveredSeconds: TimeInterval = 0
     /// Guarded by `levelLock`; filled only for multichannel voice processing.
-    private var channelSumSquares: [Double] = []
+    /// Fixed storage so the realtime tap never allocates for it.
+    static let maxDiagnosticChannels = 16
+    private let channelSumSquares: UnsafeMutablePointer<Double> = {
+        let storage = UnsafeMutablePointer<Double>.allocate(capacity: AudioRecorder.maxDiagnosticChannels)
+        storage.initialize(repeating: 0, count: AudioRecorder.maxDiagnosticChannels)
+        return storage
+    }()
+    private var channelLevelChannels = 0
     private var channelFrameCount = 0
+    /// Guarded by `pcmBuffersLock`: the capture generation whose tap already
+    /// reported a channel-extraction failure.
+    private var channelExtractionFailedGeneration: UInt64?
     private var previousHoldShowedLowLevelWarning = false
     private var currentHoldShowedLowLevelWarning = false
     private var lastLowLevelWarningAt: Date?
@@ -2141,8 +2187,16 @@ final class AudioRecorder {
             installMicTap(format: format) { [weak self] tapBuffer, _ in
                 guard let self = self else { return }
                 let buffer: AVAudioPCMBuffer
-                if extractFirstChannel, let monoFormat,
-                   let mono = Self.firstChannelBuffer(of: tapBuffer, format: monoFormat) {
+                if extractFirstChannel {
+                    // Raw voice-processing channels include reference and
+                    // beam channels; they must never reach storage or a
+                    // stream. A buffer that can't be reduced is dropped and
+                    // the hold restarts on standard capture.
+                    guard let monoFormat,
+                          let mono = Self.firstChannelBuffer(of: tapBuffer, format: monoFormat) else {
+                        self.reportChannelExtractionFailure(tapGeneration: tapGeneration)
+                        return
+                    }
                     self.accumulateChannelLevels(tapBuffer)
                     buffer = mono
                 } else {
@@ -2233,27 +2287,55 @@ final class AudioRecorder {
 
     /// Per-channel energy of the raw voice-processing buffer, logged at stop
     /// so a real hold shows which channel carries speech.
+    /// Runs on the realtime tap thread: sums go straight into the fixed
+    /// storage allocated at init, so no heap allocation per buffer.
     private func accumulateChannelLevels(_ buffer: AVAudioPCMBuffer) {
         guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return }
-        let channels = min(Int(buffer.format.channelCount), 16)
+        let channels = min(Int(buffer.format.channelCount), Self.maxDiagnosticChannels)
         let frames = Int(buffer.frameLength)
-        var sums = [Double](repeating: 0, count: channels)
+        levelLock.lock()
+        if channelLevelChannels != channels {
+            channelSumSquares.update(repeating: 0, count: Self.maxDiagnosticChannels)
+            channelLevelChannels = channels
+            channelFrameCount = 0
+        }
         for ch in 0 ..< channels {
             var sum: Double = 0
             for i in 0 ..< frames {
                 let sample = Double(data[ch][i])
                 sum += sample * sample
             }
-            sums[ch] = sum
+            channelSumSquares[ch] += sum
         }
-        levelLock.lock()
-        if channelSumSquares.count != channels {
-            channelSumSquares = [Double](repeating: 0, count: channels)
-            channelFrameCount = 0
-        }
-        for ch in 0 ..< channels { channelSumSquares[ch] += sums[ch] }
         channelFrameCount += frames
         levelLock.unlock()
+    }
+
+    /// Tap thread: a voice-processing buffer that can't be reduced to channel
+    /// 0. Hops to main once per capture generation and treats it like any
+    /// other voice-processing failure.
+    private func reportChannelExtractionFailure(tapGeneration: UInt64) {
+        pcmBuffersLock.lock()
+        let firstForGeneration = bufferDeliveryGeneration == tapGeneration
+            && channelExtractionFailedGeneration != tapGeneration
+        if firstForGeneration { channelExtractionFailedGeneration = tapGeneration }
+        pcmBuffersLock.unlock()
+        guard firstForGeneration else { return }
+        scheduleMicHealthCheck(after: 0) { [weak self] in
+            self?.recoverFromChannelExtractionFailure(tapGeneration: tapGeneration)
+        }
+    }
+
+    private func recoverFromChannelExtractionFailure(tapGeneration: UInt64) {
+        guard captureGeneration == tapGeneration, voiceProcessingActive,
+              wantsRecording, !isStopping else { return }
+        // Same-hold recovery as an engine.start failure: buffers already
+        // stored are processed channel 0 and stay.
+        suppressVoiceProcessing(reason: "channel 0 extraction failed")
+        invalidateSecureInputPollTimer()
+        teardownMicEngine()
+        engineNeedsRebuild = true
+        startMicCapture(isWatchdogRetry: true)
     }
 
     private func sendCapturedAudioToCloud(_ buffer: AVAudioPCMBuffer) {
@@ -3288,7 +3370,7 @@ final class AudioRecorder {
         levelLock.lock()
         let maxLevel = maxLevelObserved
         let frames = lowLevelFrames
-        let channelSums = channelSumSquares
+        let channelSums = Array(UnsafeBufferPointer(start: channelSumSquares, count: channelLevelChannels))
         let channelFrames = channelFrameCount
         levelLock.unlock()
         vlog("recording max RMS \(String(format: "%.4f", maxLevel)) (threshold \(String(format: "%.4f", Self.speechRMSThreshold)))")
@@ -3513,7 +3595,8 @@ final class AudioRecorder {
         lowLevelFrames.removeAll(keepingCapacity: true)
         lowLevelFrames.reserveCapacity(128)
         lowLevelDeliveredSeconds = 0
-        channelSumSquares = []
+        channelSumSquares.update(repeating: 0, count: Self.maxDiagnosticChannels)
+        channelLevelChannels = 0
         channelFrameCount = 0
         levelLock.unlock()
     }
@@ -3892,4 +3975,33 @@ final class LockedReference<Value: AnyObject> {
             lock.unlock()
         }
     }
+}
+
+extension AVAudioInputNode: AudioRecorder.MicBindInputNode {
+    func enableVoiceProcessing() throws {
+        try setVoiceProcessingEnabled(true)
+    }
+
+    func setMinimumOtherAudioDucking() {
+        // Dictation is not a call: keep music and video audible.
+        voiceProcessingOtherAudioDuckingConfiguration = AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+            enableAdvancedDucking: false,
+            duckingLevel: .min
+        )
+    }
+
+    func setCurrentDevice(_ deviceID: AudioDeviceID, element: AudioUnitElement) -> OSStatus? {
+        guard let audioUnit else { return nil }
+        var id = deviceID
+        return AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            element,
+            &id,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+    }
+
+    var boundOutputFormat: AVAudioFormat { outputFormat(forBus: 0) }
 }
