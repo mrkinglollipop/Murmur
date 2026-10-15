@@ -543,6 +543,7 @@ final class StuckProcessingHUDTests: XCTestCase {
     /// The post-release grace inflates buffered audio past the silence guard's
     /// floor, so the tap decision must sit below the grace, not include it.
     func testAccidentalTapThresholdIsBelowPostReleaseGrace() {
+        XCTAssertEqual(AudioRecorder.postReleaseCaptureGraceForTesting, 0.400)
         XCTAssertLessThan(
             AudioRecorder.accidentalTapMaxHoldSeconds,
             AudioRecorder.postReleaseCaptureGraceForTesting
