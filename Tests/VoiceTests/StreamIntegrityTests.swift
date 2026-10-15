@@ -311,10 +311,13 @@ final class StreamIntegrityTests: XCTestCase {
     }
 
     func testElevenLabsKnownRecoverySkipsCommitWaitAndPreservesRawBuffer() async {
-        for scenario in ["long", "vad", "priorCommit"] {
+        // Hold length is no longer a recovery trigger: long holds prove
+        // coverage through Murmur's own segment commits (see
+        // ElevenLabsLongHoldCoverageTests). A commit Murmur never sent still is.
+        for scenario in ["vad", "priorCommit"] {
             var options = ElevenLabsRealtimeOptions.defaults
             if scenario == "vad" { options.commitStrategy = .vad }
-            let duration: TimeInterval = scenario == "long" ? 30 : 4
+            let duration: TimeInterval = 4
             let buffer = Self.audioBuffer(seconds: duration)
             let session = ElevenLabsRealtimeTranscriber(
                 apiKey: "key", realtimeOptions: options,
