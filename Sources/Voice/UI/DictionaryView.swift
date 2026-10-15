@@ -34,17 +34,14 @@ struct DictionaryView: View {
     @FocusState private var isSearchFocused: Bool
     @FocusState private var focusedEditID: UUID?
 
-    private var filteredEntries: [DictionaryEntry] {
-        DictionarySearch.sortedEntries(
+    var body: some View {
+        let filteredEntries = DictionarySearch.sortedEntries(
             DictionarySearch.entries(store.entries, query: searchText)
         )
-    }
-
-    var body: some View {
         VStack(spacing: 0) {
             composer
             Divider().overlay(Theme.hairline)
-            searchBar
+            searchBar(entries: filteredEntries)
 
             // One outer scroll: entries (or compact empty) + pending review +
             // corrections. Composer/search stay pinned above.
@@ -53,10 +50,10 @@ struct DictionaryView: View {
                     if store.entries.isEmpty {
                         emptyState
                     } else {
-                        termsSectionHeader
-                        entryRows
+                        termsSectionHeader(count: filteredEntries.count)
+                        entryRows(entries: filteredEntries)
                     }
-                    autoLearnedSection
+                    autoLearnedSection(entries: filteredEntries)
                     recentCorrectionsSection
                 }
             }
@@ -150,16 +147,36 @@ struct DictionaryView: View {
     }
 
     private func recentCorrectionRow(_ record: CorrectionRecord) -> some View {
-        HStack(alignment: .center, spacing: 8) {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                recentCorrectionSummary(record)
+                Spacer(minLength: 0)
+                recentCorrectionActions(record)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                recentCorrectionSummary(record)
+                HStack {
+                    Spacer(minLength: 0)
+                    recentCorrectionActions(record)
+                }
+            }
+        }
+    }
+
+    private func recentCorrectionSummary(_ record: CorrectionRecord) -> some View {
+        HStack(spacing: 8) {
             HeardChip(variant: record.heard)
 
             Text("→")
                 .font(Theme.body(13, weight: .medium))
                 .foregroundColor(Theme.textSecondary)
+                .fixedSize()
 
             Text(record.replaced)
                 .font(Theme.body(13, weight: .semibold))
                 .foregroundColor(Theme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
 
             Text(correctionSourceLabel(record.source))
                 .font(.system(size: 10, weight: .medium))
@@ -167,9 +184,14 @@ struct DictionaryView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 2)
                 .murmurGlassCapsule()
+                .fixedSize()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Heard \(record.heard), replaced with \(record.replaced), \(correctionSourceLabel(record.source))")
+    }
 
-            Spacer()
-
+    private func recentCorrectionActions(_ record: CorrectionRecord) -> some View {
+        HStack(spacing: 8) {
             switch record.source {
             case .learnRejected:
                 Button("Restore") {
@@ -211,6 +233,8 @@ struct DictionaryView: View {
                 .foregroundColor(Theme.textSecondary)
             }
         }
+        .fixedSize()
+        .layoutPriority(1)
     }
 
     private func removeLogPair(_ record: CorrectionRecord) {
@@ -376,8 +400,8 @@ struct DictionaryView: View {
     // MARK: - Auto-learned entries
 
     @ViewBuilder
-    private var autoLearnedSection: some View {
-        let autoLearned = filteredEntries.filter { $0.isAutoLearned }
+    private func autoLearnedSection(entries: [DictionaryEntry]) -> some View {
+        let autoLearned = entries.filter { $0.isAutoLearned }
         if !autoLearned.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 Text("Waiting for your OK")
@@ -457,7 +481,7 @@ struct DictionaryView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 DictionaryTextField(
                     title: "Heard as",
-                    hint: "· separate with commas",
+                    hint: "separate with commas",
                     placeholder: "e.g. cube net ease, cooper netties",
                     text: $newVariants
                 )
@@ -486,12 +510,12 @@ struct DictionaryView: View {
 
     // MARK: - Search
 
-    private var searchBar: some View {
+    private func searchBar(entries: [DictionaryEntry]) -> some View {
         SearchBar(
             text: $searchText,
             placeholder: "Search terms",
             resultCount: DictionarySearch.needle(searchText).isEmpty ? nil
-                : DictionarySearch.resultCount(entries: filteredEntries, groups: visibleCorrectionGroups),
+                : DictionarySearch.resultCount(entries: entries, groups: visibleCorrectionGroups),
             isFocused: $isSearchFocused
         )
         .padding(12)
@@ -499,8 +523,8 @@ struct DictionaryView: View {
 
     // MARK: - List
 
-    private var termsSectionHeader: some View {
-        Text("Your words (\(filteredEntries.count))")
+    private func termsSectionHeader(count: Int) -> some View {
+        Text("Your words (\(count))")
             .font(.system(size: 12, weight: .semibold))
             .foregroundColor(Theme.textSecondary)
             .padding(.horizontal, 16)
@@ -510,8 +534,8 @@ struct DictionaryView: View {
     }
 
     @ViewBuilder
-    private var entryRows: some View {
-        ForEach(filteredEntries) { entry in
+    private func entryRows(entries: [DictionaryEntry]) -> some View {
+        ForEach(entries) { entry in
             Group {
                 if editingID == entry.id {
                     editRow(for: entry)
@@ -607,7 +631,7 @@ struct DictionaryView: View {
             VStack(alignment: .leading, spacing: 4) {
                 DictionaryFieldLabel(title: "Heard as", hint: "separate with commas")
                 TextField("e.g. cube net ease, cooper netties", text: $editVariants)
-                    .accessibilityLabel("Heard as")
+                    .accessibilityLabel("Heard as, separate with commas")
                     .textFieldStyle(.plain)
                     .font(Theme.body(13))
                     .padding(.horizontal, 10)
@@ -695,11 +719,12 @@ private struct DictionaryFieldLabel: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(Theme.textSecondary)
             if let hint {
-                Text(hint)
+                Text("· \(hint)")
                     .font(.system(size: 11))
                     .foregroundColor(Theme.textSecondary)
             }
         }
+        .accessibilityHidden(true)
     }
 }
 
@@ -714,7 +739,7 @@ private struct DictionaryTextField: View {
         VStack(alignment: .leading, spacing: 4) {
             DictionaryFieldLabel(title: title, hint: hint)
             TextField(placeholder, text: $text)
-                .accessibilityLabel(title)
+                .accessibilityLabel(hint.map { "\(title), \($0)" } ?? title)
                 .textFieldStyle(.plain)
                 .font(Theme.body(13, weight: emphasizesText ? .semibold : .regular))
                 .padding(.horizontal, 12)
@@ -725,27 +750,28 @@ private struct DictionaryTextField: View {
     }
 }
 
-private struct DictionaryPreview: View {
+struct DictionaryPreview: View {
     let variants: [String]
     let term: String
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 5) {
+        let trimmedTerm = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        if DictionaryEntryInput.showsPreview(term: trimmedTerm, variants: variants) {
+            ChipFlowLayout(spacing: 5) {
                 Text("Will fix")
                     .foregroundColor(Theme.textSecondary)
                 ForEach(Array(variants.enumerated()), id: \.offset) { _, variant in
                     HeardChip(variant: variant)
                 }
-                Text("→")
-                    .foregroundColor(Theme.textSecondary)
-                Text(term)
-                    .font(Theme.body(12, weight: .semibold))
-                    .foregroundColor(Theme.textPrimary)
+                (Text("→ ").foregroundColor(Theme.textSecondary)
+                    + Text(trimmedTerm)
+                        .font(Theme.body(12, weight: .semibold))
+                        .foregroundColor(Theme.textPrimary))
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .font(Theme.body(12))
         }
-        .frame(height: 22)
     }
 }
 
@@ -769,12 +795,15 @@ private struct HeardChip: View {
 
     var body: some View {
         Text(variant)
+            .lineLimit(1)
+            .truncationMode(.middle)
             .font(.system(size: 11, weight: .medium))
             .foregroundColor(Theme.textSecondary)
             .strikethrough(true, color: Theme.textSecondary.opacity(0.55))
             .padding(.horizontal, 9)
             .padding(.vertical, 3)
             .murmurGlassCapsule()
+            .overlay(Capsule().strokeBorder(Theme.hairline, lineWidth: 0.5))
     }
 }
 
@@ -820,8 +849,9 @@ private struct ChipFlowLayout: Layout {
         var rowHeight: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if rowWidth + size.width > maxWidth, rowWidth > 0 {
+            let size = subview.sizeThatFits(ProposedViewSize(width: maxWidth.isFinite ? maxWidth : nil, height: nil))
+            let gap = rowWidth > 0 ? spacing : 0
+            if rowWidth + gap + size.width > maxWidth, rowWidth > 0 {
                 totalHeight += rowHeight + spacing
                 rowWidth = 0
                 rowHeight = 0
@@ -839,7 +869,7 @@ private struct ChipFlowLayout: Layout {
         var rowHeight: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
+            let size = subview.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
             if x + size.width > bounds.maxX, x > bounds.minX {
                 x = bounds.minX
                 y += rowHeight + spacing
@@ -898,6 +928,10 @@ enum DictionarySearch {
 }
 
 enum DictionaryEntryInput {
+    static func showsPreview(term: String, variants: [String]) -> Bool {
+        !term.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !variants.isEmpty
+    }
+
     static func variants(from value: String) -> [String] {
         value
             .split(separator: ",")

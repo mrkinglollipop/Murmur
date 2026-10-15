@@ -217,6 +217,47 @@ final class Polish030Tests: XCTestCase {
         )
     }
 
+    func testDictionaryPreviewRequiresTermAndParsedVariants() {
+        for term in ["", " ", " \n\t"] {
+            XCTAssertFalse(DictionaryEntryInput.showsPreview(term: term, variants: ["Tari"]))
+        }
+        for input in ["", " ", ", ,\n\t"] {
+            XCTAssertFalse(DictionaryEntryInput.showsPreview(
+                term: "Tauri", variants: DictionaryEntryInput.variants(from: input)
+            ))
+        }
+        XCTAssertTrue(DictionaryEntryInput.showsPreview(
+            term: " Tauri \n", variants: DictionaryEntryInput.variants(from: " , Tari, ")
+        ))
+    }
+
+    @MainActor
+    func testDictionaryPreviewWrapsLongVariantsAndReplacement() throws {
+        let variants = ["cube net ease", "cooper netties", String(repeating: "a long heard phrase ", count: 8)]
+        let term = "Kubernetes configuration with a deliberately long replacement that must remain fully visible"
+        let heights = try [407.0, 527.0].map { width -> CGFloat in
+            let view = NSHostingView(rootView: DictionaryPreview(variants: variants, term: term)
+                .frame(width: width, alignment: .leading)
+                .background(Theme.bg)
+                .preferredColorScheme(.dark))
+            let size = view.fittingSize
+            XCTAssertEqual(size.width, width, accuracy: 0.5)
+            XCTAssertGreaterThan(size.height, 44, "The preview must grow beyond the old single line")
+            view.frame = NSRect(origin: .zero, size: size)
+            view.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let image = NSImage(size: bitmap.size)
+            image.addRepresentation(bitmap)
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "dictionary-wrapping-preview-\(Int(width))w"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            return size.height
+        }
+        XCTAssertGreaterThanOrEqual(heights[0], heights[1])
+    }
+
     @MainActor
     func testDictionaryLayoutSnapshotsAtMainPaneWidths() throws {
         let dictionaryURL = directory.appendingPathComponent("dictionary.json")
@@ -233,7 +274,9 @@ final class Polish030Tests: XCTestCase {
         let corrections = CorrectionsLog(fileURL: directory.appendingPathComponent("corrections.json"))
         corrections.append([
             CorrectionRecord(heard: "Tari", replaced: "Tauri", source: .dictionary),
-            CorrectionRecord(heard: "WhisperFlow", replaced: "Wispr Flow", source: .dictionary)
+            CorrectionRecord(heard: "WhisperFlow", replaced: "Wispr Flow", source: .dictionary),
+            CorrectionRecord(heard: "a multi-word heard phrase that needs more room", replaced: "Kubernetes configuration", source: .dictionary),
+            CorrectionRecord(heard: String(repeating: "misheard", count: 12), replaced: String(repeating: "Kubernetes", count: 8), source: .learnAccepted)
         ])
 
         let height: CGFloat = 1_050
