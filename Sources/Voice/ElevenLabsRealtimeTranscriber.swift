@@ -181,8 +181,9 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     // recording is no longer than that audio), every commit Murmur sent (the
     // last one after the final audio sample) has exactly one committed event,
     // no event arrived without an outstanding commit, and no segment that
-    // showed speech was answered with empty text. Anything else needs
-    // buffered recovery.
+    // showed speech was answered with empty text. "Every captured sample"
+    // includes the resampler's retained tail, flushed at finalize once no
+    // conversion is in flight. Anything else needs buffered recovery.
 
     /// 16 kHz samples enqueued since the last commit frame (tap thread writes,
     /// finalize reads; stateLock-guarded).
@@ -217,6 +218,26 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// Ordinal of the commit covering the final audio sample; finalize may
     /// complete only once that many committed events have arrived.
     private var terminalCommitOrdinal: Int?
+
+    /// `send(_:)` calls converting outside stateLock. Finalize waits for this
+    /// to reach zero before draining the converter and closing the queue.
+    private var conversionsInFlight = 0
+    /// Set when finalize begins: later `send(_:)` calls never start a
+    /// conversion, so the in-flight set can only shrink.
+    private var captureClosed = false
+    /// Set only by `cancel()`. Audio arriving after the queue closed latches
+    /// recovery for every other session end.
+    private var cancelledByUser = false
+    /// Bound on how long finalize waits for in-flight conversions (normally
+    /// microseconds). Past it, the result recovers from the recording.
+    static let conversionSettleNanoseconds: UInt64 = 200_000_000
+
+    /// Emits whatever the converter still holds once input has ended. A nil
+    /// return means the drain failed. Replaceable in tests.
+    var drainConverterTail: (AVAudioConverter, AVAudioFormat) -> Data? = ElevenLabsRealtimeTranscriber.drainTail(of:outputFormat:)
+    /// Runs between conversion and the enqueue re-check, outside stateLock.
+    /// Tests use it to hold a conversion in flight.
+    var afterConversionHook: (() -> Void)?
 
     /// Earliest point a mid-hold commit may be placed (ElevenLabs recommends
     /// committing every 20–30 s). Waiting for a quieter chunk only moves the
@@ -430,20 +451,28 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     /// network. Buffers before start; no-op after finalize/cancel.
     func send(_ buffer: AVAudioPCMBuffer) {
         stateLock.lock()
-        guard frameContinuation != nil else {
+        guard frameContinuation != nil, !captureClosed else {
             noteUnstreamedAudioLocked(samples: Int(buffer.frameLength))
             stateLock.unlock()
             return
         }
+        // Counted before the lock is released so finalize can wait for this
+        // conversion instead of closing the queue underneath it.
+        conversionsInFlight += 1
         stateLock.unlock()
-        guard let pcmData = convertToPCM16(buffer) else {
-            markStreamIntegrityFailed()
+        let converted = convertToPCM16(buffer)
+        afterConversionHook?()
+        stateLock.lock()
+        conversionsInFlight -= 1
+        guard let pcmData = converted else {
+            streamIntegrityFailed = true
+            lastFinalizeRequiresBufferedAudioRecovery = true
+            stateLock.unlock()
             vlogFromAudioTap(.conversionFailure(.elevenlabs, .emptyConversion))
             return
         }
         let samples = pcmData.count / MemoryLayout<Int16>.size
         let chunkRMS = Self.rms(ofPCM16: pcmData)
-        stateLock.lock()
         // Re-read under the lock that also covers the yield: finalize may have
         // closed the queue during conversion, and a yield into a finished
         // queue would lose this audio without a trace.
@@ -485,12 +514,17 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     }
 
     /// Must be called with stateLock held. Captured audio arrived after the
-    /// frame queue closed, so the stream never carried it. While finalize is
-    /// running (or the sender stopped on its own) that result must recover
-    /// from the recording. After cancel, or once finalize has delivered its
-    /// result, nothing is waiting on the stream.
+    /// frame queue closed, so the stream never carried it. Latches for every
+    /// session end except a user cancel, independent of finalize's own state
+    /// resets. A latch after finalize returned cannot reach an accepted
+    /// result: finalize accepts only after every conversion begun before
+    /// `captureClosed` has finished (see `runFinalizeWork`), and the recorder
+    /// returns from `send(_:)` for every buffer in its recovery snapshot
+    /// before finalize is called (`AudioRecorder.finishStop`,
+    /// `captureDeliveryLock`). Later audio is in neither the stream nor the
+    /// recording that `recordingDuration` measures.
     private func noteUnstreamedAudioLocked(samples: Int) {
-        guard samples > 0, finalizeRequested || !tornDown else { return }
+        guard samples > 0, !cancelledByUser else { return }
         streamIntegrityFailed = true
         lastFinalizeRequiresBufferedAudioRecovery = true
     }
@@ -537,22 +571,11 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         finalizeFirstEventAt = nil
         let budget = Self.finalizeBudgetNanoseconds
             + (midHoldCommitsQueued > committedEventsReceived ? Self.outstandingSegmentBudgetNanoseconds : 0)
+        // No new conversion starts from here on. Conversions already running
+        // may still enqueue; the worker waits for them before closing the
+        // queue, all inside the finalize budget.
+        captureClosed = true
         stateLock.unlock()
-
-        // Stop accepting new frames, then wait for the sender to flush every
-        // already-captured frame before sending the commit frame — otherwise
-        // the commit could overtake buffered audio and truncate the tail.
-        stateLock.lock()
-        let framesToFinish = frameContinuation
-        frameContinuation = nil
-        let senderToDrain = senderTask
-        if startInvoked && !readyResolved {
-            streamIntegrityFailed = true
-            senderReadyContinuation?.finish()
-            senderReadyContinuation = nil
-        }
-        stateLock.unlock()
-        framesToFinish?.finish()
 
         let result = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
             stateLock.lock()
@@ -571,7 +594,6 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
                 guard let self else { return }
                 await self.runFinalizeWork(
                     recordingDuration: recordingDuration,
-                    senderToDrain: senderToDrain,
                     generation: generation
                 )
             }
@@ -606,11 +628,107 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         return result
     }
 
+    /// Waits for conversions begun before `captureClosed`, flushes the
+    /// converter's retained tail into the queue, then closes it. Returns the
+    /// sender to drain; `active` is false once this finalize has resolved.
+    private func closeCaptureQueue(generation: UInt64) async -> (sender: Task<Void, Never>?, active: Bool) {
+        let settleDeadline = DispatchTime.now().uptimeNanoseconds + Self.conversionSettleNanoseconds
+        var settled = false
+        while true {
+            stateLock.lock()
+            let active = finalizeGeneration == generation && !doneResolved
+            settled = conversionsInFlight == 0
+            stateLock.unlock()
+            guard active else { return (nil, false) }
+            if settled || DispatchTime.now().uptimeNanoseconds >= settleDeadline { break }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        // With capture closed and nothing in flight, no conversion can touch
+        // the converter concurrently. Resampling keeps up to a few samples
+        // back until end-of-stream; those are captured audio and must be sent
+        // before the terminal commit, or the commit answers less than the
+        // recording holds.
+        var tail = Data()
+        var tailFailed = !settled
+        if settled, let converter {
+            if let drained = drainConverterTail(converter, outputFormat) {
+                tail = drained
+            } else {
+                tailFailed = true
+            }
+        }
+
+        stateLock.lock()
+        if tailFailed {
+            // An unfinished conversion may still hold captured audio, and a
+            // failed drain leaves the converter's tail unsent.
+            streamIntegrityFailed = true
+            lastFinalizeRequiresBufferedAudioRecovery = true
+        }
+        if !tailFailed, !tail.isEmpty, let continuation = frameContinuation {
+            let samples = tail.count / MemoryLayout<Int16>.size
+            let frame = QueuedFrame(
+                payload: Self.makeInputAudioChunkFrame(pcmData: tail, commit: false),
+                samples: samples,
+                commit: false
+            )
+            if case .enqueued = continuation.yield(frame) {
+                samplesQueued += samples
+                samplesSinceCommit += samples
+            } else {
+                streamIntegrityFailed = true
+                lastFinalizeRequiresBufferedAudioRecovery = true
+            }
+        }
+        // Stop accepting new frames, then let the sender flush every
+        // already-captured frame before the commit frame — otherwise the
+        // commit could overtake buffered audio and truncate the tail.
+        let framesToFinish = frameContinuation
+        frameContinuation = nil
+        let senderToDrain = senderTask
+        if startInvoked && !readyResolved {
+            streamIntegrityFailed = true
+            senderReadyContinuation?.finish()
+            senderReadyContinuation = nil
+        }
+        stateLock.unlock()
+        framesToFinish?.finish()
+        if tailFailed {
+            vlog("elevenlabs-stream: capture close \(settled ? "converter drain failed" : "timed out on in-flight conversion") — recovery")
+        }
+        return (senderToDrain, true)
+    }
+
+    /// Flushes `converter` with end-of-stream input. Nil on any converter
+    /// error, or if it never reports end-of-stream within a bounded number of
+    /// passes.
+    static func drainTail(of converter: AVAudioConverter, outputFormat: AVAudioFormat) -> Data? {
+        var tail = Data()
+        for _ in 0..<16 {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 1024) else { return nil }
+            var error: NSError?
+            let status = converter.convert(to: buffer, error: &error) { _, inputStatus in
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            guard status != .error, error == nil else { return nil }
+            let frames = Int(buffer.frameLength)
+            if frames > 0 {
+                guard let samples = buffer.int16ChannelData else { return nil }
+                tail.append(Data(bytes: samples[0], count: frames * MemoryLayout<Int16>.size))
+            }
+            if status == .endOfStream { return tail }
+        }
+        return nil
+    }
+
     private func runFinalizeWork(
         recordingDuration: TimeInterval,
-        senderToDrain: Task<Void, Never>?,
         generation: UInt64
     ) async {
+        let (senderToDrain, active) = await closeCaptureQueue(generation: generation)
+        guard active else { return }
         await senderToDrain?.value
         stateLock.lock()
         guard finalizeGeneration == generation, !doneResolved else {
@@ -739,6 +857,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             return
         }
         tornDown = true
+        cancelledByUser = true
         stateLock.unlock()
         stateLock.lock()
         let framesToFinish = frameContinuation
@@ -1311,7 +1430,18 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     private func convertToPCM16(_ buffer: AVAudioPCMBuffer) -> Data? {
         let inputFormat = buffer.format
 
-        if converter == nil || converterInputFormat != inputFormat {
+        // A format change replaces the converter; its retained tail is
+        // captured audio and leads this buffer's output.
+        var carriedTail = Data()
+        if let previous = converter, converterInputFormat != inputFormat {
+            guard let drained = drainConverterTail(previous, outputFormat) else {
+                vlogFromAudioTap(.conversionFailure(.elevenlabs, .conversion))
+                return nil
+            }
+            carriedTail = drained
+            converter = nil
+        }
+        if converter == nil {
             guard let newConverter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
                 vlogFromAudioTap(.conversionFailure(.elevenlabs, .converterCreation))
                 return nil
@@ -1351,6 +1481,6 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
         let frameCount = Int(outputBuffer.frameLength)
         guard frameCount > 0 else { return nil }
-        return Data(bytes: int16Data[0], count: frameCount * MemoryLayout<Int16>.size)
+        return carriedTail + Data(bytes: int16Data[0], count: frameCount * MemoryLayout<Int16>.size)
     }
 }

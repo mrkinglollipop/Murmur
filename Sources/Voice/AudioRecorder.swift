@@ -19,6 +19,12 @@ final class AudioRecorder {
     private var engine = AVAudioEngine()
     private var pcmBuffers: [AVAudioPCMBuffer] = []
     private let pcmBuffersLock = NSLock()
+    /// Held by the tap callback from the recovery copy through the streaming
+    /// `send`, and by `finishStop` around its recovery snapshot. Every buffer
+    /// in that snapshot has therefore finished its `send` before a streaming
+    /// session is finalized; whether `removeTap`/`stop()` wait for an
+    /// in-flight callback is not documented. Taken before `pcmBuffersLock`.
+    private let captureDeliveryLock = NSLock()
     /// Guarded by `pcmBuffersLock`; retained audio from a prior tap must not
     /// make a silent replacement tap look healthy.
     private var bufferDeliveryGeneration: UInt64 = 0
@@ -1948,6 +1954,9 @@ final class AudioRecorder {
                     )
                 }
 
+                self.captureDeliveryLock.lock()
+                defer { self.captureDeliveryLock.unlock() }
+
                 // ALWAYS copy the unmodified mic buffer before speaker gating.
                 // This is the bounded recovery/history source: a false gate
                 // decision must not destroy the only recording of the hold.
@@ -2549,12 +2558,15 @@ final class AudioRecorder {
             teardownMicEngine()
         }
 
-        // Stop/remove the tap before taking the recovery snapshot. An
-        // in-flight callback finishes under this same lock, so its final raw
-        // buffer is included rather than racing the stop path.
+        // Stop/remove the tap before taking the recovery snapshot. A callback
+        // holds captureDeliveryLock from its copy through its streaming send,
+        // so every snapshotted buffer has already been handed to the session
+        // that finalize will measure against this recording.
+        captureDeliveryLock.lock()
         pcmBuffersLock.lock()
         let bufferedAudio = pcmBuffers
         pcmBuffersLock.unlock()
+        captureDeliveryLock.unlock()
 
         let streamTextEver = streamingCoordinator.coordinatorEverHadStreamText
             || (streamingCoordinator.xaiSession?.hasEverHadNonEmptyStreamText ?? false)

@@ -339,6 +339,165 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
         XCTAssertEqual(transport.all.count, 9, "eight audio chunks and the terminal commit; the late chunk was not sent")
     }
 
+    // MARK: - Converter tail
+
+    /// 48 kHz float, the shape the mic tap delivers.
+    private static func micBuffer(frames: Int, offset: Int) -> AVAudioPCMBuffer {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))!
+        buffer.frameLength = AVAudioFrameCount(frames)
+        for index in 0..<frames {
+            buffer.floatChannelData![0][index] = sin(Float(offset + index) * 0.05) * 0.5
+        }
+        return buffer
+    }
+
+    /// The resampler keeps samples back until end-of-stream. Finalize must
+    /// flush them as audio, counted as sent, before the terminal commit.
+    func testResamplerTailWithheldUntilEndOfStreamIsSentBeforeTerminalCommit() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        let chunks = 10, frames = 4096
+        for chunk in 0..<chunks {
+            session.send(Self.micBuffer(frames: frames, offset: chunk * frames))
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while transport.all.count < chunks, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let expected = Int((Double(chunks * frames) / 3).rounded())
+        let streamedBeforeFinalize = transport.all.reduce(0) { $0 + $1.samples }
+        XCTAssertLessThan(streamedBeforeFinalize, expected, "fixture premise: the converter withholds a tail")
+
+        let finalizer = Task { await session.finalize(recordingDuration: Double(chunks * frames) / 48_000) }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        commit(session, Self.third)
+        let text = await finalizer.value
+        XCTAssertEqual(text, Self.third)
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+
+        let sent = transport.all
+        XCTAssertEqual(sent.count, chunks + 2, "audio chunks, the drained tail, then the terminal commit")
+        XCTAssertEqual(sent[chunks].samples, expected - streamedBeforeFinalize)
+        XCTAssertFalse(sent[chunks].commit)
+        XCTAssertEqual(sent.last?.commit, true)
+        XCTAssertEqual(sent.last?.samples, 0)
+        XCTAssertEqual(sent.reduce(0) { $0 + $1.samples }, expected)
+    }
+
+    func testFailedConverterDrainLatchesRecoveryWithoutTerminalCommit() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        session.drainConverterTail = { _, _ in nil }
+        await hold(session, transport, seconds: 0..<8, quietSeconds: [])
+        let finalizer = Task { await session.finalize(recordingDuration: 8) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        commit(session, Self.third)
+        _ = await finalizer.value
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        XCTAssertEqual(transport.commitOffsetsSeconds, [], "an unsent tail cannot be answered by a commit")
+    }
+
+    // MARK: - In-flight conversion at release
+
+    /// Holds one `send(_:)` between conversion and enqueue.
+    private final class ConversionGate: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var armed = false
+
+        func arm() { lock.withLock { armed = true } }
+        func pass() {
+            let wait = lock.withLock { () -> Bool in
+                defer { armed = false }
+                return armed
+            }
+            guard wait else { return }
+            entered.signal()
+            release.wait()
+        }
+
+        /// Starts a send on another thread and returns once it is converting.
+        func sendHeld(_ session: ElevenLabsRealtimeTranscriber, _ buffer: AVAudioPCMBuffer) async {
+            arm()
+            DispatchQueue.global().async { session.send(buffer) }
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global().async {
+                    self.entered.wait()
+                    done.resume()
+                }
+            }
+        }
+    }
+
+    /// The final buffer is mid-conversion when finalize starts. Finalize must
+    /// wait for it and send it ahead of the terminal commit.
+    func testFinalizeWaitsForInFlightConversionBeforeTerminalCommit() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        let gate = ConversionGate()
+        session.afterConversionHook = { gate.pass() }
+        await hold(session, transport, seconds: 0..<8, quietSeconds: [])
+        await gate.sendHeld(session, Self.pcm(seconds: 1, amplitude: Self.loud))
+
+        let finalizer = Task { await session.finalize(recordingDuration: 9) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(transport.all.count, 8, "no terminal commit while a conversion is in flight")
+        gate.release.signal()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        commit(session, Self.third)
+        let text = await finalizer.value
+        XCTAssertEqual(text, Self.third)
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+        XCTAssertEqual(transport.commitOffsetsSeconds, [9], "the held second is streamed before the terminal commit")
+    }
+
+    /// A conversion outlasting the settle bound latches recovery before the
+    /// result is returned, and its late completion cannot clear it.
+    func testConversionOutlastingSettleBoundLatchesRecovery() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        let gate = ConversionGate()
+        session.afterConversionHook = { gate.pass() }
+        await hold(session, transport, seconds: 0..<8, quietSeconds: [])
+        await gate.sendHeld(session, Self.pcm(seconds: 1, amplitude: Self.loud))
+
+        let startedAt = Date()
+        let finalizer = Task { await session.finalize(recordingDuration: 9) }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        commit(session, Self.third) // a prompt reply must not complete finalize
+        _ = await finalizer.value
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(startedAt), 0.2)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        XCTAssertEqual(transport.commitOffsetsSeconds, [])
+
+        gate.release.signal()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+        XCTAssertEqual(transport.all.count, 8, "the late conversion never reached the transport")
+    }
+
+    /// Finalize's state reset must not reopen the late-audio window; only a
+    /// user cancel discards it.
+    func testAudioAfterResolvedFinalizeLatchesButNotAfterCancel() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        await hold(session, transport, seconds: 0..<8, quietSeconds: [])
+        let finalizer = Task { await session.finalize(recordingDuration: 8) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        commit(session, Self.third)
+        _ = await finalizer.value
+        XCTAssertFalse(session.requiresBufferedAudioRecovery)
+        session.send(Self.pcm(seconds: 1, amplitude: Self.loud))
+        XCTAssertTrue(session.requiresBufferedAudioRecovery)
+
+        let cancelled = try await startedSession(Transport())
+        cancelled.cancel()
+        cancelled.send(Self.pcm(seconds: 1, amplitude: Self.loud))
+        XCTAssertFalse(cancelled.requiresBufferedAudioRecovery)
+    }
+
     func testVADStrategyNeverPlacesMurmurCommitsAndStillRecovers() async throws {
         var options = ElevenLabsRealtimeOptions.defaults
         options.commitStrategy = .vad
