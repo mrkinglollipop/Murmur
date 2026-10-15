@@ -39,6 +39,7 @@ final class SettingsStoreCoverageTests: XCTestCase {
             XCTAssertFalse(store.codeAwareMode)
             XCTAssertFalse(store.playDictationSound)
             XCTAssertFalse(store.allowLastResortInputFallback)
+            XCTAssertFalse(store.voiceIsolation)
             XCTAssertTrue(store.useStreaming)
             XCTAssertTrue(store.removeFillerWords)
             XCTAssertFalse(store.elevenLabsFilterBackgroundAudio)
@@ -77,7 +78,7 @@ final class SettingsStoreCoverageTests: XCTestCase {
             "useStreaming": false, "removeFillerWords": false, "smartLeadingSpace": false,
             "voiceEditSelectedText": false, "learnFromInlineCorrections": false,
             "useCloudEngine": true, "cleanupEnabled": true, "codeAwareMode": true,
-            "playDictationSound": true, "allowLastResortInputFallback": true,
+            "playDictationSound": true, "allowLastResortInputFallback": true, "voiceIsolation": true,
             "elevenLabsFilterBackgroundAudio": true, "useToggleLock": true, "speakerGatingEnabled": true
         ]
         try withStore(values) { store, defaults in
@@ -91,6 +92,7 @@ final class SettingsStoreCoverageTests: XCTestCase {
             XCTAssertTrue(store.codeAwareMode)
             XCTAssertTrue(store.playDictationSound)
             XCTAssertTrue(store.allowLastResortInputFallback)
+            XCTAssertTrue(store.voiceIsolation)
             XCTAssertTrue(store.elevenLabsFilterBackgroundAudio)
             XCTAssertTrue(store.useToggleLock)
             XCTAssertTrue(store.speakerGatingEnabled)

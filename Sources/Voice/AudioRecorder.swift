@@ -57,6 +57,18 @@ final class AudioRecorder {
     /// that ID across launches.
     private var lastBoundInputDeviceName = "Microphone"
 
+    /// Whether the current engine's input is bound through Apple voice
+    /// processing. Main-thread confined; the tap captures its own copy.
+    private var voiceProcessingActive = false
+
+    /// Set by the first voice-processing failure (bind, start, timeout, or
+    /// silent tap) and kept until relaunch, so later holds go straight to the
+    /// standard capture path.
+    private var voiceProcessingSuppressedReason: String?
+
+    /// Tap format of the current capture, for the per-hold diagnostic line.
+    private var captureFormatDescription = "unknown"
+
     /// Avoid repeating the unavailable-preference diagnostic on every
     /// recovery bind in the same hold.
     private var loggedUnavailablePreferredUID: String?
@@ -123,6 +135,11 @@ final class AudioRecorder {
         /// The test host's real frontmost app must not retarget a fixture hold.
         /// Nil is an unknown release identity, which keeps the hold-start target.
         var releaseFrontmostPID: pid_t?
+        var boundDeviceIsBuiltIn = true
+        /// Errors returned by the next `engine.start()` calls, in order.
+        var startErrors: [Error] = []
+        /// Voice-processing value of each successful start, in order.
+        var voiceProcessingAtStart: [Bool] = []
         let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
         let schedule: MicHealthWarningMonitor.Schedule
         let now: () -> Date
@@ -160,6 +177,10 @@ final class AudioRecorder {
 
     var micCaptureStateForTesting: (wanted: Bool, stopping: Bool, tapInstalled: Bool, buffers: [AVAudioPCMBuffer], maxRMS: Float) {
         (wantsRecording, isStopping, isSetUp, pcmBuffersLock.withLock { pcmBuffers }, levelLock.withLock { maxLevelObserved })
+    }
+
+    var voiceProcessingStateForTesting: (active: Bool, suppressedReason: String?) {
+        (voiceProcessingActive, voiceProcessingSuppressedReason)
     }
 
     var micLevelFramesForTesting: (frames: [MicHealth.LevelFrame], deliveredSeconds: TimeInterval) {
@@ -353,6 +374,12 @@ final class AudioRecorder {
         #if DEBUG
         if let hooks = micCaptureTestHooks {
             lastBoundInputDeviceID = hooks.boundDeviceID
+            voiceProcessingActive = hooks.boundDeviceID != nil && Self.shouldEnableVoiceProcessing(
+                settingOn: voiceIsolationProvider?() ?? false,
+                deviceIsBuiltIn: hooks.boundDeviceIsBuiltIn,
+                suppressed: voiceProcessingSuppressedReason != nil,
+                engineRunning: hooks.engineRunning
+            )
             return hooks.boundDeviceID
         }
         #endif
@@ -457,53 +484,168 @@ final class AudioRecorder {
         !bindSucceeded
     }
 
+    enum MicBindOutcome: Equatable {
+        case bound
+        case inputUnitUnavailable
+        case setCurrentDeviceFailed(OSStatus)
+        case voiceProcessingFailed
+        case exception
+    }
+
+    /// Hardware calls made by `performMicBind`, injectable so the order is
+    /// unit-tested without an audio device.
+    struct MicBindOperations {
+        let enableVoiceProcessing: () throws -> Void
+        let configureOtherAudioDucking: () -> Void
+        /// Nil when the input node has no audio unit.
+        let setCurrentDevice: (AudioUnitElement) -> OSStatus?
+        let prepare: () -> Void
+    }
+
+    /// CurrentDevice must be set before `prepare()`: 0.1.36 prepared first
+    /// and `AVAudioEngineGraph::Initialize` aborted on the ghost HAL default.
+    /// Skipping prepare left inputNode at 0ch, so we excluded the built-in
+    /// and started Continuity iPhone instead (2026-08-17 10:17–10:18).
+    ///
+    /// Voice processing swaps the input node's AUHAL for VoiceProcessingIO,
+    /// so it is enabled first — a device set on the AUHAL would be dropped
+    /// with it. VoiceProcessingIO keeps the OUTPUT device on element 0 and
+    /// the input device on element 1 (probed on macOS 27, 2026-10-15:
+    /// setting element 0 to the mic returns noErr and routes output to it).
+    static func performMicBind(voiceProcessing: Bool, _ ops: MicBindOperations) -> MicBindOutcome {
+        if voiceProcessing {
+            do {
+                try ops.enableVoiceProcessing()
+            } catch {
+                return .voiceProcessingFailed
+            }
+            ops.configureOtherAudioDucking()
+        }
+        guard let status = ops.setCurrentDevice(voiceProcessing ? 1 : 0) else {
+            return .inputUnitUnavailable
+        }
+        guard status == noErr else { return .setCurrentDeviceFailed(status) }
+        ops.prepare()
+        return .bound
+    }
+
+    /// Voice processing only on the built-in mic: Bluetooth and Continuity
+    /// inputs pair with a different output device, and VoiceProcessingIO
+    /// fails to initialize mismatched pairs (-10875). It can only be
+    /// enabled on a stopped engine. Any earlier failure this session keeps
+    /// it off so a broken voice-processing route costs at most one retry.
+    static func shouldEnableVoiceProcessing(
+        settingOn: Bool,
+        deviceIsBuiltIn: Bool,
+        suppressed: Bool,
+        engineRunning: Bool
+    ) -> Bool {
+        settingOn && deviceIsBuiltIn && !suppressed && !engineRunning
+    }
+
     /// Bind the input AU to `deviceID`. Must not abort: `-[AVAudioEngine prepare]`
     /// can raise NSException (`AVAudioEngineGraph::Initialize`) on a ghost/0ch
     /// HAL default — 0.1.36 SIGABRT on every hold (IPS 2026-08-17 10:07).
+    /// A voice-processing bind that fails in any way falls back to the plain
+    /// bind on a fresh engine.
     private func bindInputNode(to deviceID: AudioDeviceID) -> Bool {
-        var bound = false
-        var auWasNil = false
-        var setStatus: OSStatus = noErr
-        switch ObjCExceptionCatcher.run({
-            // Set CurrentDevice *before* prepare(). 0.1.36 prepared first and
-            // Initialize aborted on the ghost HAL default. Skipping prepare
-            // left inputNode at 0ch, so we excluded the built-in and started
-            // Continuity iPhone instead (2026-08-17 10:17–10:18).
-            guard let audioUnit = self.engine.inputNode.audioUnit else {
-                auWasNil = true
-                return
+        let wantsVoiceProcessing = Self.shouldEnableVoiceProcessing(
+            settingOn: voiceIsolationProvider?() ?? false,
+            deviceIsBuiltIn: Self.audioDeviceIsBuiltIn(deviceID),
+            suppressed: voiceProcessingSuppressedReason != nil,
+            engineRunning: engine.isRunning
+        )
+        voiceProcessingActive = false
+        if !wantsVoiceProcessing, engine.inputNode.isVoiceProcessingEnabled {
+            // A plain bind must not inherit a previous hold's VPIO unit.
+            replaceEngineForVoiceProcessingChange()
+        }
+        if wantsVoiceProcessing {
+            let outcome = runMicBind(deviceID, voiceProcessing: true)
+            let format = engine.inputNode.outputFormat(forBus: 0)
+            if outcome == .bound,
+               !Self.inputFormatLooksDead(sampleRate: format.sampleRate, channelCount: format.channelCount) {
+                voiceProcessingActive = true
+                vlog("voice isolation on — device \(deviceID), \(Int(format.sampleRate)) Hz, \(format.channelCount) ch")
+                return true
             }
-            var id = deviceID
-            setStatus = AudioUnitSetProperty(
-                audioUnit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &id,
-                UInt32(MemoryLayout<AudioDeviceID>.size)
-            )
-            guard setStatus == noErr else { return }
-            self.engine.prepare()
-            bound = true
+            let reason = outcome == .bound ? "dead format after prepare" : "bind \(outcome)"
+            suppressVoiceProcessing(reason: reason)
+            replaceEngineForVoiceProcessingChange()
+        }
+        return runMicBind(deviceID, voiceProcessing: false) == .bound
+    }
+
+    private func runMicBind(_ deviceID: AudioDeviceID, voiceProcessing: Bool) -> MicBindOutcome {
+        var outcome = MicBindOutcome.inputUnitUnavailable
+        let inputNode = engine.inputNode
+        let engine = self.engine
+        let operations = MicBindOperations(
+            enableVoiceProcessing: { try inputNode.setVoiceProcessingEnabled(true) },
+            configureOtherAudioDucking: {
+                // Dictation is not a call: keep music and video audible.
+                inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                        enableAdvancedDucking: false,
+                        duckingLevel: .min
+                    )
+            },
+            setCurrentDevice: { element in
+                guard let audioUnit = inputNode.audioUnit else { return nil }
+                var id = deviceID
+                return AudioUnitSetProperty(
+                    audioUnit,
+                    kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global,
+                    element,
+                    &id,
+                    UInt32(MemoryLayout<AudioDeviceID>.size)
+                )
+            },
+            prepare: { engine.prepare() }
+        )
+        switch ObjCExceptionCatcher.run({
+            outcome = Self.performMicBind(voiceProcessing: voiceProcessing, operations)
         }) {
         case .failure(let error):
             logger.error(
-                "bindInputNode: NSException device \(deviceID): \(error.localizedDescription)"
+                "bindInputNode: NSException device \(deviceID) vp=\(voiceProcessing): \(error.localizedDescription)"
             )
-            return false
+            return .exception
         case .success:
-            if auWasNil {
+            switch outcome {
+            case .bound:
+                break
+            case .inputUnitUnavailable:
                 logger.error("bindInputNode: input AU is nil (device \(deviceID))")
-                return false
-            }
-            if !bound {
+            case .setCurrentDeviceFailed(let status):
                 logger.error(
-                    "AudioUnitSetProperty CurrentDevice failed: OSStatus \(setStatus) (device \(deviceID))"
+                    "AudioUnitSetProperty CurrentDevice failed: OSStatus \(status) (device \(deviceID))"
                 )
-                return false
+            case .voiceProcessingFailed:
+                logger.error("bindInputNode: enabling voice processing failed (device \(deviceID))")
+            case .exception:
+                break
             }
-            return true
+            return outcome
         }
+    }
+
+    /// Fresh engine without voice processing. Any tap belonged to the old
+    /// engine, so the next capture start must install a new one.
+    private func replaceEngineForVoiceProcessingChange() {
+        engine.stop()
+        engine = AVAudioEngine()
+        registerEngineConfigObserver()
+        isSetUp = false
+    }
+
+    private func suppressVoiceProcessing(reason: String) {
+        voiceProcessingActive = false
+        guard voiceProcessingSuppressedReason == nil else { return }
+        voiceProcessingSuppressedReason = reason
+        logger.error("voice isolation disabled until relaunch — \(reason)")
+        vlog("voice isolation disabled until relaunch — \(reason); using standard capture")
     }
 
     private static func isAudioDeviceAlive(_ deviceID: AudioDeviceID) -> Bool {
@@ -1148,6 +1290,11 @@ final class AudioRecorder {
     /// Explicit input-device preference and Never use set, both keyed by
     /// CoreAudio UID so a device ID never leaks into persisted settings.
     var preferredInputDeviceUIDProvider: (() -> String?)?
+
+    /// Apple voice processing (noise suppression; enables the system Mic
+    /// Mode menu) on the built-in mic. Wired by `AppDelegate` to
+    /// `SettingsStore.voiceIsolation`; read at each bind.
+    var voiceIsolationProvider: (() -> Bool)?
     var excludedInputDeviceUIDsProvider: (() -> Set<String>)?
 
     /// Short label for the HUD key chip (e.g. "fn", "⌥"). Wired by
@@ -1189,6 +1336,9 @@ final class AudioRecorder {
     /// Duration-weighted tap RMS frames; percentiles run on the main thread.
     private var lowLevelFrames: [MicHealth.LevelFrame] = []
     private var lowLevelDeliveredSeconds: TimeInterval = 0
+    /// Guarded by `levelLock`; filled only for multichannel voice processing.
+    private var channelSumSquares: [Double] = []
+    private var channelFrameCount = 0
     private var previousHoldShowedLowLevelWarning = false
     private var currentHoldShowedLowLevelWarning = false
     private var lastLowLevelWarningAt: Date?
@@ -1975,12 +2125,29 @@ final class AudioRecorder {
         }
 
         let format = micInputFormat()
+        // VoiceProcessingIO reports a multichannel input (9 ch on a MacBook
+        // Pro, 2026-10-15). Channel 0 carries the processed voice; every
+        // downstream consumer gets that channel as mono so converters never
+        // downmix the extra channels.
+        let extractFirstChannel = voiceProcessingActive && format.channelCount > 1
+        let monoFormat = extractFirstChannel
+            ? AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1)
+            : nil
+        captureFormatDescription = "\(Int(format.sampleRate)) Hz \(format.channelCount) ch"
 
         // Avoid double-installing a tap
         if !isSetUp {
             let tapGeneration = captureGeneration
-            installMicTap(format: format) { [weak self] buffer, _ in
+            installMicTap(format: format) { [weak self] tapBuffer, _ in
                 guard let self = self else { return }
+                let buffer: AVAudioPCMBuffer
+                if extractFirstChannel, let monoFormat,
+                   let mono = Self.firstChannelBuffer(of: tapBuffer, format: monoFormat) {
+                    self.accumulateChannelLevels(tapBuffer)
+                    buffer = mono
+                } else {
+                    buffer = tapBuffer
+                }
                 self.pcmBuffersLock.lock()
                 if self.bufferDeliveryGeneration == tapGeneration {
                     self.buffersDeliveredThisGeneration += 1
@@ -2050,6 +2217,45 @@ final class AudioRecorder {
         startEngineOffMain(isWatchdogRetry: isWatchdogRetry)
     }
 
+    /// Copies channel 0 of a deinterleaved float buffer into `format` (mono).
+    static func firstChannelBuffer(of source: AVAudioPCMBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard format.channelCount == 1,
+              format.sampleRate == source.format.sampleRate,
+              let sourceData = source.floatChannelData,
+              !source.format.isInterleaved,
+              let mono = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: max(source.frameLength, 1)),
+              let monoData = mono.floatChannelData
+        else { return nil }
+        mono.frameLength = source.frameLength
+        memcpy(monoData[0], sourceData[0], Int(source.frameLength) * MemoryLayout<Float>.size)
+        return mono
+    }
+
+    /// Per-channel energy of the raw voice-processing buffer, logged at stop
+    /// so a real hold shows which channel carries speech.
+    private func accumulateChannelLevels(_ buffer: AVAudioPCMBuffer) {
+        guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return }
+        let channels = min(Int(buffer.format.channelCount), 16)
+        let frames = Int(buffer.frameLength)
+        var sums = [Double](repeating: 0, count: channels)
+        for ch in 0 ..< channels {
+            var sum: Double = 0
+            for i in 0 ..< frames {
+                let sample = Double(data[ch][i])
+                sum += sample * sample
+            }
+            sums[ch] = sum
+        }
+        levelLock.lock()
+        if channelSumSquares.count != channels {
+            channelSumSquares = [Double](repeating: 0, count: channels)
+            channelFrameCount = 0
+        }
+        for ch in 0 ..< channels { channelSumSquares[ch] += sums[ch] }
+        channelFrameCount += frames
+        levelLock.unlock()
+    }
+
     private func sendCapturedAudioToCloud(_ buffer: AVAudioPCMBuffer) {
         streamingCoordinator.sendToXAI(buffer)
         streamingCoordinator.sendToElevenLabs(buffer)
@@ -2076,8 +2282,16 @@ final class AudioRecorder {
     private func startEngineOffMain(isWatchdogRetry: Bool) {
         #if DEBUG
         if let hooks = micCaptureTestHooks {
+            if !hooks.startErrors.isEmpty {
+                let error = hooks.startErrors.removeFirst()
+                handleEngineStartFinished(token: engineStartToken, generation: captureGeneration,
+                                          engineToStart: engine, result: .failure(error),
+                                          isWatchdogRetry: isWatchdogRetry)
+                return
+            }
             hooks.engineRunning = true
             hooks.successfulStarts += 1
+            hooks.voiceProcessingAtStart.append(voiceProcessingActive)
             handleEngineStartFinished(token: engineStartToken, generation: captureGeneration,
                                       engineToStart: engine, result: .success(()),
                                       isWatchdogRetry: isWatchdogRetry)
@@ -2206,6 +2420,16 @@ final class AudioRecorder {
             armZeroBufferWatchdog()
         case .failure(let error):
             logger.error("AVAudioEngine start failed: \(error.localizedDescription)")
+            if voiceProcessingActive {
+                // The device bound fine; voice processing is the suspect.
+                // Retry the same hold on the standard path, keeping its audio.
+                suppressVoiceProcessing(reason: "engine.start error")
+                invalidateSecureInputPollTimer()
+                teardownMicEngine()
+                engineNeedsRebuild = true
+                startMicCapture(isWatchdogRetry: true)
+                return
+            }
             if !isWatchdogRetry, Self.isGhostInputStartError(error) {
                 vlog("engine.start ghost device — rebinding alive input and retrying once")
                 watchdogRetriedThisTake = true
@@ -2242,6 +2466,12 @@ final class AudioRecorder {
             // cross-thread safe — residual affinity risk. The abandoned
             // start may still occupy that queue until HAL returns.
             engineToStart.stop()
+        }
+        if voiceProcessingActive {
+            suppressVoiceProcessing(reason: "engine.start timed out")
+            engineNeedsRebuild = true
+            startMicCapture(isWatchdogRetry: true)
+            return
         }
         // Next hold must not call start() on this same instance while the
         // abandoned attempt is still inside HAL, and must not re-pick the
@@ -2322,7 +2552,9 @@ final class AudioRecorder {
                 stillWanted: self.wantsRecording,
                 tapInstalled: self.isSetUp,
                 buffersSeen: buffersSeen,
-                alreadyRetried: self.watchdogRetriedThisTake
+                // A silent voice-processing tap gets its own retry on the
+                // standard path, whatever recovery already ran this hold.
+                alreadyRetried: self.watchdogRetriedThisTake && !self.voiceProcessingActive
             )
             switch action {
             case .ignore:
@@ -2340,7 +2572,11 @@ final class AudioRecorder {
 
             self.watchdogRetriedThisTake = true
             vlog("mic watchdog: no buffers \(Int(Self.zeroBufferWatchdogDelay * 1000)) ms after engine start — rebuilding engine, restarting capture")
-            let failedID = self.lastBoundInputDeviceID
+            var failedID = self.lastBoundInputDeviceID
+            if self.voiceProcessingActive {
+                self.suppressVoiceProcessing(reason: "no buffers from voice-processing tap")
+                failedID = nil
+            }
             self.teardownMicEngine()
             self.rebuildEngine(excluding: failedID)
             self.startMicCapture(isWatchdogRetry: true, excluding: failedID)
@@ -3051,9 +3287,69 @@ final class AudioRecorder {
     private func recordingHadSpeech() -> Bool {
         levelLock.lock()
         let maxLevel = maxLevelObserved
+        let frames = lowLevelFrames
+        let channelSums = channelSumSquares
+        let channelFrames = channelFrameCount
         levelLock.unlock()
         vlog("recording max RMS \(String(format: "%.4f", maxLevel)) (threshold \(String(format: "%.4f", Self.speechRMSThreshold)))")
+        logCaptureDiagnostics(frames: frames, channelSums: channelSums, channelFrames: channelFrames)
         return maxLevel >= Self.speechRMSThreshold
+    }
+
+    /// One line per hold for before/after comparison of capture quality.
+    /// Levels only — never audio content.
+    private func logCaptureDiagnostics(frames: [MicHealth.LevelFrame], channelSums: [Double], channelFrames: Int) {
+        let vp: String
+        if voiceProcessingActive {
+            vp = "on micMode=\(Self.microphoneModeName(AVCaptureDevice.activeMicrophoneMode))"
+        } else if let reason = voiceProcessingSuppressedReason {
+            vp = "off (fallback: \(reason))"
+        } else {
+            vp = "off"
+        }
+        var line = "capture diagnostics — input=\(lastBoundInputDeviceName) vp=\(vp) format=\(captureFormatDescription)"
+        if let stats = Self.speechLevelStatsDBFS(frames.map(\.rms)) {
+            line += String(
+                format: " speech p90=%.1f p10=%.1f SNR=%.1f dB (n=%d)",
+                stats.p90, stats.p10, stats.snr, frames.count
+            )
+        } else {
+            line += " speech n=0"
+        }
+        if channelFrames > 0 {
+            let perChannel = channelSums.map {
+                String(format: "%.1f", Self.dBFS(Float(($0 / Double(channelFrames)).squareRoot())))
+            }
+            line += " chRMS=[\(perChannel.joined(separator: ","))]"
+        }
+        vlog(line)
+    }
+
+    static func dBFS(_ rms: Float) -> Double {
+        20 * log10(Double(max(rms, 1e-7)))
+    }
+
+    /// p90 and p10 of per-buffer RMS in dBFS; their gap approximates SNR
+    /// (speech peaks over the room floor).
+    static func speechLevelStatsDBFS(_ rmsValues: [Float]) -> (p90: Double, p10: Double, snr: Double)? {
+        guard !rmsValues.isEmpty else { return nil }
+        let sorted = rmsValues.map(dBFS).sorted()
+        func percentile(_ p: Double) -> Double {
+            let rank = Int((p * Double(sorted.count - 1)).rounded())
+            return sorted[min(max(rank, 0), sorted.count - 1)]
+        }
+        let p90 = percentile(0.9)
+        let p10 = percentile(0.1)
+        return (p90, p10, p90 - p10)
+    }
+
+    static func microphoneModeName(_ mode: AVCaptureDevice.MicrophoneMode) -> String {
+        switch mode {
+        case .standard: return "standard"
+        case .wideSpectrum: return "wideSpectrum"
+        case .voiceIsolation: return "voiceIsolation"
+        @unknown default: return "unknown(\(mode.rawValue))"
+        }
     }
 
     // MARK: - Mic level publishing (audio-reactive waveform)
@@ -3217,6 +3513,8 @@ final class AudioRecorder {
         lowLevelFrames.removeAll(keepingCapacity: true)
         lowLevelFrames.reserveCapacity(128)
         lowLevelDeliveredSeconds = 0
+        channelSumSquares = []
+        channelFrameCount = 0
         levelLock.unlock()
     }
 
