@@ -182,6 +182,7 @@ final class AudioRecorder {
     func test_flushStopGrace() { flushPendingStopGrace() }
     func test_abortForSecureInput() { abortForSecureInput() }
     func test_receiveAudio(_ buffer: AVAudioPCMBuffer) { sendCapturedAudioToCloud(buffer) }
+    var test_captureDeliveryLock: NSLock { captureDeliveryLock }
     var test_bufferCount: Int { pcmBuffersLock.withLock { pcmBuffers.count } }
     func test_bufferAudio(_ buffer: AVAudioPCMBuffer) {
         pcmBuffersLock.withLock { pcmBuffers.append(buffer) }
@@ -2547,6 +2548,22 @@ final class AudioRecorder {
     /// the tap installed in `startMicCapture` keeps firing — appending to
     /// `pcmBuffers` and calling `sendToXAI`/`sendToElevenLabs`/`sendToGemini`/
     /// `sendToMuse` — for every buffer that arrives before this runs.
+    /// Longest the main thread waits for an in-flight tap callback at stop.
+    static let captureDeliveryStopWait: TimeInterval = 0.25
+
+    /// Recovery snapshot taken once any in-flight tap callback has finished
+    /// handing its buffer to the session. Waits a bounded time: a stalled
+    /// conversion must not freeze the main thread, so on timeout the snapshot
+    /// is taken anyway and the caller must treat the stream as unproven.
+    func snapshotBufferedAudioForStop(
+        lockTimeout: TimeInterval = AudioRecorder.captureDeliveryStopWait
+    ) -> (buffers: [AVAudioPCMBuffer], timedOut: Bool) {
+        let acquired = captureDeliveryLock.lock(before: Date(timeIntervalSinceNow: lockTimeout))
+        defer { if acquired { captureDeliveryLock.unlock() } }
+        let buffers = pcmBuffersLock.withLock { pcmBuffers }
+        return (buffers, !acquired)
+    }
+
     private func finishStop(sessionHold: SessionHold, holdDuration: TimeInterval?) {
         let elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
         lastHoldDuration = elapsed
@@ -2562,11 +2579,15 @@ final class AudioRecorder {
         // holds captureDeliveryLock from its copy through its streaming send,
         // so every snapshotted buffer has already been handed to the session
         // that finalize will measure against this recording.
-        captureDeliveryLock.lock()
-        pcmBuffersLock.lock()
-        let bufferedAudio = pcmBuffers
-        pcmBuffersLock.unlock()
-        captureDeliveryLock.unlock()
+        let snapshot = snapshotBufferedAudioForStop()
+        let bufferedAudio = snapshot.buffers
+        if snapshot.timedOut {
+            // A tap callback is still inside conversion/send, so the session
+            // may be missing a buffer the snapshot contains. Never accept the
+            // stream result; the buffered recording is the source of truth.
+            vlog("finishStop: capture-delivery lock wait timed out after \(String(format: "%.0f", Self.captureDeliveryStopWait * 1000)) ms — buffers=\(bufferedAudio.count), forcing buffered-audio recovery")
+            streamingCoordinator.requireBufferedAudioRecoveryForActiveSessions()
+        }
 
         let streamTextEver = streamingCoordinator.coordinatorEverHadStreamText
             || (streamingCoordinator.xaiSession?.hasEverHadNonEmptyStreamText ?? false)
