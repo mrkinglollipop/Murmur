@@ -42,15 +42,6 @@ enum CaretContext {
         kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String, "AXSearchField",
     ]
 
-    /// Controls whose value may be writable but which never take typed text.
-    static let nonTextRoles: Set<String> = [
-        kAXCheckBoxRole as String, kAXRadioButtonRole as String, kAXSliderRole as String,
-        kAXIncrementorRole as String, kAXPopUpButtonRole as String, kAXMenuButtonRole as String,
-        kAXButtonRole as String, kAXScrollBarRole as String, kAXValueIndicatorRole as String,
-        kAXColorWellRole as String, kAXDisclosureTriangleRole as String, kAXProgressIndicatorRole as String,
-        kAXLevelIndicatorRole as String, "AXSwitch", "AXToggle", "AXDateTimeArea", "AXStepper",
-    ]
-
     static let secureTextFieldRole = kAXSecureTextFieldSubrole as String
 
     static func role(of element: AXUIElement, reader: AXReader = AXReader()) -> String? {
@@ -66,10 +57,10 @@ enum CaretContext {
         error == .noValue || error == .attributeUnsupported
     }
 
-    /// True only for a real text input, never a password field. Text roles
-    /// qualify directly; any other role must expose a caret (selected text
-    /// range or insertion line), because a writable `AXValue` alone also
-    /// describes checkboxes and sliders. Nil = unreadable.
+    /// True only for a real text input, never a password field. Decided by
+    /// role alone: caret attributes (selected range, insertion line) and a
+    /// writable `AXValue` also appear on static text and controls, so they
+    /// say nothing about editability. Nil = unreadable role or subrole.
     static func isEditableText(_ element: AXUIElement, role: String?, reader: AXReader = AXReader()) -> Bool? {
         if role == secureTextFieldRole { return false }
         var subroleRef: CFTypeRef?
@@ -80,20 +71,7 @@ enum CaretContext {
             return nil
         }
         if let role, editableTextRoles.contains(role) { return true }
-        if let role, nonTextRoles.contains(role) { return false }
-        var rangeRef: CFTypeRef?
-        let rangeError = reader.copyAttribute(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef)
-        if rangeError == .success, let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID(),
-           AXValueGetType(rangeRef as! AXValue) == .cfRange {
-            return true
-        }
-        var lineRef: CFTypeRef?
-        let lineError = reader.copyAttribute(element, kAXInsertionPointLineNumberAttribute as CFString, &lineRef)
-        if lineError == .success, lineRef is NSNumber { return true }
-        if (rangeError == .success || isAbsent(rangeError)) && (lineError == .success || isAbsent(lineError)) {
-            return false
-        }
-        return nil
+        return role == nil ? nil : false
     }
 
     static func focusedField(frontmostPID: pid_t?, reader: AXReader = AXReader()) -> FocusedField? {

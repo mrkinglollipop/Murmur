@@ -95,17 +95,35 @@ final class DeliveryTargetHardeningTests: XCTestCase {
         ])), false)
     }
 
-    func testTextRolesAndCaretBearingElementsAreText() {
+    func testTextRolesAreText() {
         for role in [kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String, "AXSearchField"] {
             XCTAssertEqual(CaretContext.isEditableText(element, role: role, reader: reader([:])), true, role)
         }
-        XCTAssertEqual(CaretContext.isEditableText(element, role: "AXGroup",
-            reader: reader([kAXSelectedTextRangeAttribute: (.success, caretRange)])), true)
-        XCTAssertEqual(CaretContext.isEditableText(element, role: "AXWebArea",
-            reader: reader([kAXInsertionPointLineNumberAttribute: (.success, 0 as NSNumber)])), true)
-        // A timed-out caret read is unknown, never editable.
-        XCTAssertNil(CaretContext.isEditableText(element, role: "AXGroup",
-            reader: reader([kAXSelectedTextRangeAttribute: (.cannotComplete, nil)])))
+        // No role at all is unreadable, never editable.
+        XCTAssertNil(CaretContext.isEditableText(element, role: nil, reader: reader([:])))
+    }
+
+    /// Chromium exposes selected-text range and insertion line on labels, so
+    /// caret attributes must not make a non-input role editable.
+    func testStaticTextWithCaretAttributesIsNotEditable() {
+        let caretAnswers: [String: (AXError, CFTypeRef?)] = [
+            kAXSelectedTextRangeAttribute: (.success, caretRange),
+            kAXInsertionPointLineNumberAttribute: (.success, 0 as NSNumber),
+        ]
+        for role in ["AXStaticText", "AXGroup", "AXWebArea"] {
+            XCTAssertEqual(CaretContext.isEditableText(element, role: role, reader: reader(caretAnswers)), false, role)
+        }
+        // An unbound take released with nothing focused, then a label focused
+        // at insert: the relaxed gate refuses it, so the take goes to the clipboard.
+        let focusAnswers = caretAnswers.merging([
+            kAXFocusedUIElementAttribute: (.success, element),
+            kAXRoleAttribute: (.success, "AXStaticText" as CFString),
+        ]) { current, _ in current }
+        guard let label = CaretContext.focusedField(frontmostPID: 123, reader: reader(focusAnswers)) else {
+            return XCTFail("a label is focused")
+        }
+        XCTAssertEqual(label.isEditable, false)
+        XCTAssertFalse(label.acceptsRelaxedDelivery)
     }
 
     func testPasswordFieldsAreNeverEditableText() {
