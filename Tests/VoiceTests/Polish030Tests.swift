@@ -174,6 +174,126 @@ final class Polish030Tests: XCTestCase {
         XCTAssertEqual(DictionarySearch.resultCount(entries: [learned], groups: matches), 3)
     }
 
+    func testDictionarySearchSortsDisplayEntriesWithoutMutatingInput() {
+        let tieFirst = DictionaryEntry(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            term: "Áegis",
+            variants: []
+        )
+        let tieSecond = DictionaryEntry(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+            term: "aegis",
+            variants: []
+        )
+        let entries = [
+            DictionaryEntry(term: "Z", variants: []),
+            DictionaryEntry(term: "xAI", variants: []),
+            DictionaryEntry(term: "Wispr Flow", variants: ["WhisperFlow"]),
+            DictionaryEntry(term: "tavily", variants: []),
+            DictionaryEntry(term: "Tauri", variants: []),
+            tieSecond,
+            tieFirst
+        ]
+        let original = entries
+
+        let sorted = DictionarySearch.sortedEntries(entries)
+
+        XCTAssertEqual(sorted.map(\.term), ["Áegis", "aegis", "Tauri", "tavily", "Wispr Flow", "xAI", "Z"])
+        XCTAssertEqual(entries, original, "sorting is display-only and must not rewrite store input")
+        XCTAssertEqual(DictionarySearch.sortedEntries(Array(entries.reversed())).map(\.id), sorted.map(\.id))
+        let pending = entries.map { entry in
+            var pendingEntry = entry
+            pendingEntry.isAutoLearned = true
+            return pendingEntry
+        }
+        XCTAssertEqual(DictionarySearch.sortedEntries(pending).map(\.term), sorted.map(\.term))
+        XCTAssertEqual(DictionarySearch.sortedEntries(DictionarySearch.entries(entries, query: " flow ")).map(\.term), ["Wispr Flow"])
+    }
+
+    func testDictionaryVariantInputParsesCommaSeparatedPreviewValues() {
+        XCTAssertEqual(
+            DictionaryEntryInput.variants(from: " cube net ease, , cooper netties ,\n\t"),
+            ["cube net ease", "cooper netties"]
+        )
+    }
+
+    @MainActor
+    func testDictionaryLayoutSnapshotsAtMainPaneWidths() throws {
+        let dictionaryURL = directory.appendingPathComponent("dictionary.json")
+        try JSONEncoder().encode([
+            DictionaryEntry(term: "Tauri", variants: ["Tari"], fixCount: 1),
+            DictionaryEntry(term: "Wispr Flow", variants: ["WhisperFlow", "whisper flow"], fixCount: 2),
+            DictionaryEntry(term: "tavily", variants: ["Tivoli"], isAutoLearned: true)
+        ]).write(to: dictionaryURL)
+        let store = DictionaryStore(
+            fileURL: dictionaryURL,
+            blocklistFileURL: directory.appendingPathComponent("dictionary-blocklist.json")
+        )
+
+        let corrections = CorrectionsLog(fileURL: directory.appendingPathComponent("corrections.json"))
+        corrections.append([
+            CorrectionRecord(heard: "Tari", replaced: "Tauri", source: .dictionary),
+            CorrectionRecord(heard: "WhisperFlow", replaced: "Wispr Flow", source: .dictionary)
+        ])
+
+        // Opt-in preview keeps the real glass compositor available for local
+        // visual review while all stores remain isolated synthetic fixtures.
+        let previewURL = URL(fileURLWithPath: "/tmp/murmur-dictionary-visual-preview")
+        let showsPreview = FileManager.default.fileExists(atPath: previewURL.path)
+        let activationPolicy = NSApp.activationPolicy()
+        if showsPreview { NSApp.setActivationPolicy(.regular) }
+        defer { if showsPreview { NSApp.setActivationPolicy(activationPolicy) } }
+        let height: CGFloat = showsPreview ? 760 : 1_050
+        for width: CGFloat in [439, 559] {
+            let view = NSHostingView(
+                rootView: DictionaryView(store: store, correctionsLog: corrections)
+                    .frame(width: width, height: height)
+                    .background(Theme.bg)
+                    .preferredColorScheme(.dark)
+            )
+            view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+            view.layoutSubtreeIfNeeded()
+
+            var previewWindow: NSWindow?
+            if showsPreview {
+                let window = NSWindow(
+                    contentRect: view.frame,
+                    styleMask: [.titled, .closable],
+                    backing: .buffered,
+                    defer: false
+                )
+                window.isReleasedWhenClosed = false
+                window.title = "Murmur Dictionary Preview — \(Int(width)) pt"
+                window.contentView = view
+                window.center()
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                previewWindow = window
+                RunLoop.current.run(until: Date().addingTimeInterval(45))
+            }
+            defer { previewWindow?.close() }
+
+            XCTAssertTrue(view.bounds.width.isFinite && view.bounds.height.isFinite)
+            XCTAssertEqual(view.bounds.width, width)
+            XCTAssertEqual(view.bounds.height, height)
+            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let scale = view.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+            XCTAssertEqual(bitmap.pixelsWide, Int(width * scale))
+            XCTAssertEqual(bitmap.pixelsHigh, Int(height * scale))
+
+            let image = NSImage(size: bitmap.size)
+            image.addRepresentation(bitmap)
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "dictionary-correct-first-\(Int(width))w"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+
+        store.flush()
+        corrections.flush()
+    }
+
     func testRetryStateKeepsConcurrentRowsIndependentAndRejectsDuplicateStart() {
         let first = UUID()
         let second = UUID()

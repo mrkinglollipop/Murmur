@@ -35,7 +35,9 @@ struct DictionaryView: View {
     @FocusState private var focusedEditID: UUID?
 
     private var filteredEntries: [DictionaryEntry] {
-        DictionarySearch.entries(store.entries, query: searchText)
+        DictionarySearch.sortedEntries(
+            DictionarySearch.entries(store.entries, query: searchText)
+        )
     }
 
     var body: some View {
@@ -44,8 +46,8 @@ struct DictionaryView: View {
             Divider().overlay(Theme.hairline)
             searchBar
 
-            // One outer scroll: entries (or compact empty) + corrections +
-            // auto-learned. Composer/search stay pinned above.
+            // One outer scroll: entries (or compact empty) + pending review +
+            // corrections. Composer/search stay pinned above.
             ScrollView {
                 LazyVStack(spacing: 0) {
                     if store.entries.isEmpty {
@@ -54,8 +56,8 @@ struct DictionaryView: View {
                         termsSectionHeader
                         entryRows
                     }
-                    recentCorrectionsSection
                     autoLearnedSection
+                    recentCorrectionsSection
                 }
             }
         }
@@ -149,8 +151,14 @@ struct DictionaryView: View {
 
     private func recentCorrectionRow(_ record: CorrectionRecord) -> some View {
         HStack(alignment: .center, spacing: 8) {
-            Text(record.heard)
+            HeardChip(variant: record.heard)
+
+            Text("→")
                 .font(Theme.body(13, weight: .medium))
+                .foregroundColor(Theme.textSecondary)
+
+            Text(record.replaced)
+                .font(Theme.body(13, weight: .semibold))
                 .foregroundColor(Theme.textPrimary)
 
             Text(correctionSourceLabel(record.source))
@@ -372,7 +380,7 @@ struct DictionaryView: View {
         let autoLearned = filteredEntries.filter { $0.isAutoLearned }
         if !autoLearned.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
-                Text("Auto-learned entries")
+                Text("Waiting for your OK")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(Theme.textSecondary)
                     .padding(.horizontal, 16)
@@ -390,9 +398,22 @@ struct DictionaryView: View {
     private func autoLearnedRow(for entry: DictionaryEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.lavenderText)
+                    .help("Learned automatically from a History edit")
+                    .accessibilityLabel("Learned automatically")
+
                 Text(entry.term)
                     .font(Theme.body(14, weight: .semibold))
                     .foregroundColor(Theme.textPrimary)
+
+                Text("auto-learned")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .murmurGlassCapsule()
 
                 Spacer()
 
@@ -415,7 +436,7 @@ struct DictionaryView: View {
             }
 
             if !entry.variants.isEmpty {
-                FlowChips(variants: entry.variants)
+                HeardVariants(variants: entry.variants)
             }
         }
         .padding(.horizontal, 16)
@@ -426,27 +447,28 @@ struct DictionaryView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField("Correct spelling — e.g. Kubernetes", text: $newTerm)
-                .textFieldStyle(.plain)
-                .font(Theme.body(13))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .murmurGlassCard()
+            DictionaryTextField(
+                title: "Correct spelling",
+                placeholder: "e.g. Kubernetes",
+                text: $newTerm,
+                emphasizesText: true
+            )
 
-            HStack(spacing: 8) {
-                TextField("Misheard variants, comma-separated", text: $newVariants)
-                    .textFieldStyle(.plain)
-                    .font(Theme.body(13))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .murmurGlassCard()
-                    .onSubmit(addTerm)
+            HStack(alignment: .bottom, spacing: 8) {
+                DictionaryTextField(
+                    title: "Heard as",
+                    hint: "· separate with commas",
+                    placeholder: "e.g. cube net ease, cooper netties",
+                    text: $newVariants
+                )
+                .onSubmit(addTerm)
 
-                Button("Add term", action: addTerm)
+                Button("Add word", action: addTerm)
                     .buttonStyle(.glassProminent)
                     .foregroundColor(Theme.ctaText)
                     .tint(Theme.lavender)
                     .font(.system(size: 13, weight: .semibold))
+                    .fixedSize()
                     .disabled(newTerm.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
@@ -454,10 +476,7 @@ struct DictionaryView: View {
     }
 
     private func addTerm() {
-        let variants = newVariants
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        let variants = DictionaryEntryInput.variants(from: newVariants)
         let term = newTerm.trimmingCharacters(in: .whitespaces)
         guard !term.isEmpty else { return }
         store.add(term: term, variants: variants)
@@ -523,7 +542,7 @@ struct DictionaryView: View {
                 Spacer()
 
                 if entry.fixCount > 0 {
-                    Text("\(entry.fixCount) correction\(entry.fixCount == 1 ? "" : "s")")
+                    Text("\(entry.fixCount) \(entry.fixCount == 1 ? "fix" : "fixes")")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Theme.textSecondary)
                         .padding(.horizontal, 8)
@@ -556,7 +575,7 @@ struct DictionaryView: View {
             }
 
             if !entry.variants.isEmpty {
-                FlowChips(variants: entry.variants)
+                HeardVariants(variants: entry.variants)
             }
         }
         .contextMenu {
@@ -572,22 +591,35 @@ struct DictionaryView: View {
 
     private func editRow(for entry: DictionaryEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField("Term", text: $editTerm)
-                .textFieldStyle(.plain)
-                .font(Theme.body(13))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact)
-                .focused($focusedEditID, equals: entry.id)
-                .onSubmit { saveEdit(for: entry) }
+            VStack(alignment: .leading, spacing: 4) {
+                DictionaryFieldLabel(title: "Correct spelling")
+                TextField("e.g. Kubernetes", text: $editTerm)
+                    .accessibilityLabel("Correct spelling")
+                    .textFieldStyle(.plain)
+                    .font(Theme.body(13, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact)
+                    .focused($focusedEditID, equals: entry.id)
+                    .onSubmit { saveEdit(for: entry) }
+            }
 
-            TextField("Variants, comma-separated", text: $editVariants)
-                .textFieldStyle(.plain)
-                .font(Theme.body(13))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact)
-                .onSubmit { saveEdit(for: entry) }
+            VStack(alignment: .leading, spacing: 4) {
+                DictionaryFieldLabel(title: "Heard as", hint: "separate with commas")
+                TextField("e.g. cube net ease, cooper netties", text: $editVariants)
+                    .accessibilityLabel("Heard as")
+                    .textFieldStyle(.plain)
+                    .font(Theme.body(13))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact)
+                    .onSubmit { saveEdit(for: entry) }
+            }
+
+            DictionaryPreview(
+                variants: DictionaryEntryInput.variants(from: editVariants),
+                term: editTerm.trimmingCharacters(in: .whitespaces)
+            )
 
             HStack(spacing: 8) {
                 Spacer()
@@ -646,13 +678,103 @@ struct DictionaryView: View {
         guard !term.isEmpty else { return }
         var updated = entry
         updated.term = term
-        updated.variants = editVariants
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        updated.variants = DictionaryEntryInput.variants(from: editVariants)
         store.update(updated)
         editingID = nil
         focusedEditID = nil
+    }
+}
+
+private struct DictionaryFieldLabel: View {
+    let title: String
+    var hint: String? = nil
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(Theme.textSecondary)
+            if let hint {
+                Text(hint)
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textSecondary)
+            }
+        }
+    }
+}
+
+private struct DictionaryTextField: View {
+    let title: String
+    var hint: String? = nil
+    let placeholder: String
+    @Binding var text: String
+    var emphasizesText = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            DictionaryFieldLabel(title: title, hint: hint)
+            TextField(placeholder, text: $text)
+                .accessibilityLabel(title)
+                .textFieldStyle(.plain)
+                .font(Theme.body(13, weight: emphasizesText ? .semibold : .regular))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .murmurGlassCard(cornerRadius: Theme.cornerRadiusCompact)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct DictionaryPreview: View {
+    let variants: [String]
+    let term: String
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 5) {
+                Text("Will fix")
+                    .foregroundColor(Theme.textSecondary)
+                ForEach(Array(variants.enumerated()), id: \.offset) { _, variant in
+                    HeardChip(variant: variant)
+                }
+                Text("→")
+                    .foregroundColor(Theme.textSecondary)
+                Text(term)
+                    .font(Theme.body(12, weight: .semibold))
+                    .foregroundColor(Theme.textPrimary)
+            }
+            .font(Theme.body(12))
+        }
+        .frame(height: 22)
+    }
+}
+
+private struct HeardVariants: View {
+    let variants: [String]
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 5) {
+            Text("Heard as")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.textSecondary)
+                .fixedSize()
+                .padding(.top, 3)
+            FlowChips(variants: variants)
+        }
+    }
+}
+
+private struct HeardChip: View {
+    let variant: String
+
+    var body: some View {
+        Text(variant)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(Theme.textSecondary)
+            .strikethrough(true, color: Theme.textSecondary.opacity(0.55))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 3)
+            .murmurGlassCapsule()
     }
 }
 
@@ -665,12 +787,7 @@ private struct FlowChips: View {
         // shapes sample and blend together rather than double-refracting.
         GlassEffectContainer(spacing: 5) {
             FlexibleView(data: variants) { variant in
-                Text(variant)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Theme.textSecondary)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3)
-                    .murmurGlassCapsule()
+                HeardChip(variant: variant)
             }
         }
     }
@@ -749,6 +866,20 @@ enum DictionarySearch {
         }
     }
 
+    /// Presentation-only A–Z order. Store order remains untouched so merely
+    /// opening or searching the Dictionary never rewrites persisted entries.
+    static func sortedEntries(_ entries: [DictionaryEntry]) -> [DictionaryEntry] {
+        entries.sorted { lhs, rhs in
+            let lhsKey = lhs.term.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            let rhsKey = rhs.term.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            let comparison = lhsKey.compare(rhsKey, options: [.numeric], range: nil, locale: .current)
+            if comparison != .orderedSame {
+                return comparison == .orderedAscending
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
     static func corrections(_ groups: [CorrectionGroup], query: String) -> [CorrectionGroup] {
         let needle = needle(query)
         guard !needle.isEmpty else { return groups }
@@ -763,5 +894,14 @@ enum DictionarySearch {
     static func resultCount(entries: [DictionaryEntry], groups: [CorrectionGroup]) -> Int {
         // Auto-learned terms also appear in the approval section.
         entries.count + entries.filter(\.isAutoLearned).count + groups.reduce(0) { $0 + $1.rows.count }
+    }
+}
+
+enum DictionaryEntryInput {
+    static func variants(from value: String) -> [String] {
+        value
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 }
