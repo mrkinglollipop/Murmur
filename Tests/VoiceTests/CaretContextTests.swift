@@ -1265,13 +1265,13 @@ final class HeldCaretLifecycleTests: XCTestCase {
         )
     }
 
-    // MARK: - Post-release capture grace (250ms trailing-word fix)
+    // MARK: - Post-release capture grace
 
-    func testPostReleaseCaptureGraceIsTwoHundredFiftyMilliseconds() {
+    func testPostReleaseCaptureGraceIsFourHundredMilliseconds() {
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGraceForTesting,
-            0.750,
-            "grace window regressed — the last spoken word will clip again"
+            0.400,
+            "grace window regressed — release can capture bystander speech too long"
         )
     }
 

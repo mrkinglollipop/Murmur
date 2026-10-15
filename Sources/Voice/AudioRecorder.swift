@@ -1051,11 +1051,12 @@ final class AudioRecorder {
     /// immediately. The grace buffers still ride the RMS silence guard and
     /// (for streaming engines) must finish landing before
     /// `ElevenLabsRealtimeTranscriber.finalize()` sends its commit frame —
-    /// see `finishStop`. Scales up on long holds (cap 1.25s).
-    /// Base listen-after-release. 500ms still clipped trailing sentences in
-    /// field use; 750ms covers a short last clause after finger-off.
-    private static let postReleaseCaptureGraceBase: TimeInterval = 0.750
-    private static let postReleaseCaptureGraceMax: TimeInterval = 1.25
+    /// see `finishStop`. Scales up on long holds (cap 0.6s).
+    /// Base listen-after-release. 750ms could catch bystander speech after
+    /// release; 400ms ends that window sooner. It is below the old 500ms
+    /// floor, so releasing on a final syllable can clip a trailing word.
+    private static let postReleaseCaptureGraceBase: TimeInterval = 0.400
+    private static let postReleaseCaptureGraceMax: TimeInterval = 0.600
     private static let postReleaseCaptureGraceScaleStart: TimeInterval = 15.0
     private static let postReleaseCaptureGraceScalePerSecond: TimeInterval = 0.005
 
