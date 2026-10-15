@@ -101,6 +101,11 @@ enum SpokenNumberNormalizer {
                 continue
             }
             if let phrase = parsePhrase(at: i, tokens: tokens, text: text) {
+                // A fragment after "point" belongs to a decimal; never convert it alone.
+                if i > 0, tokens[i - 1].lower == "point", joinable(tokens[i - 1], tokens[i], text) {
+                    i = phrase.end
+                    continue
+                }
                 if let (edit, next) = numberEdit(phrase, from: i, tokens: tokens, text: text) {
                     edits.append(edit)
                     i = next
@@ -225,6 +230,11 @@ enum SpokenNumberNormalizer {
         if end < n, joinable(tokens[end - 1], tokens[end], text), tokens[end].isCardinalNumber { return nil }
         if let before = text[..<lower].last, ".@/#_".contains(before) { return nil }
         if isCapitalizedMidSentence(tokens[start], text: text) { return nil }
+        // Consecutive capitalized number words ("Twenty One Pilots") are a name, even at sentence start.
+        let capitalized = (start..<end).filter {
+            tokens[$0].parts != nil && text[tokens[$0].range].first?.isUppercase == true
+        }.count
+        if capitalized >= 2 { return nil }
         return ((lower..<tokens[end - 1].range.upperBound, "\(phrase.value)"), end)
     }
 
@@ -264,7 +274,10 @@ enum SpokenNumberNormalizer {
                     guard last == nil || last == .hundred || last == .thousand else { break outer }
                     group += part.value
                 case .hundred:
-                    guard last == .unit, !hundredUsed, group < 10 else { break outer }
+                    // "twenty-six hundred" is 2600; after a thousand only a lone unit may take "hundred".
+                    guard !hundredUsed,
+                          (last == .unit && (group < 10 || total == 0))
+                            || ((last == .teen || last == .tens) && total == 0) else { break outer }
                     group *= 100
                     hundredUsed = true
                 case .thousand:

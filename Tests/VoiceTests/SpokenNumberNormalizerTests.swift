@@ -97,11 +97,60 @@ final class SpokenNumberNormalizerTests: XCTestCase {
 
     // MARK: - Where it applies
 
-    func testElevenLabsBatchDecodeNormalizes() throws {
-        let json = #"{"text":"Effective September twenty-ninth, it fell zero point eight one percent."}"#
+    func testDecimalFragmentsAfterPointAreNeverConverted() {
+        XCTAssertEqual(n("It costs one point five dollars."), "It costs one point five dollars.")
+        XCTAssertEqual(n("It rose one point twenty five percent."), "It rose one point twenty five percent.")
+        XCTAssertEqual(n("Up twelve point five percent."), "Up 12.5%.")
+    }
+
+    func testCapitalizedNumberWordsAreAName() {
+        XCTAssertEqual(n("Twenty One Pilots released an album."), "Twenty One Pilots released an album.")
+        XCTAssertEqual(n("I love Twenty One Pilots."), "I love Twenty One Pilots.")
+        XCTAssertEqual(n("Twenty one people came."), "21 people came.")
+    }
+
+    func testHundredMultiples() {
+        XCTAssertEqual(n("It cost twenty-six hundred dollars."), "It cost $2600.")
+        XCTAssertEqual(n("About twenty one hundred people."), "About 2100 people.")
+        XCTAssertEqual(n("Two thousand one hundred dollars."), "$2100.")
+    }
+
+    func testElevenLabsBatchDecodeDoesNotNormalize() throws {
+        let json = #"{"text":"Effective September twenty-ninth."}"#
         XCTAssertEqual(
             try ElevenLabsTranscriptionService.decodeTranscript(from: Data(json.utf8)),
-            "Effective September 29th, it fell 0.81%.")
+            "Effective September twenty-ninth.")
+    }
+
+    @MainActor
+    func testPipelineNormalizesOnlyElevenLabsBatchDictation() async {
+        let pipeline = TranscriptionPipeline()
+        let spelled = "Effective September twenty-ninth, it fell zero point eight one percent."
+        let batch = await pipeline.prepareTranscript(
+            spelled, holdToken: 0, replaceHistoryEntryID: nil, engineID: "cloud:elevenLabs")
+        XCTAssertTrue(batch.text.contains("September 29th"), batch.text)
+        XCTAssertTrue(batch.text.contains("0.81%"), batch.text)
+        for other in [nil, "cloud:xai", "elevenLabs-stream", "local"] as [String?] {
+            let r = await pipeline.prepareTranscript(
+                "The date was September twenty-ninth.", holdToken: 0, replaceHistoryEntryID: nil, engineID: other)
+            XCTAssertTrue(r.text.contains("twenty-ninth"), "\(other ?? "nil"): \(r.text)")
+        }
+    }
+
+    @MainActor
+    func testVoiceEditInstructionIsNotNormalized() async {
+        let pipeline = TranscriptionPipeline()
+        let snap = CaretContext.Snapshot(
+            value: String(repeating: "a", count: 33), location: 0, selectionLength: .readable(33),
+            precedingChar: .startOfField, isUnknown: false,
+            focusedElement: AXUIElementCreateApplication(42))
+        let token = pipeline.test_holdVoiceEditSnapshot(snap, frontmostPID: 42)
+        XCTAssertTrue(pipeline.isVoiceEditHold(token))
+        let r = await pipeline.prepareTranscript(
+            "Replace 'twenty five' with 'many'.", holdToken: token,
+            replaceHistoryEntryID: nil, engineID: "cloud:elevenLabs")
+        XCTAssertTrue(r.text.contains("twenty five"), r.text)
+        XCTAssertFalse(r.text.contains("25"), r.text)
     }
 
     func testOtherEnginesAndSharedPipelineAreNotNormalized() throws {
