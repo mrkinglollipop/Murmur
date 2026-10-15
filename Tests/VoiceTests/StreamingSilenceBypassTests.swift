@@ -350,21 +350,24 @@ final class StreamingSilenceBypassTests: XCTestCase {
     }
 
     func testPostReleaseCaptureGraceScalesForLongHolds() {
+        XCTAssertEqual(AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 15), 0.400, accuracy: 0.0001)
+        XCTAssertEqual(AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 35), 0.500, accuracy: 0.0001)
+        XCTAssertEqual(AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 55), 0.600, accuracy: 0.0001)
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 10),
-            0.750,
+            0.400,
             accuracy: 0.0001
         )
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 60),
-            0.975,
+            0.600,
             accuracy: 0.0001
         )
         XCTAssertEqual(
             AudioRecorder.postReleaseCaptureGrace(forHoldDuration: 180),
-            1.25,
+            0.600,
             accuracy: 0.0001,
-            "long holds cap at 1.25s of post-release capture"
+            "long holds cap at 0.6s of post-release capture"
         )
     }
 
