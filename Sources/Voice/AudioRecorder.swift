@@ -542,11 +542,11 @@ final class AudioRecorder {
     /// it off so a broken voice-processing route costs at most one retry.
     static func shouldEnableVoiceProcessing(
         settingOn: Bool,
-        deviceIsBuiltIn: Bool,
-        suppressed: Bool,
-        engineRunning: Bool
+        deviceIsBuiltIn: @autoclosure () -> Bool,
+        suppressed: @autoclosure () -> Bool,
+        engineRunning: @autoclosure () -> Bool
     ) -> Bool {
-        settingOn && deviceIsBuiltIn && !suppressed && !engineRunning
+        settingOn && deviceIsBuiltIn() && !suppressed() && !engineRunning()
     }
 
     /// Bind the input AU to `deviceID`. Must not abort: `-[AVAudioEngine prepare]`
@@ -555,6 +555,8 @@ final class AudioRecorder {
     /// A voice-processing bind that fails in any way falls back to the plain
     /// bind on a fresh engine.
     private func bindInputNode(to deviceID: AudioDeviceID) -> Bool {
+        // Default-off bind must match the pre-feature call sequence: the
+        // autoclosure arguments below are not evaluated unless the setting is on.
         let wantsVoiceProcessing = Self.shouldEnableVoiceProcessing(
             settingOn: voiceIsolationProvider?() ?? false,
             deviceIsBuiltIn: Self.audioDeviceIsBuiltIn(deviceID),

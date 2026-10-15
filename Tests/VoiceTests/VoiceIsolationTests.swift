@@ -107,6 +107,15 @@ final class VoiceIsolationTests: XCTestCase {
         XCTAssertEqual(node.resolutions, [true], "First inputNode access must be inside the catcher")
         XCTAssertEqual(node.calls, ["setCurrentDevice(42, 0)"])
         XCTAssertEqual(steps, ["prepare(inside=true)"])
+
+        // With the setting off, no device or engine state is queried at all.
+        var queries: [String] = []
+        XCTAssertFalse(AudioRecorder.shouldEnableVoiceProcessing(
+            settingOn: false,
+            deviceIsBuiltIn: { queries.append("builtIn"); return true }(),
+            suppressed: { queries.append("suppressed"); return false }(),
+            engineRunning: { queries.append("isRunning"); return false }()))
+        XCTAssertEqual(queries, [], "Default-off bind must query nothing")
     }
 
     func testVoiceProcessingBindReadsFormatInsideTheCatcher() throws {
