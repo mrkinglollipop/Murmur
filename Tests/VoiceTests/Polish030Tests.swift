@@ -174,6 +174,143 @@ final class Polish030Tests: XCTestCase {
         XCTAssertEqual(DictionarySearch.resultCount(entries: [learned], groups: matches), 3)
     }
 
+    func testDictionarySearchSortsDisplayEntriesWithoutMutatingInput() {
+        let tieFirst = DictionaryEntry(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            term: "Áegis",
+            variants: []
+        )
+        let tieSecond = DictionaryEntry(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+            term: "aegis",
+            variants: []
+        )
+        let entries = [
+            DictionaryEntry(term: "Z", variants: []),
+            DictionaryEntry(term: "xAI", variants: []),
+            DictionaryEntry(term: "Wispr Flow", variants: ["WhisperFlow"]),
+            DictionaryEntry(term: "tavily", variants: []),
+            DictionaryEntry(term: "Tauri", variants: []),
+            tieSecond,
+            tieFirst
+        ]
+        let original = entries
+
+        let sorted = DictionarySearch.sortedEntries(entries)
+
+        XCTAssertEqual(sorted.map(\.term), ["Áegis", "aegis", "Tauri", "tavily", "Wispr Flow", "xAI", "Z"])
+        XCTAssertEqual(entries, original, "sorting is display-only and must not rewrite store input")
+        XCTAssertEqual(DictionarySearch.sortedEntries(Array(entries.reversed())).map(\.id), sorted.map(\.id))
+        let pending = entries.map { entry in
+            var pendingEntry = entry
+            pendingEntry.isAutoLearned = true
+            return pendingEntry
+        }
+        XCTAssertEqual(DictionarySearch.sortedEntries(pending).map(\.term), sorted.map(\.term))
+        XCTAssertEqual(DictionarySearch.sortedEntries(DictionarySearch.entries(entries, query: " flow ")).map(\.term), ["Wispr Flow"])
+    }
+
+    func testDictionaryVariantInputParsesCommaSeparatedPreviewValues() {
+        XCTAssertEqual(
+            DictionaryEntryInput.variants(from: " cube net ease, , cooper netties ,\n\t"),
+            ["cube net ease", "cooper netties"]
+        )
+    }
+
+    func testDictionaryPreviewRequiresTermAndParsedVariants() {
+        for term in ["", " ", " \n\t"] {
+            XCTAssertFalse(DictionaryEntryInput.showsPreview(term: term, variants: ["Tari"]))
+        }
+        for input in ["", " ", ", ,\n\t"] {
+            XCTAssertFalse(DictionaryEntryInput.showsPreview(
+                term: "Tauri", variants: DictionaryEntryInput.variants(from: input)
+            ))
+        }
+        XCTAssertTrue(DictionaryEntryInput.showsPreview(
+            term: " Tauri \n", variants: DictionaryEntryInput.variants(from: " , Tari, ")
+        ))
+    }
+
+    @MainActor
+    func testDictionaryPreviewWrapsLongVariantsAndReplacement() throws {
+        let variants = ["cube net ease", "cooper netties", String(repeating: "a long heard phrase ", count: 8)]
+        let term = "Kubernetes configuration with a deliberately long replacement that must remain fully visible"
+        let heights = try [407.0, 527.0].map { width -> CGFloat in
+            let view = NSHostingView(rootView: DictionaryPreview(variants: variants, term: term)
+                .frame(width: width, alignment: .leading)
+                .background(Theme.bg)
+                .preferredColorScheme(.dark))
+            let size = view.fittingSize
+            XCTAssertEqual(size.width, width, accuracy: 0.5)
+            XCTAssertGreaterThan(size.height, 44, "The preview must grow beyond the old single line")
+            view.frame = NSRect(origin: .zero, size: size)
+            view.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let image = NSImage(size: bitmap.size)
+            image.addRepresentation(bitmap)
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "dictionary-wrapping-preview-\(Int(width))w"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            return size.height
+        }
+        XCTAssertGreaterThanOrEqual(heights[0], heights[1])
+    }
+
+    @MainActor
+    func testDictionaryLayoutSnapshotsAtMainPaneWidths() throws {
+        let dictionaryURL = directory.appendingPathComponent("dictionary.json")
+        try JSONEncoder().encode([
+            DictionaryEntry(term: "Tauri", variants: ["Tari"], fixCount: 1),
+            DictionaryEntry(term: "Wispr Flow", variants: ["WhisperFlow", "whisper flow"], fixCount: 2),
+            DictionaryEntry(term: "tavily", variants: ["Tivoli"], isAutoLearned: true)
+        ]).write(to: dictionaryURL)
+        let store = DictionaryStore(
+            fileURL: dictionaryURL,
+            blocklistFileURL: directory.appendingPathComponent("dictionary-blocklist.json")
+        )
+
+        let corrections = CorrectionsLog(fileURL: directory.appendingPathComponent("corrections.json"))
+        corrections.append([
+            CorrectionRecord(heard: "Tari", replaced: "Tauri", source: .dictionary),
+            CorrectionRecord(heard: "WhisperFlow", replaced: "Wispr Flow", source: .dictionary),
+            CorrectionRecord(heard: "a multi-word heard phrase that needs more room", replaced: "Kubernetes configuration", source: .dictionary),
+            CorrectionRecord(heard: String(repeating: "misheard", count: 12), replaced: String(repeating: "Kubernetes", count: 8), source: .learnAccepted)
+        ])
+
+        let height: CGFloat = 1_050
+        for width: CGFloat in [439, 559] {
+            let view = NSHostingView(
+                rootView: DictionaryView(store: store, correctionsLog: corrections)
+                    .frame(width: width, height: height)
+                    .background(Theme.bg)
+                    .preferredColorScheme(.dark)
+            )
+            view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+            view.layoutSubtreeIfNeeded()
+
+            XCTAssertTrue(view.bounds.width.isFinite && view.bounds.height.isFinite)
+            XCTAssertEqual(view.bounds.width, width)
+            XCTAssertEqual(view.bounds.height, height)
+            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let scale = view.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+            XCTAssertEqual(bitmap.pixelsWide, Int(width * scale))
+            XCTAssertEqual(bitmap.pixelsHigh, Int(height * scale))
+
+            let image = NSImage(size: bitmap.size)
+            image.addRepresentation(bitmap)
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "dictionary-correct-first-\(Int(width))w"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+
+        store.flush()
+        corrections.flush()
+    }
+
     func testRetryStateKeepsConcurrentRowsIndependentAndRejectsDuplicateStart() {
         let first = UUID()
         let second = UUID()
