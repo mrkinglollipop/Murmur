@@ -102,13 +102,13 @@ enum VoiceEditRouting {
         return fresh.isEditable == true
     }
 
-    /// A release with nothing editable focused binds the take to no field
-    /// (2026-10-15: browser window closed mid-hold, user clicked into another
-    /// app). Unreadable editability keeps the take bound to the release target.
+    /// A release with nothing focused, or a frontmost app with no windows,
+    /// binds the take to no field (2026-10-15: browser window closed mid-hold,
+    /// user clicked into another app). A focused element that merely reads as
+    /// non-editable stays bound: terminals (Terminal, iTerm, Ghostty) report
+    /// their text area that way and must keep typing into it.
     static func isUnboundReleaseTarget(field: CaretContext.FocusedField?, appHasWindows: Bool?) -> Bool {
-        if appHasWindows == false { return true }
-        guard let field else { return true }
-        return field.isEditable == false
+        appHasWindows == false || field == nil
     }
 
     /// AX role, editability, PID and bundle only. Never field text.

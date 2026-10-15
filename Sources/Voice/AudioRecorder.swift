@@ -1421,10 +1421,11 @@ final class AudioRecorder {
         return (token, CaretContext.snapshot(frontmostPID: releasePID), releasePID)
     }
 
-    /// Releasing with nothing editable focused (no focused element, a
-    /// non-editable one, or a frontmost app with no windows) leaves the take
-    /// unbound: it is typed into whatever editable field is focused when the
-    /// text arrives, and any hold-start selection edit is dropped.
+    /// Releasing with no focused element, or into a frontmost app with no
+    /// windows, leaves the take unbound: it is typed into whatever editable
+    /// field is focused when the text arrives, and any hold-start selection
+    /// edit is dropped. A focused but non-editable-looking element (terminals)
+    /// stays bound.
     private func markSessionHoldUnboundIfNoEditableTarget(
         _ hold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?),
         generation: UInt64
@@ -1444,7 +1445,7 @@ final class AudioRecorder {
         let hasWindows = CaretContext.appHasWindows(pid: releasePID)
         guard VoiceEditRouting.isUnboundReleaseTarget(field: field, appHasWindows: hasWindows) else { return }
         asrSelector.markHoldUnbound(token)
-        vlog("inject target unbound at release — no editable focus: "
+        vlog("inject target unbound at release — no focused element or no windows: "
             + VoiceEditRouting.focusDiagnostic(field: field, appHasWindows: hasWindows, pid: releasePID,
                 bundle: TranscriptionPipeline.bundleIDForLog(releasePID)))
     }

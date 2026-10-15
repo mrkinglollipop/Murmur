@@ -125,6 +125,18 @@ final class UnboundTakeTests: XCTestCase {
         XCTAssertEqual(result.clipboard, "Hello there.")
     }
 
+    /// Terminals report their text area as non-editable; a bound take whose
+    /// same element is still focused at insert must be typed, not clipboarded.
+    @MainActor
+    func testBoundTakeInNonEditableLookingTerminalFieldIsTyped() {
+        let terminal = field(element: 501, role: "AXTextArea", editable: false)
+        let result = deliver(
+            held: terminal, unbound: false, atInsert: terminal,
+            frontmostPID: releasePID, expectedOutcome: .inserted)
+        XCTAssertEqual(result.typed, "Hello there.")
+        XCTAssertNil(result.clipboard)
+    }
+
     @MainActor
     func testUnboundTakeDropsVoiceEditIntentAndTypesDictation() {
         let result = deliver(
@@ -151,8 +163,12 @@ final class UnboundTakeTests: XCTestCase {
             .init(element: AXUIElementCreateApplication(501), role: role, isEditable: editable)
         }
         XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: nil, appHasWindows: nil))
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXWebArea", false), appHasWindows: true))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: nil, appHasWindows: true))
         XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: focused(textArea, true), appHasWindows: false))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXWebArea", false), appHasWindows: false))
+        // Terminal-like: focused but reads non-editable — stays bound.
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXWebArea", false), appHasWindows: true))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused("AXGroup", false), appHasWindows: nil))
         XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused(textArea, true), appHasWindows: true))
         XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(field: focused(textArea, true), appHasWindows: nil))
         // Unreadable editability keeps the release target.
