@@ -60,7 +60,7 @@ enum TransformRunner {
     }
 
     /// Copies a finished Transform result as an ordinary user-facing copy,
-    /// unless the clipboard changed since the run started (a newer copy on this
+    /// unless something other than Murmur changed the clipboard since the run started (a newer copy on this
     /// Mac or one arriving over Universal Clipboard). A result that lands late
     /// must not replace what the user copied while waiting.
     static func copyResultIfClipboardUnchanged(
@@ -68,7 +68,7 @@ enum TransformRunner {
         on pasteboard: NSPasteboard,
         startedAtChangeCount: Int
     ) -> Bool {
-        guard pasteboard.changeCount == startedAtChangeCount else { return false }
+        guard TextInjector.pasteboardChangedOnlyByMurmur(since: startedAtChangeCount, on: pasteboard) else { return false }
         pasteboard.clearContents()
         pasteboard.setString(result, forType: .string)
         return true
