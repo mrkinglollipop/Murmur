@@ -211,9 +211,11 @@ final class TranscriptionPipeline {
     func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
         if let token {
             voiceEditIntents.removeValue(forKey: token)
+            unboundHoldTokens.remove(token)
             if heldCaretToken != token { return }
         } else {
             voiceEditIntents.removeAll()
+            unboundHoldTokens.removeAll()
         }
         heldCaretSnapshot = nil
         heldFrontmostPID = nil
@@ -240,6 +242,26 @@ final class TranscriptionPipeline {
     private func consumeVoiceEditIntent(matching token: UInt64) -> VoiceEditIntent? {
         voiceEditIntents.removeValue(forKey: token)
     }
+
+    /// Holds released with nothing editable focused. Their text goes to the
+    /// editable field focused at insert, in any app, as ordinary dictation.
+    /// Main-thread only; capped like `abandonedHoldTokens`.
+    private var unboundHoldTokens: Set<UInt64> = []
+
+    /// Main thread; must run before `finishTranscription` so a hold-start
+    /// selection is never edited by a take that left its field.
+    func markHoldUnbound(_ token: UInt64) {
+        assert(Thread.isMainThread, "markHoldUnbound requires main thread")
+        unboundHoldTokens.insert(token)
+        if unboundHoldTokens.count > Self.abandonedHoldTokenCap, let oldest = unboundHoldTokens.min() {
+            unboundHoldTokens.remove(oldest)
+        }
+        if voiceEditIntents.removeValue(forKey: token) != nil {
+            vlog("voice edit dropped: no editable target at release — delivering as dictation")
+        }
+    }
+
+    var test_unboundHoldTokens: Set<UInt64> { unboundHoldTokens }
 
     /// Hold tokens whose processing HUD was already dismissed by the
     /// recorder's watchdog. A late result for one of these is saved to History
@@ -1144,7 +1166,7 @@ final class TranscriptionPipeline {
             // for clear still uses sessionHeldToken; live held is only a
             // fallback when the stop sample was nil — so clearHeldCaretSnapshot
             // nilling the live slot cannot wipe a good stop sample.
-            let heldAtStart = Self.resolveHeldAtStart(
+            let releaseHeld = Self.resolveHeldAtStart(
                 sessionHeldSnapshot: sessionHeldSnapshot,
                 sessionHeldToken: sessionHeldToken,
                 liveToken: self.heldCaretToken,
@@ -1153,7 +1175,8 @@ final class TranscriptionPipeline {
             let clearToken = sessionHeldToken
             let replaceID = replaceHistoryEntryID
             // Entry-sampled will-start PID — do not re-read NSWorkspace as "held".
-            let heldPID = sessionHeldFrontmostPID
+            let releasePID = sessionHeldFrontmostPID
+            let unbound = replaceID == nil && self.unboundHoldTokens.remove(sessionHeldToken) != nil
 
             // Insert blocks up to ~1s (event delivery + confirmation waits) —
             // run it off-main so HUD animations don't stall. Only the
@@ -1162,16 +1185,27 @@ final class TranscriptionPipeline {
             DispatchQueue.global(qos: .utility).async {
                 // Sample frontmost PID + secure **before** fresh AX / transforms
                 // so app-switch abort never drives wrong-app caret reads.
-                let (currentPID, liveSecureAtSample): (pid_t?, Bool) = DispatchQueue.main.sync {
+                let (currentPID, liveSecureAtSample, unboundField): (pid_t?, Bool, CaretContext.FocusedField?) = DispatchQueue.main.sync {
                     let target = self.injectionTarget(voiceEdit: isSelectionDelivery)
-                    return (target.pid, target.secureInput)
+                    let field = unbound ? target.pid.flatMap { self.deliveryFocusedField(frontmostPID: $0) } : nil
+                    if unbound {
+                        vlog("inject: unbound take at insert — "
+                            + VoiceEditRouting.focusDiagnostic(field: field, appHasWindows: nil, pid: target.pid,
+                                bundle: target.bundleIdentifier ?? "nil"))
+                    }
+                    return (target.pid, target.secureInput, field)
                 }
+                // An unbound take adopts the app and field focused now, so the
+                // release-to-insert app-switch rule measures from here.
+                let heldPID = unbound ? currentPID : releasePID
+                let heldAtStart = unbound ? nil : releaseHeld
+                let unboundWithoutTarget = unbound && unboundField?.isEditable != true
                 let axPlan = Self.injectAXPlan(
                     replaceHistoryEntryID: replaceID,
                     heldPID: heldPID,
                     currentPID: currentPID
                 )
-                let abortForAppSwitch = axPlan == .abortWithoutFreshAX
+                let abortForAppSwitch = axPlan == .abortWithoutFreshAX || unboundWithoutTarget
 
                 let textToInject: String
                 let liveSecure: Bool
@@ -1248,7 +1282,11 @@ final class TranscriptionPipeline {
                 case .abortedAppSwitch:
                     // Live secure re-read before pasteboard — skip leave when secure.
                     DispatchQueue.main.sync {
-                        Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
+                        if unboundWithoutTarget {
+                            vlog("inject abort: unbound take and nothing editable focused at insert")
+                        } else {
+                            Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
+                        }
                         abortLeaveBecameSecure = self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: isSelectionDelivery)
                     }
                     insertResult = .failed
@@ -1306,6 +1344,14 @@ final class TranscriptionPipeline {
                     case .insert(let deliveryPID):
                         // Undo relies on the host's ⌘Z: replacement is one inject,
                         // with no delete or select-all step in any lane.
+                        // Unbound: any editable field in the adopted app will do.
+                        let unboundFieldCheck: (() -> Bool?)? = !unbound ? nil : {
+                            guard self.deliveryFocusedField(frontmostPID: deliveryPID)?.isEditable == true else {
+                                vlog("inject abort: unbound take lost its editable focus before insert")
+                                return false
+                            }
+                            return true
+                        }
                         if isSelectionDelivery, let hooks = self.voiceEditInjectionHooks {
                             insertResult = hooks.insert(textToInject)
                         } else {
@@ -1321,7 +1367,7 @@ final class TranscriptionPipeline {
                                     }
                                     return true
                                 },
-                                validateField: heldAtStart?.focusedElement.map { heldElement in
+                                validateField: unboundFieldCheck ?? heldAtStart?.focusedElement.map { heldElement in
                                     {
                                         guard let fresh = self.deliveryFocusedField(frontmostPID: deliveryPID) else {
                                             guard isSelectionDelivery else { return nil }

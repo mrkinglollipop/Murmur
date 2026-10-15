@@ -49,6 +49,19 @@ enum CaretContext {
         return FocusedField(element: element, role: role, isEditable: isEditableText(element, role: role, reader: reader))
     }
 
+    /// False when the app reports an empty window list (a browser whose last
+    /// window just closed stays frontmost). Nil = unreadable.
+    static func appHasWindows(pid: pid_t, reader: AXReader = AXReader()) -> Bool? {
+        let appElement = AXUIElementCreateApplication(pid)
+        _ = reader.setTimeout(appElement, messagingTimeoutSeconds)
+        var windowsRef: CFTypeRef?
+        guard reader.copyAttribute(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AnyObject] else {
+            return nil
+        }
+        return !windows.isEmpty
+    }
+
     enum PrecedingChar: Equatable {
         case known(Character)
         case startOfField

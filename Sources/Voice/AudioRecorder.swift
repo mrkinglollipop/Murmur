@@ -1421,6 +1421,34 @@ final class AudioRecorder {
         return (token, CaretContext.snapshot(frontmostPID: releasePID), releasePID)
     }
 
+    /// Releasing with nothing editable focused (no focused element, a
+    /// non-editable one, or a frontmost app with no windows) leaves the take
+    /// unbound: it is typed into whatever editable field is focused when the
+    /// text arrives, and any hold-start selection edit is dropped.
+    private func markSessionHoldUnboundIfNoEditableTarget(
+        _ hold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?),
+        generation: UInt64
+    ) {
+        assert(Thread.isMainThread, "markSessionHoldUnboundIfNoEditableTarget requires main thread")
+        guard let token = hold.token else { return }
+        #if DEBUG
+        // Fixture holds must not probe the test host's real focus.
+        if micCaptureTestHooks != nil { return }
+        #endif
+        guard let releasePID = Self.resolvedReleasePID(
+            sample: releaseSample,
+            generation: generation,
+            live: { currentFrontmostPID() }
+        ) else { return }
+        let field = CaretContext.focusedField(frontmostPID: releasePID)
+        let hasWindows = CaretContext.appHasWindows(pid: releasePID)
+        guard VoiceEditRouting.isUnboundReleaseTarget(field: field, appHasWindows: hasWindows) else { return }
+        asrSelector.markHoldUnbound(token)
+        vlog("inject target unbound at release — no editable focus: "
+            + VoiceEditRouting.focusDiagnostic(field: field, appHasWindows: hasWindows, pid: releasePID,
+                bundle: TranscriptionPipeline.bundleIDForLog(releasePID)))
+    }
+
     /// After inject pipeline finishes a take: drop that take's AudioRecorder
     /// session slots + cache entry. Token-matched so a newer pending that
     /// differs from the consumed token is preserved. Does not touch the live
@@ -2475,6 +2503,7 @@ final class AudioRecorder {
         // gesture and must not drift to whatever app is frontmost 250ms
         // later.
         let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold(), generation: capturedGeneration)
+        markSessionHoldUnboundIfNoEditableTarget(sessionHold, generation: capturedGeneration)
         let holdDuration = startTime.map { Date().timeIntervalSince($0) }
 
         armProcessingWatchdog(sessionToken: sessionHold.token, audioDuration: holdDuration ?? 0)

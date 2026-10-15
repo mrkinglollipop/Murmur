@@ -102,6 +102,23 @@ enum VoiceEditRouting {
         return fresh.isEditable == true
     }
 
+    /// A release with nothing editable focused binds the take to no field
+    /// (2026-10-15: browser window closed mid-hold, user clicked into another
+    /// app). Unreadable editability keeps the take bound to the release target.
+    static func isUnboundReleaseTarget(field: CaretContext.FocusedField?, appHasWindows: Bool?) -> Bool {
+        if appHasWindows == false { return true }
+        guard let field else { return true }
+        return field.isEditable == false
+    }
+
+    /// AX role, editability, PID and bundle only. Never field text.
+    static func focusDiagnostic(field: CaretContext.FocusedField?, appHasWindows: Bool?, pid: pid_t?, bundle: String) -> String {
+        let role = field.map { $0.role ?? "?" } ?? "none"
+        let editable = field?.isEditable.map { $0 ? "yes" : "no" } ?? "?"
+        let windows = appHasWindows.map { $0 ? "yes" : "no" } ?? "?"
+        return "role=\(role) editable=\(editable) windows=\(windows) pid=\(pid.map { String($0) } ?? "nil") bundle=\(bundle)"
+    }
+
     /// Counts, ranges and AX roles only. Never field text.
     static func deliveryCheckDiagnostic(
         check: String, held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot, pid: pid_t?
