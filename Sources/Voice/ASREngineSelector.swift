@@ -176,6 +176,10 @@ final class ASREngineSelector {
         pipeline.isVoiceEditHold(token)
     }
 
+    func dropVoiceEditIntent(matching token: UInt64) {
+        pipeline.dropVoiceEditIntent(matching: token)
+    }
+
     @discardableResult
     func test_holdSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
         pipeline.test_holdSnapshot(snapshot)
