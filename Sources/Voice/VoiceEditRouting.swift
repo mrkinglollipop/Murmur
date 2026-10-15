@@ -73,13 +73,37 @@ enum VoiceEditRouting {
         guard !splitsSurrogatePair(snapshot.location), !splitsSurrogatePair(end) else { return nil }
         return String(decoding: units[snapshot.location..<end], as: UTF16.self)
     }
+
+    /// Assistant-style lead-in ("Sure! Here's the edited text:") ending in a colon
+    /// or line break. Deliberately narrow: a bare "OK" or "Here" without the
+    /// terminator is ordinary prose.
+    private static let assistantPreamble = "^(?:"
+        + "(?:sure|certainly|of course|okay|ok|absolutely)[!.,]?[ \\t]*(?:here(?:'s|’s| is| are)[^:\\n]{0,40})?[:\\n]"
+        + "|here(?:'s|’s| is| are)[^:\\n]{0,40}[:\\n]"
+        + "|the (?:edited|revised|rewritten|updated) (?:text|version)[^:\\n]{0,20}[:\\n]"
+        + "|(?:edited|revised|rewritten|updated)(?: text| version)?[:\\n]"
+        + ")"
+
+    private static func startsWithAssistantPreamble(_ text: String) -> Bool {
+        text.range(of: assistantPreamble, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     /// Rewrites share cleanup's length and symbol-only checks, but deliberately
     /// skip word preservation: changing the wording is the requested operation.
     static func resultLooksUsable(_ result: String, over selection: String) -> Bool {
         let output = result.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !output.isEmpty, output.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
-        let ratio = Double(output.count) / Double(max(selection.count, 1))
-        return (0.4...2.0).contains(ratio)
+        // The prompt demands only the edited text. A lead-in the selection did not
+        // itself start with is the model talking, and must not be injected.
+        let selectionStart = selection.trimmingCharacters(in: .whitespacesAndNewlines)
+        if startsWithAssistantPreamble(output), !startsWithAssistantPreamble(selectionStart) { return false }
+        // Short selections legitimately grow (one word becomes a phrase), so the
+        // ceiling is the larger of 2x and +160 characters; long selections are
+        // still held to 2x so runaway model output cannot replace them.
+        let count = selection.count
+        let ceiling = max(count * 2, count + 160)
+        let floor = Int(0.4 * Double(count))
+        return output.count >= floor && output.count <= ceiling
     }
 
     static func fieldMatches(held: AXUIElement, fresh: AXUIElement?) -> Bool {
