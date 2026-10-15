@@ -423,6 +423,45 @@ final class VoiceEditTests: XCTestCase {
         }
     }
 
+    func testResultLengthBoundaryIsExact() {
+        func ok(_ n: Int, over selection: String) -> Bool {
+            VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: n), over: selection)
+        }
+        let eight = String(repeating: "a", count: 8)
+        XCTAssertTrue(ok(168, over: eight))
+        XCTAssertFalse(ok(169, over: eight))
+        let twoHundred = String(repeating: "a", count: 200)
+        XCTAssertTrue(ok(400, over: twoHundred))
+        XCTAssertFalse(ok(401, over: twoHundred))
+        let ten = String(repeating: "a", count: 10)
+        XCTAssertTrue(ok(4, over: ten))
+        XCTAssertFalse(ok(3, over: ten))
+    }
+
+    func testResultRejectsAssistantPreamblesOnlyWhenSelectionLacksOne() {
+        let selection = "tomorrow"
+        for chatty in [
+            "Sure! Here's the edited text: Tomorrow",
+            "Sure, here is the result:\nTomorrow",
+            "Certainly!\nTomorrow",
+            "Of course: Tomorrow",
+            "OK: Tomorrow",
+            "Here are the edits: Tomorrow",
+            "The edited text: Tomorrow",
+            "Edited: Tomorrow",
+            "here's the revised version:\nTomorrow",
+        ] {
+            XCTAssertFalse(VoiceEditRouting.resultLooksUsable(chatty, over: selection), chatty)
+        }
+        // Ordinary prose that merely starts the same way stays acceptable.
+        for fine in ["OK then, see you at 5: sharp", "Here we go again", "Tomorrow: Sure thing", "Okay"] {
+            XCTAssertTrue(VoiceEditRouting.resultLooksUsable(fine, over: selection), fine)
+        }
+        // The selection itself began with a lead-in, so keeping it is not a preamble.
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("Here is the plan: ship it", over: "here is the plan: ship"))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("OK: ready", over: "ok: ready now"))
+    }
+
     func testSelectionRecheckRequiresReadableUnchangedValueAndExactRange() {
         let held = snapshot(value: "same same", location: 0, selectionLength: .readable(4))
         XCTAssertTrue(VoiceEditRouting.selectionMatches(held: held, fresh: held))
