@@ -361,7 +361,8 @@ final class ElevenLabsTranscriptionService: CloudTranscriptionService {
         guard !decoded.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CloudTranscriptionError.emptyTranscript(provider: .elevenLabs)
         }
-        return decoded.text
+        // Batch spells numbers out; the realtime stream writes digits.
+        return SpokenNumberNormalizer.normalize(decoded.text)
     }
 }
 
