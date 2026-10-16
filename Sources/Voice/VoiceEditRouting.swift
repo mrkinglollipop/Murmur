@@ -111,6 +111,71 @@ enum VoiceEditRouting {
         return CFEqual(held, fresh)
     }
 
+    /// Ordinary dictation types at the current caret, as a keyboard would.
+    /// Chromium/Electron recreate the composer's AX element while it keeps
+    /// focus, so identity alone false-aborts (2026-10-15, Claude desktop).
+    /// With the frontmost PID already pinned by the injector, an editable
+    /// element of the held role is accepted. An unread held role keeps the
+    /// strict identity rule. Voice edit never uses this: it must replace the
+    /// exact selection it read.
+    static func ordinaryDeliveryFieldMatches(
+        held: AXUIElement, heldRole: String?, fresh: CaretContext.FocusedField
+    ) -> Bool {
+        if CFEqual(held, fresh.element) { return true }
+        guard let heldRole, fresh.role == heldRole else { return false }
+        return fresh.acceptsRelaxedDelivery
+    }
+
+    /// A release with nothing focused, or a frontmost app with no windows,
+    /// binds the take to no field (2026-10-15: browser window closed mid-hold,
+    /// user clicked into another app). A focused element that merely reads as
+    /// non-editable stays bound: terminals (Terminal, iTerm, Ghostty) report
+    /// their text area that way and must keep typing into it. Only definite
+    /// answers unbind: a timed-out or failed focus read keeps the release app,
+    /// so a slow app cannot hand its text to whatever is focused later.
+    static func isUnboundReleaseTarget(focus: CaretContext.FocusRead, appHasWindows: Bool?) -> Bool {
+        if appHasWindows == false { return true }
+        if case .noFocus = focus { return true }
+        return false
+    }
+
+    /// AX role, editability, PID and bundle only. Never field text.
+    static func focusDiagnostic(field: CaretContext.FocusedField?, appHasWindows: Bool?, pid: pid_t?, bundle: String) -> String {
+        let role = field.map { $0.role ?? "?" } ?? "none"
+        let editable = field?.isEditable.map { $0 ? "yes" : "no" } ?? "?"
+        let windows = appHasWindows.map { $0 ? "yes" : "no" } ?? "?"
+        return "role=\(role) editable=\(editable) windows=\(windows) pid=\(pid.map { String($0) } ?? "nil") bundle=\(bundle)"
+    }
+
+    /// Counts, ranges and AX roles only. Never field text.
+    static func deliveryCheckDiagnostic(
+        check: String, held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot, pid: pid_t?
+    ) -> String {
+        func selection(_ s: CaretContext.Snapshot) -> String {
+            guard !s.isUnknown else { return "?" }
+            switch s.selectionLength {
+            case .readable(let n): return "\(s.location)+\(n)"
+            case .unreadable: return "\(s.location)+?"
+            }
+        }
+        func valueLength(_ s: CaretContext.Snapshot) -> String { s.isUnknown ? "?" : "\(s.value.utf16.count)" }
+        let identity: String
+        switch (held?.focusedElement, fresh.focusedElement) {
+        case (let h?, let f?): identity = CFEqual(h, f) ? "same" : "differs"
+        case (nil, _): identity = "held-unavailable"
+        case (_, nil): identity = "fresh-unavailable"
+        }
+        let editable: String = fresh.focusedIsEditable.map { $0 ? "yes" : "no" } ?? "?"
+        let heldRole: String = held?.focusedRole ?? "?"
+        let freshRole: String = fresh.focusedRole ?? "?"
+        let heldLength: String = held.map(valueLength) ?? "?"
+        let heldSelection: String = held.map(selection) ?? "?"
+        let pidText: String = pid.map { String($0) } ?? "?"
+        return "\(check) check failed — identity=\(identity) role=\(heldRole)→\(freshRole)"
+            + " freshEditable=\(editable) valueLen=\(heldLength)→\(valueLength(fresh))"
+            + " selection=\(heldSelection)→\(selection(fresh)) pid=\(pidText)"
+    }
+
     /// Element identity, field value, and range must all match the hold-start
     /// snapshot. Another field with identical content is not the same selection.
     static func selectionMatches(held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot) -> Bool {

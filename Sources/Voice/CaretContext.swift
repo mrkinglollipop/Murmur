@@ -9,6 +9,106 @@ enum CaretContext {
         var copyAttribute: (AXUIElement, CFString, UnsafeMutablePointer<CFTypeRef?>) -> AXError = AXUIElementCopyAttributeValue
     }
 
+    /// Focused element plus the two properties ordinary delivery compares when
+    /// AX identity alone cannot: Chromium/Electron recreate the composer's AX
+    /// element while it keeps focus, so `CFEqual` fails for the same field.
+    struct FocusedField {
+        let element: AXUIElement
+        let role: String?
+        let isEditable: Bool?
+
+        /// A relaxed or unbound delivery may type here: a confirmed text
+        /// input that is not a password field.
+        var acceptsRelaxedDelivery: Bool {
+            isEditable == true && role != CaretContext.secureTextFieldRole
+        }
+    }
+
+    /// Focus read at release. Only `.noFocus` is a definite answer that
+    /// nothing is focused; a failed, timed-out or malformed read is `.unknown`
+    /// and must be treated as still bound to the release app.
+    enum FocusRead {
+        case focused(FocusedField)
+        case noFocus
+        case unknown
+
+        var field: FocusedField? {
+            if case .focused(let field) = self { return field }
+            return nil
+        }
+    }
+
+    static let editableTextRoles: Set<String> = [
+        kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String, "AXSearchField",
+    ]
+
+    static let secureTextFieldRole = kAXSecureTextFieldSubrole as String
+
+    static func role(of element: AXUIElement, reader: AXReader = AXReader()) -> String? {
+        var roleRef: CFTypeRef?
+        guard reader.copyAttribute(element, kAXRoleAttribute as CFString, &roleRef) == .success else {
+            return nil
+        }
+        return roleRef as? String
+    }
+
+    /// An attribute the element simply lacks, as opposed to a read that failed.
+    private static func isAbsent(_ error: AXError) -> Bool {
+        error == .noValue || error == .attributeUnsupported
+    }
+
+    /// True only for a real text input, never a password field. Decided by
+    /// role alone: caret attributes (selected range, insertion line) and a
+    /// writable `AXValue` also appear on static text and controls, so they
+    /// say nothing about editability. Nil = unreadable role or subrole.
+    static func isEditableText(_ element: AXUIElement, role: String?, reader: AXReader = AXReader()) -> Bool? {
+        if role == secureTextFieldRole { return false }
+        var subroleRef: CFTypeRef?
+        let subroleError = reader.copyAttribute(element, kAXSubroleAttribute as CFString, &subroleRef)
+        if subroleError == .success {
+            if (subroleRef as? String) == secureTextFieldRole { return false }
+        } else if !isAbsent(subroleError) {
+            return nil
+        }
+        if let role, editableTextRoles.contains(role) { return true }
+        return role == nil ? nil : false
+    }
+
+    static func focusedField(frontmostPID: pid_t?, reader: AXReader = AXReader()) -> FocusedField? {
+        focusRead(frontmostPID: frontmostPID, reader: reader).field
+    }
+
+    static func focusRead(frontmostPID: pid_t?, reader: AXReader = AXReader()) -> FocusRead {
+        guard let pid = frontmostPID else { return .unknown }
+        let appElement = AXUIElementCreateApplication(pid)
+        _ = reader.setTimeout(appElement, messagingTimeoutSeconds)
+        var focusedRef: CFTypeRef?
+        let error = reader.copyAttribute(appElement, kAXFocusedUIElementAttribute as CFString, &focusedRef)
+        // AX answers noValue only when the app definitively has no focused
+        // element; timeouts and refusals are other codes.
+        if error == .noValue { return .noFocus }
+        guard error == .success, let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
+            return .unknown
+        }
+        let element = focusedRef as! AXUIElement
+        _ = reader.setTimeout(element, messagingTimeoutSeconds)
+        let role = role(of: element, reader: reader)
+        return .focused(FocusedField(element: element, role: role, isEditable: isEditableText(element, role: role, reader: reader)))
+    }
+
+    /// False when the app reports an empty window list (a browser whose last
+    /// window just closed stays frontmost). Nil = unreadable.
+    static func appHasWindows(pid: pid_t, reader: AXReader = AXReader()) -> Bool? {
+        let appElement = AXUIElementCreateApplication(pid)
+        _ = reader.setTimeout(appElement, messagingTimeoutSeconds)
+        var windowsRef: CFTypeRef?
+        guard reader.copyAttribute(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AnyObject] else {
+            return nil
+        }
+        return !windows.isEmpty
+    }
+
     enum PrecedingChar: Equatable {
         case known(Character)
         case startOfField
@@ -35,6 +135,10 @@ enum CaretContext {
 
         /// Retained AX identity prevents equal text in another field impersonating this one.
         var focusedElement: AXUIElement? = nil
+        /// AX role of `focusedElement` (e.g. `AXTextArea`); nil when unread.
+        var focusedRole: String? = nil
+        /// Whether `focusedElement` accepts typed text; nil when unread.
+        var focusedIsEditable: Bool? = nil
 
         static let unknown = Snapshot(
             value: "",
@@ -116,13 +220,16 @@ enum CaretContext {
         }
 
         let preceding = precedingGrapheme(in: value, beforeUTF16Location: parsed.location)
+        let focusedRole = role(of: focused, reader: reader)
         return Snapshot(
             value: value,
             location: parsed.location,
             selectionLength: selectionLength,
             precedingChar: preceding,
             isUnknown: false,
-            focusedElement: focused
+            focusedElement: focused,
+            focusedRole: focusedRole,
+            focusedIsEditable: isEditableText(focused, role: focusedRole, reader: reader)
         )
     }
 
