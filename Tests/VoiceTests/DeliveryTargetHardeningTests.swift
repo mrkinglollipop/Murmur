@@ -60,7 +60,14 @@ final class DeliveryTargetHardeningTests: XCTestCase {
         let generation = recorder.releaseFocusSample?.generation ?? 0
         XCTAssertFalse(AudioRecorder.isUnboundAtRelease(sample: recorder.releaseFocusSample, generation: generation))
 
+        // Windows present + "no value" focus (Electron) stays bound.
         hooks.releaseFocus = (.noFocus, true)
+        recorder.stopRecording()
+        let electronGeneration = recorder.releaseFocusSample?.generation ?? 0
+        XCTAssertFalse(AudioRecorder.isUnboundAtRelease(sample: recorder.releaseFocusSample, generation: electronGeneration))
+
+        // A definite "no windows" at release unbinds.
+        hooks.releaseFocus = (.noFocus, false)
         recorder.stopRecording()
         let nextGeneration = recorder.releaseFocusSample?.generation ?? 0
         XCTAssertTrue(AudioRecorder.isUnboundAtRelease(sample: recorder.releaseFocusSample, generation: nextGeneration))

@@ -162,24 +162,44 @@ final class UnboundTakeTests: XCTestCase {
         func focused(_ role: String?, _ editable: Bool?) -> CaretContext.FocusRead {
             .focused(.init(element: AXUIElementCreateApplication(501), role: role, isEditable: editable))
         }
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: nil))
-        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: true))
+        // Only a definite "no windows" unbinds, whatever the focus answer.
         XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: focused(textArea, true), appHasWindows: false))
         XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXWebArea", false), appHasWindows: false))
+        XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: false))
         XCTAssertTrue(VoiceEditRouting.isUnboundReleaseTarget(focus: .unknown, appHasWindows: false))
-        // Terminal-like: focused but reads non-editable — stays bound.
+        // Electron/Chromium: windows present, focused-element query says "no value".
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: true))
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: .noFocus, appHasWindows: nil))
+        // Terminal-like: focused but reads non-editable stays bound.
         XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXWebArea", false), appHasWindows: true))
         XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXGroup", false), appHasWindows: nil))
         XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused(textArea, true), appHasWindows: true))
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused(textArea, true), appHasWindows: nil))
-        // Unreadable editability keeps the release target.
         XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: focused("AXGroup", nil), appHasWindows: true))
     }
 
-    /// Codex P1: a timed-out or failed focus read is not "nothing focused".
-    func testFailedFocusReadKeepsTakeBound() {
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: .unknown, appHasWindows: nil))
-        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: .unknown, appHasWindows: true))
+    /// Regression (2026-10-16, Claude desktop / Cursor): an Electron app with
+    /// windows answers the focused-element query with "no value" at release
+    /// and at insert. The user never left the app, so the take is typed.
+    @MainActor
+    func testElectronNoValueFocusInSameAppIsTypedNotClipboarded() {
+        let release = CaretContext.FocusRead.noFocus
+        XCTAssertFalse(VoiceEditRouting.isUnboundReleaseTarget(focus: release, appHasWindows: true))
+        let result = deliver(
+            held: .unknown, unbound: false, atInsert: .unknown,
+            frontmostPID: releasePID, expectedOutcome: .inserted)
+        XCTAssertEqual(result.typed, "Hello there.")
+        XCTAssertNil(result.clipboard)
+    }
+
+    /// An unbound take (closed window) whose app is still frontmost at insert
+    /// takes the normal bound path, with no readable editable element needed.
+    @MainActor
+    func testUnboundTakeStillInReleaseAppIsTyped() {
+        let result = deliver(
+            held: .unknown, unbound: true, atInsert: .unknown,
+            frontmostPID: releasePID, expectedOutcome: .inserted)
+        XCTAssertEqual(result.typed, "Hello there.")
+        XCTAssertNil(result.clipboard)
     }
 
     /// Codex P1: a password field is never an unbound destination, even when
