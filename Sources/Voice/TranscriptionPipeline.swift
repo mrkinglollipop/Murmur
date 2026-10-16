@@ -1198,8 +1198,11 @@ final class TranscriptionPipeline {
                 // so app-switch abort never drives wrong-app caret reads.
                 let (currentPID, liveSecureAtSample, unboundField): (pid_t?, Bool, CaretContext.FocusedField?) = DispatchQueue.main.sync {
                     let target = self.injectionTarget(voiceEdit: isSelectionDelivery)
-                    let field = unbound ? target.pid.flatMap { self.deliveryFocusedField(frontmostPID: $0) } : nil
-                    if unbound {
+                    // Same app as at release: the user never moved, so the
+                    // take is delivered on the normal bound path below.
+                    let movedApps = target.pid == nil || target.pid != releasePID
+                    let field = unbound && movedApps ? target.pid.flatMap { self.deliveryFocusedField(frontmostPID: $0) } : nil
+                    if unbound && movedApps {
                         vlog("inject: unbound take at insert — "
                             + VoiceEditRouting.focusDiagnostic(field: field, appHasWindows: nil, pid: target.pid,
                                 bundle: target.bundleIdentifier ?? "nil"))
@@ -1208,9 +1211,10 @@ final class TranscriptionPipeline {
                 }
                 // An unbound take adopts the app and field focused now, so the
                 // release-to-insert app-switch rule measures from here.
-                let heldPID = unbound ? currentPID : releasePID
-                let heldAtStart = unbound ? nil : releaseHeld
-                let unboundWithoutTarget = unbound && unboundField?.acceptsRelaxedDelivery != true
+                let adoptsFocus = unbound && !(currentPID != nil && currentPID == releasePID)
+                let heldPID = adoptsFocus ? currentPID : releasePID
+                let heldAtStart = adoptsFocus ? nil : releaseHeld
+                let unboundWithoutTarget = adoptsFocus && unboundField?.acceptsRelaxedDelivery != true
                 let axPlan = Self.injectAXPlan(
                     replaceHistoryEntryID: replaceID,
                     heldPID: heldPID,
@@ -1356,7 +1360,7 @@ final class TranscriptionPipeline {
                         // Undo relies on the host's ⌘Z: replacement is one inject,
                         // with no delete or select-all step in any lane.
                         // Unbound: any editable field in the adopted app will do.
-                        let unboundFieldCheck: (() -> Bool?)? = !unbound ? nil : {
+                        let unboundFieldCheck: (() -> Bool?)? = !adoptsFocus ? nil : {
                             guard self.deliveryFocusedField(frontmostPID: deliveryPID)?.acceptsRelaxedDelivery == true else {
                                 vlog("inject abort: unbound take lost its editable focus before insert")
                                 return false

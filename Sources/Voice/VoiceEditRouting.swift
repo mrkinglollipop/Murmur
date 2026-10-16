@@ -126,17 +126,16 @@ enum VoiceEditRouting {
         return fresh.acceptsRelaxedDelivery
     }
 
-    /// A release with nothing focused, or a frontmost app with no windows,
-    /// binds the take to no field (2026-10-15: browser window closed mid-hold,
-    /// user clicked into another app). A focused element that merely reads as
-    /// non-editable stays bound: terminals (Terminal, iTerm, Ghostty) report
-    /// their text area that way and must keep typing into it. Only definite
-    /// answers unbind: a timed-out or failed focus read keeps the release app,
-    /// so a slow app cannot hand its text to whatever is focused later.
+    /// A frontmost app that definitely has no windows binds the take to no
+    /// field (2026-10-15: browser window closed mid-hold, user clicked into
+    /// another app). The focus answer is deliberately ignored: Electron and
+    /// Chromium apps answer the AX focused-element query with "no value"
+    /// until their accessibility tree is enabled, and terminals report their
+    /// text area as non-editable; both must keep typing into the release app.
+    /// Only a definite "no windows" unbinds; an unknown answer keeps the take
+    /// bound.
     static func isUnboundReleaseTarget(focus: CaretContext.FocusRead, appHasWindows: Bool?) -> Bool {
-        if appHasWindows == false { return true }
-        if case .noFocus = focus { return true }
-        return false
+        appHasWindows == false
     }
 
     /// AX role, editability, PID and bundle only. Never field text.
