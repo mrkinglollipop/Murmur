@@ -153,7 +153,13 @@ final class DictionaryStore: ObservableObject {
 
     private let fileURL: URL
     private let blocklistFileURL: URL
+    private let learnCandidatesFileURL: URL
     private let lexicon: RealWordLexicon
+    /// Pending (seen once) and user-rejected pairs for automated learning.
+    private(set) var learnCandidates = LearnCandidateLedger()
+    private var learnCandidatesSavesBlocked = false
+    /// Injectable clock for candidate aging (tests).
+    var learnClock: () -> Date = Date.init
 
     /// Set when dictionary.json / blocklist.json exists but could not be read
     /// or moved aside. Saving then would overwrite recoverable user data, so
@@ -161,12 +167,26 @@ final class DictionaryStore: ObservableObject {
     private var dictionarySavesBlocked = false
     private var blocklistSavesBlocked = false
 
-    init(fileURL: URL? = nil, blocklistFileURL: URL? = nil, lexicon: RealWordLexicon = .system) {
+    /// When `fileURL` is supplied (tests) the blocklist and learn-candidate
+    /// files default to siblings of it, never the real Application Support
+    /// copies.
+    init(
+        fileURL: URL? = nil,
+        blocklistFileURL: URL? = nil,
+        learnCandidatesFileURL: URL? = nil,
+        lexicon: RealWordLexicon = .system
+    ) {
         self.fileURL = fileURL ?? DictionaryStore.defaultFileURL()
-        self.blocklistFileURL = blocklistFileURL ?? DictionaryStore.defaultBlocklistFileURL()
+        self.blocklistFileURL = blocklistFileURL
+            ?? fileURL.map { URL(fileURLWithPath: $0.path + ".blocklist") }
+            ?? DictionaryStore.defaultBlocklistFileURL()
+        self.learnCandidatesFileURL = learnCandidatesFileURL
+            ?? fileURL.map { URL(fileURLWithPath: $0.path + ".learn-candidates") }
+            ?? DictionaryStore.defaultLearnCandidatesFileURL()
         self.lexicon = lexicon
         load()
         loadBlocklist()
+        loadLearnCandidates()
         rebuildRegexCache()
     }
 
@@ -180,6 +200,11 @@ final class DictionaryStore: ObservableObject {
     private static func defaultBlocklistFileURL() -> URL {
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         return VoicePaths.applicationSupportVoiceDirectory.appendingPathComponent("blocklist.json")
+    }
+
+    private static func defaultLearnCandidatesFileURL() -> URL {
+        VoicePaths.prepareApplicationSupportVoiceDirectory()
+        return VoicePaths.applicationSupportVoiceDirectory.appendingPathComponent("learn-candidates.json")
     }
 
     // MARK: - Load / save
@@ -227,6 +252,49 @@ final class DictionaryStore: ObservableObject {
                 self.blocklist = []
             }
         }
+    }
+
+    private func loadLearnCandidates() {
+        guard FileManager.default.fileExists(atPath: learnCandidatesFileURL.path) else { return }
+        guard let data = try? Data(contentsOf: learnCandidatesFileURL) else {
+            learnCandidatesSavesBlocked = true
+            logger.error("learn-candidates.json exists but is unreadable — saves disabled this session")
+            return
+        }
+        do {
+            learnCandidates = try JSONDecoder().decode(LearnCandidateLedger.self, from: data)
+        } catch {
+            quarantineCorruptFile(
+                at: learnCandidatesFileURL,
+                label: "learn-candidates.json",
+                error: error,
+                blockSaves: { self.learnCandidatesSavesBlocked = true }
+            ) {
+                self.learnCandidates = LearnCandidateLedger()
+            }
+        }
+    }
+
+    private func saveLearnCandidates() {
+        guard !learnCandidatesSavesBlocked else { return }
+        do {
+            let data = try JSONEncoder().encode(learnCandidates)
+            try data.write(to: learnCandidatesFileURL, options: .atomic)
+        } catch {
+            logger.error("Failed to save learn-candidates.json: \(error.localizedDescription)")
+        }
+    }
+
+    /// Stops automated learning from ever re-proposing `heard` → `term`.
+    /// Does not touch `correct()` (unlike the blocklist), so a later hand-added
+    /// entry for the same pair still applies.
+    func rejectLearnCandidate(heard: String, term: String) {
+        let mutate = {
+            guard !self.learnCandidates.isRejected(heard: heard, term: term) else { return }
+            self.learnCandidates.reject(heard: heard, term: term)
+            self.saveLearnCandidates()
+        }
+        Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }
 
     private func quarantineCorruptFile(at url: URL, label: String, error: Error, blockSaves: () -> Void, reset: () -> Void) {
@@ -501,6 +569,14 @@ final class DictionaryStore: ObservableObject {
 
     func delete(_ entry: DictionaryEntry) {
         let mutate = {
+            // Deleting a rule Murmur learned on its own (never approved) is a
+            // rejection: automated learning must not bring it back.
+            let current = self.entries.first { $0.id == entry.id } ?? entry
+            if current.isAutoLearned {
+                for variant in current.variants {
+                    self.rejectLearnCandidate(heard: variant, term: current.term)
+                }
+            }
             self.entries.removeAll { $0.id == entry.id }
             self.scheduleSave()
         }
@@ -683,7 +759,8 @@ final class DictionaryStore: ObservableObject {
         from oldText: String,
         to newText: String,
         userInitiated: Bool = false,
-        announce: Bool = true
+        announce: Bool = true,
+        observationID: UUID = UUID()
     ) -> [LearnedCorrection] {
         let old = oldText.trimmingCharacters(in: .whitespacesAndNewlines)
         let new = newText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -695,7 +772,12 @@ final class DictionaryStore: ObservableObject {
 
         let recorded: [LearnedCorrection]
         if oldWords.count == newWords.count {
-            recorded = learnSameWordCount(oldWords: oldWords, newWords: newWords, userInitiated: userInitiated)
+            recorded = learnSameWordCount(
+                oldWords: oldWords,
+                newWords: newWords,
+                userInitiated: userInitiated,
+                observationID: observationID
+            )
         } else if userInitiated {
             recorded = learnAligned(oldWords: oldWords, newWords: newWords, userInitiated: true)
         } else {
@@ -723,10 +805,12 @@ final class DictionaryStore: ObservableObject {
     private func learnSameWordCount(
         oldWords: [String],
         newWords: [String],
-        userInitiated: Bool
+        userInitiated: Bool,
+        observationID: UUID
     ) -> [LearnedCorrection] {
         let punctuation = CharacterSet.punctuationCharacters
         var recorded: [LearnedCorrection] = []
+        var observedThisCall = false
 
         for (oldWord, newWord) in zip(oldWords, newWords) {
             guard oldWord != newWord else { continue }
@@ -734,12 +818,28 @@ final class DictionaryStore: ObservableObject {
             let strippedOld = oldWord.trimmingCharacters(in: punctuation)
             let strippedNew = newWord.trimmingCharacters(in: punctuation)
             guard isLearnableVariant(strippedOld), !strippedNew.isEmpty else { continue }
-            guard strippedOld.caseInsensitiveCompare(strippedNew) != .orderedSame else { continue }
+            // Case-only or typography-only ("it's" → "it’s") is presentation.
+            guard CorrectionExtractor.normalizingTypography(strippedOld)
+                .caseInsensitiveCompare(CorrectionExtractor.normalizingTypography(strippedNew)) != .orderedSame else { continue }
 
             if !userInitiated {
                 let maxLen = max(strippedOld.count, strippedNew.count)
                 let similarity = maxLen == 0 ? 0 : 1.0 - Double(editDistance(strippedOld, strippedNew)) / Double(maxLen)
                 guard similarity >= Self.minLearnSimilarity else { continue }
+                guard !isOrdinaryEnglish(strippedOld) else { continue }
+                guard !isBlocklisted(heard: strippedOld, replaced: strippedNew),
+                      !learnCandidates.isRejected(heard: strippedOld, term: strippedNew),
+                      !hasVariant(strippedOld, forTerm: strippedNew) else { continue }
+                // One sighting is never enough: promote only on the second
+                // independent dictation (same observation never counts twice).
+                let promoted = learnCandidates.observe(
+                    heard: strippedOld,
+                    term: strippedNew,
+                    observationID: observationID,
+                    now: learnClock()
+                )
+                observedThisCall = true
+                guard promoted else { continue }
             }
 
             if let correction = recordLearnedVariant(
@@ -751,7 +851,30 @@ final class DictionaryStore: ObservableObject {
             }
         }
 
+        if observedThisCall {
+            saveLearnCandidates()
+        }
         return recorded
+    }
+
+    /// Automated learning never treats an ordinary English word (or
+    /// contraction) as a mishearing: "mark" → "Mock" or "we've" → "I've"
+    /// would rewrite that word in every future dictation. Reuses the phonetic
+    /// matcher's protected-token check and lexicon.
+    private func isOrdinaryEnglish(_ heard: String) -> Bool {
+        let words = CorrectionExtractor.normalizingTypography(heard)
+            .split(whereSeparator: \.isWhitespace)
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else { return true }
+        return words.allSatisfy { PhoneticMatcher.isProtectedHeardToken($0, lexicon: lexicon) }
+    }
+
+    private func hasVariant(_ variant: String, forTerm term: String) -> Bool {
+        entries.contains { entry in
+            entry.term.caseInsensitiveCompare(term) == .orderedSame
+                && entry.variants.contains { $0.caseInsensitiveCompare(variant) == .orderedSame }
+        }
     }
 
     /// Aligns word sequences when counts differ — handles ASR splitting one term
@@ -976,6 +1099,12 @@ final class DictionaryStore: ObservableObject {
     /// Applies unlearn without `onUnlearn` (used by toast Reject).
     @discardableResult
     private func applyUnlearn(_ correction: LearnedCorrection) -> Bool {
+        guard applyUnlearnRemovingVariant(correction) else { return false }
+        rejectLearnCandidate(heard: correction.variant, term: correction.term)
+        return true
+    }
+
+    private func applyUnlearnRemovingVariant(_ correction: LearnedCorrection) -> Bool {
         if let existing = entries.first(where: { $0.id == correction.entryID }) {
             return applyUnlearnToEntry(correction, existing, deleteIfCreatedAndEmpty: true)
         }
