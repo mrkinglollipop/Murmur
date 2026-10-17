@@ -37,9 +37,13 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
     }
 
     private static func pcm(seconds: Double, amplitude: Int16) -> AVAudioPCMBuffer {
+        pcm(samples: Int(16_000 * seconds), amplitude: amplitude)
+    }
+
+    private static func pcm(samples: Int, amplitude: Int16) -> AVAudioPCMBuffer {
         let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
                                    channels: 1, interleaved: true)!
-        let frames = AVAudioFrameCount(16_000 * seconds)
+        let frames = AVAudioFrameCount(samples)
         let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
         buffer.frameLength = frames
         for index in 0..<Int(frames) {
@@ -243,14 +247,14 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
         XCTAssertEqual(transport.commitOffsetsSeconds, [24, 48, 54])
     }
 
-    /// Commit counts cannot vouch for audio: one answered 28 s segment must not
+    /// Commit counts cannot vouch for audio: one answered 33 s segment must not
     /// pass for a 54 s recording, even though one Murmur segment "could" have
     /// spanned it under the hard limit.
     func testRecordingLongerThanStreamedAudioFallsBackDespiteAnsweredCommit() async throws {
         let transport = Transport()
         let session = try await startedSession(transport)
-        await hold(session, transport, seconds: 0..<28, quietSeconds: [])
-        XCTAssertEqual(transport.commitOffsetsSeconds, [28])
+        await hold(session, transport, seconds: 0..<33, quietSeconds: [])
+        XCTAssertEqual(transport.commitOffsetsSeconds, [33])
         commit(session, Self.first)
 
         let coordinator = StreamingCoordinator(elevenLabsSession: session)
@@ -259,7 +263,7 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
         XCTAssertTrue(coordinator.handleStopElevenLabs(
             context: .init(duration: 54, hadSpeech: true, bufferedAudio: [recording], streamTextEver: true),
             onSilence: { XCTFail("unexpected silence") },
-            onStreamSuccess: { _ in XCTFail("26 s of unstreamed audio accepted as covered") },
+            onStreamSuccess: { _ in XCTFail("21 s of unstreamed audio accepted as covered") },
             onBatchFallback: { buffers, _ in
                 XCTAssertTrue(buffers.first === recording)
                 fallback.fulfill()
@@ -267,7 +271,7 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
         ))
         await fulfillment(of: [fallback], timeout: 1)
         XCTAssertTrue(session.requiresBufferedAudioRecovery)
-        XCTAssertEqual(transport.commitOffsetsSeconds, [28], "the answered commit must not double as terminal")
+        XCTAssertEqual(transport.commitOffsetsSeconds, [33], "the answered commit must not double as terminal")
     }
 
     /// The tolerance covers converter latency only (0.25 s).
@@ -511,26 +515,151 @@ final class ElevenLabsLongHoldCoverageTests: XCTestCase {
 
     // MARK: - Boundary rule
 
-    func testBoundaryRuleWaitsForSoftLimitPrefersPauseAndForcesHardLimit() {
-        let soft = ElevenLabsRealtimeTranscriber.segmentSoftCommitSamples
-        let hard = ElevenLabsRealtimeTranscriber.segmentHardCommitSamples
-        XCTAssertFalse(ElevenLabsRealtimeTranscriber.shouldCommitSegment(
-            samplesSinceCommit: soft - 1, chunkRMS: 0, segmentMeanRMS: 3000))
-        XCTAssertTrue(ElevenLabsRealtimeTranscriber.shouldCommitSegment(
-            samplesSinceCommit: soft, chunkRMS: 200, segmentMeanRMS: 3000))
-        XCTAssertFalse(ElevenLabsRealtimeTranscriber.shouldCommitSegment(
-            samplesSinceCommit: hard - 1, chunkRMS: 3000, segmentMeanRMS: 3000))
-        XCTAssertTrue(ElevenLabsRealtimeTranscriber.shouldCommitSegment(
-            samplesSinceCommit: hard, chunkRMS: 3000, segmentMeanRMS: 3000))
-        // The hard limit stays well under the server's ~36 s auto-commit.
-        XCTAssertLessThanOrEqual(hard, 30 * 16_000)
+    private typealias Boundary = ElevenLabsRealtimeTranscriber.SegmentBoundary
+
+    /// Feeds `chunks` (samples, RMS) and returns the segment-relative end
+    /// offset, in samples, of every chunk that carried a commit.
+    private static func boundaries(_ chunks: [(Int, Double)]) -> [Int] {
+        var rule = Boundary()
+        var offset = 0
+        var commits: [Int] = []
+        for (samples, rms) in chunks {
+            offset += samples
+            if rule.admit(samples: samples, rms: rms) { commits.append(offset) }
+        }
+        return commits
+    }
+
+    /// Exactly one commit, on the chunk that crossed the hard limit.
+    private static func assertForcedAtHardLimit(
+        _ commits: [Int], chunk: Int = 1_365, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(commits.count, 1, "commits: \(commits)", file: file, line: line)
+        guard let commit = commits.first else { return }
+        XCTAssertGreaterThanOrEqual(commit, Boundary.hardSamples, file: file, line: line)
+        XCTAssertLessThan(commit, Boundary.hardSamples + chunk, file: file, line: line)
+    }
+
+    /// Repeating tap-sized chunks of steady speech, `seconds` long.
+    private static func speech(seconds: Double, sizes: [Int] = [1_365], rms: Double = 3000) -> [(Int, Double)] {
+        var chunks: [(Int, Double)] = []
+        var total = 0
+        let target = Int(seconds * 16_000)
+        var index = 0
+        while total < target {
+            let size = min(sizes[index % sizes.count], target - total)
+            chunks.append((size, rms))
+            total += size
+            index += 1
+        }
+        return chunks
+    }
+
+    func testSingleQuietChunkMidSpeechDoesNotCommit() {
+        // The field failure: 21.2 s, one ~85 ms dip between words.
+        let chunks = Self.speech(seconds: 21.2) + [(1_365, 200)] + Self.speech(seconds: 14)
+        Self.assertForcedAtHardLimit(Self.boundaries(chunks))
+    }
+
+    func testSustainedPauseAfterSoftLimitCommitsWhereThePauseIsProven() {
+        let speech = Self.speech(seconds: 21)
+        let pause = Array(repeating: (1_365, 150.0), count: 6)
+        let commits = Self.boundaries(speech + pause + Self.speech(seconds: 5))
+        // 4 x 1365 = 5460 is the first run at or past 4800 samples (300 ms).
+        XCTAssertEqual(commits, [21 * 16_000 + 4 * 1_365])
+    }
+
+    func testPauseBeforeSoftLimitDoesNotCommitButOneSpanningItDoes() {
+        let early = Self.speech(seconds: 15) + [(8_000, 150)] + Self.speech(seconds: 4)
+        let spanning = early + [(6_000, 150), (6_000, 150)] + Self.speech(seconds: 5)
+        // The 15 s pause is ignored. The run starting at 19.5 s is already
+        // 375 ms long by 19.875 s but too early; the commit rides on its next
+        // chunk, the first past 20 s, still inside the pause.
+        XCTAssertEqual(Self.boundaries(spanning), [20 * 16_000 + 4_000])
+    }
+
+    func testPauseIsMeasuredInSamplesNotChunks() {
+        let speech = Self.speech(seconds: 22, sizes: [512, 4_096, 1_365, 2_000])
+        let offset = speech.reduce(0) { $0 + $1.0 }
+        // Ten small quiet chunks are only 2560 samples (160 ms): no pause.
+        let shortRun = Array(repeating: (256, 100.0), count: 10)
+        // Then varied sizes: 1000, 2000, 3000, 4000, 4700 (short), 5000.
+        let longRun: [(Int, Double)] = [(1_000, 100), (1_000, 100), (1_000, 100), (1_000, 100), (700, 100), (300, 100), (2_000, 100)]
+        let chunks = speech + shortRun + Self.speech(seconds: 1, sizes: [4_096, 512]) + longRun + Self.speech(seconds: 5)
+        XCTAssertEqual(Self.boundaries(chunks), [offset + 2_560 + 16_000 + 5_000])
+        // One large quiet buffer is a full pause by itself.
+        XCTAssertEqual(Self.boundaries(speech + [(4_800, 100)]), [offset + 4_800])
+    }
+
+    func testQuietIsRelativeToTheSegmentLevel() {
+        // A soft passage (-6 dB) is still speech, not a pause.
+        let soft = Self.speech(seconds: 21) + Self.speech(seconds: 2, rms: 1_500) + Self.speech(seconds: 12)
+        Self.assertForcedAtHardLimit(Self.boundaries(soft))
+    }
+
+    func testNoPauseCommitsAtTheQuietestPointAfterTheLastResortWindowOpens() {
+        // Steady speech with ordinary dips to 2000 while observing 30-31 s,
+        // then one deeper dip at 31.5 s.
+        let observed = Self.speech(seconds: 30) + Self.speech(seconds: 0.5) + [(1_600, 2_000)]
+            + Self.speech(seconds: 0.4)
+        let lead = observed.reduce(0) { $0 + $1.0 }
+        let chunks = observed + Self.speech(seconds: 0.5) + [(1_365, 1_800)] + Self.speech(seconds: 3)
+        XCTAssertEqual(Self.boundaries(chunks), [lead + 8_000 + 1_365])
+    }
+
+    func testNoPauseAndNoDeeperDipForcesTheHardLimit() {
+        let hard = Boundary.hardSamples
+        Self.assertForcedAtHardLimit(Self.boundaries(Self.speech(seconds: 40)))
+        // The forced segment stays under the ~36 s auto-commit even when the
+        // crossing chunk is a full second long.
+        XCTAssertEqual(Self.boundaries(Self.speech(seconds: 32.5) + [(16_000, 3000)]), [hard + 8_000])
+        XCTAssertLessThanOrEqual(hard + 16_000, 35 * 16_000)
+        XCTAssertEqual(ElevenLabsRealtimeTranscriber.segmentSoftCommitSamples, 20 * 16_000)
+        XCTAssertEqual(ElevenLabsRealtimeTranscriber.segmentHardCommitSamples, 33 * 16_000)
+    }
+
+    func testEmptyChunksNeverCommit() {
+        let chunks = Self.speech(seconds: 32) + Array(repeating: (0, 0.0), count: 5)
+        XCTAssertEqual(Self.boundaries(chunks), [])
     }
 
     func testContinuousSpeechIsForcedIntoSegmentsAtHardLimit() async throws {
         let transport = Transport()
         let session = try await startedSession(transport)
-        await hold(session, transport, seconds: 0..<60, quietSeconds: [])
-        XCTAssertEqual(transport.commitOffsetsSeconds, [28, 56])
+        await hold(session, transport, seconds: 0..<70, quietSeconds: [])
+        XCTAssertEqual(transport.commitOffsetsSeconds, [33, 66])
+        session.cancel()
+    }
+
+    /// Through the real send path with tap-sized buffers: a dip between
+    /// words at 21 s stays inside the segment; the 300 ms pause at 24 s
+    /// carries the commit.
+    func testTapSizedBuffersCommitAtTheRealPauseNotTheDip() async throws {
+        let transport = Transport()
+        let session = try await startedSession(transport)
+        func chunk(_ samples: Int, _ amplitude: Int16) {
+            session.send(Self.pcm(samples: samples, amplitude: amplitude))
+        }
+        var sent = 0
+        func speak(seconds: Double) {
+            let target = sent + Int(seconds * 16_000)
+            while sent < target {
+                let size = min(1_365, target - sent)
+                chunk(size, Self.loud)
+                sent += size
+            }
+        }
+        speak(seconds: 21)
+        chunk(1_365, Self.quiet); sent += 1_365
+        speak(seconds: 3)
+        let pauseStart = sent
+        for _ in 0..<6 { chunk(1_365, Self.quiet); sent += 1_365 }
+        speak(seconds: 2)
+        let deadline = Date().addingTimeInterval(2)
+        while transport.all.reduce(0, { $0 + $1.samples }) < sent, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(transport.commitOffsetsSeconds, [Double(pauseStart + 4 * 1_365) / 16_000])
         session.cancel()
     }
 }

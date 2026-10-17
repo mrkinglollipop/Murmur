@@ -33,7 +33,8 @@ import os.log
 ///     time a commit is processed. The service also commits automatically
 ///     after roughly 36 seconds of uncommitted audio even in manual mode
 ///     (https://elevenlabs.io/docs/eleven-api/guides/how-to/speech-to-text/realtime/transcripts-and-commit-strategies),
-///     so `send(_:)` sets `commit:true` on a chunk every 20–28 s itself and
+///     so `send(_:)` sets `commit:true` itself at a pause 20–33 s into each
+///     segment (see `SegmentBoundary`) and
 ///     finalize proves coverage by matching events to those commits (see
 ///     "Coverage proof" below).
 ///   - Non-fatal server errors arrive as distinct message types
@@ -187,9 +188,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
 
     /// 16 kHz samples enqueued since the last commit frame (tap thread writes,
     /// finalize reads; stateLock-guarded).
-    private var samplesSinceCommit = 0
-    private var segmentRMSSum: Double = 0
-    private var segmentChunkCount = 0
+    private var segment = SegmentBoundary()
     /// Mid-hold commit frames enqueued by `send(_:)`.
     private var midHoldCommitsQueued = 0
     /// 16 kHz samples accepted into the frame queue.
@@ -240,12 +239,12 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     var afterConversionHook: (() -> Void)?
 
     /// Earliest point a mid-hold commit may be placed (ElevenLabs recommends
-    /// committing every 20–30 s). Waiting for a quieter chunk only moves the
+    /// committing every 20–30 s). Waiting for a pause only moves the
     /// boundary; every sample is still sent.
-    static let segmentSoftCommitSamples = 20 * 16_000
-    /// Forced boundary, far enough below the ~36 s auto-commit that the
-    /// server never chooses a boundary of its own.
-    static let segmentHardCommitSamples = 28 * 16_000
+    static let segmentSoftCommitSamples = SegmentBoundary.softSamples
+    /// Forced boundary, below the ~36 s auto-commit by enough that the server
+    /// never chooses a boundary of its own.
+    static let segmentHardCommitSamples = SegmentBoundary.hardSamples
     /// Allowed shortfall of streamed audio against `recordingDuration` (the
     /// captured recording): sample-rate converter latency and per-buffer
     /// rounding only, far below one spoken word.
@@ -481,22 +480,12 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             stateLock.unlock()
             return
         }
-        let commit = realtimeOptions.commitStrategy == .manual && Self.shouldCommitSegment(
-            samplesSinceCommit: samplesSinceCommit + samples,
-            chunkRMS: chunkRMS,
-            segmentMeanRMS: segmentChunkCount > 0 ? segmentRMSSum / Double(segmentChunkCount) : chunkRMS
-        )
+        let commit = realtimeOptions.commitStrategy == .manual
+            && segment.admit(samples: samples, rms: chunkRMS)
         // Count and enqueue under one lock so finalize never observes a
         // commit that is not yet in the queue (or the reverse).
         if commit {
-            samplesSinceCommit = 0
-            segmentRMSSum = 0
-            segmentChunkCount = 0
             midHoldCommitsQueued += 1
-        } else {
-            samplesSinceCommit += samples
-            segmentRMSSum += chunkRMS
-            segmentChunkCount += 1
         }
         let frame = QueuedFrame(
             payload: Self.makeInputAudioChunkFrame(pcmData: pcmData, commit: commit),
@@ -529,14 +518,89 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
         lastFinalizeRequiresBufferedAudioRecovery = true
     }
 
-    /// Mid-hold boundary rule. After the soft limit, commit on the first chunk
-    /// clearly quieter than the segment so far (likely a pause between words);
-    /// at the hard limit, commit regardless. Only placement changes: the
-    /// chunk is still sent, as the last audio of its segment.
-    static func shouldCommitSegment(samplesSinceCommit: Int, chunkRMS: Double, segmentMeanRMS: Double) -> Bool {
-        if samplesSinceCommit >= segmentHardCommitSamples { return true }
-        guard samplesSinceCommit >= segmentSoftCommitSamples else { return false }
-        return chunkRMS <= segmentMeanRMS * 0.5
+    /// Mid-hold boundary rule. A commit inside speech makes ElevenLabs drop
+    /// or garble the words around it (replayed 2026-10-17: a cut at 21.0 s
+    /// or 21.2 s lost "that we're building" every time; 21.4 s split the
+    /// phrase and inserted "Yeah"), and a single quiet tap buffer is often
+    /// just a dip between words. So the commit goes only where the speaker
+    /// has actually paused, decided online one chunk at a time: the commit
+    /// rides on the current chunk, so every sample is still sent, in order,
+    /// with nothing held back. All lengths are in 16 kHz samples, never
+    /// chunk counts, because tap buffer sizes vary.
+    ///
+    /// 1. From `softSamples` (20 s) on, commit on the chunk that completes
+    ///    `pauseSamples` (300 ms) of consecutive quiet audio. Quiet means a
+    ///    chunk RMS at or below `quietRatio` (0.4, about -8 dB) of the
+    ///    segment's sample-weighted mean RMS. The mean includes pauses, so
+    ///    it sits below the true speech level; -8 dB under it is still well
+    ///    under speech, yet above a typical room-noise floor. 300 ms is longer
+    ///    than stop closures and between-word gaps (mostly under 200 ms) and
+    ///    about as short as a phrase pause gets. A run that began before 20 s
+    ///    counts: the commit then lands inside that pause.
+    /// 2. With no such pause, from `lastResortSamples` (30 s) watch
+    ///    `lastResortObserveSamples` (1 s) of audio and remember its quietest
+    ///    chunk; after that, commit on the first chunk strictly quieter than
+    ///    anything seen since 30 s. That is the deepest dip available without
+    ///    looking ahead (the standard observe-then-pick stopping rule).
+    /// 3. At `hardSamples` (33 s), commit regardless. ElevenLabs auto-commits
+    ///    after approximately 36 s of uncommitted audio, and a segment can run
+    ///    past the limit by up to one chunk (about 0.1 s for a 4096-frame tap
+    ///    at 48 kHz, 0.5 s at 8 kHz). 33 s leaves about 2.5 s for that
+    ///    overshoot and for the "approximately".
+    struct SegmentBoundary {
+        static let softSamples = 20 * 16_000
+        static let pauseSamples = 4_800
+        static let quietRatio = 0.4
+        static let lastResortSamples = 30 * 16_000
+        static let lastResortObserveSamples = 16_000
+        static let hardSamples = 33 * 16_000
+
+        /// 16 kHz samples enqueued since the last commit frame.
+        private(set) var samples = 0
+        private var levelWeightedSum: Double = 0
+        private var levelSamples = 0
+        private var quietRunSamples = 0
+        private var lastResortQuietestRMS = Double.infinity
+
+        /// Sample-weighted mean RMS of the segment so far.
+        var level: Double? { levelSamples > 0 ? levelWeightedSum / Double(levelSamples) : nil }
+
+        /// Decides whether `commit:true` rides on this chunk, then records
+        /// it. A commit starts a new segment.
+        mutating func admit(samples chunk: Int, rms: Double) -> Bool {
+            guard chunk > 0 else { return false }
+            let end = samples + chunk
+            let quiet = rms <= (level ?? rms) * Self.quietRatio
+            quietRunSamples = quiet ? quietRunSamples + chunk : 0
+
+            let commit: Bool
+            if end >= Self.hardSamples {
+                commit = true
+            } else if end >= Self.softSamples, quietRunSamples >= Self.pauseSamples {
+                commit = true
+            } else if end > Self.lastResortSamples + Self.lastResortObserveSamples {
+                commit = rms < lastResortQuietestRMS
+            } else {
+                commit = false
+            }
+            if commit {
+                self = SegmentBoundary()
+                return true
+            }
+            if end > Self.lastResortSamples {
+                lastResortQuietestRMS = min(lastResortQuietestRMS, rms)
+            }
+            samples = end
+            levelWeightedSum += rms * Double(chunk)
+            levelSamples += chunk
+            return false
+        }
+
+        /// The converter tail flushed at finalize: streamed, but after the
+        /// last boundary decision, so it only extends the segment.
+        mutating func noteTail(samples tail: Int) {
+            samples += tail
+        }
     }
 
     static func rms(ofPCM16 data: Data) -> Double {
@@ -675,7 +739,7 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
             )
             if case .enqueued = continuation.yield(frame) {
                 samplesQueued += samples
-                samplesSinceCommit += samples
+                segment.noteTail(samples: samples)
             } else {
                 streamIntegrityFailed = true
                 lastFinalizeRequiresBufferedAudioRecovery = true
