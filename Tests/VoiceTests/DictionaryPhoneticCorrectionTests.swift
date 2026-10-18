@@ -97,11 +97,18 @@ final class DictionaryPhoneticCorrectionTests: XCTestCase {
         XCTAssertTrue(result.records.isEmpty)
     }
 
-    func testAutoLearnedSourceTagging() {
+    /// A learned rule is a suggestion: it tags nothing until approved, then
+    /// behaves like any dictionary entry.
+    func testLearnedRuleIsInertUntilApprovedThenTagsDictionary() {
         let store = makeStore()
-        _ = store.learn(from: "use wispr here", to: "use whisper here", userInitiated: true)
+        let learned = store.learn(from: "use wispr here", to: "use whisper here", userInitiated: true)
+        let pending = store.correct("dictate wispr now")
+        XCTAssertEqual(pending.text, "dictate wispr now")
+        XCTAssertTrue(pending.records.isEmpty)
+
+        store.approveLearnedBatch(LearnBatch(corrections: learned))
         let result = store.correct("dictate wispr now")
         XCTAssertTrue(result.text.contains("whisper"))
-        XCTAssertEqual(result.records.first?.source, .autoLearned)
+        XCTAssertEqual(result.records.first?.source, .dictionary)
     }
 }

@@ -38,6 +38,8 @@ struct DictionaryView: View {
         let filteredEntries = DictionarySearch.sortedEntries(
             DictionarySearch.entries(store.entries, query: searchText)
         )
+        // Pending suggestions are inert, so they are not "your words".
+        let activeEntries = filteredEntries.filter { !$0.isPendingApproval }
         VStack(spacing: 0) {
             composer
             Divider().overlay(Theme.hairline)
@@ -47,13 +49,13 @@ struct DictionaryView: View {
             // corrections. Composer/search stay pinned above.
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    if store.entries.isEmpty {
+                    if store.activeEntries.isEmpty {
                         emptyState
                     } else {
-                        termsSectionHeader(count: filteredEntries.count)
-                        entryRows(entries: filteredEntries)
+                        termsSectionHeader(count: activeEntries.count)
+                        entryRows(entries: activeEntries)
                     }
-                    autoLearnedSection(entries: filteredEntries)
+                    pendingSuggestionsSection(entries: filteredEntries)
                     recentCorrectionsSection
                 }
             }
@@ -257,7 +259,9 @@ struct DictionaryView: View {
 
     private func handleRestore(_ record: CorrectionRecord) {
         store.unblockPair(heard: record.heard, replaced: record.replaced)
-        // announce: false — no toast; coordinator appends learnAccepted via onLearnBatch when non-empty.
+        // announce: false — no pop-up; the pair returns as a pending suggestion
+        // under "Waiting for your OK" (inert until Add). Coordinator appends
+        // learnAccepted via onLearnBatch when non-empty.
         _ = store.learn(
             from: record.heard,
             to: record.replaced,
@@ -397,70 +401,76 @@ struct DictionaryView: View {
         }
     }
 
-    // MARK: - Auto-learned entries
+    // MARK: - Pending suggestions
 
+    /// Learned suggestions awaiting the user's OK. They change nothing until
+    /// added: no rewrite, no phonetic match, no engine vocabulary.
     @ViewBuilder
-    private func autoLearnedSection(entries: [DictionaryEntry]) -> some View {
-        let autoLearned = entries.filter { $0.isAutoLearned }
-        if !autoLearned.isEmpty {
+    private func pendingSuggestionsSection(entries: [DictionaryEntry]) -> some View {
+        let pending = entries.filter(\.hasPendingSuggestion)
+        if !pending.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
-                Text("Waiting for your OK")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(Theme.textSecondary)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
-                    .padding(.bottom, 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Waiting for your OK (\(pending.count))")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Theme.textSecondary)
+                        .accessibilityAddTraits(.isHeader)
+                    Text("Not used in dictation until you add them.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 8)
 
-                ForEach(autoLearned) { entry in
-                    autoLearnedRow(for: entry)
+                ForEach(pending) { entry in
+                    pendingSuggestionRow(for: entry)
                     Divider().overlay(Theme.hairline)
                 }
             }
         }
     }
 
-    private func autoLearnedRow(for entry: DictionaryEntry) -> some View {
+    private func pendingSuggestionRow(for entry: DictionaryEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Image(systemName: "sparkles")
                     .font(.system(size: 11))
                     .foregroundColor(Theme.lavenderText)
-                    .help("Learned automatically from a History edit")
-                    .accessibilityLabel("Learned automatically")
+                    .help("Suggested from your corrections")
+                    .accessibilityLabel("Suggested")
 
                 Text(entry.term)
                     .font(Theme.body(14, weight: .semibold))
                     .foregroundColor(Theme.textPrimary)
 
-                Text("auto-learned")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Theme.textSecondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .murmurGlassCapsule()
-
                 Spacer()
 
-                Button("Approve") {
-                    var updated = entry
-                    updated.isAutoLearned = false
-                    store.update(updated)
+                Button("Never") {
+                    withAnimation(Theme.easeOutOrNil()) {
+                        store.rejectPending(entry)
+                    }
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 12))
                 .foregroundColor(Theme.textSecondary)
+                .help("Don't suggest this again")
+                .accessibilityLabel("Never suggest \(entry.term)")
 
-                Button("Delete") {
-                    pendingDeleteEntry = entry
-                    showDeleteConfirmation = true
+                Button("Add") {
+                    withAnimation(Theme.easeOutOrNil()) {
+                        store.approvePending(entry)
+                    }
                 }
                 .buttonStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundColor(Theme.textSecondary)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Theme.primary)
+                .help("Add to your dictionary")
+                .accessibilityLabel("Add \(entry.term) to dictionary")
             }
 
-            if !entry.variants.isEmpty {
-                HeardVariants(variants: entry.variants)
+            if !entry.unapprovedVariants.isEmpty {
+                HeardVariants(variants: entry.unapprovedVariants)
             }
         }
         .padding(.horizontal, 16)
@@ -551,14 +561,6 @@ struct DictionaryView: View {
     private func row(for entry: DictionaryEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                if entry.isAutoLearned {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 11))
-                        .foregroundColor(Theme.lavenderText)
-                        .help("Learned automatically from a History edit")
-                        .accessibilityLabel("Learned automatically")
-                }
-
                 Text(entry.term)
                     .font(Theme.body(14, weight: .semibold))
                     .foregroundColor(Theme.textPrimary)
@@ -892,7 +894,7 @@ enum DictionarySearch {
         guard !needle.isEmpty else { return entries }
         return entries.filter {
             $0.term.lowercased().contains(needle)
-                || $0.variants.contains { $0.lowercased().contains(needle) }
+                || ($0.variants + $0.pendingVariants).contains { $0.lowercased().contains(needle) }
         }
     }
 
@@ -922,8 +924,11 @@ enum DictionarySearch {
     }
 
     static func resultCount(entries: [DictionaryEntry], groups: [CorrectionGroup]) -> Int {
-        // Auto-learned terms also appear in the approval section.
-        entries.count + entries.filter(\.isAutoLearned).count + groups.reduce(0) { $0 + $1.rows.count }
+        // Pending entries list only under "Waiting for your OK"; an approved
+        // entry with pending heard-forms lists in both sections.
+        entries.filter { !$0.isPendingApproval }.count
+            + entries.filter(\.hasPendingSuggestion).count
+            + groups.reduce(0) { $0 + $1.rows.count }
     }
 }
 

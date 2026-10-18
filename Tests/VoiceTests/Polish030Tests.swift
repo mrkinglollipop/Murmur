@@ -170,8 +170,11 @@ final class Polish030Tests: XCTestCase {
         XCTAssertEqual(DictionarySearch.corrections([group], query: " alpha "), [group])
         XCTAssertEqual(DictionarySearch.corrections([group], query: " \t\n"), [group])
         XCTAssertTrue(DictionarySearch.corrections([group], query: "absent").isEmpty)
+        // A pending entry lists only under "Waiting for your OK".
         let learned = DictionaryEntry(term: "Alpha", variants: ["alfa"], isAutoLearned: true)
-        XCTAssertEqual(DictionarySearch.resultCount(entries: [learned], groups: matches), 3)
+        XCTAssertEqual(DictionarySearch.resultCount(entries: [learned], groups: matches), 2)
+        let withPending = DictionaryEntry(term: "Alpha", variants: ["alfa"], pendingVariants: ["alpa"])
+        XCTAssertEqual(DictionarySearch.resultCount(entries: [withPending], groups: matches), 3)
     }
 
     func testDictionarySearchSortsDisplayEntriesWithoutMutatingInput() {
@@ -338,7 +341,8 @@ final class Polish030Tests: XCTestCase {
         XCTAssertEqual(RecordingHUD.State.success.accessibilityAnnouncement, "Dictation complete")
         XCTAssertEqual(RecordingHUD.State.clipboardFlash.accessibilityAnnouncement, "Text copied to clipboard")
         XCTAssertEqual(RecordingHUD.State.error("Try again").accessibilityAnnouncement, "Dictation failed. Try again")
-        XCTAssertEqual(LearnToastHUD.learnedAnnouncement(count: 1), "Learned 1 dictionary correction")
-        XCTAssertEqual(LearnToastHUD.learnedAnnouncement(count: 3), "Learned 3 dictionary corrections")
+        XCTAssertEqual(LearnToastHUD.suggestionAnnouncement(count: 1), "Dictionary suggestion. Add it?")
+        XCTAssertEqual(LearnToastHUD.suggestionAnnouncement(count: 3), "3 dictionary suggestions. Add them?")
+        XCTAssertEqual(LearnToastHUD.addedAnnouncement(count: 1), "Added to dictionary")
     }
 }

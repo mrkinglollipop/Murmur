@@ -116,6 +116,8 @@ final class CorrectionExtractorTests: XCTestCase {
         XCTAssertEqual(learned.count, 1)
         XCTAssertEqual(learned.first?.variant, "Groq")
         XCTAssertEqual(learned.first?.term, "Grok")
+        XCTAssertEqual(store.correct("try Groq now").text, "try Groq now", "inert until approved")
+        store.approveLearnedBatch(LearnBatch(corrections: learned))
         XCTAssertEqual(store.correct("try Groq now").text, "try Grok now")
     }
 
