@@ -1371,7 +1371,8 @@ final class ElevenLabsRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate
     static func selectKeyterms(from entries: [DictionaryEntry]) -> [String] {
         var seen = Set<String>()
         var candidates: [(term: String, fixCount: Int, index: Int)] = []
-        for (index, entry) in entries.enumerated() {
+        // Pending learn suggestions bias nothing until the user approves them.
+        for (index, entry) in entries.enumerated() where !entry.isPendingApproval {
             let term = entry.term.trimmingCharacters(in: .whitespacesAndNewlines)
             // Length-check in UTF-8 BYTES, not Swift grapheme clusters: the
             // server's counting method is unknown, and bytes is the strictest
