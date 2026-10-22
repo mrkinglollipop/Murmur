@@ -780,6 +780,10 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         try await task.send(message)
     }
 
+    /// Forces the buffered-audio fallback for this session. The recorder uses it
+    /// when it could not prove every captured buffer reached the session.
+    func requireBufferedAudioRecovery() { markStreamIntegrityFailed() }
+
     private func markStreamIntegrityFailed() {
         stateLock.lock()
         streamIntegrityFailed = true
@@ -830,7 +834,8 @@ final class GeminiLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     static func selectVocabulary(from entries: [DictionaryEntry]) -> [String] {
         var seen = Set<String>()
         var candidates: [(term: String, fixCount: Int, index: Int)] = []
-        for (index, entry) in entries.enumerated() {
+        // Pending learn suggestions bias nothing until the user approves them.
+        for (index, entry) in entries.enumerated() where !entry.isPendingApproval {
             let term = entry.term.trimmingCharacters(in: .whitespacesAndNewlines)
             guard term.count > 1 else { continue }
             let key = term.lowercased()

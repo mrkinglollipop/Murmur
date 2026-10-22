@@ -12,14 +12,62 @@ struct DictionaryEntry: Codable, Identifiable, Equatable {
     /// correction folded in automatically) rather than typed into the
     /// composer by hand. Decodes to `false` for pre-existing persisted
     /// entries that predate this field.
+    ///
+    /// An auto-learned entry is a *suggestion* until the user approves it:
+    /// it rewrites nothing, is no phonetic target and biases no engine.
+    /// Approving clears the flag and makes it a normal entry.
     var isAutoLearned: Bool
+    /// Learned heard-forms appended to an approved entry that still await the
+    /// user's OK. Inert like a pending entry; approving moves them into
+    /// `variants`.
+    var pendingVariants: [String]
 
-    init(id: UUID = UUID(), term: String, variants: [String], fixCount: Int = 0, isAutoLearned: Bool = false) {
+    init(
+        id: UUID = UUID(),
+        term: String,
+        variants: [String],
+        fixCount: Int = 0,
+        isAutoLearned: Bool = false,
+        pendingVariants: [String] = []
+    ) {
         self.id = id
         self.term = term
         self.variants = variants
         self.fixCount = fixCount
         self.isAutoLearned = isAutoLearned
+        self.pendingVariants = pendingVariants
+    }
+
+    /// Whole entry awaits approval (inert everywhere).
+    var isPendingApproval: Bool { isAutoLearned }
+
+    /// Something on this entry awaits approval: the whole entry, or learned
+    /// heard-forms appended to an approved entry.
+    var hasPendingSuggestion: Bool { isAutoLearned || !pendingVariants.isEmpty }
+
+    /// Heard-forms the user has not approved yet.
+    var unapprovedVariants: [String] {
+        isAutoLearned ? Self.union(variants, pendingVariants) : pendingVariants
+    }
+
+    /// Manual action on a pending entry (hand-added same term, merge with a
+    /// manual entry): the term becomes the user's, but heard-forms Murmur
+    /// learned on its own stay pending until approved.
+    func adoptedByUser() -> DictionaryEntry {
+        guard isAutoLearned else { return self }
+        var result = self
+        result.pendingVariants = Self.union(variants, pendingVariants)
+        result.variants = []
+        result.isAutoLearned = false
+        return result
+    }
+
+    static func union(_ lhs: [String], _ rhs: [String]) -> [String] {
+        var result = lhs
+        for value in rhs where !result.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) {
+            result.append(value)
+        }
+        return result
     }
 
     // Custom decoding so pre-existing persisted entries (written before this
@@ -32,6 +80,7 @@ struct DictionaryEntry: Codable, Identifiable, Equatable {
         variants = try container.decode([String].self, forKey: .variants)
         fixCount = try container.decode(Int.self, forKey: .fixCount)
         isAutoLearned = try container.decodeIfPresent(Bool.self, forKey: .isAutoLearned) ?? false
+        pendingVariants = try container.decodeIfPresent([String].self, forKey: .pendingVariants) ?? []
     }
 }
 
@@ -133,6 +182,22 @@ final class DictionaryStore: ObservableObject {
     /// least one still-present correction.
     var onRejectCompleted: ((LearnBatch) -> Void)?
 
+    /// Fired after a Dictionary-screen Add approves suggestions, so a pop-up
+    /// still showing them can drop those lines. Not fired from
+    /// `approveLearnedBatch` (the pop-up already owns its teardown).
+    var onApprove: ((Set<UnlearnedCorrectionIdentity>) -> Void)?
+
+    /// Entries that change dictation: everything except pending suggestions.
+    /// Engine vocabulary/keyterm providers read this, never `entries`.
+    var activeEntries: [DictionaryEntry] {
+        entries.filter { !$0.isPendingApproval }
+    }
+
+    /// Entries with at least one suggestion awaiting the user's OK.
+    var pendingEntries: [DictionaryEntry] {
+        entries.filter(\.hasPendingSuggestion)
+    }
+
     /// Minimum normalized similarity (1 - editDistance/maxLen) a candidate
     /// variant→term pair must clear to be learned. See `learn(from:to:)`.
     private static let minLearnSimilarity = 0.5
@@ -153,7 +218,13 @@ final class DictionaryStore: ObservableObject {
 
     private let fileURL: URL
     private let blocklistFileURL: URL
+    private let learnCandidatesFileURL: URL
     private let lexicon: RealWordLexicon
+    /// Pending (seen once) and user-rejected pairs for automated learning.
+    private(set) var learnCandidates = LearnCandidateLedger()
+    private var learnCandidatesSavesBlocked = false
+    /// Injectable clock for candidate aging (tests).
+    var learnClock: () -> Date = Date.init
 
     /// Set when dictionary.json / blocklist.json exists but could not be read
     /// or moved aside. Saving then would overwrite recoverable user data, so
@@ -161,12 +232,26 @@ final class DictionaryStore: ObservableObject {
     private var dictionarySavesBlocked = false
     private var blocklistSavesBlocked = false
 
-    init(fileURL: URL? = nil, blocklistFileURL: URL? = nil, lexicon: RealWordLexicon = .system) {
+    /// When `fileURL` is supplied (tests) the blocklist and learn-candidate
+    /// files default to siblings of it, never the real Application Support
+    /// copies.
+    init(
+        fileURL: URL? = nil,
+        blocklistFileURL: URL? = nil,
+        learnCandidatesFileURL: URL? = nil,
+        lexicon: RealWordLexicon = .system
+    ) {
         self.fileURL = fileURL ?? DictionaryStore.defaultFileURL()
-        self.blocklistFileURL = blocklistFileURL ?? DictionaryStore.defaultBlocklistFileURL()
+        self.blocklistFileURL = blocklistFileURL
+            ?? fileURL.map { URL(fileURLWithPath: $0.path + ".blocklist") }
+            ?? DictionaryStore.defaultBlocklistFileURL()
+        self.learnCandidatesFileURL = learnCandidatesFileURL
+            ?? fileURL.map { URL(fileURLWithPath: $0.path + ".learn-candidates") }
+            ?? DictionaryStore.defaultLearnCandidatesFileURL()
         self.lexicon = lexicon
         load()
         loadBlocklist()
+        loadLearnCandidates()
         rebuildRegexCache()
     }
 
@@ -180,6 +265,11 @@ final class DictionaryStore: ObservableObject {
     private static func defaultBlocklistFileURL() -> URL {
         VoicePaths.prepareApplicationSupportVoiceDirectory()
         return VoicePaths.applicationSupportVoiceDirectory.appendingPathComponent("blocklist.json")
+    }
+
+    private static func defaultLearnCandidatesFileURL() -> URL {
+        VoicePaths.prepareApplicationSupportVoiceDirectory()
+        return VoicePaths.applicationSupportVoiceDirectory.appendingPathComponent("learn-candidates.json")
     }
 
     // MARK: - Load / save
@@ -227,6 +317,49 @@ final class DictionaryStore: ObservableObject {
                 self.blocklist = []
             }
         }
+    }
+
+    private func loadLearnCandidates() {
+        guard FileManager.default.fileExists(atPath: learnCandidatesFileURL.path) else { return }
+        guard let data = try? Data(contentsOf: learnCandidatesFileURL) else {
+            learnCandidatesSavesBlocked = true
+            logger.error("learn-candidates.json exists but is unreadable — saves disabled this session")
+            return
+        }
+        do {
+            learnCandidates = try JSONDecoder().decode(LearnCandidateLedger.self, from: data)
+        } catch {
+            quarantineCorruptFile(
+                at: learnCandidatesFileURL,
+                label: "learn-candidates.json",
+                error: error,
+                blockSaves: { self.learnCandidatesSavesBlocked = true }
+            ) {
+                self.learnCandidates = LearnCandidateLedger()
+            }
+        }
+    }
+
+    private func saveLearnCandidates() {
+        guard !learnCandidatesSavesBlocked else { return }
+        do {
+            let data = try JSONEncoder().encode(learnCandidates)
+            try data.write(to: learnCandidatesFileURL, options: .atomic)
+        } catch {
+            logger.error("Failed to save learn-candidates.json: \(error.localizedDescription)")
+        }
+    }
+
+    /// Stops automated learning from ever re-proposing `heard` → `term`.
+    /// Does not touch `correct()` (unlike the blocklist), so a later hand-added
+    /// entry for the same pair still applies.
+    func rejectLearnCandidate(heard: String, term: String) {
+        let mutate = {
+            guard !self.learnCandidates.isRejected(heard: heard, term: term) else { return }
+            self.learnCandidates.reject(heard: heard, term: term)
+            self.saveLearnCandidates()
+        }
+        Thread.isMainThread ? mutate() : DispatchQueue.main.async(execute: mutate)
     }
 
     private func quarantineCorruptFile(at url: URL, label: String, error: Error, blockSaves: () -> Void, reset: () -> Void) {
@@ -352,10 +485,92 @@ final class DictionaryStore: ObservableObject {
         Thread.isMainThread ? work() : DispatchQueue.main.async(execute: work)
     }
 
+    /// Pop-up Add: approve each still-pending correction. Corrections already
+    /// approved, rejected or unlearned are skipped.
+    func approveLearnedBatch(_ batch: LearnBatch) {
+        let work = {
+            for correction in batch.corrections {
+                _ = self.applyApprove(correction)
+            }
+        }
+        Thread.isMainThread ? work() : DispatchQueue.main.async(execute: work)
+    }
+
+    /// Dictionary Add: approve every pending suggestion on `entry`.
+    func approvePending(_ entry: DictionaryEntry) {
+        let work = {
+            guard let current = self.entries.first(where: { $0.id == entry.id }),
+                  current.hasPendingSuggestion else { return }
+            let identities = Set(self.pendingCorrections(for: current).map(UnlearnedCorrectionIdentity.init))
+            var approved = current
+            approved.variants = DictionaryEntry.union(current.variants, current.pendingVariants)
+            approved.pendingVariants = []
+            approved.isAutoLearned = false
+            self.update(approved)
+            if !identities.isEmpty {
+                self.onApprove?(identities)
+            }
+        }
+        Thread.isMainThread ? work() : DispatchQueue.main.async(execute: work)
+    }
+
+    /// Dictionary Never: reject + blocklist every pending suggestion on
+    /// `entry` (same path as pop-up Never), and drop them from any pop-up.
+    func rejectPending(_ entry: DictionaryEntry) {
+        let work = {
+            guard let current = self.entries.first(where: { $0.id == entry.id }),
+                  current.hasPendingSuggestion else { return }
+            let corrections = self.pendingCorrections(for: current)
+            self.rejectLearnedBatch(LearnBatch(corrections: corrections))
+            self.notifyUnlearned(Set(corrections.map(UnlearnedCorrectionIdentity.init)))
+        }
+        Thread.isMainThread ? work() : DispatchQueue.main.async(execute: work)
+    }
+
+    /// The pending suggestions on `entry`, shaped like learned corrections so
+    /// approve / reject reuse the pop-up paths.
+    func pendingCorrections(for entry: DictionaryEntry) -> [LearnedCorrection] {
+        if entry.isAutoLearned {
+            return entry.unapprovedVariants.map {
+                LearnedCorrection(variant: $0, term: entry.term, createdNewEntry: true, entryID: entry.id)
+            }
+        }
+        return entry.pendingVariants.map {
+            LearnedCorrection(variant: $0, term: entry.term, createdNewEntry: false, entryID: entry.id)
+        }
+    }
+
+    /// Approves one correction. A pending entry becomes a normal entry; a
+    /// pending heard-form on an approved entry moves into `variants`.
+    @discardableResult
+    private func applyApprove(_ correction: LearnedCorrection) -> Bool {
+        guard let entry = entries.first(where: { $0.id == correction.entryID })
+            ?? entries.first(where: { $0.term.caseInsensitiveCompare(correction.term) == .orderedSame })
+        else { return false }
+        var approved = entry
+        if entry.isAutoLearned {
+            guard entry.unapprovedVariants.contains(where: {
+                $0.caseInsensitiveCompare(correction.variant) == .orderedSame
+            }) else { return false }
+            approved.variants = DictionaryEntry.union(entry.variants, entry.pendingVariants)
+            approved.pendingVariants = []
+            approved.isAutoLearned = false
+        } else {
+            guard let index = entry.pendingVariants.firstIndex(where: {
+                $0.caseInsensitiveCompare(correction.variant) == .orderedSame
+            }) else { return false }
+            let variant = approved.pendingVariants.remove(at: index)
+            approved.variants = DictionaryEntry.union(approved.variants, [variant])
+        }
+        update(approved)
+        return true
+    }
+
     private func rebuildRegexCache() {
         var cache: [String: NSRegularExpression] = [:]
         var index: [String: [UUID]] = [:]
-        for entry in entries {
+        // Pending suggestions are inert: no literal regex, no phonetic target.
+        for entry in entries where !entry.isPendingApproval {
             for variant in entry.variants where !variant.isEmpty {
                 let pattern = PhraseBoundaryPattern.wholePhrase(for: variant)
                 if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
@@ -367,12 +582,11 @@ final class DictionaryStore: ObservableObject {
             // text already has (".net" -> "..NET"). Those terms are reachable
             // through the literal variant pass above only.
             guard PhraseBoundaryPattern.hasWordCharacterEdges(entry.term) else { continue }
-            // A contraction is never jargon. A term the user added by hand stays
-            // a target even when it is also an English word ("Aegis", "Manna",
-            // "Tauri" are all in the system word list); an auto-learned one does not.
+            // A contraction is never jargon. A term the user added or approved
+            // stays a target even when it is also an English word ("Aegis",
+            // "Manna", "Tauri" are all in the system word list).
             guard !PhoneticMatcher.isContraction(entry.term),
                   !PhoneticMatcher.isProtectedHeardToken(entry.term) else { continue }
-            guard !(entry.isAutoLearned && lexicon.contains(entry.term)) else { continue }
             let encoded = PhoneticMatcher.encode(entry.term)
             for code in [encoded.primary, encoded.secondary].compactMap({ $0 }) where !code.isEmpty {
                 index[code, default: []].append(entry.id)
@@ -407,14 +621,23 @@ final class DictionaryStore: ObservableObject {
             }) {
                 var updated = self.entries[idx]
                 var changed = false
+                if !isAutoLearned && updated.isAutoLearned {
+                    // Hand-adding the same term adopts it; Murmur's own
+                    // heard-forms stay pending unless typed here too.
+                    updated = updated.adoptedByUser()
+                    changed = true
+                }
+                if !isAutoLearned {
+                    let before = updated.pendingVariants.count
+                    updated.pendingVariants.removeAll { pending in
+                        cleanVariants.contains { $0.caseInsensitiveCompare(pending) == .orderedSame }
+                    }
+                    changed = changed || updated.pendingVariants.count != before
+                }
                 for variant in cleanVariants where !updated.variants.contains(where: {
                     $0.caseInsensitiveCompare(variant) == .orderedSame
                 }) {
                     updated.variants.append(variant)
-                    changed = true
-                }
-                if !isAutoLearned && updated.isAutoLearned {
-                    updated.isAutoLearned = false
                     changed = true
                 }
                 if changed {
@@ -451,6 +674,12 @@ final class DictionaryStore: ObservableObject {
         cleaned.variants = entry.variants
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && !PhoneticMatcher.isProtectedEnglishPhrase($0) }
+        cleaned.pendingVariants = entry.pendingVariants
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { pending in
+                !pending.isEmpty && !PhoneticMatcher.isProtectedEnglishPhrase(pending)
+                    && !cleaned.variants.contains { $0.caseInsensitiveCompare(pending) == .orderedSame }
+            }
         let mutate = {
             guard let idx = self.entries.firstIndex(where: { $0.id == cleaned.id }) else { return }
             if let otherIdx = self.entries.firstIndex(where: {
@@ -486,21 +715,30 @@ final class DictionaryStore: ObservableObject {
     }
 
     private static func absorbing(_ donor: DictionaryEntry, into survivor: DictionaryEntry) -> DictionaryEntry {
-        var result = survivor
-        for variant in donor.variants where !result.variants.contains(where: {
-            $0.caseInsensitiveCompare(variant) == .orderedSame
-        }) {
-            result.variants.append(variant)
-        }
-        result.fixCount += donor.fixCount
-        if !donor.isAutoLearned {
-            result.isAutoLearned = false
-        }
+        // Manual wins over auto, but a pending side's heard-forms stay
+        // pending: a merge is not the user's OK.
+        let bothPending = survivor.isAutoLearned && donor.isAutoLearned
+        let survivorSide = bothPending ? survivor : survivor.adoptedByUser()
+        let donorSide = bothPending ? donor : donor.adoptedByUser()
+        var result = survivorSide
+        result.variants = DictionaryEntry.union(survivorSide.variants, donorSide.variants)
+        result.pendingVariants = DictionaryEntry.union(survivorSide.pendingVariants, donorSide.pendingVariants)
+            .filter { pending in
+                !result.variants.contains { $0.caseInsensitiveCompare(pending) == .orderedSame }
+            }
+        result.fixCount = survivor.fixCount + donor.fixCount
+        result.isAutoLearned = bothPending
         return result
     }
 
     func delete(_ entry: DictionaryEntry) {
         let mutate = {
+            // Deleting a rule Murmur learned on its own (never approved) is a
+            // rejection: automated learning must not bring it back.
+            let current = self.entries.first { $0.id == entry.id } ?? entry
+            for variant in current.unapprovedVariants {
+                self.rejectLearnCandidate(heard: variant, term: current.term)
+            }
             self.entries.removeAll { $0.id == entry.id }
             self.scheduleSave()
         }
@@ -517,13 +755,15 @@ final class DictionaryStore: ObservableObject {
     /// counts landing slightly after return — the returned corrected string
     /// is always computed synchronously and correct immediately).
     func correct(_ text: String) -> (text: String, records: [CorrectionRecord]) {
-        guard !entries.isEmpty else { return (text, []) }
+        let active = activeEntries
+        guard !active.isEmpty else { return (text, []) }
 
         var result = text
         var fixCounts: [UUID: Int] = [:]
         var records: [CorrectionRecord] = []
 
-        for entry in entries {
+        // `variants` only: pending heard-forms and pending entries are inert.
+        for entry in active {
             for variant in entry.variants {
                 guard !variant.isEmpty else { continue }
                 guard !PhoneticMatcher.isProtectedEnglishPhrase(variant) else { continue }
@@ -548,9 +788,8 @@ final class DictionaryStore: ObservableObject {
                 )
                 guard !realHeard.isEmpty else { continue }
                 fixCounts[entry.id, default: 0] += realHeard.count
-                let source: CorrectionSource = entry.isAutoLearned ? .autoLearned : .dictionary
                 for heard in realHeard {
-                    records.append(CorrectionRecord(heard: heard, replaced: entry.term, source: source))
+                    records.append(CorrectionRecord(heard: heard, replaced: entry.term, source: .dictionary))
                 }
             }
         }
@@ -622,7 +861,7 @@ final class DictionaryStore: ObservableObject {
         guard !token.isEmpty else { return nil }
         guard !PhoneticMatcher.isProtectedHeardToken(token, lexicon: lexicon) else { return nil }
 
-        if entries.contains(where: { $0.term.caseInsensitiveCompare(token) == .orderedSame }) {
+        if activeEntries.contains(where: { $0.term.caseInsensitiveCompare(token) == .orderedSame }) {
             return nil
         }
 
@@ -639,7 +878,7 @@ final class DictionaryStore: ObservableObject {
         guard !candidateIDs.isEmpty else { return nil }
 
         var best: (entry: DictionaryEntry, distance: Int)?
-        for entry in entries where candidateIDs.contains(entry.id) {
+        for entry in entries where candidateIDs.contains(entry.id) && !entry.isPendingApproval {
             guard !isBlocklisted(heard: token, replaced: entry.term) else { continue }
             let primaryKeyMatch = PhoneticMatcher.encode(entry.term).primary == encoded.primary
             guard PhoneticMatcher.guardAccepts(
@@ -659,8 +898,7 @@ final class DictionaryStore: ObservableObject {
         }
 
         guard let winner = best else { return nil }
-        let source: CorrectionSource = winner.entry.isAutoLearned ? .autoLearned : .phonetic
-        return PhoneticReplacement(term: winner.entry.term, entryID: winner.entry.id, source: source)
+        return PhoneticReplacement(term: winner.entry.term, entryID: winner.entry.id, source: .phonetic)
     }
 
     // MARK: - Learn from corrections (History edit → Dictionary)
@@ -683,7 +921,8 @@ final class DictionaryStore: ObservableObject {
         from oldText: String,
         to newText: String,
         userInitiated: Bool = false,
-        announce: Bool = true
+        announce: Bool = true,
+        observationID: UUID = UUID()
     ) -> [LearnedCorrection] {
         let old = oldText.trimmingCharacters(in: .whitespacesAndNewlines)
         let new = newText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -695,7 +934,12 @@ final class DictionaryStore: ObservableObject {
 
         let recorded: [LearnedCorrection]
         if oldWords.count == newWords.count {
-            recorded = learnSameWordCount(oldWords: oldWords, newWords: newWords, userInitiated: userInitiated)
+            recorded = learnSameWordCount(
+                oldWords: oldWords,
+                newWords: newWords,
+                userInitiated: userInitiated,
+                observationID: observationID
+            )
         } else if userInitiated {
             recorded = learnAligned(oldWords: oldWords, newWords: newWords, userInitiated: true)
         } else {
@@ -723,10 +967,12 @@ final class DictionaryStore: ObservableObject {
     private func learnSameWordCount(
         oldWords: [String],
         newWords: [String],
-        userInitiated: Bool
+        userInitiated: Bool,
+        observationID: UUID
     ) -> [LearnedCorrection] {
         let punctuation = CharacterSet.punctuationCharacters
         var recorded: [LearnedCorrection] = []
+        var observedThisCall = false
 
         for (oldWord, newWord) in zip(oldWords, newWords) {
             guard oldWord != newWord else { continue }
@@ -734,12 +980,28 @@ final class DictionaryStore: ObservableObject {
             let strippedOld = oldWord.trimmingCharacters(in: punctuation)
             let strippedNew = newWord.trimmingCharacters(in: punctuation)
             guard isLearnableVariant(strippedOld), !strippedNew.isEmpty else { continue }
-            guard strippedOld.caseInsensitiveCompare(strippedNew) != .orderedSame else { continue }
+            // Case-only or typography-only ("it's" → "it’s") is presentation.
+            guard CorrectionExtractor.normalizingTypography(strippedOld)
+                .caseInsensitiveCompare(CorrectionExtractor.normalizingTypography(strippedNew)) != .orderedSame else { continue }
 
             if !userInitiated {
                 let maxLen = max(strippedOld.count, strippedNew.count)
                 let similarity = maxLen == 0 ? 0 : 1.0 - Double(editDistance(strippedOld, strippedNew)) / Double(maxLen)
                 guard similarity >= Self.minLearnSimilarity else { continue }
+                guard !isOrdinaryEnglish(strippedOld) else { continue }
+                guard !isBlocklisted(heard: strippedOld, replaced: strippedNew),
+                      !learnCandidates.isRejected(heard: strippedOld, term: strippedNew),
+                      !hasVariant(strippedOld, forTerm: strippedNew) else { continue }
+                // One sighting is never enough: promote only on the second
+                // independent dictation (same observation never counts twice).
+                let promoted = learnCandidates.observe(
+                    heard: strippedOld,
+                    term: strippedNew,
+                    observationID: observationID,
+                    now: learnClock()
+                )
+                observedThisCall = true
+                guard promoted else { continue }
             }
 
             if let correction = recordLearnedVariant(
@@ -751,7 +1013,30 @@ final class DictionaryStore: ObservableObject {
             }
         }
 
+        if observedThisCall {
+            saveLearnCandidates()
+        }
         return recorded
+    }
+
+    /// Automated learning never treats an ordinary English word (or
+    /// contraction) as a mishearing: "mark" → "Mock" or "we've" → "I've"
+    /// would rewrite that word in every future dictation. Reuses the phonetic
+    /// matcher's protected-token check and lexicon.
+    private func isOrdinaryEnglish(_ heard: String) -> Bool {
+        let words = CorrectionExtractor.normalizingTypography(heard)
+            .split(whereSeparator: \.isWhitespace)
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else { return true }
+        return words.allSatisfy { PhoneticMatcher.isProtectedHeardToken($0, lexicon: lexicon) }
+    }
+
+    private func hasVariant(_ variant: String, forTerm term: String) -> Bool {
+        entries.contains { entry in
+            entry.term.caseInsensitiveCompare(term) == .orderedSame
+                && (entry.variants + entry.pendingVariants).contains { $0.caseInsensitiveCompare(variant) == .orderedSame }
+        }
     }
 
     /// Aligns word sequences when counts differ — handles ASR splitting one term
@@ -934,10 +1219,17 @@ final class DictionaryStore: ObservableObject {
             return nil
         }
         if let existing = entries.first(where: { $0.term.caseInsensitiveCompare(term) == .orderedSame }) {
-            let alreadyPresent = existing.variants.contains { $0.caseInsensitiveCompare(variant) == .orderedSame }
+            let alreadyPresent = (existing.variants + existing.pendingVariants)
+                .contains { $0.caseInsensitiveCompare(variant) == .orderedSame }
             guard !alreadyPresent else { return nil }
             var updated = existing
-            updated.variants.append(variant)
+            // A pending entry is inert as a whole; on an approved entry the
+            // learned heard-form waits in `pendingVariants` for the user's OK.
+            if existing.isAutoLearned {
+                updated.variants.append(variant)
+            } else {
+                updated.pendingVariants.append(variant)
+            }
             update(updated)
             return LearnedCorrection(variant: variant, term: term, createdNewEntry: false, entryID: existing.id)
         } else {
@@ -976,6 +1268,12 @@ final class DictionaryStore: ObservableObject {
     /// Applies unlearn without `onUnlearn` (used by toast Reject).
     @discardableResult
     private func applyUnlearn(_ correction: LearnedCorrection) -> Bool {
+        guard applyUnlearnRemovingVariant(correction) else { return false }
+        rejectLearnCandidate(heard: correction.variant, term: correction.term)
+        return true
+    }
+
+    private func applyUnlearnRemovingVariant(_ correction: LearnedCorrection) -> Bool {
         if let existing = entries.first(where: { $0.id == correction.entryID }) {
             return applyUnlearnToEntry(correction, existing, deleteIfCreatedAndEmpty: true)
         }
@@ -996,6 +1294,14 @@ final class DictionaryStore: ObservableObject {
         _ existing: DictionaryEntry,
         deleteIfCreatedAndEmpty: Bool
     ) -> Bool {
+        if let index = existing.pendingVariants.firstIndex(where: {
+            $0.caseInsensitiveCompare(correction.variant) == .orderedSame
+        }) {
+            var updated = existing
+            updated.pendingVariants.remove(at: index)
+            update(updated)
+            return true
+        }
         if correction.createdNewEntry {
             let others = existing.variants.filter {
                 $0.caseInsensitiveCompare(correction.variant) != .orderedSame

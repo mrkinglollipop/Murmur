@@ -214,6 +214,26 @@ final class StuckProcessingHUDTests: XCTestCase {
     }
 
     @MainActor
+    func testBatchServiceReceivesKeytermsProviderTerms() {
+        let selector = ASREngineSelector()
+        selector.cloudModel = .elevenLabsScribeV2Realtime
+        selector.apiKeyProvider = { _ in "dummy-test-key" }
+        selector.keytermsProvider = { ["Khipu", "Murmur"] }
+        let service = ElevenLabsTranscriptionService()
+        let pipeline = selector.pipeline
+        pipeline.cloudServiceProvider = { _ in service }
+        pipeline.localEngineProvider = { LocalStub { _ in "" } }
+        pipeline.onTranscriptionLogged = { _, _, _, _, _, _ in }
+        let done = expectation(description: "pipeline finished")
+        // Missing audio file makes the batch call throw after keyterms are set.
+        pipeline.transcribeAndLog(
+            audioURL: URL(fileURLWithPath: "/nonexistent-keyterms-test.caf"), audioIsTemporary: true
+        ) { _ in done.fulfill() }
+        wait(for: [done], timeout: 10)
+        XCTAssertEqual(service.keyterms, ["Khipu", "Murmur"])
+    }
+
+    @MainActor
     func testEmptyCloudRecoversVoiceEditInstructionBeforeTransform() {
         let selector = ASREngineSelector()
         selector.cloudModel = .elevenLabsScribeV2Realtime
@@ -796,6 +816,55 @@ final class HoldOwnershipRegressionTests: XCTestCase {
         let id = "local-recovery"
         let displayName = "Local recovery"
         func transcribe(audioURL: URL) async throws -> String { "Recovered A" }
+    }
+
+    // MARK: - Bounded capture-delivery wait at stop
+
+    @MainActor
+    func testStopSnapshotTimesOutInsteadOfBlockingOnStalledTap() {
+        let recorder = recorder()
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!
+        buffer.frameLength = 160
+        recorder.test_bufferAudio(buffer)
+
+        let free = recorder.snapshotBufferedAudioForStop(lockTimeout: 0.05)
+        XCTAssertFalse(free.timedOut)
+        XCTAssertEqual(free.buffers.count, 1)
+
+        let lock = recorder.test_captureDeliveryLock
+        let held = expectation(description: "lock held")
+        let release = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            lock.lock()
+            held.fulfill()
+            release.wait()
+            lock.unlock()
+        }
+        wait(for: [held], timeout: 2)
+        let start = Date()
+        let stalled = recorder.snapshotBufferedAudioForStop(lockTimeout: 0.05)
+        release.signal()
+        XCTAssertTrue(stalled.timedOut)
+        XCTAssertEqual(stalled.buffers.count, 1, "the snapshot is still taken on timeout")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.0)
+    }
+
+    func testForcedRecoveryMakesEveryActiveSessionUnacceptable() {
+        let xai = XAIStreamingTranscriber(apiKey: "offline", messageSender: { _ in })
+        let eleven = ElevenLabsRealtimeTranscriber(apiKey: "offline", messageSender: { _ in })
+        let gemini = GeminiLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        let muse = MuseLiveTranscriber(apiKey: "offline", messageSender: { _ in })
+        for requires in [xai.requiresBufferedAudioRecovery, eleven.requiresBufferedAudioRecovery,
+                         gemini.requiresBufferedAudioRecovery, muse.requiresBufferedAudioRecovery] {
+            XCTAssertFalse(requires)
+        }
+        StreamingCoordinator(xaiSession: xai, elevenLabsSession: eleven, geminiSession: gemini, museSession: muse)
+            .requireBufferedAudioRecoveryForActiveSessions()
+        XCTAssertTrue(xai.requiresBufferedAudioRecovery)
+        XCTAssertTrue(eleven.requiresBufferedAudioRecovery)
+        XCTAssertTrue(gemini.requiresBufferedAudioRecovery)
+        XCTAssertTrue(muse.requiresBufferedAudioRecovery)
     }
 
     @MainActor

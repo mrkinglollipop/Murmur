@@ -615,6 +615,15 @@ final class StreamingCoordinator {
         session.send(buffer)
     }
 
+    /// Makes every active session's result unacceptable so the stop path falls
+    /// back to buffered audio.
+    func requireBufferedAudioRecoveryForActiveSessions() {
+        xaiSession?.requireBufferedAudioRecovery()
+        elevenLabsSession?.requireBufferedAudioRecovery()
+        geminiSession?.requireBufferedAudioRecovery()
+        museSession?.requireBufferedAudioRecovery()
+    }
+
     /// Aborts any in-flight streaming session and drops the reference without
     /// waiting for a final transcript — used when the capture is abandoned
     /// (secure input activated mid-hold) and the audio must not be used.
@@ -764,7 +773,10 @@ final class StreamingCoordinator {
 
         let releaseAt = Date()
         Task {
-            let text = await session.finalize(recordingDuration: context.duration)
+            // The coverage proof compares streamed audio with the recording
+            // the fallback would use. The wall-clock hold also counts mic
+            // start-up time that neither the stream nor the recording holds.
+            let text = await session.finalize(recordingDuration: bufferedSecs)
             vlog("elevenlabs streaming: finalize-at-release \(String(format: "%.3f", Date().timeIntervalSince(releaseAt)))s")
             if session.requiresBufferedAudioRecovery {
                 self.logger.warning("ElevenLabs stream coverage was not established — falling back to buffered audio.")

@@ -400,13 +400,66 @@ final class VoiceEditTests: XCTestCase {
         let rewrite = "Deliver five crates."
         XCTAssertTrue(VoiceEditRouting.resultLooksUsable(rewrite, over: selection))
         XCTAssertFalse(TranscriptionPipeline.cleanupLooksSane(input: selection, output: rewrite))
-        for invalid in ["", "  \n", "…😀!!!", "x", String(repeating: "x", count: selection.count * 2 + 1)] {
+        for invalid in ["", "  \n", "…😀!!!", "x"] {
             XCTAssertFalse(VoiceEditRouting.resultLooksUsable(invalid, over: selection))
         }
         XCTAssertTrue(VoiceEditRouting.resultLooksUsable("12345", over: "abcdefghij"))
         XCTAssertTrue(VoiceEditRouting.resultLooksUsable("abcd", over: "abcdefghij"))
         XCTAssertTrue(VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: 20), over: "abcdefghij"))
         XCTAssertFalse(VoiceEditRouting.resultLooksUsable("abc", over: "abcdefghij"))
+    }
+
+    func testResultLengthAllowsShortSelectionsToGrowButBoundsLongOnes() {
+        let short = "abcdefgh"
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: 26), over: short))
+        XCTAssertFalse(VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: 170), over: short))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("abc", over: short))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("Tue", over: "Tuesday"))
+        let long = String(repeating: "a", count: 200)
+        XCTAssertFalse(VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: 450), over: long))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: 380), over: long))
+        for invalid in ["", "   ", "...!?"] {
+            XCTAssertFalse(VoiceEditRouting.resultLooksUsable(invalid, over: short))
+        }
+    }
+
+    func testResultLengthBoundaryIsExact() {
+        func ok(_ n: Int, over selection: String) -> Bool {
+            VoiceEditRouting.resultLooksUsable(String(repeating: "x", count: n), over: selection)
+        }
+        let eight = String(repeating: "a", count: 8)
+        XCTAssertTrue(ok(168, over: eight))
+        XCTAssertFalse(ok(169, over: eight))
+        let twoHundred = String(repeating: "a", count: 200)
+        XCTAssertTrue(ok(400, over: twoHundred))
+        XCTAssertFalse(ok(401, over: twoHundred))
+        let ten = String(repeating: "a", count: 10)
+        XCTAssertTrue(ok(4, over: ten))
+        XCTAssertFalse(ok(3, over: ten))
+    }
+
+    func testResultRejectsAssistantPreamblesOnlyWhenSelectionLacksOne() {
+        let selection = "tomorrow"
+        for chatty in [
+            "Sure! Here's the edited text: Tomorrow",
+            "Sure, here is the result:\nTomorrow",
+            "Certainly!\nTomorrow",
+            "Of course: Tomorrow",
+            "OK: Tomorrow",
+            "Here are the edits: Tomorrow",
+            "The edited text: Tomorrow",
+            "Edited: Tomorrow",
+            "here's the revised version:\nTomorrow",
+        ] {
+            XCTAssertFalse(VoiceEditRouting.resultLooksUsable(chatty, over: selection), chatty)
+        }
+        // Ordinary prose that merely starts the same way stays acceptable.
+        for fine in ["OK then, see you at 5: sharp", "Here we go again", "Tomorrow: Sure thing", "Okay"] {
+            XCTAssertTrue(VoiceEditRouting.resultLooksUsable(fine, over: selection), fine)
+        }
+        // The selection itself began with a lead-in, so keeping it is not a preamble.
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("Here is the plan: ship it", over: "here is the plan: ship"))
+        XCTAssertTrue(VoiceEditRouting.resultLooksUsable("OK: ready", over: "ok: ready now"))
     }
 
     func testSelectionRecheckRequiresReadableUnchangedValueAndExactRange() {
@@ -582,7 +635,7 @@ final class VoiceEditTests: XCTestCase {
 
     @MainActor
     func testEditDeliveryEmptyOrRejectedResultLeavesSelectionUntouched() {
-        for result in ["", "  \n", "!!!…😀", "x", String(repeating: "x", count: 31)] {
+        for result in ["", "  \n", "!!!…😀", "x", String(repeating: "x", count: 176)] {
             assertEditDelivery(result: result, expectedOutcome: .failed, expectedFailure: .voiceEditFailed)
         }
         XCTAssertEqual(DictationFailure.voiceEditFailed.message, "Try rephrasing")
@@ -889,7 +942,7 @@ final class VoiceEditTests: XCTestCase {
 
     @MainActor
     func testEditEmptyBodyAndImplausibleBodyFailWithoutInjection() {
-        for response in ["EDIT", "EDIT\n ", "edit!\nx", "EDIT\n" + String(repeating: "x", count: 31)] {
+        for response in ["EDIT", "EDIT\n ", "edit!\nx", "EDIT\n" + String(repeating: "x", count: 176)] {
             assertSelectionResponse(response, spoken: "rewrite this", expected: nil, edit: true)
         }
     }

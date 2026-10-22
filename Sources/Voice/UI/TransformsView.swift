@@ -347,6 +347,7 @@ struct TransformsView: View {
     private func run(_ transform: Transform) {
         guard let text = lastDictationText else { return }
         runState[transform.id] = .running
+        let startedAtChangeCount = NSPasteboard.general.changeCount
 
         Task {
             do {
@@ -355,12 +356,16 @@ struct TransformsView: View {
                     over: text,
                     credentials: transformCredentialsProvider()
                 )
-                await MainActor.run {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(result, forType: .string)
-                    runState[transform.id] = .copied
+                let copied = await MainActor.run { () -> Bool in
+                    let copied = TransformRunner.copyResultIfClipboardUnchanged(
+                        result,
+                        on: .general,
+                        startedAtChangeCount: startedAtChangeCount
+                    )
+                    runState[transform.id] = copied ? .copied : .failed(TransformRunner.clipboardChangedMessage)
+                    return copied
                 }
+                guard copied else { return }
                 try? await Task.sleep(nanoseconds: UInt64(Theme.copyConfirmSeconds * 1_000_000_000))
                 await MainActor.run {
                     if case .copied = runState[transform.id] {

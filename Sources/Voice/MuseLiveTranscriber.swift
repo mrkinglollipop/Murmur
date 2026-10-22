@@ -674,6 +674,10 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         try await task.send(message)
     }
 
+    /// Forces the buffered-audio fallback for this session. The recorder uses it
+    /// when it could not prove every captured buffer reached the session.
+    func requireBufferedAudioRecovery() { markStreamIntegrityFailed() }
+
     private func markStreamIntegrityFailed() {
         stateLock.lock()
         streamIntegrityFailed = true
@@ -706,7 +710,8 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
     static func selectKeywords(from entries: [DictionaryEntry]) -> [String] {
         var seen = Set<String>()
         var candidates: [(term: String, fixCount: Int, index: Int)] = []
-        for (index, entry) in entries.enumerated() {
+        // Pending learn suggestions bias nothing until the user approves them.
+        for (index, entry) in entries.enumerated() where !entry.isPendingApproval {
             let term = entry.term.trimmingCharacters(in: .whitespacesAndNewlines)
             guard term.count > 1, term.utf8.count <= maxKeywordLength else { continue }
             let key = term.lowercased()

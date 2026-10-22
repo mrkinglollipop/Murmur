@@ -106,6 +106,8 @@ final class CorrectionExtractorTests: XCTestCase {
             currentValue: "I use Grok daily"
         )
         XCTAssertNotNil(diff)
+        let first = store.learn(from: diff!.oldRegion, to: diff!.newRegion, userInitiated: false)
+        XCTAssertTrue(first.isEmpty, "one sighting is only a candidate")
         let learned = store.learn(
             from: diff!.oldRegion,
             to: diff!.newRegion,
@@ -114,6 +116,8 @@ final class CorrectionExtractorTests: XCTestCase {
         XCTAssertEqual(learned.count, 1)
         XCTAssertEqual(learned.first?.variant, "Groq")
         XCTAssertEqual(learned.first?.term, "Grok")
+        XCTAssertEqual(store.correct("try Groq now").text, "try Groq now", "inert until approved")
+        store.approveLearnedBatch(LearnBatch(corrections: learned))
         XCTAssertEqual(store.correct("try Groq now").text, "try Grok now")
     }
 
@@ -125,7 +129,7 @@ final class CorrectionExtractorTests: XCTestCase {
                 .appendingPathComponent("bl-\(UUID().uuidString).json")
         )
         store.blocklistPair(heard: "Groq", replaced: "Grok")
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok")
         XCTAssertTrue(learned.isEmpty)
     }
 }

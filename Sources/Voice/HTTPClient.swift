@@ -26,7 +26,8 @@ enum HTTPClient {
         fileData: Data,
         fileName: String,
         mimeType: String,
-        fields: [String: String]
+        fields: [String: String],
+        repeatedFields: [(name: String, value: String)] = []
     ) -> Data {
         var body = Data()
         func append(_ string: String) {
@@ -34,6 +35,13 @@ enum HTTPClient {
         }
 
         for (key, value) in fields {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
+            append("\(value)\r\n")
+        }
+
+        // Same field name once per value, in order (e.g. ElevenLabs `keyterms`).
+        for (key, value) in repeatedFields {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
             append("\(value)\r\n")

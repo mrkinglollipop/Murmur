@@ -111,6 +111,50 @@ final class CloudRequestCoverageTests: OfflineHTTPTestCase {
         try assertMultipart(request, fields: ["model_id": "scribe_v2", "language_code": "ja", "tag_audio_events": "false"])
     }
 
+    private func keytermValues(_ captured: CoverageURLProtocol.Captured) -> [String] {
+        let text = String(decoding: captured.body, as: UTF8.self)
+        let marker = "name=\"keyterms\"\r\n\r\n"
+        var values: [String] = []
+        var rest = text[...]
+        while let r = rest.range(of: marker) {
+            let tail = rest[r.upperBound...]
+            guard let end = tail.range(of: "\r\n") else { break }
+            values.append(String(tail[..<end.lowerBound]))
+            rest = tail[end.upperBound...]
+        }
+        return values
+    }
+
+    func testElevenLabsBatchSendsOneKeytermsPartPerTermInOrder() async throws {
+        CoverageURLProtocol.script([.init()])
+        let service = ElevenLabsTranscriptionService()
+        service.keyterms = ["Khipu", "SwiftUI", "Murmur"]
+        _ = try await service.transcribe(audioURL: audioURL, apiKey: key,
+                                         model: .elevenLabsScribeV2Realtime, language: "en")
+        let request = try onlyRequest()
+        XCTAssertEqual(keytermValues(request), ["Khipu", "SwiftUI", "Murmur"])
+    }
+
+    func testElevenLabsBatchFiltersInvalidKeyterms() async throws {
+        CoverageURLProtocol.script([.init()])
+        let service = ElevenLabsTranscriptionService()
+        service.keyterms = ["Khipu", "  ", "", String(repeating: "a", count: 50),
+                            "one two three four five six", "five words are fine here", " Padded "]
+        _ = try await service.transcribe(audioURL: audioURL, apiKey: key,
+                                         model: .elevenLabsScribeV2Realtime, language: "en")
+        XCTAssertEqual(keytermValues(try onlyRequest()), ["Khipu", "five words are fine here", "Padded"])
+        XCTAssertEqual(ElevenLabsTranscriptionService.filterBatchKeyterms(
+            (0..<1200).map { "t\($0)" }).count, 1000)
+    }
+
+    func testElevenLabsBatchOmitsKeytermsWhenEmpty() async throws {
+        CoverageURLProtocol.script([.init()])
+        _ = try await ElevenLabsTranscriptionService().transcribe(audioURL: audioURL, apiKey: key,
+                                                                model: .elevenLabsScribeV2Realtime, language: "en")
+        XCTAssertTrue(keytermValues(try onlyRequest()).isEmpty)
+        XCTAssertFalse(String(decoding: try onlyRequest().body, as: UTF8.self).contains("keyterms"))
+    }
+
     func testMuseRequestUsesJSONAndAudioParts() async throws {
         CoverageURLProtocol.script([.init(body: Data(#"{"transcript":"fixture transcript"}"#.utf8))])
         _ = try await MuseTranscriptionService().transcribe(audioURL: audioURL, apiKey: key,

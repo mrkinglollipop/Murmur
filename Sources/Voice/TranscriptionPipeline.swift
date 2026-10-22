@@ -100,9 +100,14 @@ final class TranscriptionPipeline {
         deliveryHooks?.snapshot() ?? CaretContext.snapshot(frontmostPID: frontmostPID)
     }
 
-    private func deliveryFocusedElement(frontmostPID: pid_t) -> AXUIElement? {
-        if let hooks = deliveryHooks { return hooks.snapshot().focusedElement }
-        return CaretContext.focusedElement(frontmostPID: frontmostPID)
+    private func deliveryFocusedField(frontmostPID: pid_t) -> CaretContext.FocusedField? {
+        if let hooks = deliveryHooks {
+            let snapshot = hooks.snapshot()
+            return snapshot.focusedElement.map {
+                .init(element: $0, role: snapshot.focusedRole, isEditable: snapshot.focusedIsEditable)
+            }
+        }
+        return CaretContext.focusedField(frontmostPID: frontmostPID)
     }
 
     private func injectionTarget(voiceEdit: Bool) -> TextInjector.InjectionTarget {
@@ -206,9 +211,11 @@ final class TranscriptionPipeline {
     func clearHeldCaretSnapshot(matching token: UInt64? = nil) {
         if let token {
             voiceEditIntents.removeValue(forKey: token)
+            unboundHoldTokens.remove(token)
             if heldCaretToken != token { return }
         } else {
             voiceEditIntents.removeAll()
+            unboundHoldTokens.removeAll()
         }
         heldCaretSnapshot = nil
         heldFrontmostPID = nil
@@ -223,9 +230,38 @@ final class TranscriptionPipeline {
         voiceEditIntents[token] != nil
     }
 
+    /// Release landed in a different app than the hold-start selection. Main
+    /// thread; must run before `prepareTranscript` so the take gets ordinary
+    /// dictation cleanup.
+    func dropVoiceEditIntent(matching token: UInt64) {
+        assert(Thread.isMainThread, "dropVoiceEditIntent requires main thread")
+        guard voiceEditIntents.removeValue(forKey: token) != nil else { return }
+        vlog("voice edit dropped: app changed during hold — delivering as dictation")
+    }
+
     private func consumeVoiceEditIntent(matching token: UInt64) -> VoiceEditIntent? {
         voiceEditIntents.removeValue(forKey: token)
     }
+
+    /// Holds released with nothing editable focused. Their text goes to the
+    /// editable field focused at insert, in any app, as ordinary dictation.
+    /// Main-thread only; capped like `abandonedHoldTokens`.
+    private var unboundHoldTokens: Set<UInt64> = []
+
+    /// Main thread; must run before `finishTranscription` so a hold-start
+    /// selection is never edited by a take that left its field.
+    func markHoldUnbound(_ token: UInt64) {
+        assert(Thread.isMainThread, "markHoldUnbound requires main thread")
+        unboundHoldTokens.insert(token)
+        if unboundHoldTokens.count > Self.abandonedHoldTokenCap, let oldest = unboundHoldTokens.min() {
+            unboundHoldTokens.remove(oldest)
+        }
+        if voiceEditIntents.removeValue(forKey: token) != nil {
+            vlog("voice edit dropped: no editable target at release — delivering as dictation")
+        }
+    }
+
+    var test_unboundHoldTokens: Set<UInt64> { unboundHoldTokens }
 
     /// Hold tokens whose processing HUD was already dismissed by the
     /// recorder's watchdog. A late result for one of these is saved to History
@@ -402,11 +438,20 @@ final class TranscriptionPipeline {
     /// (2026-08-09); re-worded when targeting moved from hold-start to
     /// release (2026-08-10).
     static func vlogAppSwitchAbort(heldPID: pid_t?, currentPID: pid_t?) {
-        func bundleID(_ pid: pid_t?) -> String {
-            guard let pid else { return "nil" }
-            return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "pid:\(pid)"
-        }
-        vlog("inject abort: frontmost changed between release and insert — target=\(bundleID(heldPID)) current=\(bundleID(currentPID))")
+        vlog("inject abort: frontmost changed between release and insert — target=\(bundleIDForLog(heldPID)) current=\(bundleIDForLog(currentPID))")
+    }
+
+    static func bundleIDForLog(_ pid: pid_t?) -> String {
+        guard let pid else { return "nil" }
+        return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "pid:\(pid)"
+    }
+
+    static func vlogDeliveryCheckFailure(
+        check: String, held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot, pid: pid_t?
+    ) {
+        vlog("inject abort: "
+            + VoiceEditRouting.deliveryCheckDiagnostic(check: check, held: held, fresh: fresh, pid: pid)
+            + " bundle=\(bundleIDForLog(pid))")
     }
 
     /// Call on main. App-switch abort leave: re-read secure; leave clipboard
@@ -484,6 +529,9 @@ final class TranscriptionPipeline {
                         gemini.smartMode = selector.removeFillerWordsEnabled
                         gemini.vocabulary = selector.geminiVocabularyProvider?() ?? []
                     }
+                    if let elevenLabs = service as? ElevenLabsTranscriptionService {
+                        elevenLabs.keyterms = selector.keytermsProvider?() ?? []
+                    }
                     let text = try await service.transcribe(
                         audioURL: audioURL,
                         apiKey: key,
@@ -493,7 +541,8 @@ final class TranscriptionPipeline {
                     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         throw CloudTranscriptionError.emptyTranscript(provider: cloudModel.provider)
                     }
-                    let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID)
+                    let cleaned = await self.prepareTranscript(
+                        text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID, engineID: engineTag)
                     let transformed = cleaned.text
                     self.finishTranscription(
                         text: transformed,
@@ -726,10 +775,17 @@ final class TranscriptionPipeline {
         )
     }
 
-    private func prepareTranscript(
+    /// ElevenLabs batch spells numbers out while its realtime stream writes
+    /// digits, so only this engine's ordinary dictation is normalized.
+    static func normalizesSpokenNumbers(engineID: String?) -> Bool {
+        engineID == "cloud:elevenLabs"
+    }
+
+    func prepareTranscript(
         _ text: String,
         holdToken: UInt64,
-        replaceHistoryEntryID: UUID?
+        replaceHistoryEntryID: UUID?,
+        engineID: String? = nil
     ) async -> PreprocessedTranscript {
         let isEdit = await MainActor.run {
             replaceHistoryEntryID == nil && self.isVoiceEditHold(holdToken)
@@ -740,7 +796,9 @@ final class TranscriptionPipeline {
                 hadExplicitTrailingNewline: false
             )
         }
-        let cleaned = await applyCleanup(text)
+        let dictation = Self.normalizesSpokenNumbers(engineID: engineID)
+            ? SpokenNumberNormalizer.normalize(text) : text
+        let cleaned = await applyCleanup(dictation)
         return PreprocessedTranscript(
             text: await applyAutoTransform(cleaned.text),
             hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline
@@ -1032,7 +1090,8 @@ final class TranscriptionPipeline {
                             case .replace:
                                 // The selection intent was consumed before preparation, so
                                 // this follows ordinary dictation's cleanup/formatting path.
-                                let prepared = await self.prepareTranscript(trimmed, holdToken: sessionHeldToken, replaceHistoryEntryID: nil)
+                                let prepared = await self.prepareTranscript(
+                                    trimmed, holdToken: sessionHeldToken, replaceHistoryEntryID: nil, engineID: engineID)
                                 guard !Self.normalizeTranscriptForInjection(prepared.text).isEmpty else {
                                     await MainActor.run {
                                         self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath,
@@ -1118,7 +1177,7 @@ final class TranscriptionPipeline {
             // for clear still uses sessionHeldToken; live held is only a
             // fallback when the stop sample was nil — so clearHeldCaretSnapshot
             // nilling the live slot cannot wipe a good stop sample.
-            let heldAtStart = Self.resolveHeldAtStart(
+            let releaseHeld = Self.resolveHeldAtStart(
                 sessionHeldSnapshot: sessionHeldSnapshot,
                 sessionHeldToken: sessionHeldToken,
                 liveToken: self.heldCaretToken,
@@ -1127,7 +1186,8 @@ final class TranscriptionPipeline {
             let clearToken = sessionHeldToken
             let replaceID = replaceHistoryEntryID
             // Entry-sampled will-start PID — do not re-read NSWorkspace as "held".
-            let heldPID = sessionHeldFrontmostPID
+            let releasePID = sessionHeldFrontmostPID
+            let unbound = replaceID == nil && self.unboundHoldTokens.remove(sessionHeldToken) != nil
 
             // Insert blocks up to ~1s (event delivery + confirmation waits) —
             // run it off-main so HUD animations don't stall. Only the
@@ -1136,16 +1196,31 @@ final class TranscriptionPipeline {
             DispatchQueue.global(qos: .utility).async {
                 // Sample frontmost PID + secure **before** fresh AX / transforms
                 // so app-switch abort never drives wrong-app caret reads.
-                let (currentPID, liveSecureAtSample): (pid_t?, Bool) = DispatchQueue.main.sync {
+                let (currentPID, liveSecureAtSample, unboundField): (pid_t?, Bool, CaretContext.FocusedField?) = DispatchQueue.main.sync {
                     let target = self.injectionTarget(voiceEdit: isSelectionDelivery)
-                    return (target.pid, target.secureInput)
+                    // Same app as at release: the user never moved, so the
+                    // take is delivered on the normal bound path below.
+                    let movedApps = target.pid == nil || target.pid != releasePID
+                    let field = unbound && movedApps ? target.pid.flatMap { self.deliveryFocusedField(frontmostPID: $0) } : nil
+                    if unbound && movedApps {
+                        vlog("inject: unbound take at insert — "
+                            + VoiceEditRouting.focusDiagnostic(field: field, appHasWindows: nil, pid: target.pid,
+                                bundle: target.bundleIdentifier ?? "nil"))
+                    }
+                    return (target.pid, target.secureInput, field)
                 }
+                // An unbound take adopts the app and field focused now, so the
+                // release-to-insert app-switch rule measures from here.
+                let adoptsFocus = unbound && !(currentPID != nil && currentPID == releasePID)
+                let heldPID = adoptsFocus ? currentPID : releasePID
+                let heldAtStart = adoptsFocus ? nil : releaseHeld
+                let unboundWithoutTarget = adoptsFocus && unboundField?.acceptsRelaxedDelivery != true
                 let axPlan = Self.injectAXPlan(
                     replaceHistoryEntryID: replaceID,
                     heldPID: heldPID,
                     currentPID: currentPID
                 )
-                let abortForAppSwitch = axPlan == .abortWithoutFreshAX
+                let abortForAppSwitch = axPlan == .abortWithoutFreshAX || unboundWithoutTarget
 
                 let textToInject: String
                 let liveSecure: Bool
@@ -1222,7 +1297,11 @@ final class TranscriptionPipeline {
                 case .abortedAppSwitch:
                     // Live secure re-read before pasteboard — skip leave when secure.
                     DispatchQueue.main.sync {
-                        Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
+                        if unboundWithoutTarget {
+                            vlog("inject abort: unbound take and nothing editable focused at insert")
+                        } else {
+                            Self.vlogAppSwitchAbort(heldPID: heldPID, currentPID: currentPID)
+                        }
                         abortLeaveBecameSecure = self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: isSelectionDelivery)
                     }
                     insertResult = .failed
@@ -1244,8 +1323,13 @@ final class TranscriptionPipeline {
                             }
                             let fresh = self.voiceEditInjectionHooks?.snapshot()
                                 ?? self.deliverySnapshot(frontmostPID: heldPID)
-                            guard sessionHeldToken == self.heldCaretToken,
-                                  VoiceEditRouting.selectionMatches(held: heldAtStart, fresh: fresh) else {
+                            guard sessionHeldToken == self.heldCaretToken else {
+                                vlog("inject abort: voice-edit hold superseded before insert")
+                                return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
+                            }
+                            guard VoiceEditRouting.selectionMatches(held: heldAtStart, fresh: fresh) else {
+                                Self.vlogDeliveryCheckFailure(
+                                    check: "voice-edit selection (pre-insert)", held: heldAtStart, fresh: fresh, pid: heldPID)
                                 return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: true))
                             }
                         }
@@ -1262,6 +1346,7 @@ final class TranscriptionPipeline {
                         guard let deliveryPID = Self.expectedDeliveryPID(
                             heldPID: heldPID, isHistoryRetry: replaceID != nil, latePID: latePID
                         ) else {
+                            vlog("inject abort: no delivery PID — held=\(Self.bundleIDForLog(heldPID)) late=\(Self.bundleIDForLog(latePID))")
                             return .abort(becameSecure: self.leaveOnClipboardIfAllowed(textToInject, voiceEdit: isSelectionDelivery))
                         }
                         return .insert(pid: deliveryPID)
@@ -1274,6 +1359,14 @@ final class TranscriptionPipeline {
                     case .insert(let deliveryPID):
                         // Undo relies on the host's ⌘Z: replacement is one inject,
                         // with no delete or select-all step in any lane.
+                        // Unbound: any editable field in the adopted app will do.
+                        let unboundFieldCheck: (() -> Bool?)? = !adoptsFocus ? nil : {
+                            guard self.deliveryFocusedField(frontmostPID: deliveryPID)?.acceptsRelaxedDelivery == true else {
+                                vlog("inject abort: unbound take lost its editable focus before insert")
+                                return false
+                            }
+                            return true
+                        }
                         if isSelectionDelivery, let hooks = self.voiceEditInjectionHooks {
                             insertResult = hooks.insert(textToInject)
                         } else {
@@ -1281,17 +1374,37 @@ final class TranscriptionPipeline {
                                 textToInject,
                                 expectedTargetPID: deliveryPID,
                                 validateSelection: !isSelectionDelivery ? nil : {
-                                    VoiceEditRouting.selectionMatches(
-                                        held: heldAtStart,
-                                        fresh: self.deliverySnapshot(frontmostPID: deliveryPID)
-                                    )
+                                    let fresh = self.deliverySnapshot(frontmostPID: deliveryPID)
+                                    guard VoiceEditRouting.selectionMatches(held: heldAtStart, fresh: fresh) else {
+                                        Self.vlogDeliveryCheckFailure(
+                                            check: "voice-edit selection", held: heldAtStart, fresh: fresh, pid: deliveryPID)
+                                        return false
+                                    }
+                                    return true
                                 },
-                                validateField: heldAtStart?.focusedElement.map { heldElement in
+                                validateField: unboundFieldCheck ?? heldAtStart?.focusedElement.map { heldElement in
                                     {
-                                        guard let fresh = self.deliveryFocusedElement(frontmostPID: deliveryPID) else {
-                                            return !isSelectionDelivery ? nil : false
+                                        guard let fresh = self.deliveryFocusedField(frontmostPID: deliveryPID) else {
+                                            guard isSelectionDelivery else { return nil }
+                                            Self.vlogDeliveryCheckFailure(
+                                                check: "voice-edit field", held: heldAtStart, fresh: .unknown, pid: deliveryPID)
+                                            return false
                                         }
-                                        return VoiceEditRouting.fieldMatches(held: heldElement, fresh: fresh)
+                                        let matches = isSelectionDelivery
+                                            ? VoiceEditRouting.fieldMatches(held: heldElement, fresh: fresh.element)
+                                            : VoiceEditRouting.ordinaryDeliveryFieldMatches(
+                                                held: heldElement, heldRole: heldAtStart?.focusedRole, fresh: fresh)
+                                        if !matches {
+                                            // Failure path only: one more AX read for counts and ranges.
+                                            Self.vlogDeliveryCheckFailure(
+                                                check: isSelectionDelivery ? "voice-edit field" : "dictation field",
+                                                held: heldAtStart,
+                                                fresh: self.deliverySnapshot(frontmostPID: deliveryPID),
+                                                pid: deliveryPID)
+                                        } else if !CFEqual(heldElement, fresh.element) {
+                                            vlog("inject: field AX identity changed, same role \(fresh.role ?? "?") and editable — delivering at current caret")
+                                        }
+                                        return matches
                                     }
                                 },
                                 preserveBoundaryWhitespace: isSelectionDelivery

@@ -1,34 +1,69 @@
 import Foundation
-import os
 
-/// FIFO pending batches when LearnToastHUD is already showing a toast.
-enum LearnToastPendingQueue {
-    static let maxPending = 3
-    private static let logger = Logger(subsystem: "com.matt.voice-dictation", category: "learn-toast")
+/// What the learn suggestion pop-up holds. Pure state, unit-testable.
+///
+/// A suggestion stays until the user acts on it (Add / Never / ✕): there is
+/// no timer. While a dictation records or processes the pop-up is hidden and
+/// comes back afterwards. Batches that arrive while one is showing wait in a
+/// FIFO queue; once the queue is full they merge into the visible pop-up
+/// instead of being dropped.
+struct LearnToastState: Equatable {
+    static let maxQueued = 3
 
-    /// Enqueues `batch` (non-empty only). If at cap, **refuses** the newest
-    /// attempt (returns false) so already-queued batches keep their Reject
-    /// affordance. A 4th concurrent announce may skip the toast; Dictionary
-    /// Revert remains available.
-    @discardableResult
-    static func enqueue(_ batch: LearnBatch, into pending: inout [LearnBatch]) -> Bool {
-        guard !batch.corrections.isEmpty else { return false }
-        if pending.count >= maxPending {
-            logger.debug("Learn toast pending queue full; refusing newest announce")
-            return false
+    /// Shown (or held while a dictation is active).
+    private(set) var current: LearnBatch?
+    private(set) var queued: [LearnBatch] = []
+    var dictationActive = false
+
+    var isOnScreen: Bool { current != nil && !dictationActive }
+
+    mutating func receive(_ batch: LearnBatch) {
+        guard !batch.corrections.isEmpty else { return }
+        guard let shown = current else {
+            current = batch
+            return
         }
-        pending.append(batch)
-        return true
+        if queued.count < Self.maxQueued {
+            queued.append(batch)
+        } else {
+            current = Self.merging(batch, into: shown)
+        }
     }
 
-    static func dequeue(from pending: inout [LearnBatch]) -> LearnBatch? {
-        guard !pending.isEmpty else { return nil }
-        return pending.removeFirst()
+    /// Removes the visible batch (Add / Never / decide later) and promotes
+    /// the next queued one. Returns what was visible.
+    mutating func takeCurrent() -> LearnBatch? {
+        let taken = current
+        current = queued.isEmpty ? nil : queued.removeFirst()
+        return taken
+    }
+
+    /// Drops corrections resolved elsewhere (Dictionary Add / Never / Revert).
+    mutating func strip(_ identities: Set<UnlearnedCorrectionIdentity>) {
+        let plan = LearnToastUnlearnDismissal.plan(
+            identities: identities,
+            rejectable: current,
+            pending: queued
+        )
+        queued = plan.pending
+        if plan.dismissCurrent {
+            current = queued.isEmpty ? nil : queued.removeFirst()
+        } else {
+            current = plan.rejectable
+        }
+    }
+
+    /// Appends `incoming` corrections not already shown; keeps `shown.id`.
+    static func merging(_ incoming: LearnBatch, into shown: LearnBatch) -> LearnBatch {
+        let existing = Set(shown.corrections.map(UnlearnedCorrectionIdentity.init))
+        let added = incoming.corrections.filter { !existing.contains(UnlearnedCorrectionIdentity($0)) }
+        guard !added.isEmpty else { return shown }
+        return LearnBatch(id: shown.id, corrections: shown.corrections + added)
     }
 }
 
-/// Plan toast teardown when Dictionary unlearn/revert hits correction
-/// identities that are still on-screen or queued.
+/// Plan pop-up teardown when Dictionary Add / Never / Revert resolves
+/// correction identities that are still on-screen or queued.
 enum LearnToastUnlearnDismissal {
     /// Strips matching corrections from a batch. Returns `nil` when empty,
     /// the same batch when nothing matched, or a same-id batch with remainder.
@@ -62,25 +97,5 @@ enum LearnToastUnlearnDismissal {
             return (false, stripped, filtered)
         }
         return (true, nil, filtered)
-    }
-}
-
-/// Reject-during-dismiss fade: batch stays rejectable until Reject consumes it
-/// or dismiss fade completion clears it.
-enum LearnToastRejectSession {
-    /// Capture and clear; nil if already rejected or cleared.
-    static func takeRejectable(_ batch: inout LearnBatch?) -> LearnBatch? {
-        guard let value = batch else { return nil }
-        batch = nil
-        return value
-    }
-
-    /// Clear at end of dismiss fade. Returns true if a batch was still present
-    /// (genuine dismiss — call `onDismiss`). False if Reject already took it.
-    @discardableResult
-    static func clearIfStillPresent(_ batch: inout LearnBatch?) -> Bool {
-        guard batch != nil else { return false }
-        batch = nil
-        return true
     }
 }

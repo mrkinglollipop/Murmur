@@ -30,12 +30,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
         var events: [LearnBatchEvent] = []
         store.onLearnBatch = { events.append($0) }
 
-        let learned = store.learn(
-            from: "Groq",
-            to: "Grok",
-            userInitiated: false,
-            announce: false
-        )
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: false)
         XCTAssertFalse(learned.isEmpty)
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0].announce, false)
@@ -64,7 +59,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
 
     func testRejectCompletedCallbackAfterRejectBatch() {
         let store = makeStore()
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertFalse(learned.isEmpty)
         let batch = LearnBatch(corrections: learned)
 
@@ -78,7 +73,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
 
     func testRejectLearnedBatchSkipsBlocklistWhenAlreadyUnlearned() {
         let store = makeStore()
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertEqual(learned.count, 1)
         let correction = learned[0]
         let batch = LearnBatch(corrections: [correction])
@@ -96,7 +91,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
 
     func testUnlearnFiresOnUnlearnForToastTeardown() {
         let store = makeStore()
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertEqual(learned.count, 1)
 
         var notified: Set<UnlearnedCorrectionIdentity>?
@@ -118,7 +113,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
 
     func testUnlearnDismissalPlanClearsMatchingToastBatch() {
         let store = makeStore()
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertEqual(learned.count, 1)
         let rejectable = LearnBatch(corrections: learned)
         let other = LearnBatch(corrections: [
@@ -140,7 +135,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
         let (coordinator, log, _) = makeCoordinator(store: store)
         coordinator.bind()
 
-        _ = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        _ = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertEqual(log.records.filter { $0.source == .learnAccepted }.count, 1)
         XCTAssertNotNil(log.records.first?.entryID)
         XCTAssertNotNil(log.records.first?.createdNewEntry)
@@ -163,7 +158,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
         let (coordinator, log, toast) = makeCoordinator(store: store)
         coordinator.bind()
 
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertFalse(learned.isEmpty)
         let batch = LearnBatch(corrections: learned)
 
@@ -181,7 +176,7 @@ final class LearnEventsCoordinatorTests: XCTestCase {
         coordinator.bind()
         XCTAssertNotNil(store.onUnlearn)
 
-        let learned = store.learn(from: "Groq", to: "Grok", userInitiated: false, announce: true)
+        let learned = store.learnSeenTwice(from: "Groq", to: "Grok", announce: true)
         XCTAssertEqual(learned.count, 1)
         // Wired handler must be safe to invoke (dismissBatchesContaining is idempotent
         // when HUD has no matching batch).
