@@ -42,6 +42,8 @@ final class DictionaryLearnTests: XCTestCase {
         XCTAssertEqual(learned.count, 1)
         XCTAssertEqual(learned.first?.variant, "foo dot bar")
         XCTAssertEqual(learned.first?.term, "foo.bar")
+        XCTAssertEqual(store.correct("use foo dot bar here").text, "use foo dot bar here")
+        store.approveLearnedBatch(LearnBatch(corrections: learned))
         XCTAssertEqual(store.correct("use foo dot bar here").text, "use foo.bar here")
     }
 
@@ -67,6 +69,7 @@ final class DictionaryLearnTests: XCTestCase {
         XCTAssertEqual(learned.count, 1)
         XCTAssertEqual(learned.first?.variant, "Get ignore")
         XCTAssertEqual(learned.first?.term, "gitignore")
+        store.approveLearnedBatch(LearnBatch(corrections: learned))
         XCTAssertEqual(store.correct("Get ignore it.").text, "gitignore it.")
     }
 
@@ -143,7 +146,9 @@ final class DictionaryLearnTests: XCTestCase {
         store.add(term: "Khipu", variants: ["Keefu"])
         XCTAssertEqual(store.entries.count, 1)
         XCTAssertEqual(store.entries.first?.isAutoLearned, false)
-        XCTAssertEqual(Set(store.entries.first?.variants.map { $0.lowercased() } ?? []), ["keepu", "keefu"])
+        // The hand-typed heard-form applies; Murmur's own stays a suggestion.
+        XCTAssertEqual(store.entries.first?.variants, ["Keefu"])
+        XCTAssertEqual(store.entries.first?.pendingVariants, ["Keepu"])
     }
 
     func testUnlearnCreatedNewPreservesOtherMergedVariants() {
@@ -203,7 +208,9 @@ final class DictionaryLearnTests: XCTestCase {
         XCTAssertTrue(store.unlearn(correction))
         let entry = try XCTUnwrap(store.entries.first)
         XCTAssertEqual(entry.id, survivorID)
-        XCTAssertEqual(Set(entry.variants.map { $0.lowercased() }), ["keepu"])
+        // Merging with a manual entry is not approval: Keepu stays pending.
+        XCTAssertTrue(entry.variants.isEmpty)
+        XCTAssertEqual(entry.pendingVariants, ["Keepu"])
         XCTAssertFalse(entry.isAutoLearned)
     }
 

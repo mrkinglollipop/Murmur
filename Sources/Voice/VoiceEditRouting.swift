@@ -73,18 +73,106 @@ enum VoiceEditRouting {
         guard !splitsSurrogatePair(snapshot.location), !splitsSurrogatePair(end) else { return nil }
         return String(decoding: units[snapshot.location..<end], as: UTF16.self)
     }
+
+    /// Assistant-style lead-in ("Sure! Here's the edited text:") ending in a colon
+    /// or line break. Deliberately narrow: a bare "OK" or "Here" without the
+    /// terminator is ordinary prose.
+    private static let assistantPreamble = "^(?:"
+        + "(?:sure|certainly|of course|okay|ok|absolutely)[!.,]?[ \\t]*(?:here(?:'s|’s| is| are)[^:\\n]{0,40})?[:\\n]"
+        + "|here(?:'s|’s| is| are)[^:\\n]{0,40}[:\\n]"
+        + "|the (?:edited|revised|rewritten|updated) (?:text|version)[^:\\n]{0,20}[:\\n]"
+        + "|(?:edited|revised|rewritten|updated)(?: text| version)?[:\\n]"
+        + ")"
+
+    private static func startsWithAssistantPreamble(_ text: String) -> Bool {
+        text.range(of: assistantPreamble, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     /// Rewrites share cleanup's length and symbol-only checks, but deliberately
     /// skip word preservation: changing the wording is the requested operation.
     static func resultLooksUsable(_ result: String, over selection: String) -> Bool {
         let output = result.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !output.isEmpty, output.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
-        let ratio = Double(output.count) / Double(max(selection.count, 1))
-        return (0.4...2.0).contains(ratio)
+        // The prompt demands only the edited text. A lead-in the selection did not
+        // itself start with is the model talking, and must not be injected.
+        let selectionStart = selection.trimmingCharacters(in: .whitespacesAndNewlines)
+        if startsWithAssistantPreamble(output), !startsWithAssistantPreamble(selectionStart) { return false }
+        // Short selections legitimately grow (one word becomes a phrase), so the
+        // ceiling is the larger of 2x and +160 characters; long selections are
+        // still held to 2x so runaway model output cannot replace them.
+        let count = selection.count
+        let ceiling = max(count * 2, count + 160)
+        let floor = Int(0.4 * Double(count))
+        return output.count >= floor && output.count <= ceiling
     }
 
     static func fieldMatches(held: AXUIElement, fresh: AXUIElement?) -> Bool {
         guard let fresh else { return false }
         return CFEqual(held, fresh)
+    }
+
+    /// Ordinary dictation types at the current caret, as a keyboard would.
+    /// Chromium/Electron recreate the composer's AX element while it keeps
+    /// focus, so identity alone false-aborts (2026-10-15, Claude desktop).
+    /// With the frontmost PID already pinned by the injector, an editable
+    /// element of the held role is accepted. An unread held role keeps the
+    /// strict identity rule. Voice edit never uses this: it must replace the
+    /// exact selection it read.
+    static func ordinaryDeliveryFieldMatches(
+        held: AXUIElement, heldRole: String?, fresh: CaretContext.FocusedField
+    ) -> Bool {
+        if CFEqual(held, fresh.element) { return true }
+        guard let heldRole, fresh.role == heldRole else { return false }
+        return fresh.acceptsRelaxedDelivery
+    }
+
+    /// A frontmost app that definitely has no windows binds the take to no
+    /// field (2026-10-15: browser window closed mid-hold, user clicked into
+    /// another app). The focus answer is deliberately ignored: Electron and
+    /// Chromium apps answer the AX focused-element query with "no value"
+    /// until their accessibility tree is enabled, and terminals report their
+    /// text area as non-editable; both must keep typing into the release app.
+    /// Only a definite "no windows" unbinds; an unknown answer keeps the take
+    /// bound.
+    static func isUnboundReleaseTarget(focus: CaretContext.FocusRead, appHasWindows: Bool?) -> Bool {
+        appHasWindows == false
+    }
+
+    /// AX role, editability, PID and bundle only. Never field text.
+    static func focusDiagnostic(field: CaretContext.FocusedField?, appHasWindows: Bool?, pid: pid_t?, bundle: String) -> String {
+        let role = field.map { $0.role ?? "?" } ?? "none"
+        let editable = field?.isEditable.map { $0 ? "yes" : "no" } ?? "?"
+        let windows = appHasWindows.map { $0 ? "yes" : "no" } ?? "?"
+        return "role=\(role) editable=\(editable) windows=\(windows) pid=\(pid.map { String($0) } ?? "nil") bundle=\(bundle)"
+    }
+
+    /// Counts, ranges and AX roles only. Never field text.
+    static func deliveryCheckDiagnostic(
+        check: String, held: CaretContext.Snapshot?, fresh: CaretContext.Snapshot, pid: pid_t?
+    ) -> String {
+        func selection(_ s: CaretContext.Snapshot) -> String {
+            guard !s.isUnknown else { return "?" }
+            switch s.selectionLength {
+            case .readable(let n): return "\(s.location)+\(n)"
+            case .unreadable: return "\(s.location)+?"
+            }
+        }
+        func valueLength(_ s: CaretContext.Snapshot) -> String { s.isUnknown ? "?" : "\(s.value.utf16.count)" }
+        let identity: String
+        switch (held?.focusedElement, fresh.focusedElement) {
+        case (let h?, let f?): identity = CFEqual(h, f) ? "same" : "differs"
+        case (nil, _): identity = "held-unavailable"
+        case (_, nil): identity = "fresh-unavailable"
+        }
+        let editable: String = fresh.focusedIsEditable.map { $0 ? "yes" : "no" } ?? "?"
+        let heldRole: String = held?.focusedRole ?? "?"
+        let freshRole: String = fresh.focusedRole ?? "?"
+        let heldLength: String = held.map(valueLength) ?? "?"
+        let heldSelection: String = held.map(selection) ?? "?"
+        let pidText: String = pid.map { String($0) } ?? "?"
+        return "\(check) check failed — identity=\(identity) role=\(heldRole)→\(freshRole)"
+            + " freshEditable=\(editable) valueLen=\(heldLength)→\(valueLength(fresh))"
+            + " selection=\(heldSelection)→\(selection(fresh)) pid=\(pidText)"
     }
 
     /// Element identity, field value, and range must all match the hold-start

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import os.log
 #if canImport(FoundationModels)
@@ -57,6 +58,23 @@ enum TransformRunner {
         let request = try voiceEditRequest(spokenText: spokenText, selection: selection)
         return try await run(prompt: request.prompt, over: request.text, credentials: credentials)
     }
+
+    /// Copies a finished Transform result as an ordinary user-facing copy,
+    /// unless something other than Murmur changed the clipboard since the run started (a newer copy on this
+    /// Mac or one arriving over Universal Clipboard). A result that lands late
+    /// must not replace what the user copied while waiting.
+    static func copyResultIfClipboardUnchanged(
+        _ result: String,
+        on pasteboard: NSPasteboard,
+        startedAtChangeCount: Int
+    ) -> Bool {
+        guard TextInjector.pasteboardChangedOnlyByMurmur(since: startedAtChangeCount, on: pasteboard) else { return false }
+        pasteboard.clearContents()
+        pasteboard.setString(result, forType: .string)
+        return true
+    }
+
+    static let clipboardChangedMessage = "Clipboard changed while the transform ran — result not copied"
 
     static var onDeviceModelAvailable: Bool {
         #if canImport(FoundationModels)

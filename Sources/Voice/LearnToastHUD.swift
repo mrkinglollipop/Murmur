@@ -1,38 +1,39 @@
 import AppKit
 import SwiftUI
 
-/// System-wide floating toast after a successful announced `learn()`.
-/// Opt-out: Reject undoes; dismiss/timeout keeps the learn.
-/// Concurrent announced learns enqueue (FIFO, cap ``LearnToastPendingQueue.maxPending``);
-/// when full, the newest announce is skipped (oldest queued keep Reject).
+/// System-wide floating pop-up asking whether to add learned dictionary
+/// suggestions. A suggestion does nothing until the user taps **Add**;
+/// **Never** rejects and blocklists it; ✕ decides later (it stays pending,
+/// still inert, and is listed on the Dictionary screen). No auto-dismiss.
+/// Hidden while a dictation records or processes, then shown again.
+/// See ``LearnToastState`` for queueing and merge rules.
 final class LearnToastHUD {
 
     private let panel: NSPanel
     private let hosting: NSHostingView<LearnToastContent>
-    private var dismissWorkItem: DispatchWorkItem?
-    /// Batch shown (or still rejectable during dismiss fade).
-    private var rejectableBatch: LearnBatch?
-    private var pendingBatches: [LearnBatch] = []
-    private var isShowing = false
-    private var hideInProgress = false
-    private var hideGeneration = 0
+    private(set) var state = LearnToastState()
+    /// Batch currently rendered into `hosting` (nil when nothing rendered).
+    private var renderedBatch: LearnBatch?
+    private var panelShown = false
+    private var fadeGeneration = 0
 
     private let toastWidth: CGFloat = 360
     private let estimatedHeight: CGFloat = 72
-    /// Auto-dismiss window — dismiss/timeout keeps the learn either way.
-    private let autoDismissSeconds: TimeInterval = 8.0
 
     /// Recording HUD used for collision layout.
     weak var recordingHUD: RecordingHUD?
 
+    /// Add: approve every suggestion in the batch.
+    var onApprove: ((LearnBatch) -> Void)?
+    /// Never: reject + blocklist every suggestion in the batch.
     var onReject: ((LearnBatch) -> Void)?
-    var onDismiss: (() -> Void)?
 
     init() {
         let root = LearnToastContent(
             batch: LearnBatch(corrections: []),
-            onReject: {},
-            onDismiss: {}
+            onAdd: {},
+            onNever: {},
+            onDecideLater: {}
         )
         let hosting = NSHostingView(rootView: root)
         hosting.frame = NSRect(origin: .zero, size: NSSize(width: toastWidth, height: estimatedHeight))
@@ -57,70 +58,133 @@ final class LearnToastHUD {
 
     func show(batch: LearnBatch) {
         guard !batch.corrections.isEmpty else { return }
-        // Already presenting or mid fade-out → queue (FIFO; drop newest if full).
-        if isShowing || rejectableBatch != nil || hideInProgress {
-            _ = LearnToastPendingQueue.enqueue(batch, into: &pendingBatches)
-            return
-        }
-        present(batch)
+        state.receive(batch)
+        render()
     }
 
-    /// Dictionary Revert/unlearn: strip matching corrections from the visible
-    /// or pending toast batches. Dismisses only when a batch's remainder is
-    /// empty. Silent (no Reject / no `onDismiss`). Idempotent if the batch
-    /// was already rejected or cleared.
+    /// Dictionary Add / Never / Revert: strip matching corrections from the
+    /// visible or queued pop-up batches. Silent (no `onApprove`/`onReject`).
     func dismissBatchesContaining(identities: Set<UnlearnedCorrectionIdentity>) {
-        let plan = LearnToastUnlearnDismissal.plan(
-            identities: identities,
-            rejectable: rejectableBatch,
-            pending: pendingBatches
-        )
-        pendingBatches = plan.pending
-
-        if plan.dismissCurrent {
-            AccessibilityAnnouncement.post("Learned corrections removed", element: panel)
-            dismissWorkItem?.cancel()
-            dismissWorkItem = nil
-            rejectableBatch = nil
-            let generation = beginHide()
-            isShowing = false
-            hidePanel(generation: generation) { [weak self] in
-                self?.presentNextPending()
-            }
-            return
-        }
-
-        guard let updated = plan.rejectable else {
-            rejectableBatch = nil
-            return
-        }
-        let priorKeys = rejectableBatch?.corrections.map(UnlearnedCorrectionIdentity.init) ?? []
-        let nextKeys = updated.corrections.map(UnlearnedCorrectionIdentity.init)
-        rejectableBatch = updated
-        guard priorKeys != nextKeys else { return }
-        refreshPresentedContent(updated)
+        state.strip(identities)
+        render()
     }
 
-    /// Rebuild toast body after a partial unlearn without resetting the
-    /// auto-dismiss timer or fade state.
-    private func refreshPresentedContent(_ batch: LearnBatch) {
+    /// Recording HUD shown/hidden: hide the pop-up while a dictation records
+    /// or processes, and bring it back afterwards.
+    func setDictationActive(_ active: Bool) {
+        guard state.dictationActive != active else {
+            reposition()
+            return
+        }
+        state.dictationActive = active
+        render()
+    }
+
+    /// Re-syncs with the recording HUD (wired to its layout callback).
+    func recordingLayoutChanged() {
+        setDictationActive(recordingHUD?.isVisible ?? false)
+    }
+
+    // MARK: Actions (internal for tests)
+
+    func performAdd() {
+        guard let batch = state.takeCurrent() else { return }
+        onApprove?(batch)
+        AccessibilityAnnouncement.post(Self.addedAnnouncement(count: batch.corrections.count), element: panel)
+        render()
+    }
+
+    func performNever() {
+        guard let batch = state.takeCurrent() else { return }
+        onReject?(batch)
+        AccessibilityAnnouncement.post("Won't suggest again", element: panel)
+        render()
+    }
+
+    /// ✕: the suggestion stays pending (inert) and listed in Dictionary.
+    func performDecideLater() {
+        guard state.takeCurrent() != nil else { return }
+        AccessibilityAnnouncement.post("Saved for later in Dictionary", element: panel)
+        render()
+    }
+
+    static func suggestionAnnouncement(count: Int) -> String {
+        count == 1
+            ? "Dictionary suggestion. Add it?"
+            : "\(count) dictionary suggestions. Add them?"
+    }
+
+    static func addedAnnouncement(count: Int) -> String {
+        count == 1 ? "Added to dictionary" : "Added \(count) to dictionary"
+    }
+
+    // MARK: Rendering
+
+    private func render() {
+        guard state.isOnScreen, let batch = state.current else {
+            renderedBatch = nil
+            if panelShown { fadeOut() }
+            return
+        }
+        let wasShown = panelShown
+        if renderedBatch != batch {
+            let isNewBatch = renderedBatch?.id != batch.id
+            setContent(batch)
+            if wasShown && isNewBatch {
+                AccessibilityAnnouncement.post(Self.suggestionAnnouncement(count: batch.corrections.count), element: panel)
+            }
+        }
+        if !wasShown {
+            fadeIn()
+            AccessibilityAnnouncement.post(Self.suggestionAnnouncement(count: batch.corrections.count), element: panel)
+        } else {
+            reposition()
+        }
+    }
+
+    private func setContent(_ batch: LearnBatch) {
+        renderedBatch = batch
         hosting.rootView = LearnToastContent(
             batch: batch,
-            onReject: { [weak self] in self?.reject() },
-            onDismiss: { [weak self] in self?.dismiss(userInitiated: true) }
+            onAdd: { [weak self] in self?.performAdd() },
+            onNever: { [weak self] in self?.performNever() },
+            onDecideLater: { [weak self] in self?.performDecideLater() }
         )
         hosting.layoutSubtreeIfNeeded()
         let size = hosting.fittingSize
         let width = max(toastWidth, min(size.width, 420))
         let height = max(estimatedHeight, size.height)
         panel.setContentSize(NSSize(width: width, height: height))
-        reposition()
-        AccessibilityAnnouncement.post(Self.learnedAnnouncement(count: batch.corrections.count), element: panel)
     }
 
-    /// Repositions relative to RecordingHUD. Safe when toast is not showing.
+    private func fadeIn() {
+        panelShown = true
+        fadeGeneration += 1
+        reposition()
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
+    }
+
+    private func fadeOut() {
+        panelShown = false
+        fadeGeneration += 1
+        let generation = fadeGeneration
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self, self.fadeGeneration == generation, !self.panelShown else { return }
+            self.panel.orderOut(nil)
+        })
+    }
+
+    /// Repositions relative to RecordingHUD. Safe when the pop-up is hidden.
     func reposition() {
-        guard isShowing || panel.alphaValue > 0.01 || rejectableBatch != nil else { return }
+        guard panelShown else { return }
         let hud = recordingHUD
         let visible = hud?.isVisible ?? false
         let frame = hud?.frameForStacking ?? .zero
@@ -143,110 +207,20 @@ final class LearnToastHUD {
         guard let screen else { return 30 }
         return screen.visibleFrame.minY + 30
     }
-
-    private func present(_ batch: LearnBatch) {
-        rejectableBatch = batch
-        dismissWorkItem?.cancel()
-
-        hosting.rootView = LearnToastContent(
-            batch: batch,
-            onReject: { [weak self] in self?.reject() },
-            onDismiss: { [weak self] in self?.dismiss(userInitiated: true) }
-        )
-        hosting.layoutSubtreeIfNeeded()
-        let size = hosting.fittingSize
-        let width = max(toastWidth, min(size.width, 420))
-        let height = max(estimatedHeight, size.height)
-        panel.setContentSize(NSSize(width: width, height: height))
-
-        isShowing = true
-        reposition()
-        panel.orderFrontRegardless()
-        AccessibilityAnnouncement.post(Self.learnedAnnouncement(count: batch.corrections.count), element: panel)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
-        }
-
-        let work = DispatchWorkItem { [weak self] in
-            self?.dismiss(userInitiated: false)
-        }
-        dismissWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + autoDismissSeconds, execute: work)
-    }
-
-    private func reject() {
-        guard let batch = LearnToastRejectSession.takeRejectable(&rejectableBatch) else {
-            return
-        }
-        dismissWorkItem?.cancel()
-        dismissWorkItem = nil
-        onReject?(batch)
-        AccessibilityAnnouncement.post("Learned corrections removed", element: panel)
-        let generation = beginHide()
-        isShowing = false
-        hidePanel(generation: generation) { [weak self] in
-            self?.presentNextPending()
-        }
-    }
-
-    private func dismiss(userInitiated: Bool) {
-        dismissWorkItem?.cancel()
-        dismissWorkItem = nil
-        guard rejectableBatch != nil || isShowing else { return }
-        let generation = beginHide()
-        isShowing = false
-        // Keep rejectableBatch until fade ends so Reject during fade still works.
-        hidePanel(generation: generation) { [weak self] in
-            guard let self, self.hideGeneration == generation else { return }
-            if LearnToastRejectSession.clearIfStillPresent(&self.rejectableBatch) {
-                self.onDismiss?()
-            }
-            self.presentNextPending()
-        }
-        if userInitiated {
-            AccessibilityAnnouncement.post("Learn notification dismissed", element: panel)
-        }
-    }
-
-    static func learnedAnnouncement(count: Int) -> String {
-        "Learned \(count) dictionary correction\(count == 1 ? "" : "s")"
-    }
-
-    private func presentNextPending() {
-        guard rejectableBatch == nil, !isShowing else { return }
-        guard let next = LearnToastPendingQueue.dequeue(from: &pendingBatches) else { return }
-        present(next)
-    }
-
-    private func beginHide() -> Int {
-        hideInProgress = true
-        hideGeneration += 1
-        return hideGeneration
-    }
-
-    private func hidePanel(generation: Int, completion: @escaping () -> Void) {
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.15
-            panel.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self, self.hideGeneration == generation else { return }
-            self.panel.orderOut(nil)
-            self.hideInProgress = false
-            completion()
-        })
-    }
 }
 
 // MARK: - SwiftUI content
 
-private struct LearnToastContent: View {
+/// Pop-up body. Internal so tests can render it to a PNG.
+struct LearnToastContent: View {
     let batch: LearnBatch
-    let onReject: () -> Void
-    let onDismiss: () -> Void
+    let onAdd: () -> Void
+    let onNever: () -> Void
+    let onDecideLater: () -> Void
 
     private let maxShown = 3
+
+    private var count: Int { batch.corrections.count }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -254,11 +228,13 @@ private struct LearnToastContent: View {
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(Theme.lavenderText)
                 .padding(.top, 1)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Learned")
+                Text("Add to dictionary?")
                     .font(Theme.body(12, weight: .semibold))
                     .foregroundColor(Theme.textPrimary)
+                    .accessibilityAddTraits(.isHeader)
 
                 correctionsList
             }
@@ -266,21 +242,32 @@ private struct LearnToastContent: View {
             Spacer(minLength: 12)
 
             HStack(spacing: 10) {
-                Button(action: onReject) {
-                    Text("Reject")
+                Button(action: onNever) {
+                    Text("Never")
                         .font(Theme.body(12, weight: .medium))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help(count == 1 ? "Don't suggest this again" : "Don't suggest these again")
+                .accessibilityLabel(count == 1 ? "Never suggest this" : "Never suggest these \(count)")
+
+                Button(action: onAdd) {
+                    Text("Add")
+                        .font(Theme.body(12, weight: .semibold))
                         .foregroundColor(Theme.primary)
                 }
                 .buttonStyle(.plain)
+                .help(count == 1 ? "Add to your dictionary" : "Add all \(count) to your dictionary")
+                .accessibilityLabel(count == 1 ? "Add to dictionary" : "Add all \(count) to dictionary")
 
-                Button(action: onDismiss) {
+                Button(action: onDecideLater) {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(Theme.textSecondary)
                 }
                 .buttonStyle(.plain)
-                .help("Dismiss")
-                .accessibilityLabel("Dismiss")
+                .help("Decide later in Dictionary")
+                .accessibilityLabel("Decide later")
             }
         }
         .modifier(MurmurToastSurface())
@@ -318,6 +305,8 @@ private struct LearnToastContent: View {
                 .foregroundColor(Theme.textPrimary)
         }
         .font(Theme.body(12))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Heard \(correction.variant), write \(correction.term)")
     }
 }
 

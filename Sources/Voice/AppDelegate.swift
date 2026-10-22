@@ -310,20 +310,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // with no separate cache/invalidation to keep in sync.
         activationController?.audioRecorder.asrSelector.keytermsProvider = { [weak self] in
             guard let self = self else { return [] }
-            return ElevenLabsRealtimeTranscriber.selectKeyterms(from: self.dictionaryStore.entries)
+            return ElevenLabsRealtimeTranscriber.selectKeyterms(from: self.dictionaryStore.activeEntries)
         }
         activationController?.audioRecorder.asrSelector.geminiVocabularyProvider = { [weak self] in
             guard let self = self else { return [] }
-            return GeminiLiveTranscriber.selectVocabulary(from: self.dictionaryStore.entries)
+            return GeminiLiveTranscriber.selectVocabulary(from: self.dictionaryStore.activeEntries)
         }
         activationController?.audioRecorder.asrSelector.museKeywordsProvider = { [weak self] in
             guard let self = self else { return [] }
-            return MuseLiveTranscriber.selectKeywords(from: self.dictionaryStore.entries)
+            return MuseLiveTranscriber.selectKeywords(from: self.dictionaryStore.activeEntries)
         }
         activationController?.audioRecorder.asrSelector.capitalizedDictionaryTermsProvider = { [weak self] in
             guard let self = self else { return [] }
             return Set(
-                self.dictionaryStore.entries
+                self.dictionaryStore.activeEntries
                     .map(\.term)
                     .filter { term in
                         guard let first = term.first else { return false }
@@ -372,6 +372,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         activationController?.audioRecorder.allowLastResortInputFallbackProvider = { [weak self] in
             self?.settingsStore.allowLastResortInputFallback ?? false
+        }
+        activationController?.audioRecorder.voiceIsolationProvider = { [weak self] in
+            self?.settingsStore.voiceIsolation ?? false
         }
 
         activationController?.audioRecorder.activationKeyLabelProvider = { [weak self] in
@@ -677,7 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // hide() is the only reliable "back to idle" signal — reachable from
         // every terminal path (silence, early failures, post-flash) without
         // necessarily passing through a state onStateChange already handles.
-        // onHide fires at hide() start (menu-bar idle); LearnToast re-stacks
+        // onHide fires at hide() start (menu-bar idle); LearnToast returns
         // from onLayoutChange after the fade clears isVisible.
         activationController?.audioRecorder.hud.onHide = { [weak self] in
             self?.resetMenuBarIconToIdle()
@@ -687,8 +690,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func wireLearnToast() {
         let hud = activationController?.audioRecorder.hud
         learnToast.recordingHUD = hud
+        // Show/hide/resize of the recording HUD: hide learn suggestions while
+        // a dictation records or processes, bring them back after.
         hud?.onLayoutChange = { [weak self] in
-            self?.learnToast.reposition()
+            self?.learnToast.recordingLayoutChanged()
         }
 
         let coordinator = LearnEventsCoordinator(

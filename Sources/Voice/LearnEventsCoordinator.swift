@@ -1,7 +1,8 @@
 import Foundation
 
 /// Sole owner of CorrectionsLog appends for learn-time outcomes
-/// (`learnAccepted` / `learnRejected`). Wired from AppDelegate.
+/// (`learnAccepted` / `learnRejected`), and the bridge between the learn
+/// suggestion pop-up and DictionaryStore. Wired from AppDelegate.
 @MainActor
 final class LearnEventsCoordinator {
 
@@ -29,7 +30,13 @@ final class LearnEventsCoordinator {
         dictionaryStore.onUnlearn = { [weak self] identities in
             self?.learnToast.dismissBatchesContaining(identities: identities)
         }
+        dictionaryStore.onApprove = { [weak self] identities in
+            self?.learnToast.dismissBatchesContaining(identities: identities)
+        }
 
+        learnToast.onApprove = { [weak self] batch in
+            self?.dictionaryStore.approveLearnedBatch(batch)
+        }
         learnToast.onReject = { [weak self] batch in
             self?.dictionaryStore.rejectLearnedBatch(batch)
         }
@@ -49,7 +56,8 @@ final class LearnEventsCoordinator {
         }
         correctionsLog.append(records)
 
-        // Toast display only for announced learns (not Restore).
+        // Suggestion pop-up only for announced learns (not Restore, which
+        // lands in the Dictionary screen's pending section).
         if event.announce {
             learnToast.show(batch: event.batch)
         }

@@ -81,8 +81,12 @@ final class TextInjector {
 
     private func checkInjectionAllowed(targetPID: pid_t?) throws {
         let current = currentTarget()
-        guard !current.secureInput else { throw InjectionAbort.secureInput }
+        guard !current.secureInput else {
+            Self.log("abort check=secure-input pid=\(Self.describe(current.pid)) bundle=\(current.bundleIdentifier ?? "nil")")
+            throw InjectionAbort.secureInput
+        }
         if let targetPID, current.pid != targetPID {
+            Self.log("abort check=app-switch pid=\(targetPID)→\(Self.describe(current.pid)) bundle=\(current.bundleIdentifier ?? "nil")")
             throw InjectionAbort.appSwitch
         }
     }
@@ -94,7 +98,10 @@ final class TextInjector {
         let matches = selectionValidation()
         // AX can block. Recheck focus and Secure Input after it returns.
         try checkInjectionAllowed(targetPID: targetPID)
-        guard matches else { throw InjectionAbort.selectionChanged }
+        guard matches else {
+            logValidatorAbort("selection", targetPID: targetPID)
+            throw InjectionAbort.selectionChanged
+        }
     }
 
     private func checkFieldAllowed(targetPID: pid_t?) throws {
@@ -102,8 +109,19 @@ final class TextInjector {
         let matches = fieldValidation()
         try checkInjectionAllowed(targetPID: targetPID)
         guard let matches else { return }
-        guard matches else { throw InjectionAbort.selectionChanged }
+        guard matches else {
+            logValidatorAbort("field", targetPID: targetPID)
+            throw InjectionAbort.selectionChanged
+        }
     }
+
+    /// The validator closure logs what differed; this names the throw site.
+    private func logValidatorAbort(_ check: String, targetPID: pid_t?) {
+        let current = currentTarget()
+        Self.log("abort check=\(check) pid=\(Self.describe(targetPID)) bundle=\(current.bundleIdentifier ?? "nil")")
+    }
+
+    private static func describe(_ pid: pid_t?) -> String { pid.map { String($0) } ?? "nil" }
 
     private static let dedupeLock = NSLock()
     private static let dedupeWindow: TimeInterval = 1.0
@@ -516,9 +534,65 @@ final class TextInjector {
         }
     }
 
+    /// Test seam: observes the contents options each transient write requests.
+    /// `.currentHostOnly` leaves no readable marker on the pasteboard itself.
+    static var transientWriteOptionsObserverForTesting: ((NSPasteboard.Name, NSPasteboard.ContentsOptions) -> Void)?
+
+    /// Clears `pasteboard` for one of Murmur's own transient writes (paste-lane
+    /// preparation, post-paste restore). `.currentHostOnly` keeps the write off
+    /// Universal Clipboard: the temporary transcript is never advertised to the
+    /// user's other devices, and restoring a phone-originated copy does not
+    /// re-broadcast it. User-facing copies (`leaveTranscriptOnClipboard`,
+    /// History, Transforms) must stay ordinary writes.
+    @discardableResult
+    static func beginLocalOnlyTransientWrite(on pasteboard: NSPasteboard) -> Int {
+        let options: NSPasteboard.ContentsOptions = .currentHostOnly
+        transientWriteOptionsObserverForTesting?(pasteboard.name, options)
+        return pasteboard.prepareForNewContents(with: options)
+    }
+
+    private static let ownedChangeCountsLock = NSLock()
+    private static var ownedChangeCounts: [NSPasteboard.Name: [Int]] = [:]
+    private static let ownedChangeCountLimit = 64
+
+    /// Records the changeCount values produced by a Murmur write that began at
+    /// `before`, so observers can tell Murmur's own writes from a user copy.
+    private static func recordOwnedWrites(from before: Int, on pasteboard: NSPasteboard) {
+        let after = pasteboard.changeCount
+        guard after > before else { return }
+        ownedChangeCountsLock.lock()
+        var counts = ownedChangeCounts[pasteboard.name] ?? []
+        counts.append(contentsOf: (before + 1)...after)
+        if counts.count > ownedChangeCountLimit { counts.removeFirst(counts.count - ownedChangeCountLimit) }
+        ownedChangeCounts[pasteboard.name] = counts
+        ownedChangeCountsLock.unlock()
+    }
+
+    /// True when every change after `startCount` was produced by Murmur's own
+    /// transient writes (paste prep, re-stabilize, restore): no user copy or
+    /// Universal Clipboard arrival happened in between.
+    static func pasteboardChangedOnlyByMurmur(since startCount: Int, on pasteboard: NSPasteboard) -> Bool {
+        let current = pasteboard.changeCount
+        if current == startCount { return true }
+        guard current > startCount, current - startCount <= ownedChangeCountLimit else { return false }
+        ownedChangeCountsLock.lock()
+        defer { ownedChangeCountsLock.unlock() }
+        let owned = Set(ownedChangeCounts[pasteboard.name] ?? [])
+        return ((startCount + 1)...current).allSatisfy(owned.contains)
+    }
+
+    /// Test seam: forget recorded Murmur-owned change counts.
+    static func resetOwnedChangeCountsForTesting() {
+        ownedChangeCountsLock.lock()
+        ownedChangeCounts = [:]
+        ownedChangeCountsLock.unlock()
+    }
+
     /// Writes transcript + concealed marker for paste injection.
     static func preparePasteboardForPaste(_ text: String, on pasteboard: NSPasteboard) {
-        pasteboard.clearContents()
+        let before = pasteboard.changeCount
+        defer { recordOwnedWrites(from: before, on: pasteboard) }
+        beginLocalOnlyTransientWrite(on: pasteboard)
         pasteboard.setString(text, forType: .string)
         pasteboard.setData(Data(), forType: concealedPasteboardType)
     }
@@ -610,11 +684,11 @@ final class TextInjector {
                 return
             }
             guard pasteboard.changeCount == changeCount,
-                  shouldRestoreSavedPasteboard(injectedText: injectedText, on: pasteboard) else {
+                  shouldRestoreSavedPasteboard(injectedText: injectedText, on: pasteboard),
+                  restorePasteboardSnapshot(savedPasteboard, on: pasteboard, ifChangeCountIs: changeCount) else {
                 log("skip deferred pasteboard restore — external overwrite after paste")
                 return
             }
-            restorePasteboardSnapshot(savedPasteboard, on: pasteboard)
             log("deferred pasteboard restore chars=\(injectedText.utf16.count)")
         }
     }
@@ -632,9 +706,25 @@ final class TextInjector {
     /// Restores a captured snapshot, rebuilding every item with all of its
     /// representations. An empty snapshot means the pasteboard was empty before
     /// we touched it, so it is left cleared.
-    static func restorePasteboardSnapshot(_ snapshot: PasteboardSnapshot, on pasteboard: NSPasteboard) {
-        pasteboard.clearContents()
-        guard !snapshot.isEmpty else { return }
+    ///
+    /// `ifChangeCountIs` is re-checked immediately before clearing so a copy
+    /// that landed after the caller's guards (including a Universal Clipboard
+    /// arrival) is never overwritten. Check-then-clear is not atomic; this only
+    /// shrinks the window to nothing Murmur itself does. Returns false on skip.
+    @discardableResult
+    static func restorePasteboardSnapshot(
+        _ snapshot: PasteboardSnapshot,
+        on pasteboard: NSPasteboard,
+        ifChangeCountIs expectedChangeCount: Int? = nil
+    ) -> Bool {
+        if let expectedChangeCount, pasteboard.changeCount != expectedChangeCount {
+            return false
+        }
+        let before = pasteboard.changeCount
+        defer { recordOwnedWrites(from: before, on: pasteboard) }
+        // Accepted AppKit limitation: a copy landing between the check above and this clear is lost.
+        beginLocalOnlyTransientWrite(on: pasteboard)
+        guard !snapshot.isEmpty else { return true }
         let items: [NSPasteboardItem] = snapshot.map { representations in
             let item = NSPasteboardItem()
             for (type, data) in representations {
@@ -643,6 +733,7 @@ final class TextInjector {
             return item
         }
         pasteboard.writeObjects(items)
+        return true
     }
 
     /// Strips trailing whitespace/newlines only — preserves a deliberately-prepended leading space.
@@ -678,6 +769,7 @@ final class TextInjector {
 
         // Keep the captured destination anchored across the pipeline-to-inject gap.
         if let expectedTargetPID, target.pid != expectedTargetPID {
+            Self.log("abort check=app-switch-at-insert pid=\(expectedTargetPID)→\(Self.describe(target.pid)) bundle=\(target.bundleIdentifier ?? "nil")")
             leaveOnClipboard(trimmed)
             return .failed
         }
@@ -927,9 +1019,13 @@ final class TextInjector {
                     expectedChangeCount: preparedPasteboardChangeCount
                 )
             case .restoreSaved:
-                if Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: pasteboard) {
-                    Self.restorePasteboardSnapshot(savedPasteboard, on: pasteboard)
-                } else {
+                let restored = Self.shouldRestoreSavedPasteboard(injectedText: trimmed, on: pasteboard)
+                    && Self.restorePasteboardSnapshot(
+                        savedPasteboard,
+                        on: pasteboard,
+                        ifChangeCountIs: preparedPasteboardChangeCount ?? pasteboard.changeCount
+                    )
+                if !restored {
                     Self.log("skip pasteboard restore — external overwrite after paste")
                 }
             case .doNotRestoreLeaveTranscript:
