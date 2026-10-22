@@ -674,6 +674,10 @@ final class MuseLiveTranscriber: NSObject, URLSessionWebSocketDelegate {
         try await task.send(message)
     }
 
+    /// Forces the buffered-audio fallback for this session. The recorder uses it
+    /// when it could not prove every captured buffer reached the session.
+    func requireBufferedAudioRecovery() { markStreamIntegrityFailed() }
+
     private func markStreamIntegrityFailed() {
         stateLock.lock()
         streamIntegrityFailed = true
