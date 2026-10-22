@@ -14,26 +14,61 @@ final class LearnToastPresentationTests: XCTestCase {
         ])
     }
 
-    func testEnqueueFIFOAndCapDropsNewest() {
-        var pending: [LearnBatch] = []
-        XCTAssertTrue(LearnToastPendingQueue.enqueue(batch("a"), into: &pending))
-        XCTAssertTrue(LearnToastPendingQueue.enqueue(batch("b"), into: &pending))
-        XCTAssertTrue(LearnToastPendingQueue.enqueue(batch("c"), into: &pending))
-        XCTAssertEqual(pending.count, 3)
-        // Cap full → refuse newest; oldest queued keep Reject.
-        XCTAssertFalse(LearnToastPendingQueue.enqueue(batch("d"), into: &pending))
-        XCTAssertEqual(pending.count, LearnToastPendingQueue.maxPending)
-        XCTAssertEqual(pending.map { $0.corrections[0].variant }, ["a", "b", "c"])
+    func testQueueIsFIFOAndOverflowMergesIntoVisiblePopUp() {
+        var state = LearnToastState()
+        for variant in ["a", "b", "c", "d", "e", "f"] {
+            state.receive(batch(variant))
+        }
+        // "a" visible, three queued, overflow merged into the visible batch.
+        XCTAssertEqual(state.queued.map { $0.corrections[0].variant }, ["b", "c", "d"])
+        XCTAssertEqual(state.current?.corrections.map(\.variant), ["a", "e", "f"])
+        let all = ([state.current!] + state.queued).flatMap(\.corrections).map(\.variant)
+        XCTAssertEqual(Set(all), ["a", "b", "c", "d", "e", "f"], "no suggestion is dropped")
 
-        let first = LearnToastPendingQueue.dequeue(from: &pending)
-        XCTAssertEqual(first?.corrections[0].variant, "a")
-        XCTAssertEqual(pending.count, 2)
+        XCTAssertEqual(state.takeCurrent()?.corrections.count, 3)
+        XCTAssertEqual(state.current?.corrections[0].variant, "b")
+        XCTAssertEqual(state.queued.count, 2)
     }
 
-    func testEnqueueIgnoresEmptyBatch() {
-        var pending: [LearnBatch] = []
-        XCTAssertFalse(LearnToastPendingQueue.enqueue(LearnBatch(corrections: []), into: &pending))
-        XCTAssertTrue(pending.isEmpty)
+    func testMergeKeepsVisibleIDAndSkipsDuplicates() {
+        let shown = batch("a")
+        let merged = LearnToastState.merging(
+            LearnBatch(corrections: shown.corrections + batch("b").corrections),
+            into: shown
+        )
+        XCTAssertEqual(merged.id, shown.id)
+        XCTAssertEqual(merged.corrections.map(\.variant), ["a", "b"])
+    }
+
+    func testReceiveIgnoresEmptyBatch() {
+        var state = LearnToastState()
+        state.receive(LearnBatch(corrections: []))
+        XCTAssertNil(state.current)
+        XCTAssertTrue(state.queued.isEmpty)
+    }
+
+    func testDictationActiveHidesWithoutDroppingAndRestores() {
+        var state = LearnToastState()
+        state.receive(batch("a"))
+        XCTAssertTrue(state.isOnScreen)
+        state.dictationActive = true
+        XCTAssertFalse(state.isOnScreen)
+        XCTAssertEqual(state.current?.corrections[0].variant, "a")
+        state.receive(batch("b"))
+        state.dictationActive = false
+        XCTAssertTrue(state.isOnScreen)
+        XCTAssertEqual(state.current?.corrections[0].variant, "a")
+        XCTAssertEqual(state.queued.map { $0.corrections[0].variant }, ["b"])
+    }
+
+    func testStripPromotesNextWhenVisibleEmpties() {
+        let id = UUID()
+        var state = LearnToastState()
+        state.receive(batch("a", entryID: id))
+        state.receive(batch("b"))
+        state.strip([UnlearnedCorrectionIdentity(entryID: id, variant: "a", term: "Term")])
+        XCTAssertEqual(state.current?.corrections[0].variant, "b")
+        XCTAssertTrue(state.queued.isEmpty)
     }
 
     func testUnlearnDismissalRemovesMatchingPendingAndFlagsCurrent() {
@@ -113,26 +148,5 @@ final class LearnToastPresentationTests: XCTestCase {
         XCTAssertFalse(plan.dismissCurrent)
         XCTAssertEqual(plan.rejectable?.corrections[0].variant, "visible")
         XCTAssertEqual(plan.pending.count, 1)
-    }
-
-    func testRejectDuringDismissFadeStillYieldsBatch() {
-        var rejectable: LearnBatch? = batch("heard")
-        // Dismiss starts: batch stays rejectable through fade.
-        XCTAssertNotNil(rejectable)
-
-        let rejected = LearnToastRejectSession.takeRejectable(&rejectable)
-        XCTAssertEqual(rejected?.corrections[0].variant, "heard")
-        XCTAssertNil(rejectable)
-
-        // Fade end after Reject: no onDismiss.
-        XCTAssertFalse(LearnToastRejectSession.clearIfStillPresent(&rejectable))
-    }
-
-    func testDismissFadeClearsWhenNotRejected() {
-        var rejectable: LearnBatch? = batch("kept")
-        XCTAssertTrue(LearnToastRejectSession.clearIfStillPresent(&rejectable))
-        XCTAssertNil(rejectable)
-        // Late Reject after dismiss completed: no-op.
-        XCTAssertNil(LearnToastRejectSession.takeRejectable(&rejectable))
     }
 }

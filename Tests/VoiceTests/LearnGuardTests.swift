@@ -108,6 +108,8 @@ final class LearnGuardTests: XCTestCase {
         XCTAssertEqual(events, 1)
         XCTAssertTrue(store.entries.contains { $0.term == "Grok" && $0.isAutoLearned })
         XCTAssertTrue(store.learnCandidates.pending.isEmpty, "promotion consumes the candidate")
+        XCTAssertEqual(store.correct("try Groq").text, "try Groq", "a suggestion is inert until approved")
+        store.approveLearnedBatch(LearnBatch(corrections: learned))
         XCTAssertEqual(store.correct("try Groq").text, "try Grok")
     }
 
