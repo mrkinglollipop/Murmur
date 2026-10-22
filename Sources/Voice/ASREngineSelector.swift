@@ -180,6 +180,10 @@ final class ASREngineSelector {
         pipeline.dropVoiceEditIntent(matching: token)
     }
 
+    func markHoldUnbound(_ token: UInt64) {
+        pipeline.markHoldUnbound(token)
+    }
+
     @discardableResult
     func test_holdSnapshot(_ snapshot: CaretContext.Snapshot) -> UInt64 {
         pipeline.test_holdSnapshot(snapshot)

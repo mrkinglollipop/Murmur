@@ -140,6 +140,9 @@ final class AudioRecorder {
         /// The test host's real frontmost app must not retarget a fixture hold.
         /// Nil is an unknown release identity, which keeps the hold-start target.
         var releaseFrontmostPID: pid_t?
+        /// Focus and window state at release. Nil skips the probe, which keeps
+        /// a fixture hold bound to its release app.
+        var releaseFocus: (focus: CaretContext.FocusRead, appHasWindows: Bool?)?
         var boundDeviceIsBuiltIn = true
         /// Errors returned by the next `engine.start()` calls, in order.
         var startErrors: [Error] = []
@@ -1568,6 +1571,30 @@ final class AudioRecorder {
     /// release target. Tagged with the stop generation it belongs to.
     internal private(set) var releaseSample: (generation: UInt64, pid: pid_t?)?
 
+    /// Focus and window state read in `stopRecording()` with the release PID,
+    /// so a window closing or focus moving before `doStop` runs cannot
+    /// reclassify a take released into a real field.
+    internal private(set) var releaseFocusSample: (generation: UInt64, focus: CaretContext.FocusRead, appHasWindows: Bool?)?
+
+    private func sampleReleaseFocus(pid: pid_t?) -> (focus: CaretContext.FocusRead, appHasWindows: Bool?)? {
+        #if DEBUG
+        // Fixture holds must not probe the test host's real focus.
+        if let hooks = micCaptureTestHooks { return hooks.releaseFocus }
+        #endif
+        guard let pid else { return nil }
+        return (CaretContext.focusRead(frontmostPID: pid), CaretContext.appHasWindows(pid: pid))
+    }
+
+    /// Unbound only from this stop's release sample; a missing or
+    /// other-generation sample keeps the take bound (strict delivery).
+    internal static func isUnboundAtRelease(
+        sample: (generation: UInt64, focus: CaretContext.FocusRead, appHasWindows: Bool?)?,
+        generation: UInt64
+    ) -> Bool {
+        guard let sample, sample.generation == generation else { return false }
+        return VoiceEditRouting.isUnboundReleaseTarget(focus: sample.focus, appHasWindows: sample.appHasWindows)
+    }
+
     /// A sample taken for this stop wins; a missing or other-generation sample
     /// (stop not routed through `stopRecording()`) falls back to a live read.
     internal static func resolvedReleasePID(
@@ -1617,6 +1644,26 @@ final class AudioRecorder {
         asrSelector.dropVoiceEditIntent(matching: token)
         vlog("inject target re-anchored at release — frontmost changed during hold")
         return (token, CaretContext.snapshot(frontmostPID: releasePID), releasePID)
+    }
+
+    /// Releasing with no focused element, or into a frontmost app with no
+    /// windows, leaves the take unbound: it is typed into whatever editable
+    /// field is focused when the text arrives, and any hold-start selection
+    /// edit is dropped. A focused but non-editable-looking element (terminals)
+    /// stays bound.
+    private func markSessionHoldUnboundIfNoEditableTarget(
+        _ hold: (token: UInt64?, snapshot: CaretContext.Snapshot?, pid: pid_t?),
+        generation: UInt64
+    ) {
+        assert(Thread.isMainThread, "markSessionHoldUnboundIfNoEditableTarget requires main thread")
+        guard let token = hold.token,
+              Self.isUnboundAtRelease(sample: releaseFocusSample, generation: generation),
+              let sample = releaseFocusSample else { return }
+        asrSelector.markHoldUnbound(token)
+        let releasePID = releaseSample?.generation == generation ? releaseSample?.pid : nil
+        vlog("inject target unbound at release — no focused element or no windows: "
+            + VoiceEditRouting.focusDiagnostic(field: sample.focus.field, appHasWindows: sample.appHasWindows,
+                pid: releasePID, bundle: TranscriptionPipeline.bundleIDForLog(releasePID)))
     }
 
     /// After inject pipeline finishes a take: drop that take's AudioRecorder
@@ -1866,7 +1913,14 @@ final class AudioRecorder {
         let generation = stopGeneration
         // Release is the targeting gesture: read frontmost here, not in the
         // queued doStop. Off-main callers skip the sample (doStop reads live).
-        releaseSample = Thread.isMainThread ? (generation, currentFrontmostPID()) : nil
+        if Thread.isMainThread {
+            let pid = currentFrontmostPID()
+            releaseSample = (generation, pid)
+            releaseFocusSample = sampleReleaseFocus(pid: pid).map { (generation, $0.focus, $0.appHasWindows) }
+        } else {
+            releaseSample = nil
+            releaseFocusSample = nil
+        }
         invalidateSecureInputPollTimer()
         endVoiceGateRecordingSession()
         DispatchQueue.main.async { [weak self] in
@@ -2795,6 +2849,7 @@ final class AudioRecorder {
         // gesture and must not drift to whatever app is frontmost 250ms
         // later.
         let sessionHold = retargetedSessionHoldAtRelease(sampleActiveSessionHold(), generation: capturedGeneration)
+        markSessionHoldUnboundIfNoEditableTarget(sessionHold, generation: capturedGeneration)
         let holdDuration = startTime.map { Date().timeIntervalSince($0) }
 
         armProcessingWatchdog(sessionToken: sessionHold.token, audioDuration: holdDuration ?? 0)
