@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.56",
+    "build": "57",
+    "title": "What's New in 0.1.56",
+    "items": [
+      "Edit text by voice: select text in any app, hold the dictation key, and say what to change, or dictate new text to replace it.",
+      "Long dictations are no longer cut at a brief quiet moment, so words between sentences are kept.",
+      "Words you keep correcting are now suggested for your dictionary, and nothing changes until you click Add.",
+      "Apple's built-in speech recognition is available as an on-device engine, and is the default for new installs without a key or downloaded model.",
+      "Choose your microphone in Settings, mark microphones to never use, and get a hint when the mic gives no audio or the level is very low.",
+      "Text goes to the app you were in when you released the key, and ordinary dictations are no longer stopped by a false change-of-field warning.",
+      "Fixed Transcribing staying on screen after a short silent hold, and speech is kept in History if the microphone fails mid-hold.",
+      "Optional Apple voice isolation for the microphone, off by default.",
+      "The Dictionary shows the correct spelling first with what Murmur heard beneath it, in A to Z order.",
+      "Numbers are written as digits and your dictionary words are used on the ElevenLabs fallback path.",
+      "Murmur's temporary clipboard use no longer syncs to your other devices.",
+      "A new waveform menu-bar icon, plus accessibility, contrast and Reduce Motion improvements throughout."
+    ]
+  },
+  {
     "version": "0.1.55",
     "build": "56",
     "title": "What's New in 0.1.55",
