@@ -493,7 +493,8 @@ final class TranscriptionPipeline {
                     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         throw CloudTranscriptionError.emptyTranscript(provider: cloudModel.provider)
                     }
-                    let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID)
+                    let cleaned = await self.prepareTranscript(
+                        text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID, engineID: engineTag)
                     let transformed = cleaned.text
                     self.finishTranscription(
                         text: transformed,
@@ -726,10 +727,17 @@ final class TranscriptionPipeline {
         )
     }
 
-    private func prepareTranscript(
+    /// ElevenLabs batch spells numbers out while its realtime stream writes
+    /// digits, so only this engine's ordinary dictation is normalized.
+    static func normalizesSpokenNumbers(engineID: String?) -> Bool {
+        engineID == "cloud:elevenLabs"
+    }
+
+    func prepareTranscript(
         _ text: String,
         holdToken: UInt64,
-        replaceHistoryEntryID: UUID?
+        replaceHistoryEntryID: UUID?,
+        engineID: String? = nil
     ) async -> PreprocessedTranscript {
         let isEdit = await MainActor.run {
             replaceHistoryEntryID == nil && self.isVoiceEditHold(holdToken)
@@ -740,7 +748,9 @@ final class TranscriptionPipeline {
                 hadExplicitTrailingNewline: false
             )
         }
-        let cleaned = await applyCleanup(text)
+        let dictation = Self.normalizesSpokenNumbers(engineID: engineID)
+            ? SpokenNumberNormalizer.normalize(text) : text
+        let cleaned = await applyCleanup(dictation)
         return PreprocessedTranscript(
             text: await applyAutoTransform(cleaned.text),
             hadExplicitTrailingNewline: cleaned.hadExplicitTrailingNewline
@@ -1032,7 +1042,8 @@ final class TranscriptionPipeline {
                             case .replace:
                                 // The selection intent was consumed before preparation, so
                                 // this follows ordinary dictation's cleanup/formatting path.
-                                let prepared = await self.prepareTranscript(trimmed, holdToken: sessionHeldToken, replaceHistoryEntryID: nil)
+                                let prepared = await self.prepareTranscript(
+                                    trimmed, holdToken: sessionHeldToken, replaceHistoryEntryID: nil, engineID: engineID)
                                 guard !Self.normalizeTranscriptForInjection(prepared.text).isEmpty else {
                                     await MainActor.run {
                                         self.failVoiceEdit(token: sessionHeldToken, audioPath: audioPath,
