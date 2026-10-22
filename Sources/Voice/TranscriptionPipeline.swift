@@ -223,6 +223,15 @@ final class TranscriptionPipeline {
         voiceEditIntents[token] != nil
     }
 
+    /// Release landed in a different app than the hold-start selection. Main
+    /// thread; must run before `prepareTranscript` so the take gets ordinary
+    /// dictation cleanup.
+    func dropVoiceEditIntent(matching token: UInt64) {
+        assert(Thread.isMainThread, "dropVoiceEditIntent requires main thread")
+        guard voiceEditIntents.removeValue(forKey: token) != nil else { return }
+        vlog("voice edit dropped: app changed during hold — delivering as dictation")
+    }
+
     private func consumeVoiceEditIntent(matching token: UInt64) -> VoiceEditIntent? {
         voiceEditIntents.removeValue(forKey: token)
     }
