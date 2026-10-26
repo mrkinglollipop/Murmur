@@ -1,6 +1,6 @@
 # 034 — Tell the user when a cloud provider refuses, and stop paying for it
 
-**Status:** DRAFT 2026-10-26, waiting for Matt's OK on this doc and the mock
+**Status:** APPROVED 2026-10-26 (Matt: "Looks good. Proceed as you rec."). 5-minute retry window; billing link in menu bar and Settings only. Mock
 (`plans/034-provider-outage-mock.html`).
 **Origin:** 2026-10-26 00:43Z. The ElevenLabs subscription had a failed payment
 and every request came back `401 payment_required`. Three holds (83 s, 35 s and
