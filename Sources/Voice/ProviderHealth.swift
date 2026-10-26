@@ -30,6 +30,12 @@ enum CloudFailureClassifier {
         if status == 429 { return .rateLimited }
         if status == 402 { return .billing }
         guard status == 401 || status == 403 else { return .transient }
+        // A 403 from an edge proxy (xAI sits behind a bot challenge) is an HTML
+        // page, not the provider's API refusing the key: retry as normal.
+        if status == 403, let lowered = body?.lowercased(),
+           ["<html", "<!doctype", "cloudflare", "challenge"].contains(where: { lowered.contains($0) }) {
+            return .transient
+        }
         if let lowered = body?.lowercased(),
            billingKeywords.contains(where: { lowered.contains($0) }) {
             return .billing
@@ -120,6 +126,9 @@ final class ProviderHealthStore {
 
     private let lock = NSLock()
     private var records: [CloudProvider: Record] = [:]
+    /// Last 2xx per provider, kept across clears so a handshake verdict that
+    /// arrives after the same attempt already succeeded can be ignored.
+    private var lastSuccess: [CloudProvider: Date] = [:]
     private let now: () -> Date
     private let postsNotifications: Bool
 
@@ -179,11 +188,23 @@ final class ProviderHealthStore {
 
     // MARK: Writes
 
-    /// Records a failed cloud request. `.transient` changes nothing.
-    func recordFailure(_ provider: CloudProvider, kind: CloudFailureKind, provisional: Bool = false) {
+    /// The store's clock, for callers that stamp an attempt's start.
+    func timestamp() -> Date { now() }
+
+    /// Records a failed cloud request. `.transient` changes nothing. A
+    /// provisional (handshake-only) verdict is dropped when the provider has
+    /// succeeded since `attemptStartedAt`: the stream's start can fail after
+    /// the same hold already went through on batch.
+    func recordFailure(_ provider: CloudProvider, kind: CloudFailureKind, provisional: Bool = false,
+                       attemptStartedAt: Date? = nil) {
         guard kind != .transient else { return }
         let current = now()
         lock.lock()
+        if provisional, let started = attemptStartedAt,
+           let success = lastSuccess[provider], success >= started {
+            lock.unlock()
+            return
+        }
         var record = records[provider] ?? Record()
         let before = record.state
         switch kind {
@@ -212,13 +233,20 @@ final class ProviderHealthStore {
     }
 
     /// Convenience for catch blocks: classifies `error` for `provider`.
-    func recordFailure(_ provider: CloudProvider, error: Error) {
+    func recordFailure(_ provider: CloudProvider, error: Error, attemptStartedAt: Date? = nil) {
         let cloud = error as? CloudTranscriptionError
-        recordFailure(provider, kind: CloudFailureClassifier.kind(of: error), provisional: cloud?.isProvisional ?? false)
+        recordFailure(provider, kind: CloudFailureClassifier.kind(of: error),
+                      provisional: cloud?.isProvisional ?? false, attemptStartedAt: attemptStartedAt)
     }
 
     /// A request succeeded (a response with HTTP 2xx, text or not).
-    func recordSuccess(_ provider: CloudProvider) { clear(provider) }
+    func recordSuccess(_ provider: CloudProvider) {
+        let current = now()
+        lock.lock()
+        lastSuccess[provider] = current
+        lock.unlock()
+        clear(provider)
+    }
 
     /// The user saved a key for this provider: forget any refusal and retry.
     func keySaved(for provider: CloudProvider) { clear(provider) }

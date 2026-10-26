@@ -654,10 +654,10 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
     /// than letting it block on the 5s timeout) so `AudioRecorder` falls back
     /// to the file/batch path promptly. No-op once ready has resolved.
     private func failReadyIfPending(_ reason: String, handshakeStatus: Int? = nil) {
-        // A 401/402/403 on the upgrade is a provider refusal, not a flaky
+        // A 401/402 on the upgrade (403 is often an edge bot challenge) is a provider refusal, not a flaky
         // network: carry it as a provisional auth/billing error (plan 034).
         let error: CloudTranscriptionError
-        if let handshakeStatus, [401, 402, 403].contains(handshakeStatus) {
+        if let handshakeStatus, [401, 402].contains(handshakeStatus) {
             error = .handshakeRejected(handshakeStatus, provider: .xai)
         } else {
             error = CloudTranscriptionError(provider: .xai, message: reason)

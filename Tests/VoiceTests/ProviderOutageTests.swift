@@ -41,6 +41,37 @@ final class ProviderOutageTests: XCTestCase {
         XCTAssertEqual(CloudFailureClassifier.classify(status: 401, body: #"{"detail":{"status":"quota_exceeded"}}"#), .billing)
     }
 
+    func testEdgeProxy403IsTransientNotAuth() {
+        let challenge = "<!DOCTYPE html><html><title>Just a moment...</title>Cloudflare challenge</html>"
+        XCTAssertEqual(CloudFailureClassifier.classify(status: 403, body: challenge), .transient)
+        let error = CloudTranscriptionError.httpStatus(403, provider: .xai, body: challenge)
+        XCTAssertEqual(error.kind, .transient)
+        let store = makeStore(Clock())
+        store.recordFailure(.xai, error: error)
+        XCTAssertEqual(store.state(for: .xai), .ok)
+    }
+
+    func testLateHandshakeVerdictAfterSuccessOnSameAttemptIsIgnored() {
+        let clock = Clock()
+        let store = makeStore(clock)
+        let attemptStarted = store.timestamp()
+        clock.advance(2)
+        store.recordSuccess(.elevenLabs)          // batch already landed this hold
+        clock.advance(1)
+        store.recordFailure(.elevenLabs, error: CloudTranscriptionError.handshakeRejected(401, provider: .elevenLabs),
+                            attemptStartedAt: attemptStarted)
+        XCTAssertEqual(store.state(for: .elevenLabs), .ok)
+        XCTAssertTrue(store.allowsStream(for: .elevenLabs))
+
+        // A handshake verdict from an attempt that began after the success still counts.
+        let nextAttempt = store.timestamp()
+        clock.advance(1)
+        store.recordFailure(.elevenLabs, error: CloudTranscriptionError.handshakeRejected(401, provider: .elevenLabs),
+                            attemptStartedAt: nextAttempt)
+        XCTAssertFalse(store.allowsStream(for: .elevenLabs))
+        XCTAssertTrue(store.allowsBatch(for: .elevenLabs))
+    }
+
     func test429IsRateLimited() {
         XCTAssertEqual(CloudFailureClassifier.classify(status: 429, body: "slow down"), .rateLimited)
         XCTAssertEqual(CloudTranscriptionError.httpStatus(429, provider: .xai).kind, .rateLimited)

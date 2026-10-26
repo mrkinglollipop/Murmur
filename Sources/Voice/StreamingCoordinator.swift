@@ -447,12 +447,13 @@ final class StreamingCoordinator {
         }
         xaiSession = session
         vlog("doStart — attempting xAI streaming transcription")
+        let attemptStartedAt = asrSelector.providerHealth.timestamp()
         Task {
             do {
                 try await session.start()
             } catch {
                 vlog("xai streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
-                asrSelector.providerHealth.recordFailure(.xai, error: error)
+                asrSelector.providerHealth.recordFailure(.xai, error: error, attemptStartedAt: attemptStartedAt)
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.xaiSession === session {
@@ -480,12 +481,13 @@ final class StreamingCoordinator {
         }
         elevenLabsSession = session
         vlog("doStart — attempting ElevenLabs Scribe RT streaming transcription")
+        let attemptStartedAt = asrSelector.providerHealth.timestamp()
         Task {
             do {
                 try await session.start()
             } catch {
                 vlog("elevenlabs streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
-                asrSelector.providerHealth.recordFailure(.elevenLabs, error: error)
+                asrSelector.providerHealth.recordFailure(.elevenLabs, error: error, attemptStartedAt: attemptStartedAt)
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.elevenLabsSession === session {
