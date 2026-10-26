@@ -59,6 +59,9 @@ struct SettingsView: View {
     @State private var cleanupKeyInput: String = ""
 
     @State private var apiKeySaveFailed = false
+    @State private var providerHealthTick = 0
+    @State private var isCheckingProvider = false
+    @State private var providerCheckOutcome: String?
     @State private var cleanupKeySaveFailed = false
 
     @State private var pendingModelDelete: LocalModel?
@@ -970,6 +973,9 @@ struct SettingsView: View {
     @ViewBuilder
     private func apiKeyEntry(for provider: CloudProvider) -> some View {
         let hasKey = settingsStore.apiKeyPresence[provider.keychainAccount] == true
+        // Re-read whenever provider health changes (plan 034).
+        let _ = providerHealthTick
+        let refusal = settingsStore.refusalNotice(for: provider)
 
         VStack(alignment: .leading, spacing: 8) {
             Text("\(provider.displayName) API key")
@@ -1025,6 +1031,8 @@ struct SettingsView: View {
                 Text("Keychain save failed — key not stored. Try again.")
                     .font(Theme.body(10))
                     .foregroundColor(Theme.amberText)
+            } else if hasKey, let refusal {
+                providerRefusalStatus(refusal, provider: provider)
             } else if hasKey {
                 HStack(spacing: 4) {
                     Text("Key saved")
@@ -1033,12 +1041,21 @@ struct SettingsView: View {
                 }
                 .font(Theme.body(10))
                 .foregroundColor(Theme.successGreen)
+                if let checkOutcome = providerCheckOutcome {
+                    Text(checkOutcome)
+                        .font(Theme.body(10))
+                        .foregroundColor(Theme.textSecondary)
+                }
             } else {
                 Text("No key — cloud falls back to local.")
                     .font(Theme.body(10))
                     .foregroundColor(Theme.amberText)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .providerHealthDidChange)) { _ in
+            providerHealthTick &+= 1
+        }
+        .onChange(of: provider.id) { _, _ in providerCheckOutcome = nil }
         .confirmDelete(
             isPresented: $showAPIKeyRemoveConfirmation,
             title: "Remove \(pendingAPIKeyRemoval?.displayName ?? provider.displayName) API key?",
@@ -1050,6 +1067,54 @@ struct SettingsView: View {
                 apiKeySaveFailed = false
             }
         )
+    }
+
+    /// Amber "Rejected 8:43 PM: payment needed. Dictation is using on-device."
+    /// line with Check now and Open billing (plan 034). Replaces "Key saved"
+    /// until a request succeeds.
+    @ViewBuilder
+    private func providerRefusalStatus(_ notice: ProviderNotice, provider: CloudProvider) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(notice.settingsLine())
+                .font(Theme.body(10))
+                .foregroundColor(Theme.amberText)
+                .accessibilityLabel("\(provider.displayName) rejected requests. \(notice.reason). Dictation is using on-device.")
+            HStack(spacing: 10) {
+                Button(isCheckingProvider ? "Checking…" : "Check now") {
+                    isCheckingProvider = true
+                    providerCheckOutcome = nil
+                    Task {
+                        let result = await settingsStore.checkProvider(provider)
+                        isCheckingProvider = false
+                        switch result {
+                        case .ok: providerCheckOutcome = "\(provider.displayName) accepted a test request."
+                        case .rejected(let kind): providerCheckOutcome = "Still rejected: \(ProviderNotice(provider: provider, kind: kind, lastRejection: Date()).reason)."
+                        case .noKey: providerCheckOutcome = "No key saved."
+                        case .failed(let why): providerCheckOutcome = "Couldn't check: \(why)"
+                        }
+                    }
+                }
+                .buttonStyle(.glass)
+                .font(Theme.body(11, weight: .medium))
+                .disabled(isCheckingProvider)
+                .accessibilityLabel("Check \(provider.displayName) now")
+                .accessibilityHint("Sends a one second silent clip to test the key")
+
+                Button(notice.kind == .billing ? "Open billing" : "Open key page") {
+                    NSWorkspace.shared.open(notice.remedyURL)
+                }
+                .buttonStyle(.glass)
+                .font(Theme.body(11, weight: .medium))
+                .accessibilityLabel(notice.kind == .billing
+                    ? "Open \(provider.displayName) billing page"
+                    : "Open \(provider.displayName) key page")
+            }
+            if let providerCheckOutcome {
+                Text(providerCheckOutcome)
+                    .font(Theme.body(10))
+                    .foregroundColor(Theme.textSecondary)
+            }
+        }
     }
 
     /// SecureField + Save/Remove + status line for the cleanup cloud

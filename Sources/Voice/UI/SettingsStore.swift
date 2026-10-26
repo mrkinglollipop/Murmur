@@ -594,6 +594,13 @@ final class SettingsStore: ObservableObject {
     /// objects exist.
     weak var activationController: ActivationController?
     weak var asrEngineSelector: ASREngineSelector?
+
+    /// Fired after cloud settings (selected model, key lookup) reach the live
+    /// selector, so the menu bar / HUD can re-evaluate the provider notice.
+    var onCloudSettingsApplied: (() -> Void)?
+
+    /// Service used by `checkProvider(_:)`; injectable for tests.
+    var checkServiceProvider: (CloudModel) -> any CloudTranscriptionService = { CloudTranscriberFactory.service(for: $0) }
     weak var audioRecorder: AudioRecorder? {
         didSet { wireVoiceGateTelemetryPublisher() }
     }
@@ -984,6 +991,7 @@ final class SettingsStore: ObservableObject {
         asrEngineSelector.elevenLabsRealtimeOptions = elevenLabsRealtimeOptions
         asrEngineSelector.geminiLiveOptions = geminiLiveOptions
         asrEngineSelector.xaiEndpointingMs = xaiEndpointingMs
+        onCloudSettingsApplied?()
     }
 
     /// Pushes the cleanup toggle, code-aware flag, and a freshly-built
@@ -1119,6 +1127,8 @@ final class SettingsStore: ObservableObject {
     @discardableResult
     func saveAPIKey(_ value: String, for provider: CloudProvider) -> Bool {
         guard keychain.setKey(value, for: provider.keychainAccount) else { return false }
+        // A fresh key earns a fresh try: forget any refusal recorded for the old one.
+        providerHealth.keySaved(for: provider)
         applyCloudSettings()
         if provider == .xai {
             applyCleanupSettings()
@@ -1135,6 +1145,75 @@ final class SettingsStore: ObservableObject {
             applyCleanupSettings()
         }
         refreshKeyPresence()
+    }
+
+    // MARK: - Provider health (plan 034)
+
+    /// The live health record (the selector's, so tests and the app agree).
+    var providerHealth: ProviderHealthStore { asrEngineSelector?.providerHealth ?? .shared }
+
+    /// The notice for `provider` while it refuses (billing/auth), else nil.
+    func refusalNotice(for provider: CloudProvider) -> ProviderNotice? {
+        guard let notice = providerHealth.notice(for: provider), notice.kind.isRefusal else { return nil }
+        return notice
+    }
+
+    enum ProviderCheckResult: Equatable {
+        case ok
+        case rejected(CloudFailureKind)
+        case noKey
+        case failed(String)
+    }
+
+    /// "Check now": one 1 s silent clip to the provider's batch endpoint. A 2xx
+    /// (even with an empty transcript) clears the notice; a refusal updates it.
+    /// Reads the key into a local, never logs or returns it.
+    func checkProvider(_ provider: CloudProvider) async -> ProviderCheckResult {
+        guard let key = readAPIKey(provider.keychainAccount), !key.isEmpty else { return .noKey }
+        guard let model = CloudModel.selectable.first(where: { $0.provider == provider })
+                ?? CloudModel.allCases.first(where: { $0.provider == provider }) else {
+            return .failed("No model for \(provider.displayName)")
+        }
+        let clip = FileManager.default.temporaryDirectory
+            .appendingPathComponent("murmur-check-\(UUID().uuidString).wav")
+        guard (try? Self.silentWAV(seconds: 1).write(to: clip, options: .atomic)) != nil else {
+            return .failed("Couldn't write test clip")
+        }
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let health = providerHealth
+        do {
+            _ = try await checkServiceProvider(model).transcribe(
+                audioURL: clip, apiKey: key, model: model,
+                language: Self.isoLanguageCode(from: selectedLanguage))
+            health.recordSuccess(provider)
+            return .ok
+        } catch let error as CloudTranscriptionError where error.isEmptyTranscript {
+            health.recordSuccess(provider)
+            return .ok
+        } catch {
+            let kind = CloudFailureClassifier.kind(of: error)
+            if kind == .transient {
+                return .failed(StreamingCoordinator.startFailureDescription(error))
+            }
+            health.recordFailure(provider, error: error)
+            return .rejected(kind)
+        }
+    }
+
+    /// 16 kHz mono 16-bit PCM WAV of silence.
+    static func silentWAV(seconds: Int) -> Data {
+        let sampleRate = 16_000
+        let dataBytes = sampleRate * seconds * 2
+        var data = Data()
+        func u32(_ v: Int) { var x = UInt32(v).littleEndian; withUnsafeBytes(of: &x) { data.append(contentsOf: $0) } }
+        func u16(_ v: Int) { var x = UInt16(v).littleEndian; withUnsafeBytes(of: &x) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8)); u32(36 + dataBytes)
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(sampleRate); u32(sampleRate * 2); u16(2); u16(16)
+        data.append(contentsOf: Array("data".utf8)); u32(dataBytes)
+        data.append(Data(count: dataBytes))
+        return data
     }
 
     /// Whether a non-empty API key is currently stored for `provider`.

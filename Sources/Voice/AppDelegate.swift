@@ -25,6 +25,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isShowingMenuBarErrorBadge = false
     private var menuBarErrorBadgeGeneration = 0
 
+    /// The selected cloud provider's billing/auth refusal, if any (plan 034).
+    /// While set, the menu-bar badge stays on with no expiry and the status
+    /// menu gains an "Open billing…" item at the top.
+    private(set) var outageNotice: ProviderNotice?
+    private var providerHealthObserver: NSObjectProtocol?
+
     // MARK: - Main window + UI stores
 
     private let historyStore = HistoryStore()
@@ -204,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         activationController?.audioRecorder.asrSelector.onRecordingStart = { [weak self] in
+            self?.refreshProviderNotice()
             self?.styleStore.applyStyleForFrontmostApp()
             self?.correctionWatcher.endWatchForNewRecording()
         }
@@ -299,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         wireFailureReporting()
         wireHUDMenuBarSync()
+        wireProviderHealth()
 
         // Subtle start/stop feedback sound, gated on the persisted Settings
         // toggle — read fresh on every call rather than pushed once, so a
@@ -467,7 +475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateTitle: updateTitle,
             updatesEnabled: updatesEnabled,
             target: self,
-            updater: updaterController
+            updater: updaterController,
+            outage: outageNotice
         )
     }
 
@@ -477,9 +486,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateTitle: String,
         updatesEnabled: Bool,
         target: AnyObject?,
-        updater: AnyObject?
+        updater: AnyObject?,
+        outage: ProviderNotice? = nil
     ) -> NSMenu {
         let menu = NSMenu()
+        if let outage, let title = outage.menuTitle {
+            let item = menu.addItem(withTitle: title, action: #selector(openProviderRemedyMenuItemClicked(_:)), keyEquivalent: "")
+            item.target = target
+            item.representedObject = outage.remedyURL
+            item.attributedTitle = NSAttributedString(
+                string: title,
+                attributes: [.foregroundColor: NSColor(Theme.amberBorder), .font: NSFont.menuFont(ofSize: 0)])
+            menu.addItem(.separator())
+        }
         menu.addItem(withTitle: versionTitle, action: nil, keyEquivalent: "").isEnabled = false
         menu.addItem(.separator())
         let open = menu.addItem(withTitle: "Open Murmur", action: #selector(openVoiceMenuItemClicked), keyEquivalent: "")
@@ -523,18 +542,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindowController.showSettingsTab()
     }
 
+    @objc private func openProviderRemedyMenuItemClicked(_ sender: NSMenuItem) {
+        if let url = sender.representedObject as? URL { NSWorkspace.shared.open(url) }
+    }
+
     @objc private func toggleDictationPause() {
         isDictationPaused.toggle()
         activationController?.isPaused = isDictationPaused
         hotkeyController?.isPaused = isDictationPaused
-        setMenuBarIcon(isDictationPaused ? .paused : .idle)
+        setMenuBarIcon(isDictationPaused ? .paused : restingMenuBarIcon())
         rebuildStatusMenu()
     }
 
     private func setMenuBarIcon(_ icon: MenuBarIcon) {
         guard let button = menuBarButton else { return }
         button.image = icon.image
-        button.setAccessibilityLabel(icon.accessibilityDescription)
+        if icon == .error, !isShowingMenuBarErrorBadge, let outageNotice {
+            button.setAccessibilityLabel("Murmur, provider problem. \(outageNotice.title)")
+        } else {
+            button.setAccessibilityLabel(icon.accessibilityDescription)
+        }
+    }
+
+    /// The icon shown when nothing else is happening: the error badge while a
+    /// provider is refusing (no expiry), otherwise idle.
+    private func restingMenuBarIcon() -> MenuBarIcon {
+        outageNotice != nil ? .error : .idle
+    }
+
+    // MARK: - Provider outage (plan 034)
+
+    private func wireProviderHealth() {
+        providerHealthObserver = NotificationCenter.default.addObserver(
+            forName: .providerHealthDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshProviderNotice() }
+        }
+        settingsStore.onCloudSettingsApplied = { [weak self] in
+            self?.refreshProviderNotice()
+        }
+        refreshProviderNotice()
+    }
+
+    /// Re-derives the HUD notice, menu item and badge from the selected
+    /// provider's health. Cheap; safe to call often.
+    func refreshProviderNotice() {
+        let selector = activationController?.audioRecorder.asrSelector
+        let notice = selector?.cloudModel.flatMap { selector?.providerHealth.notice(for: $0.provider) }
+        activationController?.audioRecorder.hud.setProviderNotice(notice)
+        let refusal = (notice?.kind.isRefusal == true) ? notice : nil
+        guard refusal != outageNotice else { return }
+        outageNotice = refusal
+        rebuildStatusMenu()
+        if !isDictationPaused, !isShowingMenuBarErrorBadge,
+           activationController?.audioRecorder.hud.isVisible != true {
+            setMenuBarIcon(restingMenuBarIcon())
+        }
     }
 
     // MARK: - Onboarding
@@ -622,7 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // firing hide() well before the badge's own independent 3s clear) —
         // let setMenuBarErrorBadge(false) own that transition, unchanged.
         guard !isShowingMenuBarErrorBadge, !isDictationPaused else { return }
-        setMenuBarIcon(.idle)
+        setMenuBarIcon(restingMenuBarIcon())
     }
 
     func updateMenuBarIcon(for state: RecordingHUD.State) {
@@ -635,7 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .processing:
             setMenuBarIcon(.processing)
         case .success, .clipboardFlash:
-            setMenuBarIcon(.idle)
+            setMenuBarIcon(restingMenuBarIcon())
         case .error:
             return
         }
@@ -656,7 +719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if show {
             setMenuBarIcon(.error)
         } else {
-            setMenuBarIcon(.idle)
+            setMenuBarIcon(restingMenuBarIcon())
         }
     }
 }
