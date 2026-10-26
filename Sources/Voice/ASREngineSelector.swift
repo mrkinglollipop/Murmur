@@ -28,6 +28,10 @@ final class ASREngineSelector {
     /// Post-ASR pipeline (cleanup → correct → inject → history).
     let pipeline = TranscriptionPipeline()
 
+    /// Per-provider refusal state (plan 034). Injectable so tests never share
+    /// the app-wide record.
+    var providerHealth: ProviderHealthStore = .shared
+
     init() {
         pipeline.engineSelector = self
     }
@@ -349,6 +353,7 @@ final class ASREngineSelector {
     /// fresh on every recording start so a live Settings change is respected.
     func makeXAIStreamingSession() -> XAIStreamingTranscriber? {
         guard xaiStreamingEnabled,
+              providerHealth.allowsStream(for: .xai),
               cloudModel == .xaiGrokSTT,
               let key = apiKeyProvider?(.xai),
               !key.isEmpty else { return nil }
@@ -366,6 +371,7 @@ final class ASREngineSelector {
     /// transcribes via the batch fallback. Mirrors `makeXAIStreamingSession`.
     func makeElevenLabsStreamingSession() -> ElevenLabsRealtimeTranscriber? {
         guard elevenLabsStreamingEnabled,
+              providerHealth.allowsStream(for: .elevenLabs),
               cloudModel == .elevenLabsScribeV2Realtime,
               let key = apiKeyProvider?(.elevenLabs),
               !key.isEmpty else { return nil }
@@ -383,6 +389,7 @@ final class ASREngineSelector {
     /// Returns `nil` otherwise so the caller uses file/batch fallback.
     func makeGeminiStreamingSession() -> GeminiLiveTranscriber? {
         guard geminiStreamingEnabled,
+              providerHealth.allowsStream(for: .gemini),
               cloudModel == .gemini35TranscribeLive,
               let key = apiKeyProvider?(.gemini),
               !key.isEmpty else { return nil }
@@ -400,6 +407,7 @@ final class ASREngineSelector {
     /// Returns `nil` otherwise so the caller uses file/batch fallback.
     func makeMuseStreamingSession() -> MuseLiveTranscriber? {
         guard museStreamingEnabled,
+              providerHealth.allowsStream(for: .meta),
               cloudModel == .museVoiceTranscribeLive,
               let key = apiKeyProvider?(.meta),
               !key.isEmpty else { return nil }

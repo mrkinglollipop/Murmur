@@ -647,14 +647,21 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
         let intentional = intentionalSocketShutdown
         stateLock.unlock()
         if error != nil, !intentional { markStreamIntegrityFailed() }
-        failReadyIfPending("task completed httpStatus=\(status)")
+        failReadyIfPending("task completed httpStatus=\(status)", handshakeStatus: status)
     }
 
     /// If `start()` is still awaiting `transcript.created`, fail it NOW (rather
     /// than letting it block on the 5s timeout) so `AudioRecorder` falls back
     /// to the file/batch path promptly. No-op once ready has resolved.
-    private func failReadyIfPending(_ reason: String) {
-        let error = CloudTranscriptionError(provider: .xai, message: reason)
+    private func failReadyIfPending(_ reason: String, handshakeStatus: Int? = nil) {
+        // A 401/402/403 on the upgrade is a provider refusal, not a flaky
+        // network: carry it as a provisional auth/billing error (plan 034).
+        let error: CloudTranscriptionError
+        if let handshakeStatus, [401, 402, 403].contains(handshakeStatus) {
+            error = .handshakeRejected(handshakeStatus, provider: .xai)
+        } else {
+            error = CloudTranscriptionError(provider: .xai, message: reason)
+        }
         stateLock.lock()
         socketClosed = true
         let cont = readyResolved ? nil : readyContinuation
@@ -684,7 +691,7 @@ final class XAIStreamingTranscriber: NSObject, URLSessionWebSocketDelegate {
                 let intentional = intentionalSocketShutdown
                 stateLock.unlock()
                 if !intentional { markStreamIntegrityFailed() }
-                failReadyIfPending("receive: \(ns.domain)#\(ns.code)")
+                failReadyIfPending("receive: \(ns.domain)#\(ns.code)", handshakeStatus: (task.response as? HTTPURLResponse)?.statusCode)
                 break
             }
 

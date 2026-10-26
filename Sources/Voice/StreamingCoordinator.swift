@@ -452,6 +452,7 @@ final class StreamingCoordinator {
                 try await session.start()
             } catch {
                 vlog("xai streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
+                asrSelector.providerHealth.recordFailure(.xai, error: error)
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.xaiSession === session {
@@ -484,6 +485,7 @@ final class StreamingCoordinator {
                 try await session.start()
             } catch {
                 vlog("elevenlabs streaming: start failed (\(Self.startFailureDescription(error))) — continuing in file-buffer mode")
+                asrSelector.providerHealth.recordFailure(.elevenLabs, error: error)
                 session.cancel()
                 DispatchQueue.main.async {
                     if self.elevenLabsSession === session {

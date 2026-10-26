@@ -33,6 +33,11 @@ final class TranscriptionPipeline {
     var cloudServiceProvider: (CloudModel) -> any CloudTranscriptionService = CloudTranscriberFactory.service
     var localEngineProvider: (() -> any ASREngine)?
 
+    /// Fired (any thread) when a hold skips cloud entirely because the selected
+    /// provider is refusing (plan 034). The HUD notice itself is driven by
+    /// `ProviderHealthStore`; this lets callers and tests observe the skip.
+    var onCloudSkippedForOutage: ((CloudProvider) -> Void)?
+
     /// Master on/off for the AI cleanup pass.
     var cleanupEnabled: Bool = false
 
@@ -518,8 +523,28 @@ final class TranscriptionPipeline {
             )
         if let cloudModel = selector.cloudModel,
            let key = selector.apiKeyProvider?(cloudModel.provider),
+           !key.isEmpty,
+           selector.providerHealth.allowsBatch(for: cloudModel.provider) == false {
+            // Provider is refusing (billing/auth) or rate-limited: a request is
+            // bound to fail, so go straight to the on-device engine (plan 034).
+            vlog("cloud skipped [cloud:\(cloudModel.provider.rawValue)] — provider refusing; using local")
+            onCloudSkippedForOutage?(cloudModel.provider)
+            transcribeLocally(
+                audioURL: audioURL,
+                audioPath: audioPath,
+                replaceHistoryEntryID: replaceID,
+                sessionHeldToken: sessionHeldToken,
+                sessionHeldSnapshot: sessionHeldSnapshot,
+                sessionHeldFrontmostPID: sessionHeldFrontmostPID,
+                completion: completion
+            )
+            return
+        }
+        if let cloudModel = selector.cloudModel,
+           let key = selector.apiKeyProvider?(cloudModel.provider),
            !key.isEmpty {
             let engineTag = "cloud:\(cloudModel.provider.rawValue)"
+            let health = selector.providerHealth
             logger.info("Transcribing \(audioURL.lastPathComponent) with cloud engine '\(engineTag)'")
 
             Task {
@@ -541,6 +566,7 @@ final class TranscriptionPipeline {
                     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         throw CloudTranscriptionError.emptyTranscript(provider: cloudModel.provider)
                     }
+                    health.recordSuccess(cloudModel.provider)
                     let cleaned = await self.prepareTranscript(
                         text, holdToken: sessionHeldToken, replaceHistoryEntryID: replaceID, engineID: engineTag)
                     let transformed = cleaned.text
@@ -557,6 +583,13 @@ final class TranscriptionPipeline {
                     )
                 } catch {
                     let emptyResponse = (error as? CloudTranscriptionError)?.isEmptyTranscript == true
+                    // An empty transcript is still an HTTP 2xx: the provider is fine.
+                    // Transient failures change nothing; billing/auth/429 update health.
+                    if emptyResponse {
+                        health.recordSuccess(cloudModel.provider)
+                    } else {
+                        health.recordFailure(cloudModel.provider, error: error)
+                    }
                     let recoverInBackground = await MainActor.run {
                         guard emptyResponse, replaceID == nil,
                               !self.isVoiceEditHold(sessionHeldToken) else { return false }
@@ -597,6 +630,13 @@ final class TranscriptionPipeline {
         )
     }
 
+    /// "cloud:elevenlabs-streaming" -> `.elevenLabs`; nil for non-cloud engines.
+    static func streamingProvider(forEngineID engineID: String) -> CloudProvider? {
+        guard engineID.hasPrefix("cloud:"), engineID.hasSuffix("-streaming") else { return nil }
+        let name = engineID.dropFirst("cloud:".count).dropLast("-streaming".count).lowercased()
+        return CloudProvider.allCases.first { $0.rawValue.lowercased() == name }
+    }
+
     static func historyAudioPath(audioURL: URL, audioIsTemporary: Bool) -> String? {
         audioIsTemporary ? nil : audioURL.path
     }
@@ -620,6 +660,9 @@ final class TranscriptionPipeline {
                 providedSnapshot: providedSnapshot,
                 providedPID: providedPID
             )
+        if let provider = Self.streamingProvider(forEngineID: engineID) {
+            engineSelector?.providerHealth.recordSuccess(provider)
+        }
         Task {
             let cleaned = await self.prepareTranscript(text, holdToken: sessionHeldToken, replaceHistoryEntryID: nil)
             let transformed = cleaned.text
