@@ -295,7 +295,7 @@ refactor (`ASREngineSelector.engineCache` is private, `CloudTranscriberFactory`
 is static). Follow-up: add an engine seam, then a test that a failing cloud
 service lands on the local engine.
 
-## Live incident — the post-Aegis hang (2026-08-09, VOICE_DEBUG)
+## Live incident — the post-app-switch hang (2026-08-09, VOICE_DEBUG)
 
 Maintainer repro: use another app's voice mode, return, dictate → hang.
 Caught live with VOICE_DEBUG after one failed repro attempt. Two distinct
@@ -340,7 +340,7 @@ The instrumentation from PR #25 answered its own question on the next abort:
 
 ```
 inject abort: frontmost changed mid-dictation —
-  held=com.matthewschwartz.aegis current=com.anthropic.claudefordesktop
+  held=com.example.otherapp current=com.example.frontapp
 ```
 
 No app self-activated. The maintainer starts a hold while switching away from

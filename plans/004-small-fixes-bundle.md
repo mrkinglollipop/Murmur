@@ -36,7 +36,7 @@ path; (B) a failed recording-retention branch strands a raw recording of the
 user's voice in `/tmp` forever; (C) cloud-provider HTTP error bodies (which
 can echo API-key material on 401s) flow verbatim into the predictable
 world-readable file `/tmp/voice-debug.log` when `VOICE_DEBUG=1`; (D) a stray
-AI-tooling routing comment sits in a shipped resource file. All are S-effort
+agent-tooling routing comment sits in a shipped resource file. All are S-effort
 with existing patterns to copy.
 
 ## Current state
@@ -100,8 +100,8 @@ states the privacy posture to honor: "Never pass user-dictated transcript
 text to this function — content stays private."
 
 **(D)** `Resources/parakeet_transcribe.py:2` — stray line
-`# --bypass-harness (sonnet lane)`: residue from the workspace's agent
-code-routing tooling (introduced by commit `8ef794f`). Not malicious; just
+an agent-routing comment: residue from the maintainer's local agent
+tooling (introduced by commit `8ef794f`). Not malicious; just
 does not belong in a shipped resource.
 
 ## Commands you will need
@@ -203,7 +203,7 @@ ellipses.
 ### Step 5 (D): Remove the stray comment
 
 Delete line 2 of `Resources/parakeet_transcribe.py`
-(`# --bypass-harness (sonnet lane)`). Nothing else in the file changes.
+(the agent-routing comment). Nothing else in the file changes.
 
 **Verify**: `sed -n '1,4p' Resources/parakeet_transcribe.py` → shebang, then the docstring opens; `grep -rn "bypass-harness" .` (excluding `.git` and `plans/`) → no hits.
 

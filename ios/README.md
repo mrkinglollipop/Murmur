@@ -80,7 +80,7 @@ Swift toolchain or fake a build; use a Mac with Xcode.
 
 This README is the in-repo worksheet. Next slice is whatever the continuing
 thread asks for. Out of scope until explicitly pulled in: Pro/subscription,
-Murmur-server, IAP, local Whisper on iOS, Mac target changes, App
+backend, IAP, local Whisper on iOS, Mac target changes, App
 Store submit. Swipe-to-type is in this build (`SwipeTypingEngine`, Settings
 toggle, default off). It is still ship-gated pending a device bake-off — not
 absent from the keyboard.

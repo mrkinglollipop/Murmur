@@ -424,9 +424,25 @@ final class ClipboardStore: ObservableObject {
     /// Whether anything is saved, without forcing a read while history is off.
     /// Unloaded, a metadata file larger than an empty JSON array counts.
     var hasSavedHistory: Bool {
-        if isLoaded { return !entries.isEmpty }
-        let size = (try? FileManager.default.attributesOfItem(atPath: metadataURL.path)[.size] as? Int) ?? nil
-        return (size ?? 0) > 4
+        if isLoaded && !entries.isEmpty { return true }
+        return savedFilesExist()
+    }
+
+    /// Any clipboard file `clearAll()` would remove: non-empty metadata (an
+    /// empty JSON array is at most 4 bytes), leftover blobs or thumbnails,
+    /// recovered archives, or a migration backup. Directory listings only; no
+    /// file is opened.
+    private func savedFilesExist() -> Bool {
+        let fm = FileManager.default
+        let size = (try? fm.attributesOfItem(atPath: metadataURL.path)[.size] as? Int) ?? nil
+        if (size ?? 0) > 4 { return true }
+        if fm.fileExists(atPath: migrationBackupURL.path) { return true }
+        for directory in [blobsDirectory, thumbsDirectory] {
+            let names = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+            if names.contains(where: { !$0.hasPrefix(".") }) { return true }
+        }
+        let rootNames = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+        return rootNames.contains { $0.hasPrefix("clipboard.json.recovered.") }
     }
 
     private let activationLock = NSLock()
@@ -536,6 +552,9 @@ final class ClipboardStore: ObservableObject {
                     return
                 }
                 self.reconcileBlobsWithMetadata {
+                    // Turned off (and maybe back on) while reconciling: a newer
+                    // activation owns the flags and entries now.
+                    guard self.currentActivationGeneration() == generation else { return }
                     self.pruneToBudget()
                     self.isActivating = false
                     self.isActivated = true
@@ -1092,6 +1111,36 @@ final class ClipboardStore: ObservableObject {
         }
     }
 
+    /// An explicit clear also removes blob and thumbnail files no entry points
+    /// at (left by an interrupted capture or an older build). Only runs from
+    /// `clearAll()`; reconcile does the orphan sweep during normal activation.
+    private func removeLeftoverBlobFiles() -> Bool {
+        do {
+            try blobQueue.sync {
+                for directory in [blobsDirectory, thumbsDirectory] {
+                    let files: [URL]
+                    do {
+                        files = try fileOperations.contents(directory)
+                    } catch {
+                        if Self.isMissingFile(error) { continue }
+                        throw error
+                    }
+                    for url in files {
+                        do {
+                            try fileOperations.remove(url)
+                        } catch {
+                            if !Self.isMissingFile(error) { throw error }
+                        }
+                    }
+                }
+            }
+            return true
+        } catch {
+            storageFailure(error)
+            return false
+        }
+    }
+
     // MARK: - Read back
 
     /// A single broken payload is reported on that row only. The original
@@ -1204,7 +1253,7 @@ final class ClipboardStore: ObservableObject {
             self.captureWorkItems.removeAll()
             self.inFlightFingerprints.removeAll()
             let ids = Array(Set(self.entries.map(\.id) + pendingIDs))
-            guard self.deleteBlobs(for: ids) else { return }
+            guard self.deleteBlobs(for: ids), self.removeLeftoverBlobFiles() else { return }
             do {
                 let archives = try self.fileOperations.contents(self.directory).filter {
                     $0.lastPathComponent.hasPrefix("clipboard.json.recovered.")

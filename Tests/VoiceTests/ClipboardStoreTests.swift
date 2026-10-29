@@ -2030,4 +2030,59 @@ final class ClipboardStoreTests: XCTestCase {
         activated(again)
         XCTAssertTrue(again.canCapture)
     }
+
+    func testActivationCancelledDuringReconcileDoesNotPublish() {
+        let directory = tempDirectory()
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        var first = true
+        var operations = ClipboardFileOperations()
+        operations.contents = { url in
+            if first, url.lastPathComponent == "blobs" {
+                first = false
+                entered.signal()
+                _ = gate.wait(timeout: .now() + 5)
+            }
+            return try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+        }
+        let store = ClipboardStore(
+            directory: directory,
+            crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256)),
+            fileOperations: operations
+        )
+        store.activate()
+        XCTAssertTrue(waitUntil { entered.wait(timeout: .now()) == .success })
+        store.cancelActivation()
+        gate.signal()
+        settle(0.5)
+        XCTAssertFalse(store.isActivated, "a stale reconcile completion must not mark the store activated")
+        XCTAssertFalse(store.canCapture)
+    }
+
+    func testLeftoverFilesCountAsSavedHistoryAndClearAllRemovesThem() throws {
+        let directory = tempDirectory()
+        let blobs = directory.appendingPathComponent("blobs", isDirectory: true)
+        let thumbs = directory.appendingPathComponent("thumbs", isDirectory: true)
+        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: thumbs, withIntermediateDirectories: true)
+        try Data("[]".utf8).write(to: directory.appendingPathComponent("clipboard.json"))
+        try Data("orphan".utf8).write(to: blobs.appendingPathComponent(UUID().uuidString))
+        try Data("orphan".utf8).write(to: thumbs.appendingPathComponent(UUID().uuidString))
+        try Data("old".utf8).write(to: directory.appendingPathComponent("clipboard.json.recovered.1"))
+        try Data("old".utf8).write(to: directory.appendingPathComponent("clipboard.json.pre-migration-backup"))
+
+        let store = ClipboardStore(
+            directory: directory,
+            crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256)),
+            loadOnInit: false
+        )
+        XCTAssertTrue(store.hasSavedHistory, "leftover files must keep the Clear button enabled")
+        store.clearAll()
+        XCTAssertFalse(store.hasSavedHistory)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: blobs.path).isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: thumbs.path).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json.recovered.1").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json.pre-migration-backup").path))
+        XCTAssertFalse(store.isActivated)
+    }
 }

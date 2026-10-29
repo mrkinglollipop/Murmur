@@ -60,7 +60,7 @@ current setup and contribution guidance.
 **Status:** PARTIAL — P0-host, P0-chrome, P1 autocorrect, P2 Giphy REST tray, and swipe-to-type are in the tree. P2b Messages GIF bubble is a device spike. Swipe is bake-off gated (not missing).
 **Written against:** `cf13857` (`main`, 2026-08-12).
 **Canonical home:** this section in `plans/README.md` until split to `plans/026-ios-keyboard-upgrade.md`.
-**Does not authorize App Store submit, Mac target changes, Pro/IAP, or Murmur-server.**
+**Does not authorize App Store submit, Mac target changes, Pro/IAP, or the backend.**
 
 **027 wins for look (and cancels trackpad):** Plan [027](027-ios-keyboard-apple-polish.md) **replaces** this plan’s accessory CTA and key chrome. Implement **027**: mic on the QuickType bar (**not** the 106pt Start/waveform pill); brighter caps + **1pt lip** (**not** leftover `UIGlassEffect`-on-keys as remaining P0-chrome work). 027 also **cancels 026 P0 space-bar trackpad** and the **P0 acceptance “space-drag moves caret.”** Do not implement or revive that pan.
 
@@ -366,7 +366,7 @@ Implementation order is **P0-host → P0-chrome → P1 → P2 → P3**. Host-ret
 
 - App Store submit, removing private bounce APIs, in-appex microphone
 - KeyboardKit / Fleksy / Giphy SPM SDK / Tenor
-- Next-word LLM, Voice Edit / Format, Mac dictionary sync, Pro/IAP, Murmur-server
+- Next-word LLM, Voice Edit / Format, Mac dictionary sync, Pro/IAP, the backend
 - iPad (`TARGETED_DEVICE_FAMILY` stays `1`), other languages, emoji search page (unless it falls out of Giphy)
 - Drawing above the keyboard top edge
 - iOS 26 compatibility / dual chrome paths / promising to close Wispr’s iOS 26 Liquid Glass gap
