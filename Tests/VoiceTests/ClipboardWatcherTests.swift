@@ -423,4 +423,60 @@ final class ClipboardWatcherTests: XCTestCase {
         watcher.tick()
         XCTAssertFalse(store.isSecureInputActive)
     }
+
+    // MARK: - Opt-in setting
+
+    @MainActor
+    func testClipboardHistoryDefaultsOffAndPersists() throws {
+        let suite = "murmur.clipboard.optin.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let keychain = KeychainStore(service: "com.matt.voice-dictation.apikeys.TESTS.\(UUID().uuidString)")
+        let settings = SettingsStore(defaults: defaults, keychain: keychain, apiKeyLookup: { _ in nil })
+        XCTAssertFalse(settings.clipboardHistoryEnabled)
+
+        settings.clipboardHistoryEnabled = true
+        let reloaded = SettingsStore(defaults: defaults, keychain: keychain, apiKeyLookup: { _ in nil })
+        XCTAssertTrue(reloaded.clipboardHistoryEnabled)
+    }
+
+    func testDisabledDoesNotStartActivateOrCapture() {
+        let pasteboard = makePasteboard()
+        let store = makeStore(activate: false)
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, interval: 0.05)
+        watcher.setCaptureEnabled(false)
+        pasteboard.clearContents()
+        pasteboard.setString("must not be saved", forType: .string)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        XCTAssertFalse(watcher.isRunning)
+        XCTAssertFalse(store.isActivated, "off must not do Keychain/disk activation")
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
+    func testTogglingStartsAndStopsCaptureImmediately() {
+        let pasteboard = makePasteboard()
+        let store = makeStore(activate: false)
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, interval: 0.05)
+
+        // Copied before opting in: never saved.
+        pasteboard.clearContents()
+        pasteboard.setString("before opt-in", forType: .string)
+
+        watcher.setCaptureEnabled(true)
+        XCTAssertTrue(watcher.isRunning)
+        XCTAssertTrue(waitUntil { store.isActivated }, "on activates the store")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertTrue(store.entries.isEmpty, "pre-opt-in clipboard content is not captured")
+
+        pasteboard.clearContents()
+        pasteboard.setString("after opt-in", forType: .string)
+        XCTAssertTrue(waitForEntries(store, count: 1))
+
+        watcher.setCaptureEnabled(false)
+        XCTAssertFalse(watcher.isRunning)
+        pasteboard.clearContents()
+        pasteboard.setString("while off", forType: .string)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        XCTAssertEqual(store.entries.count, 1, "off stops capture; saved history is untouched")
+    }
 }

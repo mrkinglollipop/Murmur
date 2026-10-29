@@ -138,7 +138,11 @@ struct RootView: View {
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
                 case .clipboard:
-                    ClipboardView(store: clipboardStore)
+                    if settingsStore.clipboardHistoryEnabled {
+                        ClipboardView(store: clipboardStore)
+                    } else {
+                        ClipboardOffView(settingsStore: settingsStore)
+                    }
                 case .settings:
                     SettingsView(
                         settingsStore: settingsStore,

@@ -538,3 +538,38 @@ private struct ClipboardRow: View {
         }
     }
 }
+
+/// Shown on the Clipboard page while capture is off (the default). Saved
+/// history is kept but not shown until the user turns capture back on.
+struct ClipboardOffView: View {
+    @ObservedObject var settingsStore: SettingsStore
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 26))
+                .foregroundColor(Theme.primary.opacity(0.55))
+            Text("Clipboard history is off")
+                .font(Theme.body(13))
+                .foregroundColor(Theme.textPrimary)
+            Text("Turn it on to save what you copy, encrypted, on this Mac only. Anything saved earlier is kept.")
+                .font(Theme.body(12))
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 280)
+            Button {
+                settingsStore.clipboardHistoryEnabled = true
+            } label: {
+                Text("Turn on")
+                    .font(Theme.body(13, weight: .semibold))
+                    .foregroundColor(Theme.lavenderText)
+                    .padding(.horizontal, 16)
+                    .frame(height: 32)
+            }
+            .buttonStyle(.plain)
+            .murmurGlassCapsule(tint: Theme.selectionTint)
+            .padding(.top, 6)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}

@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import Sparkle
 
@@ -44,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `activate()` does the Keychain and disk work, off the launch path.
     private let clipboardStore = ClipboardStore()
     private lazy var clipboardWatcher = ClipboardWatcher(store: clipboardStore)
+    private var clipboardSettingCancellable: AnyCancellable?
     private let settingsStore = SettingsStore()
     private let correctionWatcher = CorrectionWatcher()
     private let learnToast = LearnToastHUD()
@@ -131,11 +133,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before the activation tap starts accepting dictation.
         modelManager = ModelManager()
 
-        // Clipboard history. activate() does its Keychain and disk work on a
-        // background queue, and the watcher no-ops (without consuming
-        // changeCount) until the store reports it can capture.
-        clipboardStore.activate()
-        clipboardWatcher.start()
+        // Clipboard history is opt-in (default off). While off, nothing is
+        // activated (no Keychain or disk work) and nothing is watched. The
+        // publisher replays the stored value, so this also applies at launch.
+        clipboardSettingCancellable = settingsStore.$clipboardHistoryEnabled
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in
+                self?.clipboardWatcher.setCaptureEnabled(enabled)
+            }
 
         activationController = ActivationController()
         activationController?.useToggleLockProvider = { [weak self] in

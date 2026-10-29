@@ -82,6 +82,7 @@ final class SettingsStore: ObservableObject {
         static let xaiEndpointingMs = "voice.settings.xaiEndpointingMs"
         static let useToggleLock = "voice.settings.useToggleLock"
         static let voiceEditSelectedText = "voice.settings.voiceEditSelectedText"
+        static let clipboardHistoryEnabled = "voice.settings.clipboardHistoryEnabled"
         static let smartLeadingSpace = "voice.settings.smartLeadingSpace"
         static let learnFromInlineCorrections = "voice.settings.learnFromInlineCorrections"
         static let selectedLanguage = "voice.settings.selectedLanguage"
@@ -506,6 +507,14 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Clipboard history capture. Opt-in: off by default, and while off nothing
+    /// is watched, recorded, or decrypted. Already-saved history is untouched.
+    @Published var clipboardHistoryEnabled: Bool {
+        didSet {
+            defaults.set(clipboardHistoryEnabled, forKey: Keys.clipboardHistoryEnabled)
+        }
+    }
+
     /// Holds with a readable selection become an edit instruction unless Shift
     /// is held. The preference applies to the next hold.
     @Published var voiceEditSelectedText: Bool {
@@ -850,6 +859,7 @@ final class SettingsStore: ObservableObject {
         }
 
         useToggleLock = defaults.bool(forKey: Keys.useToggleLock)
+        clipboardHistoryEnabled = defaults.bool(forKey: Keys.clipboardHistoryEnabled)
 
         if defaults.object(forKey: Keys.voiceEditSelectedText) != nil {
             voiceEditSelectedText = defaults.bool(forKey: Keys.voiceEditSelectedText)

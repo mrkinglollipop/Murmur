@@ -18,7 +18,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .general: return ["Activation", "System", "Voice"].contains(card)
         case .engine: return ["Transcription Engine", "Language", "Local Model", "Cloud Model"].contains(card)
         case .text: return ["Cleanup", "Dictation text"].contains(card)
-        case .storage: return card == "Storage"
+        case .storage: return ["Storage", "Clipboard"].contains(card)
         case .permissions: return card == "Permissions"
         case .about: return ["What's New", "Acknowledgements"].contains(card)
         }
@@ -517,6 +517,22 @@ struct SettingsView: View {
                 if shows("Storage") {
                 section(title: "Storage") {
                     storageSectionContent
+                }
+
+                }
+
+                if shows("Clipboard") {
+                section(title: "Clipboard") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("Clipboard history", isOn: $settingsStore.clipboardHistoryEnabled)
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("Saves what you copy, encrypted, on this Mac only.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+                    }
                 }
 
                 }

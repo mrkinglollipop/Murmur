@@ -43,8 +43,23 @@ final class ClipboardWatcher {
 
     var isRunning: Bool { timer != nil }
 
+    /// Single entry point for the opt-in setting. Off never activates the store
+    /// (no Keychain or disk work) and stops polling immediately; on activates
+    /// the store, then starts polling. Saved history is never touched.
+    func setCaptureEnabled(_ enabled: Bool) {
+        if enabled {
+            store.activate()
+            start()
+        } else {
+            stop()
+        }
+    }
+
     func start() {
         guard timer == nil else { return }
+        // Opt-in: whatever was copied before capture was turned on is not ours
+        // to save. `tick()` records only changes after this point.
+        lastChangeCount = pasteboard.changeCount
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.tick()
         }
