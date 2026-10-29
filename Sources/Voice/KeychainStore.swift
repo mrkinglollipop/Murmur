@@ -1,6 +1,29 @@
 import Foundation
 import Security
 
+struct KeychainOperations {
+    var read: ([String: Any]) -> (OSStatus, Data?)
+    var add: ([String: Any]) -> OSStatus
+    var update: ([String: Any], [String: Any]) -> OSStatus
+    var delete: ([String: Any]) -> OSStatus
+
+    static let live = KeychainOperations(
+        read: { query in
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            return (status, result as? Data)
+        },
+        add: { SecItemAdd($0 as CFDictionary, nil) },
+        update: { SecItemUpdate($0 as CFDictionary, $1 as CFDictionary) },
+        delete: { SecItemDelete($0 as CFDictionary) }
+    )
+}
+
+enum KeychainReadError: Error {
+    case status(OSStatus)
+    case invalidData
+}
+
 /// Thin wrapper over the macOS Keychain (`Security` framework) for storing
 /// user-supplied cloud ASR API keys. No third-party dependency — generic
 /// password items, scoped to a single service name with the provider
@@ -15,14 +38,19 @@ final class KeychainStore {
     static let defaultService = isTestHost ? productionService + ".TESTS" : productionService
 
     let service: String
+    private let operations: KeychainOperations
 
     /// The service is injectable ONLY so tests can isolate themselves in a
     /// throwaway service name. Production always uses the default: the user's
     /// real keys live under it, and a test writing/deleting through the real
     /// service OVERWRITES AND DELETES the user's actual API keys (this
     /// destroyed the live xAI key on 2026-07-09 — never again).
-    init(service: String = KeychainStore.defaultService) {
+    init(
+        service: String = KeychainStore.defaultService,
+        operations: KeychainOperations = .live
+    ) {
         self.service = service
+        self.operations = operations
     }
 
     /// The base query shared by every operation (add/update/read/delete).
@@ -64,12 +92,34 @@ final class KeychainStore {
         ]
     }
 
+    /// Clipboard keys are create-only because overwriting one can make all
+    /// encrypted history unreadable. Generic API-key writes must refuse them
+    /// before any Keychain mutation.
+    static func isClipboardKeyAccount(service: String, account: String) -> Bool {
+        service == ClipboardKeyStore.service && account == ClipboardKeyStore.account
+    }
+
     /// Stores (or overwrites) the key for `account`. Uses SecItemAdd first;
     /// on `errSecDuplicateItem` falls back to SecItemUpdate so re-saving an
     /// existing provider's key doesn't require a manual delete first.
     /// Returns `true` when the key was stored successfully.
+    ///
+    /// `accessibility` defaults to the `ThisDeviceOnly` class every BYO API key
+    /// has always used — it is what keeps those keys out of iCloud Keychain.
+    /// It is overridable because that tradeoff does not generalize: a secret
+    /// protecting data the user cannot recreate (see `ClipboardKeyStore`) must
+    /// survive a machine migration, or restoring a backup yields ciphertext
+    /// with no key.
     @discardableResult
-    func setKey(_ value: String, for account: String) -> Bool {
+    func setKey(
+        _ value: String,
+        for account: String,
+        accessibility accessibilityClass: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    ) -> Bool {
+        guard !Self.isClipboardKeyAccount(service: service, account: account) else {
+            assertionFailure("Clipboard key must use ClipboardKeyStore.createKey")
+            return false
+        }
         guard let data = value.data(using: .utf8) else { return false }
 
         let query = Self.baseQuery(service: service, account: account)
@@ -79,17 +129,17 @@ final class KeychainStore {
         ]
 
         let accessibility: [String: Any] = [
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            kSecAttrAccessible as String: accessibilityClass
         ]
 
         let addQuery = query
             .merging(attributesToUpdate) { _, new in new }
             .merging(accessibility) { _, new in new }
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        let addStatus = operations.add(addQuery)
 
         if addStatus == errSecDuplicateItem {
             let updateAttrs = attributesToUpdate.merging(accessibility) { _, new in new }
-            let updateStatus = SecItemUpdate(query as CFDictionary, updateAttrs as CFDictionary)
+            let updateStatus = operations.update(query, updateAttrs)
             if updateStatus != errSecSuccess {
                 vlog("Keychain update failed for account \(account): OSStatus \(updateStatus)")
                 return false
@@ -102,29 +152,47 @@ final class KeychainStore {
         return true
     }
 
-    /// Returns the stored key for `account`, or `nil` if none is stored.
+    /// Returns the stored key for `account`, or `nil` if none is readable.
     func key(for account: String) -> String? {
+        try? readKey(for: account)
+    }
+
+    /// Only a definite not-found is absence; all other failures preserve the item.
+    func readKey(for account: String) throws -> String? {
         var query = Self.baseQuery(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let value = String(data: data, encoding: .utf8) else {
-            if status != errSecItemNotFound {
-                vlog("Keychain read failed for account \(account): OSStatus \(status)")
-            }
-            return nil
+        let (status, data) = operations.read(query)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else {
+            vlog("Keychain read failed for account \(account): OSStatus \(status)")
+            throw KeychainReadError.status(status)
+        }
+        guard let data, let value = String(data: data, encoding: .utf8) else {
+            throw KeychainReadError.invalidData
         }
         return value
+    }
+
+    /// Adds without ever replacing an existing secret. False means duplicate.
+    func addKeyIfAbsent(
+        _ value: String,
+        for account: String,
+        accessibility: CFString
+    ) throws -> Bool {
+        var query = Self.baseQuery(service: service, account: account)
+        query[kSecValueData as String] = Data(value.utf8)
+        query[kSecAttrAccessible as String] = accessibility
+        let status = operations.add(query)
+        if status == errSecDuplicateItem { return false }
+        guard status == errSecSuccess else { throw KeychainReadError.status(status) }
+        return true
     }
 
     /// Deletes the stored key for `account`, if any. No-op if absent.
     func deleteKey(for account: String) {
         let query = Self.baseQuery(service: service, account: account)
-        SecItemDelete(query as CFDictionary)
+        _ = operations.delete(query)
     }
 }

@@ -14,6 +14,7 @@ enum RootTab: String, CaseIterable, Identifiable {
     case style
     case transforms
     case scratchpad
+    case clipboard
     case settings
 
     var id: String { rawValue }
@@ -27,6 +28,7 @@ enum RootTab: String, CaseIterable, Identifiable {
         case .style: return "Style"
         case .transforms: return "Transforms"
         case .scratchpad: return "Scratchpad"
+        case .clipboard: return "Clipboard"
         case .settings: return "Settings"
         }
     }
@@ -40,6 +42,7 @@ enum RootTab: String, CaseIterable, Identifiable {
         case .style: return "textformat"
         case .transforms: return "wand.and.stars"
         case .scratchpad: return "note.text"
+        case .clipboard: return "doc.on.clipboard"
         case .settings: return "gearshape"
         }
     }
@@ -55,7 +58,10 @@ struct RootView: View {
     @ObservedObject var styleStore: StyleStore
     @ObservedObject var transformsStore: TransformsStore
     @ObservedObject var scratchpadStore: ScratchpadStore
+    @ObservedObject var clipboardStore: ClipboardStore
     @ObservedObject var settingsStore: SettingsStore
+    @ObservedObject var authFlow: AuthFlowController
+    @ObservedObject var entitlementStore: EntitlementStore
     @ObservedObject var modelManager: ModelManager
 
     /// Resolves the BYO cloud (OpenAI) key for Transforms' cloud fallback —
@@ -73,7 +79,7 @@ struct RootView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            SidebarNav(selectedTab: $selectedTab)
+            SidebarNav(selectedTab: $selectedTab, isPro: entitlementStore.isPro, authFlow: authFlow)
             Divider().overlay(Theme.hairline)
             content
         }
@@ -133,11 +139,22 @@ struct RootView: View {
                     TransformsView(store: transformsStore, historyStore: historyStore, transformCredentialsProvider: transformCredentialsProvider)
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
+                case .clipboard:
+                    // Free users get the teaser, not the feature — and never
+                    // the data: the watcher only runs entitled, so there is
+                    // no history to protect behind this view.
+                    if entitlementStore.isPro {
+                        ClipboardView(store: clipboardStore)
+                    } else {
+                        ClipboardLockedView(authFlow: authFlow)
+                    }
                 case .settings:
                     SettingsView(
                         settingsStore: settingsStore,
                         modelManager: modelManager,
-                        onReplayOnboarding: onReplayOnboarding
+                        onReplayOnboarding: onReplayOnboarding,
+                        authFlow: authFlow,
+                        entitlementStore: entitlementStore
                     )
                 }
             }
