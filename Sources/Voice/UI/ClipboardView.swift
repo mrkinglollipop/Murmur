@@ -543,6 +543,7 @@ private struct ClipboardRow: View {
 /// history is kept but not shown until the user turns capture back on.
 struct ClipboardOffView: View {
     @ObservedObject var settingsStore: SettingsStore
+    @ObservedObject var store: ClipboardStore
 
     var body: some View {
         VStack(spacing: 8) {
@@ -569,7 +570,41 @@ struct ClipboardOffView: View {
             .buttonStyle(.plain)
             .murmurGlassCapsule(tint: Theme.selectionTint)
             .padding(.top, 6)
+
+            ClearSavedClipboardButton(store: store)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The user opened this page, so reading saved history is expected.
+        .onAppear { store.loadIfNeeded() }
+    }
+}
+
+/// Deletes saved clipboard history without turning capture on. Disabled when
+/// nothing is saved. Used by the off screen and the Settings Clipboard card.
+struct ClearSavedClipboardButton: View {
+    @ObservedObject var store: ClipboardStore
+    @State private var showConfirmation = false
+
+    var body: some View {
+        Button {
+            showConfirmation = true
+        } label: {
+            Text("Clear saved history")
+                .font(Theme.body(12))
+                .foregroundColor(Theme.textSecondary)
+                .padding(.horizontal, 11)
+                .frame(height: 28)
+        }
+        .buttonStyle(.plain)
+        .murmurGlassCapsule()
+        .disabled(!store.hasSavedHistory)
+        .opacity(store.hasSavedHistory ? 1 : 0.45)
+        .help("Delete every saved clipboard item")
+        .confirmDelete(
+            isPresented: $showConfirmation,
+            title: "Delete all saved clipboard history?",
+            message: "This cannot be undone.",
+            onConfirm: { store.clearAll() }
+        )
     }
 }

@@ -1946,4 +1946,88 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertEqual(Set(blobs), Set(store.entries.map { $0.id.uuidString }))
     }
 
+    // MARK: - Opt-in: deferred load, cancel, clear while off
+
+    private func seedHistory(_ directory: URL, key: SymmetricKey, texts: [String]) {
+        let seeded = activated(ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key)))
+        for (index, text) in texts.enumerated() {
+            seeded.record(snapshot: textSnapshot(text), sourceBundleID: nil)
+            XCTAssertTrue(waitForEntries(seeded, count: index + 1))
+        }
+        seeded.flush()
+    }
+
+    func testDeferredLoadReadsNothingUntilNeeded() {
+        let directory = tempDirectory()
+        let key = SymmetricKey(size: .bits256)
+        seedHistory(directory, key: key, texts: ["saved one"])
+        // A corrupt file must not be touched (quarantined) just by launching.
+        let metadata = directory.appendingPathComponent("clipboard.json")
+        try? Data("not json".utf8).write(to: metadata)
+
+        let store = ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key), loadOnInit: false)
+        XCTAssertFalse(store.isLoaded)
+        XCTAssertFalse(store.isMetadataCorrupt)
+        XCTAssertEqual(try? Data(contentsOf: metadata), Data("not json".utf8), "launch must not rewrite or move the file")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("clipboard.json.quarantine").path))
+    }
+
+    func testDeferredStoreLoadsOnActivate() {
+        let directory = tempDirectory()
+        let key = SymmetricKey(size: .bits256)
+        seedHistory(directory, key: key, texts: ["saved one", "saved two"])
+
+        let store = ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key), loadOnInit: false)
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertTrue(store.hasSavedHistory, "a non-empty metadata file counts without reading it")
+        activated(store)
+        XCTAssertTrue(store.isLoaded)
+        XCTAssertEqual(store.entries.count, 2)
+    }
+
+    func testClearAllWhileOffDeletesHistoryWithoutStartingCapture() {
+        let directory = tempDirectory()
+        let key = SymmetricKey(size: .bits256)
+        seedHistory(directory, key: key, texts: ["saved one", "saved two"])
+
+        let store = ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key), loadOnInit: false)
+        XCTAssertTrue(store.hasSavedHistory)
+        store.clearAll()
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertFalse(store.hasSavedHistory)
+        XCTAssertFalse(store.isActivated, "clearing must not activate the store")
+        XCTAssertFalse(store.canCapture)
+        store.record(snapshot: textSnapshot("not while off"), sourceBundleID: nil)
+        settle()
+        XCTAssertTrue(store.entries.isEmpty)
+
+        let reopened = ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: key))
+        XCTAssertTrue(reopened.entries.isEmpty, "the clear reached disk")
+        let blobs = (try? FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("blobs").path)) ?? []
+        XCTAssertTrue(blobs.isEmpty)
+    }
+
+    func testCancelledActivationPublishesAndCreatesNothing() {
+        let directory = tempDirectory()
+        var providerRan = false
+        let gate = DispatchSemaphore(value: 0)
+        let store = ClipboardStore(directory: directory, cryptoProvider: {
+            providerRan = true
+            gate.wait()
+            return ClipboardCrypto(key: SymmetricKey(size: .bits256))
+        })
+        store.activate()
+        XCTAssertTrue(waitUntil { providerRan })
+        store.cancelActivation()
+        gate.signal()
+        settle(0.5)
+        XCTAssertFalse(store.isActivated, "a cancelled activation must not publish")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("blobs").path),
+                       "a cancelled activation must not create folders")
+
+        // Turning history back on works.
+        let again = ClipboardStore(directory: directory, crypto: ClipboardCrypto(key: SymmetricKey(size: .bits256)))
+        activated(again)
+        XCTAssertTrue(again.canCapture)
+    }
 }

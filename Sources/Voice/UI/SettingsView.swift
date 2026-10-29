@@ -38,14 +38,17 @@ struct SettingsView: View {
     @ObservedObject var modelManager: ModelManager
 
     var onReplayOnboarding: () -> Void = {}
+    @ObservedObject var clipboardStore: ClipboardStore
     var permissionOverride: PermissionSnapshot?
 
     init(settingsStore: SettingsStore, modelManager: ModelManager,
          onReplayOnboarding: @escaping () -> Void = {},
+         clipboardStore: ClipboardStore,
          initialSection: SettingsSection? = nil, permissionOverride: PermissionSnapshot? = nil) {
         self.settingsStore = settingsStore
         self.modelManager = modelManager
         self.onReplayOnboarding = onReplayOnboarding
+        self.clipboardStore = clipboardStore
         self.permissionOverride = permissionOverride
         _selectedSection = State(initialValue: initialSection ?? SettingsSectionSession.selected)
     }
@@ -532,6 +535,8 @@ struct SettingsView: View {
                         Text("Saves what you copy, encrypted, on this Mac only.")
                             .font(Theme.body(10))
                             .foregroundColor(Theme.textSecondary)
+
+                        ClearSavedClipboardButton(store: clipboardStore)
                     }
                 }
 

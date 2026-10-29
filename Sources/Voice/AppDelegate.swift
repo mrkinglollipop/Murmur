@@ -41,9 +41,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let styleStore = StyleStore()
     private let transformsStore = TransformsStore()
     private let scratchpadStore = ScratchpadStore()
-    /// Clipboard manager. Construction is cheap (metadata only);
-    /// `activate()` does the Keychain and disk work, off the launch path.
-    private let clipboardStore = ClipboardStore()
+    /// Clipboard manager. Construction reads nothing from disk (`loadOnInit:
+    /// false`); `activate()` loads history and does the Keychain and disk work,
+    /// off the launch path, and only when the user has turned history on.
+    private let clipboardStore = ClipboardStore(loadOnInit: false)
     private lazy var clipboardWatcher = ClipboardWatcher(store: clipboardStore)
     private var clipboardSettingCancellable: AnyCancellable?
     private let settingsStore = SettingsStore()

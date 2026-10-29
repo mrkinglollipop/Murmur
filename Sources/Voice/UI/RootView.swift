@@ -141,13 +141,14 @@ struct RootView: View {
                     if settingsStore.clipboardHistoryEnabled {
                         ClipboardView(store: clipboardStore)
                     } else {
-                        ClipboardOffView(settingsStore: settingsStore)
+                        ClipboardOffView(settingsStore: settingsStore, store: clipboardStore)
                     }
                 case .settings:
                     SettingsView(
                         settingsStore: settingsStore,
                         modelManager: modelManager,
-                        onReplayOnboarding: onReplayOnboarding
+                        onReplayOnboarding: onReplayOnboarding,
+                        clipboardStore: clipboardStore
                     )
                 }
             }

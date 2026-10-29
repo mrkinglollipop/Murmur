@@ -479,4 +479,41 @@ final class ClipboardWatcherTests: XCTestCase {
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
         XCTAssertEqual(store.entries.count, 1, "off stops capture; saved history is untouched")
     }
+
+    // MARK: - Our own pasteboard writes
+
+    func testDictationRestoreOfPreOptInContentIsNotCaptured() {
+        let pasteboard = makePasteboard()
+        let store = makeStore()
+        let watcher = ClipboardWatcher(store: store, pasteboard: pasteboard, interval: 60)
+
+        // Y is already saved, so the restored X is not the newest entry.
+        pasteboard.clearContents()
+        pasteboard.setString("Y saved earlier", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 1))
+
+        // X is copied while history is off; turning history on skips it.
+        pasteboard.clearContents()
+        pasteboard.setString("X copied before opt-in", forType: .string)
+        watcher.start()
+        defer { watcher.stop() }
+
+        // Dictation: snapshot X, write the concealed transcript, restore X
+        // (the restore carries no concealed marker).
+        let snapshot = TextInjector.pasteboardSnapshot(from: pasteboard)
+        TextInjector.preparePasteboardForPaste("dictated words", on: pasteboard)
+        TextInjector.restorePasteboardSnapshot(snapshot, on: pasteboard)
+
+        watcher.tick()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(store.entries.count, 1, "the app's own restore must not be saved")
+        XCTAssertEqual(store.entries.first?.preview, "Y saved earlier")
+
+        // A real copy after the restore is still captured.
+        pasteboard.clearContents()
+        pasteboard.setString("Z copied later", forType: .string)
+        watcher.tick()
+        XCTAssertTrue(waitForEntries(store, count: 2))
+    }
 }

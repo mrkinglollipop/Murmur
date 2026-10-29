@@ -44,14 +44,17 @@ final class ClipboardWatcher {
     var isRunning: Bool { timer != nil }
 
     /// Single entry point for the opt-in setting. Off never activates the store
-    /// (no Keychain or disk work) and stops polling immediately; on activates
-    /// the store, then starts polling. Saved history is never touched.
+    /// (no Keychain or disk work), stops polling immediately and cancels any
+    /// activation in flight; on activates the store, then starts polling. Saved
+    /// history is never touched.
     func setCaptureEnabled(_ enabled: Bool) {
         if enabled {
             store.activate()
             start()
         } else {
             stop()
+            // An activation still in flight must not create the key or folders.
+            store.cancelActivation()
         }
     }
 
@@ -90,7 +93,13 @@ final class ClipboardWatcher {
         }
         guard store.canAttemptCapture else { return }
         guard current != lastChangeCount else { return }
+        let previous = lastChangeCount
         lastChangeCount = current
+        // Dictation's paste prep and pasteboard restore are our own writes. The
+        // restore puts back whatever was there before (possibly content copied
+        // before history was on) with no concealed marker, so it must not be
+        // saved. Advancing lastChangeCount above means it is not seen again.
+        if TextInjector.pasteboardChangedOnlyByMurmur(since: previous, on: pasteboard) { return }
 
         let snapshot = TextInjector.pasteboardSnapshot(from: pasteboard)
         guard !snapshot.isEmpty else { return }

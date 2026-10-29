@@ -388,7 +388,11 @@ final class ClipboardStore: ObservableObject {
         // 128 MB: a full-screen 6K grab carries ~81 MB of uncompressed TIFF
         // plus a PNG alongside it, and the cap counts every representation
         // together. One item can still only eat an eighth of `maxBytes`.
-        maxItemBytes: Int = 128_000_000
+        maxItemBytes: Int = 128_000_000,
+        // False defers reading clipboard.json until `loadIfNeeded()` (called by
+        // `activate()`, `clearAll()`, `delete`, and the Clipboard page). The app
+        // passes false so that launching with history off reads nothing.
+        loadOnInit: Bool = true
     ) {
         self.cryptoProvider = cryptoProvider
         self.fileOperations = fileOperations
@@ -404,7 +408,42 @@ final class ClipboardStore: ObservableObject {
         self.maxItemBytes = maxItemBytes
         self.injectedCrypto = crypto
 
+        if loadOnInit { loadIfNeeded() }
+    }
+
+    /// True once clipboard.json has been read (or found absent) this run.
+    @Published private(set) var isLoaded = false
+
+    /// Reads saved metadata once. Idempotent. Main thread.
+    func loadIfNeeded() {
+        guard !isLoaded else { return }
+        isLoaded = true
         load()
+    }
+
+    /// Whether anything is saved, without forcing a read while history is off.
+    /// Unloaded, a metadata file larger than an empty JSON array counts.
+    var hasSavedHistory: Bool {
+        if isLoaded { return !entries.isEmpty }
+        let size = (try? FileManager.default.attributesOfItem(atPath: metadataURL.path)[.size] as? Int) ?? nil
+        return (size ?? 0) > 4
+    }
+
+    private let activationLock = NSLock()
+    private var activationGeneration = 0
+    private func currentActivationGeneration() -> Int {
+        activationLock.lock(); defer { activationLock.unlock() }
+        return activationGeneration
+    }
+
+    /// Called when history is turned off. An in-flight `activate()` stops before
+    /// it touches the Keychain (if it has not yet) and, either way, does not
+    /// create folders or publish state. Main thread.
+    func cancelActivation() {
+        activationLock.lock()
+        activationGeneration += 1
+        activationLock.unlock()
+        isActivating = false
     }
 
     /// Resolves the blob key, checks it against what is already stored, and
@@ -420,8 +459,13 @@ final class ClipboardStore: ObservableObject {
     /// unavailable key can be retried later, without concurrent resolutions.
     func activate() {
         guard (!isActivated || isKeyUnavailable), !isActivating else { return }
+        loadIfNeeded()
         isActivating = true
+        let generation = currentActivationGeneration()
         let probeOrder = entries.sorted { $0.byteCount < $1.byteCount }.map(\.id)
+        // Snapshot on main: `storedEntries` is main-owned and clear/delete can
+        // change it while the probe runs on a global queue.
+        let storedSnapshot = storedEntries
         let injected = injectedCrypto
         let provider = cryptoProvider
         // Deliberately NOT `blobQueue`: `flush()` drains that queue with a
@@ -431,6 +475,8 @@ final class ClipboardStore: ObservableObject {
         // concurrent write touches.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            // History was turned off before the Keychain was touched.
+            guard self.currentActivationGeneration() == generation else { return }
             // Not `provider?() ?? injected ?? resolve()`: optional chaining
             // flattens "no provider" and "provider returned nil" into the same
             // nil, so an override that deliberately returns no key would fall
@@ -442,8 +488,10 @@ final class ClipboardStore: ObservableObject {
                 resolved = injected ?? ClipboardStore.resolveCrypto()
             }
             let locked = (!probeOrder.isEmpty || resolved != nil)
-                && !self.canOpenStoredBlob(probeOrder: probeOrder, using: resolved)
+                && !self.canOpenStoredBlob(stored: storedSnapshot, probeOrder: probeOrder, using: resolved)
             DispatchQueue.main.async {
+                // Turned off mid-activation: publish nothing, create nothing.
+                guard self.currentActivationGeneration() == generation else { return }
                 self.crypto = resolved
                 self.isKeyUnavailable = resolved == nil
                 self.isLockedOut = locked
@@ -543,7 +591,7 @@ final class ClipboardStore: ObservableObject {
     /// rather than stopping at the first one: a missing blob is a reconcile
     /// problem, and treating it as a key failure would tell the user their
     /// history is encrypted shut when it is merely incomplete.
-    private func canOpenStoredBlob(probeOrder: [UUID], using candidate: ClipboardCrypto?) -> Bool {
+    private func canOpenStoredBlob(stored storedEntries: [StoredClipboardEntry], probeOrder: [UUID], using candidate: ClipboardCrypto?) -> Bool {
         guard let candidate else { return false }
         var hasEncryptedComponent = false
         for stored in storedEntries {
@@ -1134,6 +1182,7 @@ final class ClipboardStore: ObservableObject {
 
     func delete(_ entry: ClipboardEntry) {
         let mutate = {
+            self.loadIfNeeded()
             guard !self.isMetadataCorrupt,
                   self.deleteBlobs(for: [entry.id]) else { return }
             self.entries.removeAll { $0.id == entry.id }
@@ -1145,6 +1194,7 @@ final class ClipboardStore: ObservableObject {
 
     func clearAll() {
         let mutate = {
+            self.loadIfNeeded()
             guard !self.isMetadataCorrupt else { return }
             self.saveWorkItem?.cancel()
             self.saveWorkItem = nil
