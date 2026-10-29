@@ -14,7 +14,7 @@ It is built for people who dictate into real apps all day: local or cloud speech
 system light/dark setting. That is a deliberate product decision, not a missing
 feature — the palette and Liquid Glass surfaces are tuned for a single look.
 
-**License:** [AGPL-3.0](LICENSE) · Copyright © 2026 Matthew Schwartz d/b/a [King Lollipop Studios](https://github.com/mrkinglollipop)
+**License:** [AGPL-3.0](LICENSE) ([notice](NOTICE)) · Copyright © 2026 Matthew Schwartz d/b/a [King Lollipop Studios](https://github.com/mrkinglollipop)
 
 ---
 
