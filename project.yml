@@ -82,8 +82,8 @@ targets:
         CFBundleDisplayName: Murmur
         CFBundleIconFile: AppIcon
         CFBundleIdentifier: com.matt.voice-dictation
-        CFBundleVersion: "57"
-        CFBundleShortVersionString: "0.1.56"
+        CFBundleVersion: "58"
+        CFBundleShortVersionString: "0.1.57"
         CFBundleExecutable: "$(EXECUTABLE_NAME)"
         CFBundlePackageType: APPL
         CFBundleSignature: "????"
