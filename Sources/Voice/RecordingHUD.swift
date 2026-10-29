@@ -16,6 +16,9 @@ import SwiftUI
 ///   .success    — brief checkmark flash before hide
 ///   .clipboardFlash — brief clipboard icon when text landed on clipboard
 ///   .microphoneNoAudio — nonblocking in-hold hint; recording continues
+///   provider notice — overlay (not a state): amber two-line "ElevenLabs:
+///                 payment needed / Using on-device" over listening and
+///                 processing while a cloud provider is refusing (plan 034)
 ///   .error      — red-tinted pill with a short failure message; auto-hides
 ///                 after 3s (see `showError(_:)`)
 
@@ -322,6 +325,24 @@ final class RecordingHUD {
         notifyLayoutChange()
     }
 
+    /// The cloud provider currently refusing (billing/auth/rate limit), if any.
+    /// Persists across holds: it is applied whenever the HUD is in listening,
+    /// editing-selection or processing, and never blocks or cancels the hold.
+    private(set) var providerNotice: ProviderNotice?
+
+    func setProviderNotice(_ notice: ProviderNotice?) {
+        guard notice != providerNotice else { return }
+        providerNotice = notice
+        waveformView.setProviderNotice(notice)
+        guard isVisible else { return }
+        if presentsWindows, let notice {
+            AccessibilityAnnouncement.post(notice.hudAccessibilityLabel, element: panel)
+        }
+        resizePanel(forInterim: false)
+        positionOnMainScreen(offsetBelowFinal: 0)
+        notifyLayoutChange()
+    }
+
     /// The first real RMS sample clears the in-hold hint without interrupting
     /// the waveform or changing focus.
     func clearMicrophoneWarning() {
@@ -503,11 +524,11 @@ final class RecordingHUD {
     }
 
     private var currentPillSize: NSSize {
-        NSSize(width: pillWidth, height: waveformView.hasInterimText || waveformView.hasProcessingLabel || waveformView.hasEditingSelectionLabel || waveformView.hasMicrophoneWarning ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight)
+        NSSize(width: pillWidth, height: waveformView.hasInterimText || waveformView.hasProcessingLabel || waveformView.hasEditingSelectionLabel || waveformView.hasMicrophoneWarning || waveformView.hasProviderNotice ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight)
     }
 
     private func resizePanel(forInterim: Bool, animatedShrink: Bool = false) {
-        let expanded = forInterim || waveformView.hasProcessingLabel || waveformView.hasEditingSelectionLabel || waveformView.hasMicrophoneWarning
+        let expanded = forInterim || waveformView.hasProcessingLabel || waveformView.hasEditingSelectionLabel || waveformView.hasMicrophoneWarning || waveformView.hasProviderNotice
         let targetHeight = expanded ? pillListeningHeight + pillInterimExtraHeight : pillListeningHeight
         if panel.frame.height == targetHeight { return }
         var frame = panel.frame
@@ -574,6 +595,9 @@ private final class WaveformView: NSView {
     private(set) var hasProcessingLabel = false
     private(set) var hasEditingSelectionLabel = false
     private(set) var hasMicrophoneWarning = false
+    /// True while the amber provider-outage notice owns the label (plan 034).
+    private(set) var hasProviderNotice = false
+    private var providerNotice: ProviderNotice?
     private(set) var correctionCount: Int = 0
 
     var onErrorDismiss: (() -> Void)?
@@ -748,7 +772,7 @@ private final class WaveformView: NSView {
         }
         clipboardIcon.frame = CGRect(x: bounds.midX - 12, y: midY - 12, width: 24, height: 24)
 
-        if hasInterimText || hasProcessingLabel || hasEditingSelectionLabel || hasMicrophoneWarning {
+        if hasInterimText || hasProcessingLabel || hasEditingSelectionLabel || hasMicrophoneWarning || hasProviderNotice {
             interimLabel.isHidden = false
             interimLabel.frame = CGRect(x: 12, y: 4, width: bounds.width - 24, height: bounds.height - waveformBandHeight - 4)
         } else {
@@ -879,6 +903,7 @@ private final class WaveformView: NSView {
             layer?.backgroundColor = NSColor(calibratedWhite: 0.086, alpha: 0.98).cgColor
             layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         }
+        refreshProviderNoticeOverlay()
     }
 
     func setProcessingLabel(_ show: Bool) {
@@ -890,6 +915,78 @@ private final class WaveformView: NSView {
             interimLabel.stringValue = ""
             interimLabel.isHidden = true
         }
+        needsLayout = true
+        refreshProviderNoticeOverlay()
+    }
+
+    // MARK: - Provider notice overlay (plan 034)
+
+    func setProviderNotice(_ notice: ProviderNotice?) {
+        let had = providerNotice != nil
+        providerNotice = notice
+        if notice == nil, had {
+            // Give the label back to whatever it showed before the notice.
+            hasProviderNotice = false
+            interimLabel.setAccessibilityLabel(nil)
+            if hasProcessingLabel {
+                interimLabel.stringValue = "Transcribing…"
+            } else if hasEditingSelectionLabel {
+                interimLabel.stringValue = RecordingHUD.State.editingSelection.visibleLabel ?? ""
+            } else if !hasInterimText {
+                interimLabel.stringValue = ""
+                interimLabel.isHidden = true
+            }
+            // Restore the neutral border for the live-hold states only; other
+            // states (error, mic warnings) own their colours.
+            switch state {
+            case .listening, .processing, .editingSelection:
+                layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+            default:
+                break
+            }
+            needsLayout = true
+        }
+        refreshProviderNoticeOverlay()
+    }
+
+    /// Amber two-line notice in the interim label for the states that carry a
+    /// live hold. Other states (success, error, mic warnings) keep their own look.
+    private func refreshProviderNoticeOverlay() {
+        let eligible: Bool
+        switch state {
+        case .listening, .processing, .editingSelection: eligible = true
+        default: eligible = false
+        }
+        guard let notice = providerNotice, eligible else {
+            if hasProviderNotice {
+                hasProviderNotice = false
+                interimLabel.setAccessibilityLabel(nil)
+                needsLayout = true
+            }
+            return
+        }
+        hasProviderNotice = true
+        let amber = NSColor(Theme.amberBorder)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let text = NSMutableAttributedString(
+            string: notice.title + "\n",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                .foregroundColor: amber,
+                .paragraphStyle: paragraph,
+            ])
+        text.append(NSAttributedString(
+            string: notice.subtitle,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.72),
+                .paragraphStyle: paragraph,
+            ]))
+        interimLabel.attributedStringValue = text
+        interimLabel.setAccessibilityLabel(notice.hudAccessibilityLabel)
+        interimLabel.isHidden = false
+        layer?.borderColor = amber.withAlphaComponent(0.65).cgColor
         needsLayout = true
     }
 
@@ -909,6 +1006,7 @@ private final class WaveformView: NSView {
             }
         }
         needsLayout = true
+        refreshProviderNoticeOverlay()
     }
 
     /// Returns the last `maxLines` lines of `text` for the compact HUD preview.
