@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.57",
+    "build": "58",
+    "title": "What's New in 0.1.57",
+    "items": [
+      "If ElevenLabs or xAI rejects your account or key, for example after a failed payment, Murmur now says so in the recording window, the menu bar and Settings, with a link to fix it.",
+      "While a provider is refusing, dictation goes straight to the on-device engine instead of waiting on cloud attempts that will fail, and tries the cloud again every 5 minutes.",
+      "Settings has a Check now button to test the provider again as soon as you've fixed it."
+    ]
+  },
+  {
     "version": "0.1.56",
     "build": "57",
     "title": "What's New in 0.1.56",
