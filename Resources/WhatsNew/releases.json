@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.58",
+    "build": "59",
+    "title": "What's New in 0.1.58",
+    "items": [
+      "Murmur is now open source under the AGPL-3.0 licence. The code is on GitHub at github.com/mrkinglollipop/Murmur.",
+      "Clipboard history: Murmur can keep what you copy, encrypted on this Mac, so you can find it and paste it again. It's off until you turn it on in Settings → Storage.",
+      "Password-manager and other private clipboard items are never saved, and you can clear saved history at any time, even with it turned off."
+    ]
+  },
+  {
     "version": "0.1.57",
     "build": "58",
     "title": "What's New in 0.1.57",
