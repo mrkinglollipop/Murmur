@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 import Sparkle
 
@@ -41,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let styleStore = StyleStore()
     private let transformsStore = TransformsStore()
     private let scratchpadStore = ScratchpadStore()
-    /// PRO ONLY — clipboard manager. Construction is cheap (metadata only);
+    /// Clipboard manager. Construction is cheap (metadata only);
     /// `activate()` does the Keychain and disk work, off the launch path.
     private let clipboardStore = ClipboardStore()
     private lazy var clipboardWatcher = ClipboardWatcher(store: clipboardStore)
@@ -54,17 +53,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// constructed lazily from `applicationDidFinishLaunching` (guaranteed
     /// main-thread) rather than as a stored-property initializer.
     private var modelManager: ModelManager!
-
-    /// Pro sign-in: owns the browser OAuth round trip and the restored
-    /// session. Deep links (`murmur://auth-callback`) route here via
-    /// `application(_:open:)`.
-    let authFlow = AuthFlowController()
-
-    /// PRO ONLY — server-authoritative "is this user Pro" answer. Auth state
-    /// drives refreshes; `isPro` drives the clipboard watcher and (via
-    /// RootView) the sidebar gate.
-    let entitlementStore = EntitlementStore()
-    private var proCancellables: Set<AnyCancellable> = []
 
     /// Lazily constructed so the window (and its SwiftUI hierarchy) is only
     /// built once, on first need — not at every Dock-icon click. First
@@ -81,8 +69,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboardStore: clipboardStore,
         settingsStore: settingsStore,
         modelManager: modelManager,
-        authFlow: authFlow,
-        entitlementStore: entitlementStore,
         transformCredentialsProvider: { [weak settingsStore] in
             settingsStore?.transformCredentials() ?? .unavailable
         },
@@ -145,50 +131,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before the activation tap starts accepting dictation.
         modelManager = ModelManager()
 
-        // PRO ONLY — the entitlement gate. Auth state changes drive an
-        // entitlement refresh; the entitlement drives the clipboard watcher.
-        // Nothing clipboard-related runs for a signed-out or free user.
-        authFlow.$state
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in
-                guard let self else { return }
-                switch state {
-                case .signedIn(let session):
-                    // A refreshed session re-enters here once; the preflight
-                    // then returns it unchanged, so this cannot loop.
-                    Task {
-                        await self.entitlementStore.refresh(session: session) {
-                            await self.authFlow.authenticatedSession()
-                        }
-                    }
-                case .signedOut:
-                    self.entitlementStore.clear()
-                case .waitingForBrowser, .exchanging, .failed:
-                    break
-                }
-            }
-            .store(in: &proCancellables)
-
-        entitlementStore.$isPro
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] isPro in
-                guard let self else { return }
-                if isPro {
-                    // activate() is idempotent; the watcher's tick additionally
-                    // no-ops (without consuming changeCount) until the store
-                    // reports it can capture.
-                    self.clipboardStore.activate()
-                    self.clipboardWatcher.start()
-                } else {
-                    self.clipboardWatcher.stop()
-                }
-            }
-            .store(in: &proCancellables)
-
-        // Sessions persist a refresh token in the Keychain; without this call
-        // it was write-only and every relaunch was signed out.
-        Task { await authFlow.restoreSessionIfAvailable() }
+        // Clipboard history. activate() does its Keychain and disk work on a
+        // background queue, and the watcher no-ops (without consuming
+        // changeCount) until the store reports it can capture.
+        clipboardStore.activate()
+        clipboardWatcher.start()
 
         activationController = ActivationController()
         activationController?.useToggleLockProvider = { [weak self] in
@@ -430,30 +377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindowController.showAndFocus()
     }
 
-    /// Deep links. Currently only the Pro sign-in callback
-    /// (`murmur://auth-callback`) — anything else is logged and dropped.
-    func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls {
-            if authFlow.handleCallback(url) { continue }
-            vlog("deep link ignored: unrecognized murmur:// URL")
-        }
-    }
-
     /// Clicking the Dock icon (app running, no visible windows) reopens the
     /// main window instead of doing nothing.
-    /// PRO ONLY — re-check the entitlement whenever the app comes forward, so
-    /// a grant (or revocation) lands without a relaunch. The first live test
-    /// required bouncing the app because sign-in was the only refresh trigger.
-    func applicationDidBecomeActive(_ notification: Notification) {
-        Task {
-            if let session = await authFlow.sessionForForegroundActivation() {
-                await entitlementStore.refresh(session: session) {
-                    await self.authFlow.authenticatedSession()
-                }
-            }
-        }
-    }
-
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             openMainWindow()

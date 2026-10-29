@@ -87,28 +87,15 @@ targets:
         CFBundleExecutable: "$(EXECUTABLE_NAME)"
         CFBundlePackageType: APPL
         CFBundleSignature: "????"
-        # murmur:// deep link — carries the OAuth PKCE callback from the
-        # browser back into the app (Pro sign-in). Native Sign in with Apple
-        # is unavailable to Developer ID apps, so the browser round trip is
-        # the only auth path; see Murmur-server/plans/001.
-        CFBundleURLTypes:
-          - CFBundleURLName: com.matt.voice-dictation.auth
-            CFBundleURLSchemes: [murmur]
         NSPrincipalClass: NSApplication
         # Normal Dock app (NOT LSUIElement): the app shows in the Dock while
         # running and quits with Cmd-Q / Dock → Quit, like Wispr. It still
         # installs a menu-bar status item and the floating HUD pill.
         NSMicrophoneUsageDescription: "Murmur uses the microphone to capture audio while you hold the push-to-talk key."
         NSAccessibilityUsageDescription: "Murmur uses Accessibility to inject transcribed text at your cursor and suppress the emoji picker while the push-to-talk key is held."
-        # PRO ONLY — no update feed on this branch, deliberately. The public
-        # appcast serves free builds, and a Pro build pointed at it would be
-        # overwritten by the next stock release with one click. No SUFeedURL
-        # means SparkleSupport classifies as .missingFeed and the updater is
-        # never constructed (auto AND manual checks). Pro builds update by
-        # rebuild until a private Pro appcast exists; restore these two keys
-        # (with the Pro feed URL) when it does. `main` keeps the public feed.
-        # SUFeedURL: (removed on pro — see above)
-        # SUEnableAutomaticChecks: true
+        # Sparkle auto-update — public feed on Murmur-updates (source stays private)
+        SUFeedURL: "https://github.com/mrkinglollipop/Murmur-updates/releases/download/appcast/appcast.xml"
+        SUEnableAutomaticChecks: true
         SUPublicEDKey: "avl49QCQMbC5HBkcNxpcRiFLqJrn2aTfCcAuaauEAoQ="
         # Input Monitoring: CGEvent tap apps request this at runtime via TCC; no Info.plist key required,
         # but we surface a helpful message via code when it is missing.

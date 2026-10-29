@@ -60,8 +60,6 @@ struct RootView: View {
     @ObservedObject var scratchpadStore: ScratchpadStore
     @ObservedObject var clipboardStore: ClipboardStore
     @ObservedObject var settingsStore: SettingsStore
-    @ObservedObject var authFlow: AuthFlowController
-    @ObservedObject var entitlementStore: EntitlementStore
     @ObservedObject var modelManager: ModelManager
 
     /// Resolves the BYO cloud (OpenAI) key for Transforms' cloud fallback —
@@ -79,7 +77,7 @@ struct RootView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            SidebarNav(selectedTab: $selectedTab, isPro: entitlementStore.isPro, authFlow: authFlow)
+            SidebarNav(selectedTab: $selectedTab)
             Divider().overlay(Theme.hairline)
             content
         }
@@ -140,21 +138,12 @@ struct RootView: View {
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
                 case .clipboard:
-                    // Free users get the teaser, not the feature — and never
-                    // the data: the watcher only runs entitled, so there is
-                    // no history to protect behind this view.
-                    if entitlementStore.isPro {
-                        ClipboardView(store: clipboardStore)
-                    } else {
-                        ClipboardLockedView(authFlow: authFlow)
-                    }
+                    ClipboardView(store: clipboardStore)
                 case .settings:
                     SettingsView(
                         settingsStore: settingsStore,
                         modelManager: modelManager,
-                        onReplayOnboarding: onReplayOnboarding,
-                        authFlow: authFlow,
-                        entitlementStore: entitlementStore
+                        onReplayOnboarding: onReplayOnboarding
                     )
                 }
             }

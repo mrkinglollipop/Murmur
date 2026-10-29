@@ -42,21 +42,13 @@ struct SettingsView: View {
 
     init(settingsStore: SettingsStore, modelManager: ModelManager,
          onReplayOnboarding: @escaping () -> Void = {},
-         authFlow: AuthFlowController, entitlementStore: EntitlementStore,
          initialSection: SettingsSection? = nil, permissionOverride: PermissionSnapshot? = nil) {
         self.settingsStore = settingsStore
         self.modelManager = modelManager
-        self.authFlow = authFlow
-        self.entitlementStore = entitlementStore
         self.onReplayOnboarding = onReplayOnboarding
         self.permissionOverride = permissionOverride
         _selectedSection = State(initialValue: initialSection ?? SettingsSectionSession.selected)
     }
-
-    /// PRO ONLY — account + entitlement. Wired from AppDelegate via RootView.
-    @ObservedObject var authFlow: AuthFlowController
-    @ObservedObject var entitlementStore: EntitlementStore
-    @State private var showSignInSheet = false
 
     /// Local editing buffer for the currently-selected cloud model's API
     /// key field. Not written to Keychain until Save is tapped.
@@ -534,13 +526,6 @@ struct SettingsView: View {
                     voiceSectionContent
                 }
 
-                }
-
-                // PRO ONLY — must not merge to `main`.
-                if selectedSection == .general {
-                section(title: "Murmur Pro") {
-                    proSectionContent
-                }
                 }
 
                 if shows("Permissions") {
@@ -1209,60 +1194,6 @@ struct SettingsView: View {
                 cleanupKeySaveFailed = false
             }
         )
-    }
-
-    // MARK: - Murmur Pro (PRO ONLY)
-
-    @ViewBuilder
-    private var proSectionContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            switch authFlow.state {
-            case .signedIn(let session):
-                HStack(spacing: 8) {
-                    Image(systemName: entitlementStore.isPro ? "checkmark.seal.fill" : "person.crop.circle")
-                        .foregroundColor(entitlementStore.isPro ? Theme.successGreen : Theme.textSecondary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(session.email ?? "Signed in")
-                            .font(Theme.body(13))
-                            .foregroundColor(Theme.textPrimary)
-                        if entitlementStore.isRefreshing {
-                            Text("Checking subscription…")
-                                .font(Theme.body(11.5))
-                                .foregroundColor(Theme.textSecondary)
-                        } else {
-                            Text(entitlementStore.isPro ? "Murmur Pro is active" : "Free plan")
-                                .font(Theme.body(11.5))
-                                .foregroundColor(entitlementStore.isPro ? Theme.successGreen : Theme.textSecondary)
-                        }
-                    }
-                    Spacer()
-                    Button("Sign out") { authFlow.signOut() }
-                        .buttonStyle(.plain)
-                        .font(Theme.body(12))
-                        .foregroundColor(Theme.textSecondary)
-                }
-            default:
-                HStack(spacing: 10) {
-                    Text("Sign in to unlock Pro features like Clipboard history.")
-                        .font(Theme.body(12))
-                        .foregroundColor(Theme.textSecondary)
-                    Spacer()
-                    Button("Sign in") { showSignInSheet = true }
-                        .buttonStyle(.plain)
-                        .font(Theme.body(12, weight: .semibold))
-                        .foregroundColor(Theme.lavenderText)
-                        .padding(.horizontal, 12)
-                        .frame(height: 28)
-                        .murmurGlassCapsule(tint: Theme.selectionTint)
-                }
-            }
-        }
-        .sheet(isPresented: $showSignInSheet) {
-            SignInSheetView(authFlow: authFlow, onDismiss: { showSignInSheet = false })
-        }
-        .onChange(of: authFlow.state) { _, newState in
-            if case .signedIn = newState { showSignInSheet = false }
-        }
     }
 
     private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {

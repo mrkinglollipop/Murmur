@@ -18,8 +18,6 @@ final class MainWindowController: NSWindowController {
         clipboardStore: ClipboardStore,
         settingsStore: SettingsStore,
         modelManager: ModelManager,
-        authFlow: AuthFlowController,
-        entitlementStore: EntitlementStore,
         transformCredentialsProvider: @escaping () -> TransformCredentials,
         asrEngineSelector: @escaping () -> ASREngineSelector?,
         onReplayOnboarding: @escaping () -> Void
@@ -33,8 +31,6 @@ final class MainWindowController: NSWindowController {
             scratchpadStore: scratchpadStore,
             clipboardStore: clipboardStore,
             settingsStore: settingsStore,
-            authFlow: authFlow,
-            entitlementStore: entitlementStore,
             modelManager: modelManager,
             transformCredentialsProvider: transformCredentialsProvider,
             asrEngineSelector: asrEngineSelector,

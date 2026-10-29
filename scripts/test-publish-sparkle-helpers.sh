@@ -78,10 +78,9 @@ echo "==> local unnotarized path never reaches public release state"
 if grep -q 'source_git status --porcelain --untracked-files=all' "$SCRIPT" \
   && grep -q 'if \[\[ "\${ALLOW_UNNOTARIZED:-0}" == "1" \]\]; then' "$SCRIPT" \
   && grep -q 'is_stable_dmg_path "\$DMG" "\$ROOT/build/Murmur.dmg"' "$SCRIPT" \
-  && grep -q 'is_pro_app_bundle "\$APP"' "$SCRIPT" \
   && grep -q 'Local-only artifact' "$SCRIPT" \
   && grep -q 'Built from commit' "$SCRIPT"; then
-  pass "dirty tree, stable alias, Pro bundle, and commit-SHA gates are present"
+  pass "dirty tree, stable alias, and commit-SHA gates are present"
 else
   fail "publish-sparkle.sh lost a release safety gate"
 fi

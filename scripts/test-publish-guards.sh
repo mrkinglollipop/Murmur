@@ -123,7 +123,7 @@ DMG="$FIXTURE/Murmur-$SHORT.dmg"
 DMG_PATH="$DMG" SKIPPED_MAKE_DMG=0
 WHATSNEW_NOTES=fixture
 trap cleanup_dmg_mount EXIT
-# Portable plist reader; real Pro classification still runs from release-lib.sh.
+# Portable plist reader.
 plist_get() {
   python3 - "$1" "$2" <<'PY'
 import plistlib, sys
@@ -154,7 +154,7 @@ CASE
 make_fixture() {
   rm -rf "$FIXTURE"
   mkdir -p "$FIXTURE"
-  python3 - "$FIXTURE" "${1:-standard}" <<'PY'
+  python3 - "$FIXTURE" <<'PY'
 import pathlib, plistlib, sys
 root = pathlib.Path(sys.argv[1])
 info = dict(CFBundleShortVersionString='1.0', CFBundleVersion='2',
@@ -163,8 +163,6 @@ for name in ['DerivedData/Build/Products/Release', 'payload']:
     path = root / name / 'Murmur.app/Contents/Info.plist'
     path.parent.mkdir(parents=True)
     data = info.copy()
-    if name == 'payload' and sys.argv[2] == 'pro':
-        data['CFBundleURLTypes'] = [dict(CFBundleURLName='com.matt.voice-dictation.auth')]
     path.write_bytes(plistlib.dumps(data))
 (root / 'Murmur-1.0.dmg').write_text('same-version artifact from different, dirty source')
 (root / 'downloadable.dmg').write_text('previous signed bytes')
@@ -199,11 +197,6 @@ LABEL='sourcing does not execute publish flow'; check test "$RC" -eq 0
 
 # Regression cases follow audit severity/order. Failure requires the guard's
 # own diagnosis, not an incidental command error, and no upload/build side effect.
-make_fixture pro
-run_case payload
-LABEL='#1 actual Pro DMG refused despite matching standard DerivedData'
-check refused 'refusing to publish a Pro build'
-
 make_fixture
 run_case collision
 LABEL='#2 failed replacement cannot delete an advertised enclosure'
@@ -286,15 +279,6 @@ d = plistlib.loads(p.read_bytes()); d['CFBundleVersion'] = '1'; p.write_bytes(pl
 PY
 run_case payload
 LABEL='payload version mismatch refuses despite matching DerivedData'; check refused '!= project.yml'
-
-make_fixture
-python3 - "$FIXTURE" <<'PY'
-import pathlib, plistlib, sys
-p = pathlib.Path(sys.argv[1]) / 'payload/Murmur.app/Contents/Info.plist'
-d = plistlib.loads(p.read_bytes()); d['CFBundleURLTypes'] = 'malformed'; p.write_bytes(plistlib.dumps(d))
-PY
-run_case payload
-LABEL='indeterminate Pro identity refuses'; check refused 'cannot determine whether'
 
 make_fixture
 export STAPLER_RC=1

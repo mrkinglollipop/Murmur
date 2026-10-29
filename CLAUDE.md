@@ -17,21 +17,15 @@ Separate XcodeGen project under [`ios/`](ios/README.md). Do **not** add those
 targets to the Mac `project.yml`. Spike shipped in PR #35; that README is the
 in-repo worksheet. Linux cloud agents cannot build or device-test it.
 
-## Clipboard manager — PRO ONLY, must not reach `main`
+## Single edition
 
-The clipboard manager (`ClipboardCrypto`, `ClipboardStore`, `ClipboardWatcher`,
-`ClipboardView`, and the `RootTab.clipboard` case) is a **paid Pro feature**.
-
-- **Never merge it into `main`.** Its merge target is the `pro` branch, and
-  only once a Pro entitlement check exists to gate it. Shipping it on `main`
-  gives a paid feature away to every free user, and it cannot be clawed back.
-- It is being built on a branch cut from `main` purely because it has zero
-  dependency on the Supabase auth plumbing that lives on `pro` — not because
-  `main` is the destination.
-- Before opening a PR for any branch touching these files, check the base
-  branch. `gh pr create --base main` is the mistake this note exists to stop.
-- Sole exception: the additive `accessibility:` parameter on
-  `KeychainStore.setKey` is generic infrastructure and is safe on `main`.
+There is no separate Pro edition: the former `pro` branch was folded into
+`main` (2026-10-29). The clipboard manager (`ClipboardCrypto`, `ClipboardStore`,
+`ClipboardWatcher`, `ClipboardView`, `RootTab.clipboard`) ships to everyone.
+The Supabase sign-in, entitlement checks and `murmur://` Mac URL scheme were
+deleted, and the app updates from the public Sparkle feed. Old Supabase
+Keychain items may linger on machines that ran Pro builds; leave them alone
+(no launch-time Keychain sweeps).
 
 ## Setup
 

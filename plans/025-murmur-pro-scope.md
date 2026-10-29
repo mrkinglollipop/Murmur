@@ -1,6 +1,6 @@
 # 025 — Murmur Pro: scope & design
 
-**Status:** approved direction (Matt, 2026-08-10); phase 1 not yet started.
+**Status:** SUPERSEDED (Matt, 2026-10-29: "merge the pro and get rid of it"). There is no Pro edition; the clipboard manager shipped to everyone and the Supabase sign-in was deleted. Kept as history.
 **Canonical home:** this file, on `main` of the (now PRIVATE) `Murmur` repo.
 **Repos:** app = `Murmur` (taken private 2026-08-10; Pro work on the `pro`
 branch, never merged to `main` until launch); backend = `Murmur-server`

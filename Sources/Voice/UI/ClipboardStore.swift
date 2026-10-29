@@ -1,7 +1,3 @@
-// PRO ONLY — this file is part of the paid clipboard manager and must never
-// merge into `main`. Its target is the `pro` branch, gated behind a Pro
-// entitlement check. See the "Clipboard manager" section of CLAUDE.md.
-
 import AppKit
 import CryptoKit
 import Darwin

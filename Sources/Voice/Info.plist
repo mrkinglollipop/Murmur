@@ -22,17 +22,6 @@
 	<string>0.1.57</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>com.matt.voice-dictation.auth</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>murmur</string>
-			</array>
-		</dict>
-	</array>
 	<key>CFBundleVersion</key>
 	<string>58</string>
 	<key>NSAccessibilityUsageDescription</key>
@@ -41,6 +30,10 @@
 	<string>Murmur uses the microphone to capture audio while you hold the push-to-talk key.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/mrkinglollipop/Murmur-updates/releases/download/appcast/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>avl49QCQMbC5HBkcNxpcRiFLqJrn2aTfCcAuaauEAoQ=</string>
 </dict>

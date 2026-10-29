@@ -36,7 +36,7 @@ current setup and contribution guidance.
 | 022 | Speaker-gating spike report | DONE (spike) |
 | 023 | Open-source readiness | SHIPPED (Phases 1–5) |
 | 024 | Repo audit findings | archival (fix pass 1 landed) |
-| 025 | Murmur Pro scope | approved direction; not started |
+| 025 | Murmur Pro scope | SUPERSEDED (2026-10-29) — no Pro edition; the `pro` branch was folded into `main` and the paid-tier plan dropped |
 | 026 | iOS keyboard: Wispr-parity chrome + swipe/autocorrect/GIPHY (swipe bake-off gated) | PARTIAL — P0–P2 in tree; swipe is in the build (Settings toggle, default off), still bake-off gated; P2b Messages bubble is a device spike; **027 wins for look** (mic not Start/waveform; brighter caps + 1pt lip, not leftover UIGlassEffect-on-keys); **P0 space-bar trackpad cancelled by 027** |
 | 027 | iOS keyboard: Apple chrome polish + multi-iPhone sizing | SHIPPED (2026-08-13) — visual vs Apple unverified until Messages screenshot; **wins for look** vs 026 (mic not Start/waveform; brighter caps + 1pt lip); **cancels 026 P0 space-bar trackpad**; 026 still owns P0-host / GIF / swipe / dictation bounce |
 | 028 | Gemini 3.5 Transcribe as selectable cloud engine (Mac + iOS host) | SHIPPED (code 2026-08-26) — live WS handshake unverified; additive; default xAI |
