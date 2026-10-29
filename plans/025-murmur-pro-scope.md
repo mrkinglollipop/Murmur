@@ -1,9 +1,9 @@
 # 025 — Murmur Pro: scope & design
 
-**Status:** approved direction (Matt, 2026-08-10); phase 1 not yet started.
+**Status:** SUPERSEDED (Matt, 2026-10-29: "merge the pro and get rid of it"). There is no Pro edition; the clipboard manager shipped to everyone and the Supabase sign-in was deleted. Kept as history.
 **Canonical home:** this file, on `main` of the (now PRIVATE) `Murmur` repo.
 **Repos:** app = `Murmur` (taken private 2026-08-10; Pro work on the `pro`
-branch, never merged to `main` until launch); backend = `Murmur-server`
+branch, never merged to `main` until launch); backend = the private backend repo
 (private, forever). `Murmur-updates` stays PUBLIC — its release assets are the
 Sparkle feed.
 
@@ -96,7 +96,7 @@ Murmur proxy (JWT check · metering · provider routing)   Paddle (checkout ·
 ```
 
 Proxy = one small always-on service (Cloudflare Workers + D1/KV, or a $5 VPS)
-in `Murmur-server`: JWT validation, WSS relay for realtime, upload endpoint
+in the private backend repo: JWT validation, WSS relay for realtime, upload endpoint
 for batch, usage counter. **Scope fact:** "cloud" in Murmur is ASR *and* the
 xAI-backed cleanup/transforms (`TransformRunner`, `CleanupService`) — both
 must be proxied or Pro users lose cleanup when BYO keys are buried.
@@ -115,7 +115,7 @@ return 200 anonymously. Rules that remain:
   `publish-sparkle.sh` ships whatever `main` contains — a premature merge
   would put dormant Pro code in the next free DMG.
 - Free fixes land on `main` as today; `pro` merges `main` regularly.
-- **Backend lives only in `Murmur-server`** (private forever).
+- **Backend lives only in the private backend repo** (private forever).
 - Pre-launch Pro beta builds, if wanted, get a separate private appcast URL.
 - **If the repo ever goes public again**, everything committed while private
   (this file's pricing, Pro history) becomes visible — that future decision
@@ -125,13 +125,13 @@ return 200 anonymously. Rules that remain:
 
 ## Build order — one-session slices (briefs point here; do not restate)
 
-1. **Accounts + billing** (`Murmur-server`) — **SIWA spike done**: native
+1. **Accounts + billing** (the private backend repo) — **SIWA spike done**: native
    Sign in with Apple is dead for Developer ID; browser OAuth + PKCE replaces
-   it for both providers. Brief: `Murmur-server/plans/001-phase-1-accounts-billing.md`.
+   it for both providers. Brief: the backend repo's `plans/001-phase-1-accounts-billing.md`.
    Supabase project, Apple Services ID, Google client, Paddle product +
    portal, webhook → sub state, draft schema with RLS. Exit: sign in on a test
    build, subscribe, cancel from portal, state visible in Postgres.
-2. **Proxy + metering** (`Murmur-server`) — includes a spike verifying the
+2. **Proxy + metering** (the private backend repo) — includes a spike verifying the
    chosen host can originate/relay WSS to the ASR provider. JWT validation,
    realtime relay, batch endpoint, cleanup relay, minute counter. Exit: a
    signed-in subscriber dictates and transcribes a file end-to-end on our

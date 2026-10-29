@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import Sparkle
 
@@ -40,6 +41,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let styleStore = StyleStore()
     private let transformsStore = TransformsStore()
     private let scratchpadStore = ScratchpadStore()
+    /// Clipboard manager. Construction reads nothing from disk (`loadOnInit:
+    /// false`); `activate()` loads history and does the Keychain and disk work,
+    /// off the launch path, and only when the user has turned history on.
+    private let clipboardStore = ClipboardStore(loadOnInit: false)
+    private lazy var clipboardWatcher = ClipboardWatcher(store: clipboardStore)
+    private var clipboardSettingCancellable: AnyCancellable?
     private let settingsStore = SettingsStore()
     private let correctionWatcher = CorrectionWatcher()
     private let learnToast = LearnToastHUD()
@@ -62,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         styleStore: styleStore,
         transformsStore: transformsStore,
         scratchpadStore: scratchpadStore,
+        clipboardStore: clipboardStore,
         settingsStore: settingsStore,
         modelManager: modelManager,
         transformCredentialsProvider: { [weak settingsStore] in
@@ -125,6 +133,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ModelManager init runs WhisperKit Documents→App Support migration
         // before the activation tap starts accepting dictation.
         modelManager = ModelManager()
+
+        // Clipboard history is opt-in (default off). While off, nothing is
+        // activated (no Keychain or disk work) and nothing is watched. The
+        // publisher replays the stored value, so this also applies at launch.
+        clipboardSettingCancellable = settingsStore.$clipboardHistoryEnabled
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in
+                self?.clipboardWatcher.setCaptureEnabled(enabled)
+            }
 
         activationController = ActivationController()
         activationController?.useToggleLockProvider = { [weak self] in
@@ -383,6 +401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        clipboardWatcher.stop()
+        clipboardStore.flush()
         historyStore.flush()
         dictionaryStore.flush()
         correctionsLog.flush()

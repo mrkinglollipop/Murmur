@@ -14,6 +14,7 @@ enum RootTab: String, CaseIterable, Identifiable {
     case style
     case transforms
     case scratchpad
+    case clipboard
     case settings
 
     var id: String { rawValue }
@@ -27,6 +28,7 @@ enum RootTab: String, CaseIterable, Identifiable {
         case .style: return "Style"
         case .transforms: return "Transforms"
         case .scratchpad: return "Scratchpad"
+        case .clipboard: return "Clipboard"
         case .settings: return "Settings"
         }
     }
@@ -40,6 +42,7 @@ enum RootTab: String, CaseIterable, Identifiable {
         case .style: return "textformat"
         case .transforms: return "wand.and.stars"
         case .scratchpad: return "note.text"
+        case .clipboard: return "doc.on.clipboard"
         case .settings: return "gearshape"
         }
     }
@@ -55,6 +58,7 @@ struct RootView: View {
     @ObservedObject var styleStore: StyleStore
     @ObservedObject var transformsStore: TransformsStore
     @ObservedObject var scratchpadStore: ScratchpadStore
+    @ObservedObject var clipboardStore: ClipboardStore
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var modelManager: ModelManager
 
@@ -133,11 +137,18 @@ struct RootView: View {
                     TransformsView(store: transformsStore, historyStore: historyStore, transformCredentialsProvider: transformCredentialsProvider)
                 case .scratchpad:
                     ScratchpadView(store: scratchpadStore)
+                case .clipboard:
+                    if settingsStore.clipboardHistoryEnabled {
+                        ClipboardView(store: clipboardStore)
+                    } else {
+                        ClipboardOffView(settingsStore: settingsStore, store: clipboardStore)
+                    }
                 case .settings:
                     SettingsView(
                         settingsStore: settingsStore,
                         modelManager: modelManager,
-                        onReplayOnboarding: onReplayOnboarding
+                        onReplayOnboarding: onReplayOnboarding,
+                        clipboardStore: clipboardStore
                     )
                 }
             }

@@ -17,6 +17,16 @@ Separate XcodeGen project under [`ios/`](ios/README.md). Do **not** add those
 targets to the Mac `project.yml`. Spike shipped in PR #35; that README is the
 in-repo worksheet. Linux cloud agents cannot build or device-test it.
 
+## Single edition
+
+There is no separate Pro edition: the former `pro` branch was folded into
+`main` (2026-10-29). The clipboard manager (`ClipboardCrypto`, `ClipboardStore`,
+`ClipboardWatcher`, `ClipboardView`, `RootTab.clipboard`) ships to everyone.
+The Supabase sign-in, entitlement checks and `murmur://` Mac URL scheme were
+deleted, and the app updates from the public Sparkle feed. Old Supabase
+Keychain items may linger on machines that ran Pro builds; leave them alone
+(no launch-time Keychain sweeps).
+
 ## Setup
 
 ```bash

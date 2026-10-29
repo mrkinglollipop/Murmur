@@ -433,15 +433,6 @@ validate_dmg_payload() {
     echo "error: DMG Murmur.app version $APP_SHORT/$APP_BUILD != project.yml $SHORT/$BUILD." >&2
     return 1
   fi
-  local app_is_pro=0
-  is_pro_app_bundle "$APP" || app_is_pro=$?
-  if [[ "$app_is_pro" -eq 0 ]]; then
-    echo "error: refusing to publish a Pro build to the public Murmur-updates feed." >&2
-    return 1
-  elif [[ "$app_is_pro" -ne 1 ]]; then
-    echo "error: cannot determine whether the built app is Pro; refusing public publish." >&2
-    return 1
-  fi
   if ! xcrun stapler validate "$DMG"; then
     echo "error: DMG has no valid notarization ticket: $DMG" >&2
     return 1

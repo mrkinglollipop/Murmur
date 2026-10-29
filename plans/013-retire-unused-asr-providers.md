@@ -92,7 +92,7 @@ performs the stored-selection load (`SettingsStore`), `Tests/VoiceTests/`,
 - Branch: `chore/retire-unused-asr-providers` off `main` (currently `aef0c93`).
 - If the shared working directory is dirty or on another branch, create an
   isolated `git worktree` rather than checking out in place.
-- Conventional commits; `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+- Conventional commits; a `Co-Authored-By:` trailer for the authoring agent.
 - Do NOT push, do NOT open a PR.
 
 ## Steps

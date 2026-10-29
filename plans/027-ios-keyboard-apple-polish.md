@@ -3,7 +3,7 @@
 **Status:** SHIPPED (2026-08-13) — code on `main` via this ship. Visual vs Apple in Messages is **unverified** until a device screenshot. Kill the keyboard once after install. **Supersession:** the bottom-row 😊 opens Murmur’s in-app emoji page (search, 9-column grid, category strip, ABC). It is **not** wired to `handleInputModeList`. The system globe in the keyboard well still switches keyboards.
 **Written against:** Murmur-ios working tree 2026-08-13 (uncommitted typing-safety + first chrome pass on `main`).
 **Canonical home:** this file. Index row in [`plans/README.md`](README.md).
-**Does not authorize:** App Store / TestFlight, iOS 26 compatibility, iPad, Mac targets, Pro/IAP, Murmur-server, space-bar trackpad, key popups that draw above the keyboard’s top edge.
+**Does not authorize:** App Store / TestFlight, iOS 26 compatibility, iPad, Mac targets, Pro/IAP, the backend, space-bar trackpad, key popups that draw above the keyboard’s top edge.
 
 Thread intent (2026-08-13): the keyboard still does not look Apple-y after the wide-spacebar pass. Do **all** of the punch-list batches (QuickType bar + mic relocate, geometry/keycaps, Apple gestures). Add **other iPhone** sizing if it is easy. Relocating the microphone is acceptable. Write this plan, then verify it — **do not implement in the verify-plan turn**.
 

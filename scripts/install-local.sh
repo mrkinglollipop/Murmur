@@ -48,24 +48,6 @@ echo "==> Verifying build product signature"
 codesign --verify --deep --strict "$PRODUCT"
 assert_no_get_task_allow "$PRODUCT" || exit 1
 
-# A standard checkout must not silently replace the owner's private Pro app.
-if [[ -e "$DEST" ]]; then
-  set +e
-  is_pro_app_bundle "$DEST"
-  dest_is_pro=$?
-  is_pro_app_bundle "$PRODUCT"
-  product_is_pro=$?
-  set -e
-  if [[ "$dest_is_pro" -eq 2 || "$product_is_pro" -eq 2 ]]; then
-    echo "error: cannot determine whether the installed or built app is Pro; refusing replacement." >&2
-    exit 1
-  fi
-  if [[ "$dest_is_pro" -eq 0 && "$product_is_pro" -ne 0 ]]; then
-    echo "error: refusing to replace the installed Pro app with a standard build. Build from the private Pro checkout." >&2
-    exit 1
-  fi
-fi
-
 INSTALL_ROOT="$(mktemp -d /Applications/.Murmur-install.XXXXXX)"
 STAGING="$INSTALL_ROOT/Murmur.app"
 ditto "$PRODUCT" "$STAGING"

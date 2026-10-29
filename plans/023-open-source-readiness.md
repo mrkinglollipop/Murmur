@@ -67,7 +67,7 @@ Self-contained so a fresh agent can verify each independently.
 | # | Finding | Evidence |
 |---|---|---|
 | F1 | No LICENSE — repo is legally unusable | `gh repo view --json licenseInfo` → `null` |
-| F2 | A proprietary stock-screening skill is tracked in git | `.cursor/skills/fortress-compounder-screener/` — 1,642 LOC; `git rev-list --all --objects \| grep -ic fortress` → 13 |
+| F2 | A proprietary stock-screening skill is tracked in git | a personal skill under `.cursor/skills/` — 1,642 LOC; `git rev-list --all --objects \| grep -ic <skill-name>` → 13 |
 | F3 | 3.1 GB model cache written into `~/Documents`, which iCloud syncs | **Fixed** — `ModelManager.downloadBase` → `Application Support/Voice/Models` via `VoicePaths`; migrates only `models/argmaxinc/whisperkit-coreml` |
 | F4 | Injection debug log writes unconditionally, no rotation, no cap | `TextInjector.swift:549`; zero `VOICE_DEBUG` refs in that file; 109 KB accrued in ~1 week |
 | F5 | Insights stats are silently window-scoped and now frozen | `HistoryStore.swift:59` — `private let maxEntries = 1000` (instance property, not a static); live `history.json` holds exactly 1000 |
@@ -357,7 +357,7 @@ Phase 5 cut + publicize executed.
 4. `Murmur-updates` / Sparkle tip **0.1.20** / build 21 with appcast `<description>`. **Done.**
 5. Version continuity held (monotone Sparkle builds). **Done.**
 
-**Stop-condition:** if the pre-push secret scan or the `fortress` grep returns anything,
+**Stop-condition:** if the pre-push secret scan or the skill-name grep returns anything,
 stop and report. Do not push and clean up afterwards.
 
 ---
@@ -382,7 +382,7 @@ Local oracles only — this repo has **no CI by design**; do not add one or "fix
 | Destructive | screenshot History + Settings → Voice | delete affordances read as destructive |
 | Settings accent | screenshot Settings | toggles and menu pickers coral (segmented may stay system — see §3.2) |
 | No secrets | `git ls-files -z \| xargs -0 grep -InE '\bsk-[A-Za-z0-9_-]{16,}\|\bxai-[A-Za-z0-9]{16,}\|AKIA[0-9A-Z]{16}\|BEGIN [A-Z ]*PRIVATE KEY'` | empty |
-| Screener gone | `git rev-list --all --objects \| grep -ic fortress` | `0` **in the new repo** (current repo returns 13) |
+| Screener gone | `git rev-list --all --objects \| grep -ic <skill-name>` | `0` **in the new repo** (current repo returns 13) |
 
 > The secret-scan regex **must** stay length-anchored. A bare `sk-` matches ordinary prose
 > ("ask-first", "risk-premium") and returns 5 false positives on the current tree — a check
@@ -423,8 +423,8 @@ container to `Toggle`/`Picker` (§3.2); that atomic writes preserve a `chmod`ed 
 but a licensing conclusion, not something checked here — moot unless the App Store is ever
 considered, since Murmur ships via DMG and Sparkle).
 
-**Round 2 — all three audit lanes returned and are reflected above.** Two `composer-2.5`
-critics (bug-hunt + stale-claim) plus a `grok-4.5` cross-family confirm pass. Grok confirmed
+**Round 2 — all three audit lanes returned and are reflected above.** Two
+critics (bug-hunt + stale-claim) plus a cross-family confirm pass. The confirm pass confirmed
 findings 1, 3, 4 and 5 as HIGH/MEDIUM and rejected one: it read the segmented-`Picker`
 contradiction as resolvable by building a custom control. This plan resolves it the other
 way — accepting a system-accent segmented control and putting a replacement out of scope —

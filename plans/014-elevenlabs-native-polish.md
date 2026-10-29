@@ -100,7 +100,7 @@ keyterms-supply seam (see Step 2), `SettingsView.swift` (one toggle),
 
 - Branch: `feat/elevenlabs-native-polish` off main. Isolated `git worktree` if
   the shared checkout is dirty (prior agents did this successfully).
-- Conventional commits; `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+- Conventional commits; a `Co-Authored-By:` trailer for the authoring agent.
 - Do NOT push, do NOT open a PR.
 
 ## Steps

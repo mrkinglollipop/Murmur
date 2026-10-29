@@ -134,7 +134,7 @@ final class AuditFixTests: XCTestCase {
             .general: ["Activation", "System", "Voice"],
             .engine: ["Transcription Engine", "Language", "Local Model", "Cloud Model"],
             .text: ["Cleanup", "Dictation text"],
-            .storage: ["Storage"],
+            .storage: ["Storage", "Clipboard"],
             .permissions: ["Permissions"],
             .about: ["What's New", "Acknowledgements"],
         ]

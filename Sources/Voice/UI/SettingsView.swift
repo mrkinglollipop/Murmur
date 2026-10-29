@@ -18,7 +18,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .general: return ["Activation", "System", "Voice"].contains(card)
         case .engine: return ["Transcription Engine", "Language", "Local Model", "Cloud Model"].contains(card)
         case .text: return ["Cleanup", "Dictation text"].contains(card)
-        case .storage: return card == "Storage"
+        case .storage: return ["Storage", "Clipboard"].contains(card)
         case .permissions: return card == "Permissions"
         case .about: return ["What's New", "Acknowledgements"].contains(card)
         }
@@ -38,14 +38,17 @@ struct SettingsView: View {
     @ObservedObject var modelManager: ModelManager
 
     var onReplayOnboarding: () -> Void = {}
+    @ObservedObject var clipboardStore: ClipboardStore
     var permissionOverride: PermissionSnapshot?
 
     init(settingsStore: SettingsStore, modelManager: ModelManager,
          onReplayOnboarding: @escaping () -> Void = {},
+         clipboardStore: ClipboardStore,
          initialSection: SettingsSection? = nil, permissionOverride: PermissionSnapshot? = nil) {
         self.settingsStore = settingsStore
         self.modelManager = modelManager
         self.onReplayOnboarding = onReplayOnboarding
+        self.clipboardStore = clipboardStore
         self.permissionOverride = permissionOverride
         _selectedSection = State(initialValue: initialSection ?? SettingsSectionSession.selected)
     }
@@ -517,6 +520,24 @@ struct SettingsView: View {
                 if shows("Storage") {
                 section(title: "Storage") {
                     storageSectionContent
+                }
+
+                }
+
+                if shows("Clipboard") {
+                section(title: "Clipboard") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("Clipboard history", isOn: $settingsStore.clipboardHistoryEnabled)
+                            .toggleStyle(.switch)
+                            .font(Theme.body(12))
+                            .foregroundColor(Theme.textPrimary)
+
+                        Text("Saves what you copy, encrypted, on this Mac only.")
+                            .font(Theme.body(10))
+                            .foregroundColor(Theme.textSecondary)
+
+                        ClearSavedClipboardButton(store: clipboardStore)
+                    }
                 }
 
                 }

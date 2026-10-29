@@ -75,6 +75,36 @@ final class KeychainAccountConsistencyTests: XCTestCase {
         XCTAssertNotEqual(CloudProvider.gemini.keychainAccount, CloudProvider.elevenLabs.keychainAccount)
     }
 
+    func testGenericSetKeyIdentifiesClipboardKeyWithoutTouchingKeychain() {
+        XCTAssertTrue(KeychainStore.isClipboardKeyAccount(
+            service: ClipboardKeyStore.service,
+            account: ClipboardKeyStore.account
+        ))
+        XCTAssertFalse(KeychainStore.isClipboardKeyAccount(
+            service: "com.matt.voice-dictation.apikeys.TESTS",
+            account: ClipboardKeyStore.account
+        ))
+        XCTAssertFalse(KeychainStore.isClipboardKeyAccount(
+            service: ClipboardKeyStore.service,
+            account: CloudProvider.xai.keychainAccount
+        ))
+    }
+
+    func testInjectedGenericSetKeyDoesNotNeedRealKeychain() {
+        var addCount = 0
+        let isolated = KeychainStore(
+            service: "com.matt.voice-dictation.apikeys.TESTS.injected",
+            operations: KeychainOperations(
+                read: { _ in (errSecItemNotFound, nil) },
+                add: { _ in addCount += 1; return errSecSuccess },
+                update: { _, _ in errSecSuccess },
+                delete: { _ in errSecSuccess }
+            )
+        )
+        XCTAssertTrue(isolated.setKey("in-memory", for: CloudProvider.xai.keychainAccount))
+        XCTAssertEqual(addCount, 1)
+    }
+
     // MARK: - Live round trip (legacy keychain — no entitlement required)
 
     /// Proves the actual write path (`setKey`, as `SettingsStore.saveAPIKey`
